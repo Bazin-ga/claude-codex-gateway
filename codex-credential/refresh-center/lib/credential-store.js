@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmod, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, open, readFile, readdir, rename, stat as statPath, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 /**
@@ -42,8 +42,8 @@ export class CredentialStore {
   async init() {
     await mkdir(this.secretDir, { recursive: true, mode: DIR_MODE });
     await mkdir(this.publicDir, { recursive: true, mode: PUBLIC_DIR_MODE });
-    await chmod(this.secretDir, DIR_MODE);
-    await chmod(this.publicDir, PUBLIC_DIR_MODE);
+    await ensureMode(this.secretDir, DIR_MODE);
+    await ensureMode(this.publicDir, PUBLIC_DIR_MODE);
   }
 
   /** @returns {Promise<object>} the full credential, including the refresh token. */
@@ -220,6 +220,18 @@ export class CredentialStore {
       await unlink(join(this.secretDir, stale)).catch(() => {});
     }
   }
+}
+
+/**
+ * chmod requires ownership, not merely write access, so a process seeding a home
+ * owned by another user (the console writing the centre's home) gets EPERM even
+ * with an ACL granting it everything. Correcting a mode that is already correct
+ * is the only reason that ever happened, so check before asking.
+ */
+async function ensureMode(path, mode) {
+  const info = await statPath(path);
+  if ((info.mode & 0o7777) === mode) return;
+  await chmod(path, mode);
 }
 
 async function processIdentity(pid) {

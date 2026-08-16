@@ -12,11 +12,9 @@ import { dirname, join, resolve } from 'node:path';
 import {
   decryptJson,
   encryptJson,
-  hashPassword,
   randomToken,
   secretMatches,
   sha256,
-  verifyPassword,
 } from './security.js';
 
 const STATE_VERSION = 1;
@@ -26,10 +24,12 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// A state.json written before the administrator-password mode was removed still
+// carries an `admin` record. Nothing reads it any more; it is left untouched
+// rather than migrated away, so a rollback finds the file it wrote.
 function newState() {
   return {
     version: STATE_VERSION,
-    admin: null,
     accounts: [],
     oauth_flows: [],
     enrollments: [],
@@ -178,25 +178,6 @@ export class CredentialStore {
     }
   }
 
-  async setAdminPassword(password) {
-    return this.serialized(async () => {
-      this.state.admin = {
-        password: await hashPassword(password),
-        changed_at: nowIso(),
-      };
-      this.audit('admin_password_changed');
-      await this.persist();
-    });
-  }
-
-  hasAdmin() {
-    return Boolean(this.state?.admin?.password);
-  }
-
-  verifyAdminPassword(password) {
-    return verifyPassword(password, this.state?.admin?.password);
-  }
-
   publicAccounts() {
     return this.state.accounts.map((account) => ({
       id: account.id,
@@ -263,6 +244,45 @@ export class CredentialStore {
     });
   }
 
+  /**
+   * Remove an account that never finished authorizing — a typo in the alias or the
+   * owner email, most often.
+   *
+   * Keyed off the stored credential, NOT off `status`. Status is derived and moves
+   * with health checks, so a row that is `unhealthy` today may well be holding a
+   * working credential; trusting it here would eventually delete something the
+   * operator cannot recreate, because they do not hold the upstream login. An
+   * imported codex home is refused for the same reason — the row is a pointer to
+   * real credential material living outside this store.
+   */
+  async deleteAccount(id) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account) throw new Error('account not found');
+      if (account.credential) {
+        throw new Error('account holds a stored credential and cannot be deleted');
+      }
+      if (account.external) {
+        throw new Error('account is an imported credential home and cannot be deleted here');
+      }
+      const attached = this.state.devices.filter(
+        (device) => device.account_id === id && !device.revoked_at,
+      ).length;
+      if (attached) {
+        throw new Error(`account still has ${attached} active device(s)`);
+      }
+      this.state.accounts = this.state.accounts.filter((entry) => entry.id !== id);
+      // Half-finished authorization sessions and unredeemed enrollment links for a
+      // deleted account are unusable; leaving them would let a stale link resolve
+      // against a missing row.
+      this.state.oauth_flows = this.state.oauth_flows.filter((flow) => flow.account_id !== id);
+      this.state.enrollments = this.state.enrollments.filter((entry) => entry.account_id !== id);
+      this.audit('account_deleted', { account_id: id, provider: account.provider, alias: account.alias });
+      await this.persist();
+      return account;
+    });
+  }
+
   async updateAccountHealth(id, { success, error = null }) {
     return this.serialized(async () => {
       const account = this.accountById(id);
@@ -298,48 +318,61 @@ export class CredentialStore {
     });
   }
 
-  async beginClaudeAuthorization({ accountId, verifier, state, initiatedBy, ttlMinutes = 15 }) {
-    return this.serialized(async () => {
-      const account = this.accountById(accountId);
-      if (!account) throw new Error('account not found');
-      if (account.provider !== 'claude') throw new Error('account is not a Claude account');
-      if (!account.email_label) throw new Error('account owner email is required before authorization');
-      const now = Date.now();
-      for (const flow of this.state.oauth_flows) {
-        if (flow.account_id === accountId && !flow.used_at && Date.parse(flow.expires_at) > now) {
-          flow.superseded_at = nowIso();
-        }
+  // Claude and Codex share one oauth_flows collection deliberately: one set of
+  // rules for state digests, encrypted verifiers, supersession, and expiry.
+  #openAuthorizationFlow({ account, verifier, state, initiatedBy, ttlMinutes, event }) {
+    const now = Date.now();
+    for (const flow of this.state.oauth_flows) {
+      if (flow.account_id === account.id && !flow.used_at && Date.parse(flow.expires_at) > now) {
+        flow.superseded_at = nowIso();
       }
-      const id = randomToken(12);
-      const flow = {
-        id,
-        account_id: accountId,
-        state_sha256: sha256(state),
-        verifier: encryptJson(
-          this.masterKey,
-          { code_verifier: verifier },
-          `oauth-flow:${id}:verifier:v1`,
-        ),
-        initiated_by: String(initiatedBy ?? '').slice(0, 160),
-        created_at: nowIso(),
-        expires_at: new Date(now + ttlMinutes * 60_000).toISOString(),
-        used_at: null,
-      };
-      this.state.oauth_flows.push(flow);
-      if (this.state.oauth_flows.length > 100) {
-        this.state.oauth_flows.splice(0, this.state.oauth_flows.length - 100);
-      }
-      this.audit('claude_authorization_started', {
-        oauth_flow_id: id,
-        account_id: accountId,
-        initiated_by: flow.initiated_by,
-      });
-      await this.persist();
-      return { ...flow, verifier: undefined, state_sha256: undefined };
+    }
+    const id = randomToken(12);
+    const flow = {
+      id,
+      account_id: account.id,
+      state_sha256: sha256(state),
+      verifier: encryptJson(
+        this.masterKey,
+        { code_verifier: verifier },
+        `oauth-flow:${id}:verifier:v1`,
+      ),
+      initiated_by: String(initiatedBy ?? '').slice(0, 160),
+      created_at: nowIso(),
+      expires_at: new Date(now + ttlMinutes * 60_000).toISOString(),
+      used_at: null,
+    };
+    this.state.oauth_flows.push(flow);
+    if (this.state.oauth_flows.length > 100) {
+      this.state.oauth_flows.splice(0, this.state.oauth_flows.length - 100);
+    }
+    this.audit(event, {
+      oauth_flow_id: id,
+      account_id: account.id,
+      initiated_by: flow.initiated_by,
     });
+    return flow;
   }
 
-  claudeAuthorizationByState({ accountId, state }) {
+  #decryptedFlow(flow) {
+    const credential = decryptJson(
+      this.masterKey,
+      flow.verifier,
+      `oauth-flow:${flow.id}:verifier:v1`,
+    );
+    return { ...flow, verifier: credential.code_verifier, state_sha256: undefined };
+  }
+
+  #liveFlowById(flowId) {
+    const flow = this.state.oauth_flows.find((entry) => entry.id === flowId);
+    if (!flow) throw new Error('authorization session was not found');
+    if (flow.used_at) throw new Error('authorization session was already used');
+    if (flow.superseded_at) throw new Error('authorization session was replaced');
+    if (Date.parse(flow.expires_at) <= Date.now()) throw new Error('authorization session expired');
+    return flow;
+  }
+
+  #flowByState({ accountId, state }) {
     const digest = sha256(state);
     const flow = [...this.state.oauth_flows].reverse().find((entry) => (
       entry.account_id === accountId && entry.state_sha256 === digest
@@ -350,21 +383,147 @@ export class CredentialStore {
     if (Date.parse(flow.expires_at) <= Date.now()) {
       throw new Error('authorization session expired; start again');
     }
-    const credential = decryptJson(
-      this.masterKey,
-      flow.verifier,
-      `oauth-flow:${flow.id}:verifier:v1`,
-    );
-    return { ...flow, verifier: credential.code_verifier, state_sha256: undefined };
+    return this.#decryptedFlow(flow);
+  }
+
+  async beginClaudeAuthorization({ accountId, verifier, state, initiatedBy, ttlMinutes = 15 }) {
+    return this.serialized(async () => {
+      const account = this.accountById(accountId);
+      if (!account) throw new Error('account not found');
+      if (account.provider !== 'claude') throw new Error('account is not a Claude account');
+      if (!account.email_label) throw new Error('account owner email is required before authorization');
+      const flow = this.#openAuthorizationFlow({
+        account,
+        verifier,
+        state,
+        initiatedBy,
+        ttlMinutes,
+        event: 'claude_authorization_started',
+      });
+      await this.persist();
+      return { ...flow, verifier: undefined, state_sha256: undefined };
+    });
+  }
+
+  async beginCodexAuthorization({ accountId, verifier, state, initiatedBy, ttlMinutes = 15 }) {
+    return this.serialized(async () => {
+      const account = this.accountById(accountId);
+      if (!account) throw new Error('account not found');
+      if (account.provider !== 'codex') throw new Error('account is not a Codex account');
+      const flow = this.#openAuthorizationFlow({
+        account,
+        verifier,
+        state,
+        initiatedBy,
+        ttlMinutes,
+        event: 'codex_authorization_started',
+      });
+      await this.persist();
+      return { ...flow, verifier: undefined, state_sha256: undefined };
+    });
+  }
+
+  /**
+   * A codex-credential home holds exactly one credential, so seeding it for a
+   * second account overwrites the first account's — and the refresh token that
+   * replaces is single-use, so the loss is permanent. Checked when a session
+   * starts, where nothing is spent yet, and again before the write.
+   */
+  assertCodexSeedHome({ accountId, seedHome }) {
+    if (!seedHome) return;
+    // Canonicalized on both sides: `cli.js import-codex` stores `resolve(home)`,
+    // so a trailing slash or a `/./` in the configured value would otherwise read
+    // as a different home and wave through the overwrite this exists to stop.
+    const target = resolve(seedHome);
+    const account = this.accountById(accountId);
+    const boundHome = account?.external?.home;
+    if (boundHome && resolve(boundHome) !== target) {
+      throw new Error(
+        `${account.alias} holds its credential in ${boundHome}, not the configured seed home ${seedHome}`,
+      );
+    }
+    const owner = this.state.accounts.find((entry) => (
+      entry.id !== accountId && entry.external?.home && resolve(entry.external.home) === target
+    ));
+    if (owner) {
+      throw new Error(
+        `${owner.alias} already holds the credential in ${seedHome}; seeding this account would overwrite it`,
+      );
+    }
+  }
+
+  claudeAuthorizationByState({ accountId, state }) {
+    return this.#flowByState({ accountId, state });
+  }
+
+  codexAuthorizationByState({ accountId, state }) {
+    return this.#flowByState({ accountId, state });
+  }
+
+  #liveCodexFlow(accountId) {
+    return [...this.state.oauth_flows].reverse().find((entry) => (
+      entry.account_id === accountId
+      && !entry.used_at
+      && !entry.superseded_at
+      && Date.parse(entry.expires_at) > Date.now()
+    )) ?? null;
+  }
+
+  /**
+   * Whether a pasted code can still be accepted, without decrypting the verifier.
+   * The page uses this to keep the paste box on screen after a failed attempt, so
+   * a mistyped paste does not force a fresh round trip through OpenAI.
+   */
+  pendingCodexAuthorization({ accountId }) {
+    const flow = this.#liveCodexFlow(accountId);
+    return flow ? { id: flow.id, expires_at: flow.expires_at } : null;
+  }
+
+  /**
+   * A bare pasted code carries no state, so fall back to the account's single
+   * live session. Starting a session supersedes the previous one, so there is
+   * never more than one to choose between.
+   */
+  liveCodexAuthorization({ accountId }) {
+    const flow = this.#liveCodexFlow(accountId);
+    if (!flow) throw new Error('no authorization session is waiting for a code; start again');
+    return this.#decryptedFlow(flow);
+  }
+
+  /**
+   * Retire a completed Codex session. The credential itself is never passed in:
+   * it belongs in a codex-credential home or in the operator's hands, never in
+   * `state.json` or the audit log.
+   */
+  async completeCodexAuthorization({ flowId, seededHome = null, expiresAt = null }) {
+    return this.serialized(async () => {
+      const flow = this.#liveFlowById(flowId);
+      const account = this.accountById(flow.account_id);
+      if (!account || account.provider !== 'codex') throw new Error('Codex account was not found');
+      flow.used_at = nowIso();
+      delete flow.verifier;
+      if (seededHome) {
+        // Only where to read the credential's health, never the credential.
+        account.external ??= { kind: 'codex-credential', home: seededHome };
+        account.status = 'stored';
+        account.expires_at = expiresAt;
+        account.last_success_at = nowIso();
+        delete account.last_failure;
+        delete account.last_failure_at;
+      }
+      this.audit('codex_authorization_completed', {
+        oauth_flow_id: flow.id,
+        account_id: account.id,
+        seeded_home: seededHome,
+      });
+      await this.persist();
+      return account;
+    });
   }
 
   async completeClaudeAuthorization({ flowId, accessToken, emailAddress, expiresAt, scope = null }) {
     return this.serialized(async () => {
-      const flow = this.state.oauth_flows.find((entry) => entry.id === flowId);
-      if (!flow) throw new Error('authorization session was not found');
-      if (flow.used_at) throw new Error('authorization session was already used');
-      if (flow.superseded_at) throw new Error('authorization session was replaced');
-      if (Date.parse(flow.expires_at) <= Date.now()) throw new Error('authorization session expired');
+      const flow = this.#liveFlowById(flowId);
       const account = this.accountById(flow.account_id);
       if (!account || account.provider !== 'claude') throw new Error('Claude account was not found');
       const expectedEmail = String(account.email_label ?? '').trim().toLowerCase();

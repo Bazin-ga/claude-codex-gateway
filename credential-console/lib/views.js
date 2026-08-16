@@ -60,6 +60,7 @@ button.danger { background: var(--red); }
 .notice { border-left: 4px solid var(--amber); background: #fff7e9; padding: 12px 14px; border-radius: 0 10px 10px 0; }
 .success { border-left-color: var(--green); background: #eaf6ef; }
 .error { border-left-color: var(--red); background: #faebe9; }
+.open-banner { margin-bottom: 22px; font-weight: 700; }
 code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
 .login { max-width: 450px; margin: 11vh auto 0; }
@@ -90,6 +91,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .quota-message.error { color: var(--red); background: transparent; border: 0; padding: 0; }
 .member-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end; margin-top: 18px; }
 .member-form.codex-form { grid-template-columns: 1fr auto; }
+.member-form.with-label { grid-template-columns: 1fr 1fr 1fr auto; }
+.member-form.codex-form.with-label { grid-template-columns: 1fr 1fr auto; }
 .member-form label { margin-bottom: 0; }
 .admin-zone { border-top: 1px solid var(--line); padding-top: 28px; margin-top: 12px; }
 .admin-heading { margin-bottom: 18px; }
@@ -109,11 +112,16 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .table-wrap { overflow-x: auto; }
   .zone-heading { display: grid; }
   .identity-chip { white-space: normal; }
-  .provider-grid, .member-form, .member-form.codex-form { grid-template-columns: 1fr; }
+  .provider-grid, .member-form, .member-form.codex-form,
+  .member-form.with-label, .member-form.codex-form.with-label { grid-template-columns: 1fr; }
 }
 `;
 
-function layout(title, content, { canSignOut = false } = {}) {
+// Open mode has no login at all. Say so on every page instead of letting the console
+// look like something is guarding it.
+const openBanner = '<div class="notice error open-banner" role="status" data-i18n="open-banner">No authentication: anyone who can reach this console can issue and revoke credentials.</div>';
+
+function layout(title, content, { openMode = false } = {}) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -133,33 +141,13 @@ function layout(title, content, { canSignOut = false } = {}) {
           <button type="button" data-language="en" aria-pressed="true">EN</button>
           <button type="button" data-language="zh" aria-pressed="false">中文</button>
         </div>
-        ${canSignOut ? '<form method="post" action="/logout"><button class="secondary" type="submit" data-i18n="sign-out">Sign out</button></form>' : ''}
       </div>
     </header>
+    ${openMode ? openBanner : ''}
     ${content}
   </main>
 </body>
 </html>`;
-}
-
-export function loginView({ error = null, setupRequired = false } = {}) {
-  return layout('Sign in', `
-    <section class="login">
-      <div class="card">
-        <h1>Credential Console</h1>
-        <p class="muted" data-i18n="login-intro">Sign in to manage provider accounts and issue one-time device enrollment links.</p>
-        ${setupRequired ? '<div class="notice error">No administrator password is configured. Initialize it from the server CLI before exposing this service.</div>' : ''}
-        ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
-        <form method="post" action="/login" class="stack" autocomplete="off">
-          <input name="username" value="admin" autocomplete="username" hidden>
-          <label><span data-i18n="admin-password">Administrator password</span>
-            <input name="password" type="password" required minlength="14" autocomplete="current-password">
-          </label>
-          <button type="submit" data-i18n="sign-in">Sign in</button>
-        </form>
-      </div>
-    </section>
-  `);
 }
 
 function statusBadge(status) {
@@ -188,17 +176,22 @@ function quotaWindowView(usage, kind, label, i18n) {
   </div>`;
 }
 
+/**
+ * Only a reading the provider refuses to give is an error. A row that has simply
+ * never been authorized is the expected state of an account someone just added,
+ * and rendering that in red reads as a fault the operator has to chase.
+ */
+const QUOTA_MESSAGES = {
+  reauthorization_required: '<div class="quota-message" data-i18n="usage-reauthorize">Reauthorize this Claude account once to enable quota reporting.</div>',
+  authorization_required: '<div class="quota-message" data-i18n="usage-authorize-first">Authorize this account to enable quota reporting.</div>',
+  stale: '<div class="quota-message" data-i18n="usage-stale">Showing the last successful reading; the latest refresh failed.</div>',
+  unavailable: '<div class="quota-message error" data-i18n="usage-unavailable">Usage is temporarily unavailable.</div>',
+  pending: '<div class="quota-message" data-i18n="usage-loading">Waiting for the first hourly usage refresh.</div>',
+};
+
 function accountUsageView(account, { showAccount = false } = {}) {
   const usage = account.usage;
-  const message = usage?.status === 'reauthorization_required'
-    ? '<div class="quota-message" data-i18n="usage-reauthorize">Reauthorize this Claude account once to enable quota reporting.</div>'
-    : usage?.status === 'stale'
-      ? '<div class="quota-message" data-i18n="usage-stale">Showing the last successful reading; the latest refresh failed.</div>'
-      : usage?.status === 'unavailable'
-        ? '<div class="quota-message error" data-i18n="usage-unavailable">Usage is temporarily unavailable.</div>'
-        : !usage
-          ? '<div class="quota-message" data-i18n="usage-loading">Waiting for the first hourly usage refresh.</div>'
-          : '';
+  const message = QUOTA_MESSAGES[usage ? usage.status : 'pending'] ?? '';
   const updatedAt = usage?.fetched_at ?? usage?.attempted_at;
   return `<div class="quota-account">
     ${showAccount ? `<div class="quota-account-name"><strong>${escapeHtml(account.alias)}</strong>${usage?.plan_type ? `<span class="badge stored">${escapeHtml(usage.plan_type)}</span>` : ''}</div>` : ''}
@@ -216,7 +209,7 @@ export function dashboardView({
   devices,
   csrf,
   adminIdentity = null,
-  canSignOut = true,
+  openMode = false,
   codexSelfServiceReady = false,
   error = null,
 }) {
@@ -253,11 +246,24 @@ export function dashboardView({
           <input name="member_label" aria-label="Member label for ${escapeHtml(account.alias)}" placeholder="member email/name" required maxlength="160">
           <button type="submit" data-i18n="enroll-device">Enroll device</button>
         </form>` : '<span class="muted tiny" data-i18n="owner-login-required">Account owner must authorize before member enrollment.</span>'}
-        </div>` : '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>'}
+        </div>` : `<div class="stack">
+          <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>
+          ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}
+        </div>`}
+        ${account.status === 'login_required' && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <button class="danger" type="submit" data-i18n="delete-account">Delete account</button>
+        </form>` : ''}
       </td>
     </tr>
   `;
   }).join('');
+  // Open mode has no verified identity, so the member types the label that keeps their
+  // device names from colliding with somebody else's.
+  const memberLabelField = openMode ? `<label><span data-i18n="member-label">Your label (self-asserted, not verified)</span>
+                <input name="member_label" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="alex" maxlength="64">
+              </label>` : '';
+  const memberFormClass = openMode ? ' with-label' : '';
   const deviceRows = devices.map((device) => {
     const account = accounts.find((entry) => entry.id === device.account_id);
     return `<tr>
@@ -275,25 +281,28 @@ export function dashboardView({
   return layout('Dashboard', `
     <div class="stack">
       ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
-      ${adminIdentity ? `<section class="member-zone">
+      ${openMode || adminIdentity ? `<section class="member-zone">
         <div class="zone-heading">
           <div>
             <span class="zone-label" data-i18n="member-zone-label">Member self-service · This is exactly what every member sees</span>
             <h1 data-i18n="member-heading">Set up AI tools on this device</h1>
             <p class="muted" data-i18n="member-intro">Choose a team account and get a local setup. No administrator handoff and no shared provider login.</p>
           </div>
-          <div class="identity-chip"><span data-i18n="tailscale-identity">Tailscale identity</span><br><strong>${escapeHtml(adminIdentity)}</strong></div>
+          <div class="identity-chip">${openMode
+            ? '<span data-i18n="no-identity">No identity</span><br><strong data-i18n="anonymous-visitor">Anonymous visitor</strong>'
+            : `<span data-i18n="tailscale-identity">Tailscale identity</span><br><strong>${escapeHtml(adminIdentity)}</strong>`}</div>
         </div>
         <div class="provider-grid">
           <article class="provider-card">
             <div class="provider-title"><h2>Claude Code</h2>${selfServiceAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
             <p class="muted" data-i18n="claude-description">Get a public-internet configuration scoped to this member and device. The provider OAuth token never leaves the server.</p>
             ${selfServiceAccounts.length ? `<div class="quota-list">${claudeUsage}</div>` : ''}
-            ${selfServiceAccounts.length ? `<form method="post" action="/self-service" class="member-form">
+            ${selfServiceAccounts.length ? `<form method="post" action="/self-service" class="member-form${memberFormClass}">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <label><span data-i18n="team-account">Team account</span>
                 <select name="account_id" required>${selfServiceOptions}</select>
               </label>
+              ${memberLabelField}
               <label><span data-i18n="device-name">Device name</span>
                 <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-macbook" maxlength="64">
               </label>
@@ -309,8 +318,9 @@ export function dashboardView({
             ${primaryCodex ? `<p><strong>${escapeHtml(primaryCodex.alias)}</strong></p>` : ''}
             <p class="muted" data-i18n="codex-description">The refresh center rotates the master credential. Get a self-contained installer and independent device token that do not require tailnet access.</p>
             ${primaryCodex ? `<div class="quota-list">${accountUsageView(primaryCodex)}</div>` : ''}
-            ${primaryCodex && codexSelfServiceReady ? `<form method="post" action="/codex/self-service" class="member-form codex-form">
+            ${primaryCodex && codexSelfServiceReady ? `<form method="post" action="/codex/self-service" class="member-form codex-form${memberFormClass}">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              ${memberLabelField}
               <label><span data-i18n="device-name">Device name</span>
                 <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64">
               </label>
@@ -318,6 +328,7 @@ export function dashboardView({
             </form>` : '<div class="notice" data-i18n="codex-unavailable">Codex self-service enrollment is not configured yet. An administrator must connect dispenser enrollment.</div>'}
           </article>
         </div>
+        ${openMode ? '<p class="muted tiny" data-i18n="member-label-note">Nobody checks the label. It only keeps two members\' device names apart.</p>' : ''}
       </section>` : ''}
 
       <section class="admin-zone">
@@ -355,6 +366,21 @@ export function dashboardView({
             </form>
           </article>
           <article class="card split">
+            <h2 data-i18n="add-codex-heading">Add a Codex team account</h2>
+            <div class="notice"><span data-i18n="add-codex-help">Register the alias, then authorize the ChatGPT subscription from the account's own page. No separate codex login on another machine is needed.</span></div>
+            <form method="post" action="/accounts" class="stack" autocomplete="off">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <input type="hidden" name="provider" value="codex">
+              <label><span data-i18n="account-alias">Account alias</span>
+                <input name="alias" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,63}" placeholder="codex-shared-1">
+              </label>
+              <label><span data-i18n="account-email-optional">Account email label (optional, checked at authorization)</span>
+                <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160">
+              </label>
+              <button type="submit" data-i18n="register-account">Register account</button>
+            </form>
+          </article>
+          <article class="card split">
             <h2 data-i18n="member-flow">What members actually do</h2>
             <div class="stack">
               <p><strong>1.</strong> <span data-i18n="member-step-1">Join the tailnet and open this page.</span></p>
@@ -376,7 +402,7 @@ export function dashboardView({
         </section>
       </section>
     </div>
-  `, { canSignOut });
+  `, { openMode });
 }
 
 export function claudeAuthorizationView({
@@ -385,7 +411,7 @@ export function claudeAuthorizationView({
   ownerPageUrl,
   authorization = null,
   error = null,
-  canSignOut = true,
+  openMode = false,
 }) {
   return layout('Claude account authorization', `
     <section class="login">
@@ -422,10 +448,89 @@ export function claudeAuthorizationView({
         <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
       </div>
     </section>
-  `, { canSignOut });
+  `, { openMode });
 }
 
-export function enrollmentCreatedView({ account, memberLabel, link, canSignOut = true }) {
+export function codexAuthorizationView({
+  account,
+  csrf,
+  ownerPageUrl,
+  authorization = null,
+  seedHome = null,
+  error = null,
+  openMode = false,
+}) {
+  return layout('Codex account authorization', `
+    <section class="login">
+      <div class="card stack">
+        <div><span class="badge stored">Codex</span></div>
+        <h1 data-i18n="codex-auth-heading">Codex account authorization</h1>
+        <p><span data-i18n="team-account">Team account</span>: <strong>${escapeHtml(account.alias)}</strong>${account.email_label ? `<br><span data-i18n="owner-auth-account">Expected account</span>: <strong>${escapeHtml(account.email_label)}</strong>` : ''}</p>
+        ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+        <div class="notice">${seedHome
+          ? `<span data-i18n="codex-target-seed">On completion the credential is written straight into the Codex credential home below and is never shown.</span><br><span class="tiny">${escapeHtml(seedHome)}</span>`
+          : '<span data-i18n="codex-target-manual">No Codex credential home is configured, so the resulting auth.json is shown once for you to copy or download. The console writes nothing.</span>'}</div>
+        <div class="notice" data-i18n="codex-localhost-expected">Expect the final page to fail. OpenAI registers this client against http://localhost:1455 and sends the browser there, where nothing is listening. "Unable to connect" or "site can't be reached" is the successful outcome, not an error — the address bar then holds the authorization code.</div>
+        <div class="notice" data-i18n="owner-page-permanent">This control-page URL is permanent. Open it whenever the account owner is ready; the temporary OAuth session is created only after Start authorization is pressed.</div>
+        <pre id="owner-page-url">${escapeHtml(ownerPageUrl)}</pre>
+        <button type="button" class="secondary" data-copy-target="owner-page-url" data-i18n="copy-owner-link">Copy owner page link</button>
+        <form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-authorization/start">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <button type="submit" data-i18n="start-authorization">Start a fresh authorization</button>
+        </form>
+        ${authorization ? `
+          <div class="notice success">${authorization.url
+            ? '<span data-i18n="temporary-session-ready">A fresh 15-minute authorization session is ready.</span>'
+            : '<span data-i18n="session-still-open">This authorization session is still open, so the code you already have can be pasted again. Starting a fresh one would invalidate it.</span>'
+          }<br><span class="tiny">${escapeHtml(dateText(authorization.expires_at))}</span></div>
+          ${authorization.url ? `
+          <ol class="stack">
+            <li data-i18n="codex-auth-step-1">Open the OpenAI page below and sign in with the ChatGPT account that holds the Codex subscription.</li>
+            <li data-i18n="codex-auth-step-2">Let the browser land on the localhost address that fails to load, then copy that whole address out of the address bar.</li>
+            <li data-i18n="codex-auth-step-3">Paste it here and submit. The code alone also works. The server exchanges it directly with OpenAI.</li>
+          </ol>
+          <a class="button" href="${escapeHtml(authorization.url)}" target="_blank" rel="noopener noreferrer" data-i18n="open-codex-authorization">Open OpenAI authorization</a>
+          ` : ''}
+          <form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-authorization/complete" class="stack" autocomplete="off">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+            <label><span data-i18n="codex-redirect-label">Failed localhost address, or the code alone</span>
+              <textarea name="authorization_code" required minlength="8" spellcheck="false" autocomplete="off" placeholder="http://localhost:1455/auth/callback?code=...&amp;state=..."></textarea>
+            </label>
+            <button type="submit" data-i18n="complete-authorization">Complete authorization</button>
+          </form>
+        ` : ''}
+        <div class="notice" data-i18n="codex-auth-security">The authorization session is single-use, expires in 15 minutes, and is replaced when a new one starts. A pasted address is checked against the state this console issued; a bare code carries no state and relies on PKCE and there being exactly one live session. The PKCE verifier is encrypted at rest and the resulting credential is never written to state.json, the audit log, or a log line.</div>
+        <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+      </div>
+    </section>
+  `, { openMode });
+}
+
+export function codexCredentialView({ account, authJson, error = null, openMode = false }) {
+  const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
+  const filename = `codex-auth-${profile}.json`;
+  const seedCommand = `sudo -u codex-refresh CODEX_CRED_HOME=/var/lib/codex-credential node /opt/claude-codex-gateway/codex-credential/refresh-center/seed.js ./${filename}`;
+  return layout('Codex credential ready', `
+    <section class="card stack">
+      ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+      <div class="notice success"><span data-i18n="codex-account-authorized">This Codex account is authorized</span>: <strong>${escapeHtml(account.alias)}</strong></div>
+      <h1 data-i18n="codex-copy-now">Copy or download this credential now</h1>
+      <p class="muted" data-i18n="codex-one-time-json">This is the complete auth.json, including a live single-use refresh token. It is displayed once; the console stores no copy and this page cannot be reproduced. Keep it readable only by you and delete it once the credential centre has been seeded.</p>
+      <pre id="codex-auth-json">${escapeHtml(authJson)}</pre>
+      <div class="setup-actions">
+        <button type="button" data-download-target="codex-auth-json" data-download-name="${escapeHtml(filename)}" data-i18n="download-auth-json">Download auth.json</button>
+        <button type="button" class="secondary" data-copy-target="codex-auth-json" data-i18n="copy-auth-json">Copy auth.json</button>
+      </div>
+      <h3 data-i18n="codex-seed-command">Seed the credential centre with it</h3>
+      <div class="run-command">${escapeHtml(seedCommand)}</div>
+      <div class="notice" data-i18n="codex-seed-stale">Seeding is a handover, not a backup: the centre rotates the refresh token on its first run and this file dies at that moment. Delete it afterwards rather than keeping it.</div>
+      <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
+      <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+    </section>
+  `, { openMode });
+}
+
+export function enrollmentCreatedView({ account, memberLabel, link, openMode = false }) {
   return layout('Enrollment created', `
     <section class="login">
       <div class="card stack">
@@ -437,10 +542,10 @@ export function enrollmentCreatedView({ account, memberLabel, link, canSignOut =
         <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
       </div>
     </section>
-  `, { canSignOut });
+  `, { openMode });
 }
 
-export function enrollmentView({ account, memberLabel, code, error = null }) {
+export function enrollmentView({ account, memberLabel, code, error = null, openMode = false }) {
   return layout('Enroll device', `
     <section class="login">
       <div class="card stack">
@@ -457,7 +562,7 @@ export function enrollmentView({ account, memberLabel, code, error = null }) {
         <p class="muted tiny" data-i18n="device-scope-note">The resulting credential is scoped to this device and can be revoked without affecting anyone else.</p>
       </div>
     </section>
-  `);
+  `, { openMode });
 }
 
 function shellSingleQuote(value) {
@@ -489,6 +594,13 @@ write_asset() {
   mkdir -p "$(dirname "$ROOT/$relative")"
   node -e 'require("node:fs").writeFileSync(process.argv[1], Buffer.from(process.argv[2], "base64"))' \\
     "$ROOT/$relative" "$payload"
+  # Assets land at the default mode, so anything install.sh execs has to be made
+  # executable here. Keyed off the extension rather than a per-file chmod: the
+  # per-file version silently stopped covering new scripts as they were added,
+  # and the symptom was a machine that installed cleanly and never renewed.
+  case "$relative" in
+    *.sh) chmod 700 "$ROOT/$relative" ;;
+  esac
 }
 
 write_asset pull.js ${shellSingleQuote(base64Asset(assets, 'pull.js'))}
@@ -498,6 +610,8 @@ write_asset install/install.sh ${shellSingleQuote(base64Asset(assets, 'install/i
 write_asset install/systemd/codex-credential.service ${shellSingleQuote(base64Asset(assets, 'install/systemd/codex-credential.service'))}
 write_asset install/systemd/codex-credential.timer ${shellSingleQuote(base64Asset(assets, 'install/systemd/codex-credential.timer'))}
 write_asset install/launchd/com.claude-codex-gateway.codex-credential.plist ${shellSingleQuote(base64Asset(assets, 'install/launchd/com.claude-codex-gateway.codex-credential.plist'))}
+write_asset install/start-container-loop.sh ${shellSingleQuote(base64Asset(assets, 'install/start-container-loop.sh'))}
+write_asset install/diagnose.sh ${shellSingleQuote(base64Asset(assets, 'install/diagnose.sh'))}
 chmod 700 "$ROOT/install/install.sh"
 
 "$ROOT/install/install.sh" \\
@@ -537,6 +651,7 @@ export function codexConfiguredView({
   endpoint,
   certPin,
   assets,
+  openMode = false,
 }) {
   const unixScript = codexUnixInstaller({ assets, endpoint, certPin, token });
   const installers = [
@@ -580,10 +695,10 @@ export function codexConfiguredView({
       <div class="notice"><span data-i18n="do-not-codex-login">Do not run codex login after installation. The agent writes the subscription credential and refreshes it automatically.</span></div>
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
     </section>
-  `);
+  `, { openMode });
 }
 
-export function deviceConfiguredView({ account, device, token, claudeGatewayUrl }) {
+export function deviceConfiguredView({ account, device, token, claudeGatewayUrl, openMode = false }) {
   const gateway = claudeGatewayUrl.replace(/\/$/, '');
   const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
   const unix = `#!/usr/bin/env bash
@@ -687,16 +802,26 @@ Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
       <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
     </section>
-  `);
+  `, { openMode });
 }
 
-export function messageView(title, message, { error = false } = {}) {
+export function messageView(title, message, {
+  error = false,
+  openMode = false,
+  i18n = null,
+  detail = null,
+} = {}) {
+  // The translated node has to be text-only: applyLanguage replaces its children.
+  // Anything variable therefore goes in `detail`, outside it.
   return layout(title, `
     <section class="login">
       <div class="card stack">
-        <div class="notice ${error ? 'error' : 'success'}">${escapeHtml(message)}</div>
-        <a class="button secondary" href="/">Continue</a>
+        <div class="notice ${error ? 'error' : 'success'}">${i18n
+          ? `<span data-i18n="${escapeHtml(i18n)}">${escapeHtml(message)}</span>`
+          : escapeHtml(message)
+        }${detail ? `<br><span class="tiny">${escapeHtml(detail)}</span>` : ''}</div>
+        <a class="button secondary" href="/" data-i18n="continue">Continue</a>
       </div>
     </section>
-  `);
+  `, { openMode });
 }

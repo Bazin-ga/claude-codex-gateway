@@ -101,9 +101,16 @@ These are measurements, not assumptions. They constrain the implementation.
 home read-only and, when enrollment is configured, mint per-device tokens and generate
 platform-specific agent installers from a web UI.
 
+It can also perform the initial subscription login itself, so the one human login no longer has
+to happen through `codex login` on a separate machine with the resulting `auth.json` carried
+over by hand. The console either hands the finished credential to the operator for
+`refresh-center/seed.js`, or — with `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` set, which trades the
+read-only import boundary for write access to `secret/` — seeds this home directly through the
+same store and operation lock `seed.js` uses.
+
 ## Deploying
 
-See [`DEPLOY.md`](DEPLOY.md). In short: two services on one egress-capable server, one agent on every machine that runs Codex, and exactly one human login at the start.
+See [`DEPLOY.md`](DEPLOY.md). In short: two services on one egress-capable server, one agent on every machine that runs Codex, and exactly one human login at the start — performed either with `codex login` elsewhere or from the credential console.
 
 ## Status
 

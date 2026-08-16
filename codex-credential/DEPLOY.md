@@ -6,7 +6,9 @@ Prerequisites:
 
 - a server that can reach `auth.openai.com` **directly**. Verify by posting a deliberately invalid refresh token to `https://auth.openai.com/oauth/token`: a **401** means the endpoint is reachable and evaluating the request, so this host can serve as the center. A `403`, or no response at all, means it cannot;
 - Node ≥ 20 on that server (the codex CLI itself is **not** needed there);
-- one `auth.json` from a human `codex login`, performed on a machine that can reach ChatGPT.
+- one `auth.json` for the subscription account. Either a human runs `codex login` on a machine
+  that can reach ChatGPT and copies the file over, or an administrator authorizes the account
+  from `credential-console` — see [Seeding from the console](#seeding-from-the-console) below.
 
 Placeholders used below: `<server>` is the host you chose as the center, `<public-ip-or-host>`
 is the address clients will connect to, and `<machine-name>` is the name you give one client.
@@ -37,6 +39,23 @@ sudo -u codex-refresh CODEX_CRED_HOME=$CODEX_CRED_HOME \
 ```
 
 > The source `auth.json` becomes stale at the first rotation. It is a seed, not a backup — the live credential lives in `$CODEX_CRED_HOME/secret/` from here on.
+
+### Seeding from the console
+
+`codex login` on another machine is no longer the only way to produce that `auth.json`.
+`credential-console` can run the same ChatGPT authorization-code flow itself: register a Codex
+account there, open its **Codex authorization** page, sign in, and paste back the localhost
+address the browser fails to open. That console then either hands you the finished `auth.json`
+to feed to the command above, or — when its `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` points at this
+home — writes it here directly, using this same store, expiry parser, and operation lock.
+
+Console-side writing means the console's user needs write access to `$CODEX_CRED_HOME/secret/`,
+which the read-only import path deliberately avoids. Grant it only if the console and this centre
+are one trust domain; otherwise leave that variable unset and keep seeding by hand.
+
+Whichever route produced it, do not re-seed a running centre from an old file: the first
+rotation invalidated it, and overwriting the live credential with a spent token costs a fresh
+authorization.
 
 **Certificate and clients.**
 
@@ -257,7 +276,7 @@ for a garbage token, so it can only tell you the file parses. A real turn is the
 
 **Rotating the certificate** — regenerate, then update `CODEX_CRED_CERT_PIN` on every client. Until you do, clients refuse to connect. That refusal is the pin working, not a fault.
 
-**Recovering from a dead refresh chain** — a human logs in again on any machine that can reach ChatGPT, then re-seeds. Previous credential generations are retained in `$CODEX_CRED_HOME/secret/` if you need to inspect what happened.
+**Recovering from a dead refresh chain** — authorize the account again, either with `codex login` on any machine that can reach ChatGPT or from the console's Codex authorization page, then re-seed. Previous credential generations are retained in `$CODEX_CRED_HOME/secret/` if you need to inspect what happened.
 
 An ambiguous refresh leaves `secret/refresh-in-flight.json` as a persistent
 quarantine marker. Scheduled runs refuse to refresh while it exists. Re-seeding

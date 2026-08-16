@@ -75,7 +75,7 @@ distribution centre）。
 | 组件族 | 内容 | 文档 |
 |---|---|---|
 | [`codex-credential/`](codex-credential/) | `refresh-center`、`token-dispenser`、`client-agent`。把一份 Codex 凭证分发给多台机器，且各台机器之间不会互相挤掉。 | [README](codex-credential/README.md) · [DEPLOY](codex-credential/DEPLOY.md) |
-| [`credential-console/`](credential-console/) | 多账号控制平面、按设备注册、加密的 Claude OAuth 存储、隔离凭证的 Claude 网关。以只读方式导入已有的 `codex-credential` home 目录。 | [README](credential-console/README.md) · [DEPLOY](credential-console/DEPLOY.md) |
+| [`credential-console/`](credential-console/) | 多账号控制平面、按设备注册、加密的 Claude OAuth 存储、隔离凭证的 Claude 网关。以只读方式导入已有的 `codex-credential` home 目录，也可以自己完成 Codex 账号授权。 | [README](credential-console/README.md) · [DEPLOY](credential-console/DEPLOY.md) |
 
 两个组件族相互独立。只部署 `codex-credential` 本身就是一套完整方案；`credential-console`
 在其之上增加 Claude 账号、一套 UI 和自助注册。

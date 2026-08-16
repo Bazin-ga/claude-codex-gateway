@@ -3,13 +3,8 @@ import {
   createDecipheriv,
   createHash,
   randomBytes,
-  scrypt as scryptCallback,
   timingSafeEqual,
 } from 'node:crypto';
-import { promisify } from 'node:util';
-
-const scrypt = promisify(scryptCallback);
-const PASSWORD_KEY_BYTES = 32;
 
 export function randomToken(bytes = 32) {
   return randomBytes(bytes).toString('base64url');
@@ -17,25 +12,6 @@ export function randomToken(bytes = 32) {
 
 export function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
-}
-
-export async function hashPassword(password, salt = randomBytes(16).toString('base64url')) {
-  if (typeof password !== 'string' || password.length < 14) {
-    throw new Error('admin password must be at least 14 characters');
-  }
-  const key = await scrypt(password, salt, PASSWORD_KEY_BYTES);
-  return {
-    algorithm: 'scrypt',
-    salt,
-    hash: Buffer.from(key).toString('base64url'),
-  };
-}
-
-export async function verifyPassword(password, record) {
-  if (!record || record.algorithm !== 'scrypt' || !record.salt || !record.hash) return false;
-  const actual = Buffer.from(await scrypt(String(password), record.salt, PASSWORD_KEY_BYTES));
-  const expected = Buffer.from(record.hash, 'base64url');
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
 export function encryptJson(masterKey, value, aad) {

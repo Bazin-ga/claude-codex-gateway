@@ -240,14 +240,43 @@ test('re-opening a store preserves encrypted credentials and state', async () =>
     alias: 'claude-team-1',
     credential: { oauth_token: 'persisted-master-token' },
   });
-  await store.setAdminPassword('a-strong-admin-password');
 
   const reopened = await new CredentialStore(home).init();
   assert.deepEqual(reopened.accountCredential(account.id), {
     oauth_token: 'persisted-master-token',
   });
-  assert.equal(await reopened.verifyAdminPassword('a-strong-admin-password'), true);
-  assert.equal(await reopened.verifyAdminPassword('wrong-password-value'), false);
+  assert.deepEqual(reopened.publicAccounts().map((entry) => entry.alias), ['claude-team-1']);
+});
+
+test('a state.json left behind by the removed password mode still opens and is not rewritten', async () => {
+  const { home, store } = await newStore();
+  const account = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-team-1',
+    credential: { oauth_token: 'persisted-master-token' },
+  });
+  // Exactly what the deleted setAdminPassword() used to persist.
+  const legacy = JSON.parse(await readFile(join(home, 'state.json'), 'utf8'));
+  legacy.admin = {
+    password: { algorithm: 'scrypt', salt: 'synthetic-salt', hash: 'synthetic-hash' },
+    changed_at: '2026-01-01T00:00:00.000Z',
+  };
+  await writeFile(join(home, 'state.json'), `${JSON.stringify(legacy, null, 2)}\n`);
+
+  const reopened = await new CredentialStore(home).init();
+  assert.deepEqual(reopened.accountCredential(account.id), {
+    oauth_token: 'persisted-master-token',
+  });
+  // The field survives a write: nothing reads it, and nothing migrates it away.
+  await reopened.revokeDevice(
+    (await reopened.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'member@example.com',
+      deviceName: 'member-laptop',
+    })).device.id,
+  );
+  const rewritten = JSON.parse(await readFile(join(home, 'state.json'), 'utf8'));
+  assert.deepEqual(rewritten.admin, legacy.admin);
 });
 
 test('persists PKCE verifiers encrypted and stores a Claude token only after email verification', async () => {
@@ -304,4 +333,99 @@ test('persists PKCE verifiers encrypted and stores a Claude token only after ema
     /already used/,
   );
   assert.equal((await readFile(join(home, 'state.json'), 'utf8')).includes('sk-ant-oat01-correct-owner'), false);
+});
+
+test('the seed-home guard compares canonical paths, not the spelling it was given', async () => {
+  const { store } = await newStore();
+  const seedHome = '/var/lib/codex-credential';
+  const first = await store.addAccount({
+    provider: 'codex',
+    alias: 'codex-shared-1',
+    // What `cli.js import-codex` records: always resolve()d.
+    external: { kind: 'codex-credential', home: seedHome },
+  });
+  const second = await store.addAccount({ provider: 'codex', alias: 'codex-shared-2' });
+
+  // Every spelling of the home the first account holds must refuse the second,
+  // or one account silently overwrites the other's single-use refresh token.
+  for (const spelling of [
+    seedHome,
+    `${seedHome}/`,
+    '/var/lib//codex-credential',
+    '/var/lib/./codex-credential',
+    '/var/lib/codex-credential/public/..',
+  ]) {
+    assert.throws(
+      () => store.assertCodexSeedHome({ accountId: second.id, seedHome: spelling }),
+      /codex-shared-1 already holds the credential in/,
+      `spelling ${spelling} should have been refused`,
+    );
+    assert.doesNotThrow(
+      () => store.assertCodexSeedHome({ accountId: first.id, seedHome: spelling }),
+      `spelling ${spelling} is the owner's own home`,
+    );
+  }
+
+  // An account bound elsewhere is refused too: seeding would write the credential
+  // into a home the dashboard does not read that row's health from.
+  assert.throws(
+    () => store.assertCodexSeedHome({ accountId: first.id, seedHome: '/var/lib/other-codex-home' }),
+    /codex-shared-1 holds its credential in \/var\/lib\/codex-credential, not the configured seed home/,
+  );
+});
+
+test('a live Codex session is reported without decrypting its verifier', async () => {
+  const { store } = await newStore();
+  const account = await store.addAccount({ provider: 'codex', alias: 'codex-shared-1' });
+  assert.equal(store.pendingCodexAuthorization({ accountId: account.id }), null);
+
+  const flow = await store.beginCodexAuthorization({
+    accountId: account.id,
+    verifier: 'pkce-verifier-value',
+    state: 'browser-state-value',
+    initiatedBy: 'administrator',
+  });
+  assert.deepEqual(store.pendingCodexAuthorization({ accountId: account.id }), {
+    id: flow.id,
+    expires_at: flow.expires_at,
+  });
+
+  await store.completeCodexAuthorization({ flowId: flow.id });
+  assert.equal(store.pendingCodexAuthorization({ accountId: account.id }), null);
+});
+
+test('an account that never authorized can be deleted, one holding a credential cannot', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-delete-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+
+  const pending = await store.addAccount({ provider: 'claude', alias: 'typo-alias' });
+  assert.equal(pending.status, 'login_required');
+  await store.deleteAccount(pending.id);
+  assert.equal(store.accountById(pending.id), null);
+  assert.equal(store.publicAccounts().some((entry) => entry.id === pending.id), false);
+
+  // Keyed off the stored credential, not `status`: a row whose health check has
+  // moved it to `unhealthy` is still holding something unrecoverable.
+  const authorized = await store.addAccount({
+    provider: 'claude',
+    alias: 'real-account',
+    credential: { oauth_token: 'sk-ant-oat01-not-recreatable' },
+  });
+  await store.updateAccountHealth(authorized.id, { success: false, error: 'upstream 500' });
+  assert.equal(store.accountById(authorized.id).status, 'unhealthy');
+  await assert.rejects(
+    store.deleteAccount(authorized.id),
+    /holds a stored credential/,
+    'an account holding a credential must never be deletable, whatever its status says',
+  );
+  assert.ok(store.accountCredential(authorized.id).oauth_token);
+
+  const imported = await store.addAccount({
+    provider: 'codex',
+    alias: 'imported-home',
+    external: { kind: 'codex-credential', home: '/var/lib/codex-credential' },
+  });
+  await assert.rejects(store.deleteAccount(imported.id), /imported credential home/);
+
+  await assert.rejects(store.deleteAccount('no-such-id'), /account not found/);
 });

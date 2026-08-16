@@ -153,7 +153,9 @@ function unavailableSnapshot(account, code, previous = null) {
     ...(keepPrevious ? previous : { provider: account.provider, windows: [] }),
     status: keepPrevious ? 'stale' : code === 'reauthorization_required'
       ? 'reauthorization_required'
-      : 'unavailable',
+      : code === 'authorization_required'
+        ? 'authorization_required'
+        : 'unavailable',
     attempted_at: new Date().toISOString(),
     last_error: code,
   };
@@ -243,7 +245,9 @@ export class UsageMonitor {
       } else if (account.provider === 'codex') {
         const internal = this.store.accountById(account.id);
         if (internal?.external?.kind !== 'codex-credential') {
-          throw new UsageFetchError('credential_unavailable');
+          // Registered but never authorized. That is the expected state of a row
+          // the dashboard just created, not a failure to report in red.
+          throw new UsageFetchError('authorization_required');
         }
         const current = JSON.parse(
           await readFile(`${internal.external.home}/public/current.json`, 'utf8'),

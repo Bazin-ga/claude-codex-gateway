@@ -79,7 +79,7 @@ face the public internet.
 | Family | Contents | Docs |
 |---|---|---|
 | [`codex-credential/`](codex-credential/) | `refresh-center`, `token-dispenser`, `client-agent`. Distributes one Codex credential to many machines without mutual eviction. | [README](codex-credential/README.md) · [DEPLOY](codex-credential/DEPLOY.md) |
-| [`credential-console/`](credential-console/) | Multi-account control plane, per-device enrollment, encrypted Claude OAuth storage, credential-isolating Claude gateway. Imports an existing `codex-credential` home read-only. | [README](credential-console/README.md) · [DEPLOY](credential-console/DEPLOY.md) |
+| [`credential-console/`](credential-console/) | Multi-account control plane, per-device enrollment, encrypted Claude OAuth storage, credential-isolating Claude gateway. Imports an existing `codex-credential` home read-only, and can authorize a Codex account itself. | [README](credential-console/README.md) · [DEPLOY](credential-console/DEPLOY.md) |
 
 The two families are independent. Deploying `codex-credential` alone is a complete story;
 `credential-console` adds Claude accounts, a UI, and self-service enrollment on top.

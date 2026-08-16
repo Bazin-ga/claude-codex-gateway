@@ -14,7 +14,6 @@ function valueOf(name) {
 function usage() {
   console.error(`usage:
   node cli.js init-key
-  node cli.js init-admin --password-file <path>
   node cli.js import-codex --alias <alias> --home <path> [--email <label>]
   node cli.js list`);
   process.exitCode = 2;
@@ -23,7 +22,7 @@ function usage() {
 async function main() {
   const command = process.argv[2];
 
-  if (!['init-key', 'init-admin', 'import-codex'].includes(command)) {
+  if (!['init-key', 'import-codex'].includes(command)) {
     if (command === 'list') {
       const store = await new CredentialStore(HOME).init();
       console.log(JSON.stringify(store.publicAccounts(), null, 2));
@@ -68,15 +67,6 @@ async function main() {
     }
 
     const store = await new CredentialStore(HOME).init();
-
-    if (command === 'init-admin') {
-      const passwordFile = valueOf('--password-file');
-      if (!passwordFile) return usage();
-      const password = (await readFile(resolve(passwordFile), 'utf8')).replace(/\r?\n$/, '');
-      await store.setAdminPassword(password);
-      console.log('administrator password configured');
-      return;
-    }
 
     if (command === 'import-codex') {
       const alias = valueOf('--alias');

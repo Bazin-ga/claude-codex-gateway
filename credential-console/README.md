@@ -19,18 +19,24 @@ their expiry and active-client count without reading the Codex refresh token. Wh
 enrollment is configured, a tailnet member can also mint a per-device Codex token and download
 a platform-specific agent installer without receiving the shared enrollment key.
 
+A Codex account can also be authorized from the console itself, so the ChatGPT subscription
+credential no longer has to be produced by a `codex login` on some other machine and carried
+over by hand. That import boundary stays read-only unless
+`CREDENTIAL_CONSOLE_CODEX_SEED_HOME` is set — see
+[Codex account authorization](#codex-account-authorization).
+
 ## Status
 
 V1 implements:
 
-- administrator UI authenticated by Tailscale identity or a password;
+- administrator UI authenticated by Tailscale identity, or deliberately open;
 - English-by-default UI with a persistent Chinese language switch;
 - multiple Claude Code accounts, identified by operator-supplied alias and email label;
 - a permanent, tailnet-only owner page for each Claude account that creates short-lived
   Anthropic PKCE authorization sessions and exchanges the returned code on the server;
 - AES-256-GCM encryption of Claude OAuth tokens with a separate mode-600 master key;
 - one-time, 30-minute device enrollment links;
-- passwordless tailnet-member self-service issuance for Claude Code devices;
+- tailnet-member self-service issuance for Claude Code devices, with no console sign-in step;
 - distinct, revocable device tokens;
 - a public-capable streaming Claude gateway limited to `/v1/messages`,
   `/v1/messages/count_tokens`, and `/v1/models`, with failed-authentication, per-device rate,
@@ -38,6 +44,9 @@ V1 implements:
 - macOS/Linux and Windows profile instructions shown once at enrollment;
 - read-only import and expiry/health display for one or more existing
   `codex-credential` homes;
+- a permanent authorization page for each Codex account that runs the ChatGPT subscription
+  PKCE flow on the server and either seeds a `codex-credential` home directly or shows the
+  resulting `auth.json` once for the operator to copy;
 - hourly, token-free-at-rest quota snapshots for Claude Code and Codex, showing the five-hour
   and weekly windows whenever the provider reports them;
 - tailnet-member Codex self-enrollment with self-contained macOS, Linux, and Windows installers
@@ -92,12 +101,70 @@ The console stores this encrypted:
 
 It never stores the plaintext in `state.json`, the audit log, or an HTML response.
 
+## Codex account authorization
+
+A Codex account is registered in the dashboard like a Claude one — alias, and optionally the
+subscription's email address — and receives its own permanent **Codex authorization** page.
+`node cli.js import-codex` remains available for a home that is already seeded.
+
+On that page an administrator:
+
+1. selects **Start a fresh authorization**;
+2. opens the generated OpenAI link and signs in with the ChatGPT account that holds the Codex
+   subscription;
+3. **lets the browser fail.** The Codex OAuth client is registered against
+   `http://localhost:1455/auth/callback`, and nothing is listening there. "Unable to connect"
+   is the successful outcome, not a fault: the authorization code is in the address bar;
+4. pastes that whole address — or just the code — back into the page within 15 minutes and
+   selects **Complete authorization**.
+
+A pasted address carries the state, and the server verifies it against the digest it issued. A
+bare code carries no state — it is accepted against the account's single live session, and its
+binding to this console is PKCE alone. Either way the server exchanges the code directly with
+OpenAI, and refuses a response with no refresh token (a credential the centre could never rotate)
+or no `id_token` (no account id). If the account carries an email label, a different authorized
+email is rejected. Starting again supersedes every unfinished session for that account, sessions
+are single-use, and the PKCE verifier is encrypted at rest exactly as in the Claude flow. The
+resulting credential is never written to `state.json`, an audit entry, or a log line.
+
+A failed attempt — a truncated paste, a wrong ChatGPT account — leaves the session live and the
+paste box on the page, so the same code can be submitted again. **Start a fresh authorization**
+supersedes it and invalidates the code already in hand; press it only after the session expires
+or the code is genuinely gone.
+
+Where the credential goes depends on one variable, and the two options trade off differently:
+
+**`CREDENTIAL_CONSOLE_CODEX_SEED_HOME` unset (default).** The console writes nothing. The
+finished `auth.json` is rendered once, with copy and download buttons and the exact `seed.js`
+command to run on the refresh centre. Leaving the page hides it permanently; there is no second
+render. This keeps the console's relationship with every `codex-credential` home read-only.
+
+**`CREDENTIAL_CONSOLE_CODEX_SEED_HOME=/var/lib/codex-credential`.** On completion the console
+writes the credential into that home itself, reusing the refresh centre's own `CredentialStore`
+and `expiryOf` — the same atomic write, the same generation retention, the same `public/` publish
+step, and the same operation lock that `seed.js` takes. If that lock is held, the write stops with
+`is busy, so nothing was written` rather than racing a refresh that may already have spent the
+single-use token. The credential is never displayed. One home holds one credential, so an
+authorization that would seed a home another account already holds is refused before it starts.
+
+> **This contradicts the read-only import boundary described above and elsewhere in this
+> README.** With the variable set, the console process needs write access to `secret/` in that
+> home, so a console compromise reaches the Codex refresh token — which read-only import
+> deliberately keeps out of reach. Set it only when the console and the refresh centre are the
+> same trust domain, and prefer the copy/download path otherwise. It changes nothing about the
+> dispenser or the client-token registry, which the console still never writes.
+
+Either way the seed is a handover, not a backup. OpenAI rotates refresh tokens single-use, so
+the centre's first rotation invalidates the credential produced here: a copied `auth.json` is
+dead from that moment and must be deleted rather than archived, and re-seeding a running centre
+from a stale file destroys the live credential.
+
 ## Member workflow
 
 The default tailnet flow is fully self-service:
 
 1. A member opens the console from a user-owned device in the tailnet.
-2. Tailscale identifies the member; no application password is required.
+2. Tailscale identifies the member; the console has no login of its own.
 3. The member chooses an available Claude Code account and enters a device name.
 4. The console issues and displays that device's macOS/Linux and Windows configurations once;
    both can be copied or downloaded.
@@ -105,6 +172,10 @@ The default tailnet flow is fully self-service:
 
 No administrator needs to create or deliver an enrollment link. The member receives only a
 per-device console token, never the provider OAuth token.
+
+In `open` mode the same zone renders for an anonymous visitor. There is no identity to show, so
+the member types a label of their own instead; it only namespaces device names so that two people
+enrolling `laptop` do not revoke each other. Nothing verifies it.
 
 One-time links remain available for exceptional cases where an administrator needs to
 prepare access for somebody else:
@@ -168,13 +239,28 @@ replace network egress.
 
 - `master.key`, `state.json`, and the data directory are mode 600/700.
 - Provider credentials use AES-256-GCM with account-specific authenticated data.
-- Password-mode administrator passwords use `scrypt` with a random salt.
+- There are exactly two administrator-auth modes, `tailscale` and `open`, and the console has
+  no login of its own in either: no password, no sign-in page, and no `/login` or `/logout`
+  route. `CREDENTIAL_CONSOLE_ADMIN_AUTH` defaults to `tailscale`, so an unconfigured
+  deployment refuses a request that carries no tailnet identity rather than serving it.
+- `open` administrator-auth mode has no authentication at all: no identity of any kind. Every
+  client that can open the console is an administrator and can add accounts, issue device
+  credentials, and revoke them. Reaching the console is then the entire authorization boundary,
+  so it belongs only on a private overlay network whose membership you already control. Every
+  page states this, `/health` reports `admin_configured: false`, and audit entries in this mode
+  record the self-asserted member label, not a verified identity. It follows that the
+  per-administrator binding on Claude and Codex authorization sessions is a no-op here: with no
+  identity to bind to, every visitor is recorded as the same `administrator`, so any visitor can
+  complete an authorization another visitor started. PKCE, the single live session, and the
+  15-minute expiry are what remain.
+- Session CSRF tokens are enforced in `open` mode exactly as in `tailscale` mode. They are
+  unrelated to any login, and without them any web page a visitor opens could drive the console
+  from their browser.
 - Tailscale-mode administration trusts `Tailscale-User-Login` only from the loopback
   Tailscale Serve proxy; Serve removes spoofed identity headers before forwarding.
 - Administrator sessions are in memory, expire after 12 hours, and use
   `HttpOnly; Secure; SameSite=Strict` cookies in production.
 - State-changing administrator actions require a session-specific CSRF token.
-- Login attempts are rate-limited per source IP.
 - Enrollment codes are stored only as SHA-256 digests, expire after 30 minutes, and are
   single-use.
 - Claude authorization verifiers are encrypted at rest, authorization states are stored only
@@ -182,6 +268,17 @@ replace network egress.
   new session starts.
 - A completed Claude authorization is accepted only when Anthropic reports the account email
   configured for that row.
+- Codex authorization reuses that same mechanism — encrypted verifier, single-use, superseded,
+  15-minute expiry — with one documented exception: a pasted address is checked against the
+  digested state, a bare code is not and rests on PKCE plus the single live session. The
+  resulting `auth.json` is either handed to the operator once or written into a
+  `codex-credential` home; it never reaches `state.json`, an audit entry, or a log line, and no
+  page can re-render it.
+- Setting `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` deliberately gives the console write access to
+  that home's `secret/`, which read-only import otherwise denies it. Unset, the console never
+  reads or writes the refresh token stored in a `codex-credential` home — it does still hold a
+  newly authorized refresh token in memory for the length of one request and render it to the
+  operator once.
 - Device bearer tokens are stored only as SHA-256 digests and compared in constant time.
 - Codex enrollment uses the dispenser's mint-only shared key on the server side. The key cannot
   read the current Codex credential, and each minted token is independently revocable.
@@ -208,13 +305,14 @@ retain an emergency service-stop and provider-token revocation procedure.
 | `CREDENTIAL_CONSOLE_PORT` | `9443` | Listen port |
 | `CREDENTIAL_CONSOLE_PUBLIC_URL` | `https://127.0.0.1:<port>` | Tailnet-only console and enrollment-link origin |
 | `CREDENTIAL_CONSOLE_CLAUDE_GATEWAY_URL` | `<PUBLIC_URL>/claude` | Public Claude gateway URL embedded in device profiles |
-| `CREDENTIAL_CONSOLE_ADMIN_AUTH` | `password` | Administrator auth: `password` or `tailscale` |
+| `CREDENTIAL_CONSOLE_ADMIN_AUTH` | `tailscale` | Administrator auth: `tailscale` (Tailscale user identity) or `open` (no authentication at all). The default fails closed; `open` must be chosen deliberately |
 | `CREDENTIAL_CONSOLE_COOKIE_SECURE` | `1` | Set `0` only for loopback tests |
 | `CREDENTIAL_CONSOLE_TLS_CERT` | — | Direct-TLS certificate path |
 | `CREDENTIAL_CONSOLE_TLS_KEY` | — | Direct-TLS key path |
 | `CREDENTIAL_CONSOLE_CODEX_ENDPOINT` | — | Codex dispenser URL used by the console and generated installers |
 | `CREDENTIAL_CONSOLE_CODEX_CERT_PIN` | — | SHA-256 pin for the dispenser TLS certificate |
 | `CREDENTIAL_CONSOLE_CODEX_ENROLLMENT_KEY_FILE` | — | Mode-640 file containing the dispenser's mint-only enrollment key |
+| `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` | — | `codex-credential` home a completed Codex authorization writes into. Unset means show the `auth.json` once instead; setting it makes the console a **writer** of that home |
 | `CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS` | `3600000` | Provider quota refresh interval (minimum 60 seconds) |
 
 Quota polling calls the read-only provider endpoints used behind Claude Code and Codex status
@@ -228,14 +326,15 @@ The recommended deployment uses Tailscale Serve on port 443 for the tailnet-only
 and Tailscale Funnel on a different port for only the `/claude` gateway mount. The shipped
 systemd unit keeps the Node service on `127.0.0.1:9080`, so the direct TLS variables are unset.
 In `tailscale` administrator-auth mode,
-every user-owned device allowed to reach the Serve endpoint receives administrator access.
+every user-owned device allowed to reach the Serve endpoint receives administrator access. In
+`open` mode every client that can reach the listener does, with no identity at all.
 Funnel traffic has no Tailscale identity and can reach only the device-token-authenticated data
 plane. Tagged devices do not receive Tailscale user identity headers and are refused by the
 control plane.
 
 ## CLI
 
-On a genuine first deployment, initialize the master key before the administrator password:
+On a genuine first deployment, initialize the master key before starting the service:
 
 ```bash
 export CREDENTIAL_CONSOLE_HOME=/var/lib/credential-console
@@ -248,14 +347,8 @@ home contains encrypted data, the command exits non-zero, writes nothing, and re
 it; restore master.key from backup instead`. Restore the key from backup; never create a new key
 for that home.
 
-Initialize or rotate the administrator password without placing it in a command argument. Stop
-the service before running this or any other mutating CLI command:
-
-```bash
-sudo systemctl stop credential-console
-node cli.js init-admin --password-file /path/to/mode-600-password-file
-sudo systemctl start credential-console
-```
+There is no administrator credential to bootstrap. The console identifies administrators from
+Tailscale, or not at all — see [Runtime configuration](#runtime-configuration).
 
 Import an existing Codex credential service:
 
@@ -269,7 +362,9 @@ sudo systemctl start credential-console
 ```
 
 The import stores only the external home path. At dashboard render time the service reads
-`public/current.json`. It has no production access to the client-token registry or `secret/`.
+`public/current.json`. It has no production access to the client-token registry, and none to
+`secret/` unless `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` names that home — see
+[Codex account authorization](#codex-account-authorization).
 
 List public account metadata:
 
@@ -277,9 +372,8 @@ List public account metadata:
 node cli.js list
 ```
 
-The server holds the credential home's single-writer lock for its lifetime. `init-key`,
-`init-admin`, and `import-codex` fail fast while the service is running; `list` is read-only and
-unlocked.
+The server holds the credential home's single-writer lock for its lifetime. `init-key` and
+`import-codex` fail fast while the service is running; `list` is read-only and unlocked.
 
 ## Deployment
 
@@ -302,6 +396,9 @@ The suite proves that:
 - enrollment is single-use;
 - Claude authorization state is single-use, its PKCE verifier is encrypted at rest, and an
   account-email mismatch cannot replace the stored credential;
+- the administrator mode defaults to `tailscale` when `CREDENTIAL_CONSOLE_ADMIN_AUTH` is unset,
+  and an unidentified visitor is then refused;
+- neither surviving mode serves `/login` or `/logout`, and no page offers a sign-out;
 - a Tailscale identity can self-issue a device credential without an enrollment link;
 - a Tailscale identity can self-enroll a Codex device once and choose any platform installer;
 - device tokens are independently revocable;

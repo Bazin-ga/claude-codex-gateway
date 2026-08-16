@@ -3,6 +3,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomToken } from './lib/security.js';
 import {
@@ -23,14 +24,23 @@ import {
   parseClaudeAuthorizationCode,
 } from './lib/claude-oauth.js';
 import {
+  buildCodexAuthJson,
+  codexIdentityFrom,
+  completeCodexAuthorization as exchangeCodexAuthorization,
+  createCodexAuthorizationRequest,
+  parseCodexAuthorizationRedirect,
+} from './lib/codex-oauth.js';
+import { assertCodexSeedHomeWritable, seedCodexCredentialHome } from './lib/codex-seed.js';
+import {
   claudeAuthorizationView,
   dashboardView,
   deviceConfiguredView,
   enrollmentCreatedView,
   enrollmentView,
-  loginView,
   messageView,
+  codexAuthorizationView,
   codexConfiguredView,
+  codexCredentialView,
 } from './lib/views.js';
 import { requestEnrollment as requestCodexEnrollment } from '../codex-credential/client-agent/enroll.js';
 
@@ -42,17 +52,28 @@ const CLAUDE_GATEWAY_URL = process.env.CREDENTIAL_CONSOLE_CLAUDE_GATEWAY_URL;
 const TLS_CERT = process.env.CREDENTIAL_CONSOLE_TLS_CERT;
 const TLS_KEY = process.env.CREDENTIAL_CONSOLE_TLS_KEY;
 const COOKIE_SECURE = process.env.CREDENTIAL_CONSOLE_COOKIE_SECURE !== '0';
-const ADMIN_AUTH = process.env.CREDENTIAL_CONSOLE_ADMIN_AUTH ?? 'password';
+// Fail closed: an unconfigured deployment refuses unidentified requests rather than
+// handing credential issuance to whoever can route to the listener. `open` is a
+// deliberate choice, never a default.
+const ADMIN_AUTH = process.env.CREDENTIAL_CONSOLE_ADMIN_AUTH ?? 'tailscale';
 const CODEX_ENDPOINT = process.env.CREDENTIAL_CONSOLE_CODEX_ENDPOINT;
 const CODEX_CERT_PIN = process.env.CREDENTIAL_CONSOLE_CODEX_CERT_PIN;
 const CODEX_ENROLLMENT_KEY_FILE = process.env.CREDENTIAL_CONSOLE_CODEX_ENROLLMENT_KEY_FILE;
+// Setting this elevates the console from read-only importer to writer of that
+// codex-credential home. See README "Codex account authorization".
+const CODEX_SEED_HOME = process.env.CREDENTIAL_CONSOLE_CODEX_SEED_HOME;
 const USAGE_REFRESH_INTERVAL_MS = Number(
   process.env.CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS ?? 60 * 60_000,
 );
 const SESSION_TTL_MS = 12 * 60 * 60_000;
+// Open mode mints a session for any visitor, so the map needs a ceiling that does
+// not depend on someone authenticating first. The process is capped at 96 MB of
+// heap by the shipped unit; an unbounded map is an OOM plus a restart loop.
+const MAX_SESSIONS = 4_096;
+const DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const SHUTDOWN_DEADLINE_MS = 1_000;
 const CODEX_AGENT_ROOT = fileURLToPath(new URL('../codex-credential/client-agent/', import.meta.url));
-const CODEX_AGENT_ASSETS = new Map([
+export const CODEX_AGENT_ASSETS = new Map([
   ['pull.js', 'pull.js'],
   ['package.json', 'package.json'],
   ['lib/pinned-request.js', 'lib/pinned-request.js'],
@@ -61,17 +82,18 @@ const CODEX_AGENT_ASSETS = new Map([
   ['install/systemd/codex-credential.timer', 'install/systemd/codex-credential.timer'],
   ['install/launchd/com.claude-codex-gateway.codex-credential.plist', 'install/launchd/com.claude-codex-gateway.codex-credential.plist'],
   ['install/windows/install.ps1', 'install/windows/install.ps1'],
+  // install.sh execs both of these. Omitting them produced an installer that
+  // completed "successfully" and left the machine unable to renew: with no
+  // systemd user session it falls back to start-container-loop.sh, which was not
+  // there, so nothing ever pulled again and the credential died days later —
+  // exactly the silent, delayed, all-at-once failure this project exists to
+  // prevent. `installer embeds every asset install.sh execs` pins the set.
+  ['install/start-container-loop.sh', 'install/start-container-loop.sh'],
+  ['install/diagnose.sh', 'install/diagnose.sh'],
 ]);
 
 function log(event, detail = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...detail }));
-}
-
-function clientIp(req) {
-  const peer = req.socket.remoteAddress ?? 'unknown';
-  const loopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
-  if (!loopback) return peer;
-  return String(req.headers['x-forwarded-for'] ?? peer).split(',')[0].trim();
 }
 
 function tailnetIdentity(req) {
@@ -132,13 +154,15 @@ export async function createCredentialConsole(options = {}) {
     log,
   }).init();
   const sessions = new Map();
-  const loginAttempts = new Map();
   const publicBaseUrl = options.publicBaseUrl ?? PUBLIC_BASE_URL;
   const claudeGatewayUrl = options.claudeGatewayUrl
     ?? CLAUDE_GATEWAY_URL
     ?? `${publicBaseUrl.replace(/\/$/, '')}/claude`;
   const cookieSecure = options.cookieSecure ?? COOKIE_SECURE;
   const adminAuth = options.adminAuth ?? ADMIN_AUTH;
+  // Overridable only so a test can drive the eviction path without minting the real
+  // ceiling's worth of sessions.
+  const maxSessions = options.maxSessions ?? MAX_SESSIONS;
   const codexEndpoint = options.codexEndpoint ?? CODEX_ENDPOINT;
   const codexCertPin = options.codexCertPin ?? CODEX_CERT_PIN;
   let codexEnrollmentKey = options.codexEnrollmentKey;
@@ -146,7 +170,12 @@ export async function createCredentialConsole(options = {}) {
     codexEnrollmentKey = (await readFile(CODEX_ENROLLMENT_KEY_FILE, 'utf8')).trim();
   }
   const codexEnroll = options.codexEnroll ?? requestCodexEnrollment;
+  // Canonical from here on, so it compares equal to the `resolve()`d home that
+  // `cli.js import-codex` records against an account.
+  const configuredSeedHome = options.codexSeedHome ?? CODEX_SEED_HOME ?? null;
+  const codexSeedHome = configuredSeedHome ? resolvePath(configuredSeedHome) : null;
   const claudeOauthExchange = options.claudeOauthExchange ?? exchangeClaudeAuthorization;
+  const codexOauthExchange = options.codexOauthExchange ?? exchangeCodexAuthorization;
   const codexSelfServiceReady = Boolean(codexEndpoint && codexCertPin && codexEnrollmentKey);
   const codexAgentAssets = Object.fromEntries(await Promise.all(
     [...CODEX_AGENT_ASSETS].map(async ([assetName, relativePath]) => [
@@ -154,50 +183,81 @@ export async function createCredentialConsole(options = {}) {
       await readFile(`${CODEX_AGENT_ROOT}${relativePath}`, 'utf8'),
     ]),
   ));
-  if (!['password', 'tailscale'].includes(adminAuth)) {
-    throw new Error('CREDENTIAL_CONSOLE_ADMIN_AUTH must be password or tailscale');
+  if (!['tailscale', 'open'].includes(adminAuth)) {
+    throw new Error('CREDENTIAL_CONSOLE_ADMIN_AUTH must be tailscale or open');
   }
+  // Open mode has no login, so every rendered page has to say so.
+  const openMode = adminAuth === 'open';
   const cleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [token, session] of sessions) {
       if (session.expires_at <= now) sessions.delete(token);
     }
-    for (const [ip, attempt] of loginAttempts) {
-      if (now - attempt.since > 15 * 60_000) loginAttempts.delete(ip);
-    }
   }, 15 * 60_000);
   cleanupTimer.unref();
 
-  function sessionFor(req, res, { create = false } = {}) {
+  // The cap is a memory bound, not a fairness guarantee: in open mode nothing stops a
+  // visitor from asking for more sessions, so at the ceiling something has to go.
+  // Expired entries go first, then the least recently used, which keeps a flood of
+  // anonymous page loads away from the session an administrator is mid-form with for
+  // as long as there is anything staler to take.
+  function evictUntilBelowCap() {
+    if (sessions.size < maxSessions) return;
+    const now = Date.now();
+    for (const [token, session] of sessions) {
+      if (sessions.size < maxSessions) return;
+      if (session.expires_at <= now) sessions.delete(token);
+    }
+    while (sessions.size >= maxSessions) {
+      const stalest = sessions.keys().next().value;
+      if (stalest === undefined) break;
+      sessions.delete(stalest);
+    }
+  }
+
+  function sessionFor(req, res) {
     const identity = adminAuth === 'tailscale' ? tailnetIdentity(req) : null;
     if (adminAuth === 'tailscale' && !identity) return null;
     const token = parseCookies(req.headers.cookie).credential_console_session;
     const session = token ? sessions.get(token) : null;
     if (session && session.expires_at > Date.now()
       && (adminAuth !== 'tailscale' || session.admin_identity === identity)) {
+      // Re-insert so the map reads least-recently-used first: a session a browser is
+      // still presenting moves behind the ones nobody has come back for. The expiry is
+      // deliberately not extended; this only reorders eviction.
+      sessions.delete(token);
+      sessions.set(token, session);
       return session;
     }
     if (token) sessions.delete(token);
-    if (adminAuth !== 'tailscale' || !create) {
-      return null;
-    }
+    // Open mode authenticates nobody, so a page request gets a session unconditionally;
+    // the CSRF token it carries is the only thing left that another origin cannot forge.
+    // A cookieless state-changing request cannot carry a matching CSRF token and is
+    // therefore already refused, so minting it a 12-hour session would only let an
+    // anonymous caller grow this map one entry per request.
+    if (adminAuth === 'open' && req.method !== 'GET') return null;
     const newToken = randomToken(32);
     const newSession = {
       csrf: randomToken(24),
       expires_at: Date.now() + SESSION_TTL_MS,
       admin_identity: identity,
     };
+    evictUntilBelowCap();
     sessions.set(newToken, newSession);
-    if (res) res.setHeader('Set-Cookie', setSessionCookie(newToken));
-    log('tailnet_admin_authenticated', { identity });
+    res.setHeader('Set-Cookie', setSessionCookie(newToken));
+    if (adminAuth === 'tailscale') log('tailnet_admin_authenticated', { identity });
     return newSession;
   }
 
   function requireSession(req, res) {
-    const session = sessionFor(req, res, { create: true });
+    const session = sessionFor(req, res);
     if (!session) {
-      if (adminAuth === 'password') {
-        redirect(res, '/login');
+      if (adminAuth === 'open') {
+        sendHtml(res, 403, messageView(
+          'Request refused',
+          'That request carried no console session, so its CSRF token could not be checked. Reload the page and submit it again.',
+          { error: true, openMode: true },
+        ));
       } else {
         sendHtml(res, 403, messageView(
           'Tailnet identity required',
@@ -212,6 +272,18 @@ export async function createCredentialConsole(options = {}) {
 
   function checkCsrf(session, form) {
     return session && typeof form.csrf === 'string' && form.csrf === session.csrf;
+  }
+
+  // Device names are namespaced per member so that two people who both enroll "laptop"
+  // do not revoke each other. Open mode has no verified identity, so the member asserts
+  // a label: it keeps names apart, it proves nothing.
+  function memberLabelFor(session, form) {
+    if (adminAuth !== 'open') return session.admin_identity;
+    const label = String(form.member_label ?? '').trim();
+    if (!DEVICE_NAME_PATTERN.test(label)) {
+      throw new Error('member label must use letters, numbers, dots, underscores, or hyphens');
+    }
+    return label;
   }
 
   function setSessionCookie(token) {
@@ -244,16 +316,16 @@ export async function createCredentialConsole(options = {}) {
     if (req.method === 'GET' && path === '/assets/app.js') {
       sendText(res, 200, `
 const translations = {
-  'language': '语言',
   'brand-tagline': '私有账号与设备控制平面',
-  'sign-out': '退出',
-  'login-intro': '登录后可管理提供商账号并创建一次性设备登记。',
-  'admin-password': '管理员密码',
-  'sign-in': '登录',
   'member-zone-label': '成员自助区 · 所有成员看到的就是这里',
   'member-heading': '给这台设备开通 AI 工具',
   'member-intro': '选择团队账号并领取本机配置，不需要管理员转发令牌，也不需要登录共享的上游账号。',
   'tailscale-identity': 'Tailscale 身份',
+  'open-banner': '本控制台没有任何认证：任何能访问它的人都可以签发和撤销凭据。',
+  'no-identity': '无身份',
+  'anonymous-visitor': '匿名访问者',
+  'member-label': '你的标签（自己填写，不做校验）',
+  'member-label-note': '没有人会校验这个标签，它只用来区分不同成员的设备名。',
   'claude-description': '领取一个只属于当前成员和设备、可通过公网使用的配置。上游 OAuth 令牌不会离开服务器。',
   'team-account': '团队账号',
   'device-name': '本机设备名',
@@ -262,7 +334,6 @@ const translations = {
   'waiting-owner': '等待账号所有者录入',
   'owner-add-once': '账号所有者只需在下方管理员区录入一次，之后所有成员都能自行领取。',
   'codex-description': 'refresh center 会持续轮换主凭据。领取不依赖内网的单文件安装器与独立设备 token。',
-  'operating-system': '设备系统',
   'get-codex': '领取 Codex 安装脚本',
   'codex-unavailable': 'Codex 自助登记尚未配置。管理员需要连接 dispenser enrollment。',
   'admin-zone': '管理员区',
@@ -285,6 +356,7 @@ const translations = {
   'usage-not-reported': '上游未提供',
   'usage-loading': '正在等待首次每小时用量刷新。',
   'usage-reauthorize': '需要为该 Claude 账号重新授权一次，才能显示额度。',
+  'usage-authorize-first': '完成该账号的授权后才能显示额度。',
   'usage-stale': '最新刷新失败，当前显示上一次成功结果。',
   'usage-unavailable': '当前暂时无法取得用量。',
   'action': '操作',
@@ -311,6 +383,30 @@ const translations = {
   'authorization-code': '完整 authorization code',
   'complete-authorization': '完成授权',
   'owner-auth-security': '密码、浏览器 Cookie、authorization code 和上游 token 都不会展示给管理员；账号邮箱不匹配时会在保存前拒绝。',
+  'codex-authorization': 'Codex 账号授权',
+  'codex-auth-heading': 'Codex 账号授权',
+  'codex-target-seed': '完成后凭据会直接写入下方的 Codex 凭据目录，不在页面上展示。',
+  'codex-target-manual': '未配置 Codex 凭据目录，因此生成的 auth.json 只展示一次供你复制或下载。控制台不写入任何文件。',
+  'codex-localhost-expected': '最后一步浏览器打不开是正常的。OpenAI 把这个客户端注册在 http://localhost:1455，会把浏览器跳到那里，而本机并没有程序在监听。出现“无法访问”正是成功的表现，不是故障——此时地址栏里就是 authorization code。',
+  'codex-auth-step-1': '打开下面的 OpenAI 页面，使用拥有 Codex 订阅的 ChatGPT 账号登录。',
+  'codex-auth-step-2': '等浏览器跳到打不开的 localhost 地址，然后从地址栏复制整条地址。',
+  'codex-auth-step-3': '粘贴回本页并提交；只粘 code 也可以。服务器会直接与 OpenAI 兑换。',
+  'open-codex-authorization': '打开 OpenAI 授权页面',
+  'codex-redirect-label': '打不开的 localhost 地址，或仅 code',
+  'codex-auth-security': '授权会话一次性使用、15 分钟过期，并在开始新会话时作废。粘贴整条地址时会校验本控制台签发的 state；只粘 code 时没有 state，依赖 PKCE 和「同时只有一个存活会话」。PKCE verifier 加密保存，生成的凭据不会写入 state.json、审计记录或日志。',
+  'session-still-open': '这个授权会话仍然有效，你手上的 code 可以再粘贴一次。开始新的授权会让它作废。',
+  'codex-account-authorized': '该 Codex 账号已授权',
+  'codex-seeded-ok': '凭据已写入配置的 Codex 凭据目录，不在此展示。',
+  'continue': '继续',
+  'codex-copy-now': '立即复制或下载此凭据',
+  'codex-one-time-json': '这是完整的 auth.json，含一个可用的一次性 refresh token。只展示一次，控制台不保留副本，本页无法再次生成。请限制为仅自己可读，凭据中心播种完成后删除。',
+  'download-auth-json': '下载 auth.json',
+  'copy-auth-json': '复制 auth.json',
+  'codex-seed-command': '用它给凭据中心播种',
+  'codex-seed-stale': '播种是交接，不是备份：中心第一次轮换就会换掉 refresh token，这个文件当场失效。用完请删除，不要留存。',
+  'add-codex-heading': '录入 Codex 团队账号',
+  'add-codex-help': '先登记别名，再在该账号自己的页面完成 ChatGPT 订阅授权，不需要另一台机器上的 codex login。',
+  'account-email-optional': '账号邮箱标签（可选，授权时校验）',
   'member-flow': '成员实际流程',
   'member-step-1': '成员加入 tailnet 后打开本页。',
   'member-step-2': '在上方成员自助区选择工具和账号，并填写设备名。',
@@ -318,7 +414,6 @@ const translations = {
   'member-step-4': '设备丢失或停用时，只撤销该设备。',
   'same-self-service': '管理员和成员看到的是同一个自助区，不再需要人工分发授权凭证。',
   'no-devices': '尚无已登记设备。',
-  'copy-now': '立即复制或下载此安装脚本',
   'choose-codex-platform': '选择这台设备的操作系统',
   'one-platform-only': '请只在刚登记的这台设备上选择一种安装器使用，不要把这些脚本复用到其他机器。',
   'view-script': '查看脚本',
@@ -338,12 +433,11 @@ const translations = {
   'enroll-heading': '登记设备',
   'create-device-credential': '创建设备凭据',
   'device-scope-note': '生成的凭据仅属于此设备，可单独撤销而不影响其他人。',
+  // Read by name from the copy button below, not through a data-i18n attribute.
   'copied': '已复制',
-  'macos': 'macOS',
-  'linux': 'Linux',
-  'windows': 'Windows',
   'revoke': '撤销',
   'enroll-device': '登记设备',
+  'delete-account': '删除账号',
   'existing-codex-agent': '现有 Codex 代理',
   'status-healthy': '健康',
   'status-unhealthy': '异常',
@@ -432,70 +526,23 @@ document.addEventListener('click', async (event) => {
       sendJson(res, 200, {
         status: 'ok',
         admin_auth: adminAuth,
-        admin_configured: adminAuth === 'tailscale' || store.hasAdmin(),
+        // Whether an administrator is identified at all. `tailscale` authenticates
+        // one; `open` deliberately authenticates nobody, and reporting that as
+        // configured would hide the only fact worth alerting on here.
+        admin_configured: adminAuth === 'tailscale',
       });
       return;
     }
 
-    if (req.method === 'GET' && path === '/login') {
-      if (adminAuth === 'tailscale') {
-        const session = sessionFor(req, res, { create: true });
-        if (session) redirect(res, '/');
-        else sendHtml(res, 403, messageView(
-          'Tailnet identity required',
-          'Open this page through Tailscale Serve from a user-owned tailnet device.',
-          { error: true },
-        ));
-        return;
-      }
-      if (sessionFor(req)) {
-        redirect(res, '/');
-        return;
-      }
-      sendHtml(res, 200, loginView({ setupRequired: !store.hasAdmin() }));
-      return;
-    }
-
-    if (req.method === 'POST' && path === '/login') {
-      if (adminAuth !== 'password') {
-        sendHtml(res, 404, messageView('Not found', 'Password login is disabled.', { error: true }));
-        return;
-      }
-      const ip = clientIp(req);
-      const attempt = loginAttempts.get(ip) ?? { since: Date.now(), count: 0 };
-      if (Date.now() - attempt.since > 15 * 60_000) {
-        attempt.since = Date.now();
-        attempt.count = 0;
-      }
-      attempt.count += 1;
-      loginAttempts.set(ip, attempt);
-      if (attempt.count > 8) {
-        sendHtml(res, 429, loginView({ error: 'Too many login attempts. Try again later.' }));
-        return;
-      }
-      const form = await readForm(req, 16 * 1024).catch(() => ({}));
-      if (!store.hasAdmin() || !await store.verifyAdminPassword(form.password ?? '')) {
-        log('admin_login_failed', { ip });
-        sendHtml(res, 401, loginView({ error: 'Invalid administrator password.' }));
-        return;
-      }
-      loginAttempts.delete(ip);
-      const token = randomToken(32);
-      sessions.set(token, {
-        csrf: randomToken(24),
-        expires_at: Date.now() + SESSION_TTL_MS,
-      });
-      log('admin_login_succeeded', { ip });
-      redirect(res, '/', { 'Set-Cookie': setSessionCookie(token) });
-      return;
-    }
-
-    if (req.method === 'POST' && path === '/logout') {
-      const token = parseCookies(req.headers.cookie).credential_console_session;
-      if (token) sessions.delete(token);
-      redirect(res, '/login', {
-        'Set-Cookie': 'credential_console_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0',
-      });
+    // Neither surviving mode has a sign-in. Answering these two paths explicitly
+    // tells an operator following an old bookmark or runbook why, instead of
+    // leaving them with a bare "page does not exist".
+    if (path === '/login' || path === '/logout') {
+      sendHtml(res, 404, messageView(
+        'Not found',
+        'This console has no sign-in and no session to end.',
+        { error: true, openMode },
+      ));
       return;
     }
 
@@ -507,7 +554,7 @@ document.addEventListener('click', async (event) => {
         devices: store.publicDevices(),
         csrf: session.csrf,
         adminIdentity: session.admin_identity,
-        canSignOut: adminAuth === 'password',
+        openMode,
         codexSelfServiceReady,
         error: url.searchParams.get('error'),
       }));
@@ -517,7 +564,7 @@ document.addEventListener('click', async (event) => {
     if (req.method === 'POST' && path === '/codex/self-service') {
       const session = requireSession(req, res);
       if (!session) return;
-      if (!session.admin_identity) {
+      if (!openMode && !session.admin_identity) {
         sendHtml(res, 403, messageView(
           'Tailnet identity required',
           'Codex self-service requires a Tailscale user identity.',
@@ -525,19 +572,21 @@ document.addEventListener('click', async (event) => {
         ));
         return;
       }
+      const identity = session.admin_identity ?? 'anonymous';
       const form = await readForm(req).catch(() => ({}));
       if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
       try {
         if (!codexSelfServiceReady) throw new Error('Codex self-service is not configured');
+        const memberLabel = memberLabelFor(session, form);
         const deviceName = String(form.device_name ?? '').trim();
-        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(deviceName)) {
+        if (!DEVICE_NAME_PATTERN.test(deviceName)) {
           throw new Error('device name must use letters, numbers, dots, underscores, or hyphens');
         }
         const memberSuffix = createHash('sha256')
-          .update(session.admin_identity)
+          .update(memberLabel)
           .digest('hex')
           .slice(0, 10);
         const machineName = `${deviceName.slice(0, 53)}-${memberSuffix}`;
@@ -548,7 +597,8 @@ document.addEventListener('click', async (event) => {
           name: machineName,
         });
         log('codex_device_self_enrolled', {
-          identity: session.admin_identity,
+          identity,
+          member_label: memberLabel,
           device_name: deviceName,
           dispenser_name: issued.name,
         });
@@ -558,10 +608,11 @@ document.addEventListener('click', async (event) => {
           endpoint: codexEndpoint,
           certPin: codexCertPin,
           assets: codexAgentAssets,
+          openMode,
         }));
       } catch (error) {
         log('codex_device_self_enroll_failed', {
-          identity: session.admin_identity,
+          identity,
           error: error.message,
         });
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
@@ -572,7 +623,7 @@ document.addEventListener('click', async (event) => {
     if (req.method === 'POST' && path === '/self-service') {
       const session = requireSession(req, res);
       if (!session) return;
-      if (!session.admin_identity) {
+      if (!openMode && !session.admin_identity) {
         sendHtml(res, 403, messageView(
           'Tailnet identity required',
           'Self-service access requires a Tailscale user identity.',
@@ -582,18 +633,19 @@ document.addEventListener('click', async (event) => {
       }
       const form = await readForm(req).catch(() => ({}));
       if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
       try {
         const result = await store.issueDeviceCredential({
           accountId: String(form.account_id ?? ''),
-          memberLabel: session.admin_identity,
+          memberLabel: memberLabelFor(session, form),
           deviceName: String(form.device_name ?? '').trim(),
         });
         sendHtml(res, 200, deviceConfiguredView({
           ...result,
           claudeGatewayUrl,
+          openMode,
         }));
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
@@ -606,17 +658,24 @@ document.addEventListener('click', async (event) => {
       if (!session) return;
       const form = await readForm(req).catch(() => ({}));
       if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
       try {
-        if (form.provider !== 'claude') throw new Error('only Claude accounts can be added in the web UI');
+        const provider = String(form.provider ?? '');
+        if (!['claude', 'codex'].includes(provider)) {
+          throw new Error('only Claude and Codex accounts can be added in the web UI');
+        }
         const emailLabel = String(form.email_label ?? '').trim().toLowerCase();
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailLabel)) {
-          throw new Error('a valid account owner email is required');
+        // Claude matches this email against the authorized account before storing
+        // a token, so it is mandatory there. Codex treats it as an optional check.
+        if (emailLabel || provider === 'claude') {
+          if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailLabel)) {
+            throw new Error('a valid account owner email is required');
+          }
         }
         await store.addAccount({
-          provider: 'claude',
+          provider,
           alias: String(form.alias ?? '').trim(),
           emailLabel,
         });
@@ -633,14 +692,14 @@ document.addEventListener('click', async (event) => {
       if (!session) return;
       const account = store.accountById(claudeAuthorizationParams.id);
       if (!account || account.provider !== 'claude') {
-        sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true }));
+        sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true, openMode }));
         return;
       }
       sendHtml(res, 200, claudeAuthorizationView({
         account,
         csrf: session.csrf,
         ownerPageUrl: `${publicBaseUrl.replace(/\/$/, '')}/accounts/${encodeURIComponent(account.id)}/claude-authorization`,
-        canSignOut: adminAuth === 'password',
+        openMode,
       }));
       return;
     }
@@ -651,12 +710,12 @@ document.addEventListener('click', async (event) => {
       if (!session) return;
       const form = await readForm(req).catch(() => ({}));
       if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
       const account = store.accountById(claudeAuthorizationStartParams.id);
       if (!account || account.provider !== 'claude') {
-        sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true }));
+        sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true, openMode }));
         return;
       }
       try {
@@ -672,7 +731,7 @@ document.addEventListener('click', async (event) => {
           csrf: session.csrf,
           ownerPageUrl: `${publicBaseUrl.replace(/\/$/, '')}/accounts/${encodeURIComponent(account.id)}/claude-authorization`,
           authorization: { url: request.url, expires_at: flow.expires_at },
-          canSignOut: adminAuth === 'password',
+          openMode,
         }));
       } catch (error) {
         sendHtml(res, 400, claudeAuthorizationView({
@@ -680,7 +739,7 @@ document.addEventListener('click', async (event) => {
           csrf: session.csrf,
           ownerPageUrl: `${publicBaseUrl.replace(/\/$/, '')}/accounts/${encodeURIComponent(account.id)}/claude-authorization`,
           error: error.message,
-          canSignOut: adminAuth === 'password',
+          openMode,
         }));
       }
       return;
@@ -692,12 +751,12 @@ document.addEventListener('click', async (event) => {
       if (!session) return;
       const form = await readForm(req).catch(() => ({}));
       if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
       const account = store.accountById(claudeAuthorizationCompleteParams.id);
       if (!account || account.provider !== 'claude') {
-        sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true }));
+        sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true, openMode }));
         return;
       }
       try {
@@ -708,7 +767,7 @@ document.addEventListener('click', async (event) => {
         });
         const identity = session.admin_identity ?? 'administrator';
         if (flow.initiated_by !== identity) {
-          throw new Error('authorization must be completed by the same signed-in owner who started it');
+          throw new Error('authorization must be completed by the same administrator who started it');
         }
         const exchanged = await claudeOauthExchange({
           code: submitted.code,
@@ -732,6 +791,7 @@ document.addEventListener('click', async (event) => {
         sendHtml(res, 200, messageView(
           'Claude account authorized',
           `${account.alias} is ready. Existing and new device credentials now use ${exchanged.emailAddress}.`,
+          { openMode },
         ));
       } catch (error) {
         log('claude_account_authorization_failed', {
@@ -745,8 +805,189 @@ document.addEventListener('click', async (event) => {
           csrf: session.csrf,
           ownerPageUrl: `${publicBaseUrl.replace(/\/$/, '')}/accounts/${encodeURIComponent(account.id)}/claude-authorization`,
           error: error.message,
-          canSignOut: adminAuth === 'password',
+          openMode,
         }));
+      }
+      return;
+    }
+
+    function codexAuthorizationPage(account, session, extra = {}) {
+      // A session that is still live keeps the paste box on the page, so a
+      // mistyped paste costs a retry rather than a whole new trip through OpenAI.
+      // Without the authorize URL, which is never persisted, only the box renders.
+      const pending = store.pendingCodexAuthorization({ accountId: account.id });
+      return codexAuthorizationView({
+        account,
+        csrf: session.csrf,
+        ownerPageUrl: `${publicBaseUrl.replace(/\/$/, '')}/accounts/${encodeURIComponent(account.id)}/codex-authorization`,
+        seedHome: codexSeedHome,
+        openMode,
+        ...(pending ? { authorization: { expires_at: pending.expires_at } } : {}),
+        ...extra,
+      });
+    }
+
+    function codexAccountOr404(id) {
+      const account = store.accountById(id);
+      if (!account || account.provider !== 'codex') {
+        sendHtml(res, 404, messageView('Account not found', 'Codex account was not found.', { error: true, openMode }));
+        return null;
+      }
+      return account;
+    }
+
+    const codexAuthorizationParams = routeMatch(path, '/accounts/:id/codex-authorization');
+    if (req.method === 'GET' && codexAuthorizationParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const account = codexAccountOr404(codexAuthorizationParams.id);
+      if (!account) return;
+      sendHtml(res, 200, codexAuthorizationPage(account, session));
+      return;
+    }
+
+    const codexAuthorizationStartParams = routeMatch(path, '/accounts/:id/codex-authorization/start');
+    if (req.method === 'POST' && codexAuthorizationStartParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const account = codexAccountOr404(codexAuthorizationStartParams.id);
+      if (!account) return;
+      try {
+        store.assertCodexSeedHome({ accountId: account.id, seedHome: codexSeedHome });
+        // Refuse an unwritable seed home here, where nothing has been spent yet.
+        // Discovering it after the exchange costs a browser login that cannot be
+        // replayed, because the authorization code is single-use upstream.
+        if (codexSeedHome) await assertCodexSeedHomeWritable(codexSeedHome);
+        const request = createCodexAuthorizationRequest();
+        const flow = await store.beginCodexAuthorization({
+          accountId: account.id,
+          verifier: request.verifier,
+          state: request.state,
+          initiatedBy: session.admin_identity ?? 'administrator',
+        });
+        sendHtml(res, 200, codexAuthorizationPage(account, session, {
+          authorization: { url: request.url, expires_at: flow.expires_at },
+        }));
+      } catch (error) {
+        sendHtml(res, 400, codexAuthorizationPage(account, session, { error: error.message }));
+      }
+      return;
+    }
+
+    const codexAuthorizationCompleteParams = routeMatch(path, '/accounts/:id/codex-authorization/complete');
+    if (req.method === 'POST' && codexAuthorizationCompleteParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const account = codexAccountOr404(codexAuthorizationCompleteParams.id);
+      if (!account) return;
+      const identity = session.admin_identity ?? 'administrator';
+      try {
+        const submitted = parseCodexAuthorizationRedirect(form.authorization_code);
+        const flow = submitted.state
+          ? store.codexAuthorizationByState({ accountId: account.id, state: submitted.state })
+          : store.liveCodexAuthorization({ accountId: account.id });
+        if (flow.initiated_by !== identity) {
+          throw new Error('authorization must be completed by the same administrator who started it');
+        }
+        const exchanged = await codexOauthExchange({
+          code: submitted.code,
+          verifier: flow.verifier,
+        });
+        const authorized = codexIdentityFrom(exchanged.idToken);
+        const expectedEmail = String(account.email_label ?? '').trim().toLowerCase();
+        if (expectedEmail && String(authorized.email ?? '').trim().toLowerCase() !== expectedEmail) {
+          throw new Error(`authorized account email does not match ${expectedEmail}`);
+        }
+        const credential = buildCodexAuthJson(exchanged);
+        // The code is spent upstream from here on, so the session is retired
+        // whatever the seed write does, and a write that landed still binds the
+        // home to this account — otherwise the next account would be allowed to
+        // authorize into it and overwrite a live credential.
+        let seeded = null;
+        let seedFailure = null;
+        if (codexSeedHome) {
+          try {
+            store.assertCodexSeedHome({ accountId: account.id, seedHome: codexSeedHome });
+            seeded = await seedCodexCredentialHome(codexSeedHome, credential);
+          } catch (error) {
+            seedFailure = error;
+            if (error.progress?.wroteCredential) seeded = error.progress;
+          }
+        }
+        await store.completeCodexAuthorization({
+          flowId: flow.id,
+          seededHome: seeded ? codexSeedHome : null,
+          expiresAt: seeded?.expiresAt ?? null,
+        });
+        if (seedFailure) {
+          log('codex_account_seed_failed', {
+            account_id: account.id,
+            account_alias: account.alias,
+            seeded_home: codexSeedHome,
+            wrote_credential: Boolean(seeded),
+            identity,
+            error: seedFailure.message,
+          });
+          // The credential exists and the code cannot be replayed, so it is handed
+          // back rather than dropped. Once it reached disk it is already safe
+          // there, and re-rendering it would be exposure that buys nothing.
+          sendHtml(res, 400, seeded
+            ? messageView(
+              'Codex credential written, publish incomplete',
+              `The credential was written to ${seeded.home}, but finishing the seed failed: ${seedFailure.message}. Re-publish it with refresh-center/seed.js from that home's own credential.json.`,
+              { error: true, openMode },
+            )
+            : codexCredentialView({
+              account,
+              authJson: `${JSON.stringify(credential, null, 2)}\n`,
+              error: `Nothing was written to ${codexSeedHome}: ${seedFailure.message}`,
+              openMode,
+            }));
+          return;
+        }
+        log('codex_account_authorized', {
+          account_id: account.id,
+          account_alias: account.alias,
+          email: authorized.email,
+          plan: authorized.planType,
+          seeded_home: codexSeedHome,
+          identity,
+        });
+        if (seeded) {
+          sendHtml(res, 200, messageView(
+            'Codex account authorized',
+            `The credential was written to ${seeded.home} and is not shown here.`,
+            {
+              openMode,
+              i18n: 'codex-seeded-ok',
+              detail: `${account.alias} → ${seeded.home}`,
+            },
+          ));
+        } else {
+          sendHtml(res, 200, codexCredentialView({
+            account,
+            authJson: `${JSON.stringify(credential, null, 2)}\n`,
+            openMode,
+          }));
+        }
+      } catch (error) {
+        log('codex_account_authorization_failed', {
+          account_id: account.id,
+          account_alias: account.alias,
+          identity,
+          error: error.message,
+        });
+        sendHtml(res, 400, codexAuthorizationPage(account, session, { error: error.message }));
       }
       return;
     }
@@ -757,7 +998,7 @@ document.addEventListener('click', async (event) => {
       if (!session) return;
       const form = await readForm(req).catch(() => ({}));
       if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
       try {
@@ -773,8 +1014,29 @@ document.addEventListener('click', async (event) => {
           account,
           memberLabel: form.member_label,
           link,
-          canSignOut: adminAuth === 'password',
+          openMode,
         }));
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+
+    // Removing an account that never finished authorizing. The store decides what
+    // is safe to delete; this route deliberately does not re-derive that rule,
+    // because two copies of a "safe to delete" test drift apart.
+    const deleteAccountParams = routeMatch(path, '/accounts/:id/delete');
+    if (req.method === 'POST' && deleteAccountParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        await store.deleteAccount(deleteAccountParams.id);
+        redirect(res, '/');
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }
@@ -787,7 +1049,7 @@ document.addEventListener('click', async (event) => {
       if (!session) return;
       const form = await readForm(req).catch(() => ({}));
       if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
       try {
@@ -804,13 +1066,14 @@ document.addEventListener('click', async (event) => {
       const enrollment = store.enrollmentByCode(redeemParams.code);
       const account = enrollment ? store.accountById(enrollment.account_id) : null;
       if (!enrollment || !account || enrollment.used_at || Date.parse(enrollment.expires_at) <= Date.now()) {
-        sendHtml(res, 410, messageView('Enrollment unavailable', 'This enrollment link is invalid, expired, or already used.', { error: true }));
+        sendHtml(res, 410, messageView('Enrollment unavailable', 'This enrollment link is invalid, expired, or already used.', { error: true, openMode }));
         return;
       }
       sendHtml(res, 200, enrollmentView({
         account,
         memberLabel: enrollment.member_label,
         code: redeemParams.code,
+        openMode,
       }));
       return;
     }
@@ -825,25 +1088,27 @@ document.addEventListener('click', async (event) => {
         sendHtml(res, 200, deviceConfiguredView({
           ...result,
           claudeGatewayUrl,
+          openMode,
         }));
       } catch (error) {
         const enrollment = store.enrollmentByCode(redeemParams.code);
         const account = enrollment ? store.accountById(enrollment.account_id) : null;
         if (!enrollment || !account || enrollment.used_at) {
-          sendHtml(res, 410, messageView('Enrollment unavailable', error.message, { error: true }));
+          sendHtml(res, 410, messageView('Enrollment unavailable', error.message, { error: true, openMode }));
         } else {
           sendHtml(res, 400, enrollmentView({
             account,
             memberLabel: enrollment.member_label,
             code: redeemParams.code,
             error: error.message,
+            openMode,
           }));
         }
       }
       return;
     }
 
-    sendHtml(res, 404, messageView('Not found', 'The requested page does not exist.', { error: true }));
+    sendHtml(res, 404, messageView('Not found', 'The requested page does not exist.', { error: true, openMode }));
   }
 
   let server;
@@ -858,7 +1123,8 @@ document.addEventListener('click', async (event) => {
     clearInterval(cleanupTimer);
     usageMonitor.stop?.();
   });
-  return { server, store, handler, usageMonitor };
+  // sessionCount is exposed only so a test can prove the map stays bounded.
+  return { server, store, handler, usageMonitor, sessionCount: () => sessions.size };
 }
 
 async function main() {
@@ -907,13 +1173,12 @@ async function main() {
     }
     const created = await createCredentialConsole({ tls });
     ({ server } = created);
-    const { store } = created;
     server.once('close', () => {
       releaseHomeLock().catch((error) => console.error(error.stack ?? error.message));
     });
-    if (ADMIN_AUTH === 'password' && !store.hasAdmin()) {
-      log('admin_not_configured', {
-        remediation: 'run node cli.js init-admin --password-file <path> before exposing the service',
+    if (ADMIN_AUTH === 'open') {
+      log('admin_auth_open', {
+        detail: 'no console authentication; reachability is the entire authorization boundary',
       });
     }
     server.listen(PORT, BIND, () => {

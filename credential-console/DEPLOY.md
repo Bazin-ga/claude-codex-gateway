@@ -31,7 +31,9 @@ sudo install -d -o root -g root -m 0755 /var/www/letsencrypt
 
 If importing a Codex credential home on the same host, grant read-only access to its public
 credential metadata through the systemd unit's `SupplementaryGroups=codex-credential`. Do not grant
-access to its client-token registry or `/var/lib/codex-credential/secret`.
+access to its client-token registry or `/var/lib/codex-credential/secret` — unless you deliberately
+enable console-side seeding, which requires exactly that and is described in
+[Codex account authorization](#codex-account-authorization).
 
 Initialize the encryption key before any other console command on a genuine first deployment:
 
@@ -62,8 +64,12 @@ curl -fsS http://127.0.0.1:9080/health
 
 ## Administrator authentication
 
-For a tailnet-only deployment, use Tailscale identity and do not configure a separate
-application password:
+There are two modes and the console has no login of its own in either. `tailscale` takes the
+administrator's identity from Tailscale; `open` identifies nobody. `CREDENTIAL_CONSOLE_ADMIN_AUTH`
+defaults to `tailscale`, so a deployment that never sets it fails closed and refuses requests
+that carry no tailnet identity. `open` has to be chosen on purpose.
+
+For a tailnet-only deployment, use Tailscale identity:
 
 ```bash
 sudo sh -c 'umask 077; printf "%s\n" \
@@ -79,28 +85,39 @@ administrator. Tailscale Serve removes spoofed identity headers and supplies
 `Tailscale-User-Login`; the Node service must remain loopback-only. Tagged devices do not
 receive a user identity header and cannot administer the console in this mode.
 
-For deployments that need a separate application password, leave
-`CREDENTIAL_CONSOLE_ADMIN_AUTH=password` and bootstrap it as follows.
-
-Generate a password into a temporary mode-600 file. Do not put it in shell history or an
-environment variable. Run this before starting the service on a first deployment. To initialize
-or rotate it later, stop the service first:
+For a deployment where the surrounding private network is already the access-control decision,
+`CREDENTIAL_CONSOLE_ADMIN_AUTH=open` removes console authentication entirely:
 
 ```bash
-umask 077
-openssl rand -base64 24 > /tmp/credential-console-admin-password
-sudo systemctl stop credential-console 2>/dev/null || true
-sudo -u credential-console \
-  CREDENTIAL_CONSOLE_HOME=/var/lib/credential-console \
-  node /opt/claude-codex-gateway/credential-console/cli.js \
-  init-admin --password-file /tmp/credential-console-admin-password
-if sudo systemctl is-enabled --quiet credential-console; then
-  sudo systemctl start credential-console
-fi
+sudo sh -c 'umask 077; printf "%s\n" \
+  "CREDENTIAL_CONSOLE_PUBLIC_URL=https://<console-host>" \
+  "CREDENTIAL_CONSOLE_CLAUDE_GATEWAY_URL=https://<console-host>:10000/claude" \
+  "CREDENTIAL_CONSOLE_ADMIN_AUTH=open" \
+  > /etc/credential-console.env'
 ```
 
-Give the password to the administrator through a private channel, then remove the temporary
-file. The password can later be rotated with the same command.
+There is no identity of any kind. Every client that can open the console can add accounts, issue
+device credentials, and revoke them, and the audit log records only self-asserted member labels.
+With nothing to bind a flow to, one visitor can also complete a Claude or Codex authorization
+session that another visitor started; PKCE, the single live session, and the 15-minute expiry are
+the only limits left on that step.
+Reachability is the whole authorization boundary, so keep the listener on a private overlay
+network you control and never expose it through Funnel or a public reverse proxy. The service
+still binds only `127.0.0.1:9080` in this mode, so follow [Tailscale](#tailscale) to publish it
+— Serve works unchanged with `open` and keeps the loopback bind — and set the mode to `open` in
+the file that section rewrites. Per-session
+CSRF tokens still apply, so a visitor's browser cannot be driven by another site. Every page
+carries a banner stating that the console is unauthenticated, and `/health` reports
+`admin_configured: false` for as long as the mode is set — alert on it if you did not intend it.
+
+There is no third mode and nothing to bootstrap: the console has no administrator credential, so
+neither deployment needs a password file or a setup command. Confirm the mode a running service
+actually resolved before exposing it:
+
+```bash
+curl -fsS http://127.0.0.1:9080/health
+# {"status":"ok","admin_auth":"tailscale","admin_configured":true}
+```
 
 Import a Codex credential home read-only. Stop the service before running this mutating command,
 then start it again afterward:
@@ -115,10 +132,100 @@ sudo systemctl start credential-console
 curl -fsS http://127.0.0.1:9080/health
 ```
 
-The server holds a single-writer lock on the credential home for its lifetime. The `init-key`,
-`init-admin`, and `import-codex` commands acquire the same lock and fail fast while the service is
-running. Stop the service before running any of them. `list` is read-only and does not acquire the
-lock.
+The server holds a single-writer lock on the credential home for its lifetime. The `init-key` and
+`import-codex` commands acquire the same lock and fail fast while the service is running. Stop the
+service before running either of them. `list` is read-only and does not acquire the lock.
+
+## Codex account authorization
+
+The console can run the ChatGPT subscription login itself, so no `codex login` on a separate
+machine and no hand-carried `auth.json` is needed to get a Codex credential into the refresh
+centre. Register the account in the dashboard ("Add a Codex team account"), open its **Codex
+authorization** page, and follow it. The browser's final hop to `http://localhost:1455` fails by
+design — that is where the authorization code appears, and the page says so.
+
+Decide first where the finished credential should land.
+
+**Default — the console writes nothing.** Leave `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` unset. The
+`auth.json` is rendered once with copy and download buttons, and the page prints the exact seed
+command to run on the refresh centre:
+
+```bash
+sudo -u codex-refresh CODEX_CRED_HOME=/var/lib/codex-credential \
+  node /opt/claude-codex-gateway/codex-credential/refresh-center/seed.js ./codex-auth-<alias>.json
+shred -u ./codex-auth-<alias>.json
+```
+
+Leaving or reloading the page hides the credential permanently; there is no second render. This
+preserves the read-only import boundary above: the console never touches
+`/var/lib/codex-credential/secret`.
+
+**Opt-in — the console seeds the home directly.** This needs three changes, not one. The shipped
+unit deliberately walls the console off from that home, so the variable alone does nothing but
+produce a refusal.
+
+1. Add to `/etc/credential-console.env`:
+
+   ```dotenv
+   CREDENTIAL_CONSOLE_CODEX_SEED_HOME=/var/lib/codex-credential
+   ```
+
+2. Undo the unit's own hardening for that path, with
+   `sudo systemctl edit credential-console`. A systemd mount namespace cannot be reopened by a
+   filesystem ACL, so this is not optional:
+
+   ```ini
+   [Service]
+   # Both lists are additive; the empty assignment resets the shipped value first.
+   InaccessiblePaths=
+   InaccessiblePaths=/var/lib/codex-credential/clients
+   ReadOnlyPaths=
+   ReadWritePaths=/var/lib/codex-credential/secret /var/lib/codex-credential/public
+   ```
+
+3. Grant the access on the **directories**, not on `current.json`. Every write here is
+   temp-file-plus-rename, so the publish creates `current.json.<hex>.tmp` as a sibling and needs
+   write and execute on `public/` itself:
+
+   ```bash
+   sudo setfacl -m u:credential-console:rwx /var/lib/codex-credential/secret
+   sudo setfacl -m u:credential-console:rwx /var/lib/codex-credential/public
+   ```
+
+A completed authorization is then written by the console using the refresh centre's own store:
+same atomic write, same retained generations, same `public/` publish, same operation lock. If the
+lock is held by a running refresh, the console refuses with `is busy, so nothing was written`
+instead of racing it; retry once the refresh timer is idle. One variable means one home, and one
+home holds one credential: an authorization for a second Codex account that would overwrite the
+first account's credential is refused before it starts.
+
+**Start authorization** probes the home for writability before it opens a session, so a missed
+step above is reported as `is not writable by this console (EACCES)` while nothing has been spent.
+Verify it once after the changes: press **Start a fresh authorization** and expect the OpenAI
+link rather than that message.
+
+> This **contradicts the read-only rule stated under
+> [Filesystem and user](#filesystem-and-user)**. The console's user now needs write access to
+> `/var/lib/codex-credential/secret`, so a console compromise reaches the Codex refresh token
+> that read-only import was designed to keep away from it. Enable it only where the console and
+> the refresh centre are already one trust domain.
+>
+> The dispenser's client-token registry stays out of reach either way.
+
+In both cases the seed is a handover, not a backup. OpenAI rotates refresh tokens single-use, so
+the centre's first rotation kills the credential produced here. A downloaded `auth.json` is dead
+from that moment: delete it, never archive it, and never re-seed a running centre from an old
+copy — that overwrites the live credential with a spent one and costs a fresh authorization.
+
+Verify the seed the way `codex-credential/DEPLOY.md` prescribes — never with `codex login status`,
+which reports success for a garbage token:
+
+```bash
+sudo -u codex-refresh jq 'has("refresh_token"), .expires_at' \
+  /var/lib/codex-credential/public/current.json
+```
+
+Expect `false` and a future timestamp, then confirm with a real turn from an enrolled client.
 
 ## Codex member self-service
 
@@ -207,20 +314,32 @@ Tailscale reports a URL such as
 administrator-auth mode in `/etc/credential-console.env`, restart `credential-console`,
 and verify the generated enrollment links use it.
 
-This command rewrites the file. If you already added the `CREDENTIAL_CONSOLE_CODEX_*` lines
-from [Codex member self-service](#codex-member-self-service), re-add them afterwards and
-restart the service again — the console fails closed and simply hides Codex self-service when
-any of the three is missing.
+Serve keeps the loopback bind, so this step is the same for both administrator-auth modes and
+an `open` deployment needs it too — the shipped unit binds `127.0.0.1:9080` and the server
+refuses a non-loopback bind without TLS, so Serve (or your own proxy, under the constraints in
+[Do not publish the complete console](#do-not-publish-the-complete-console)) is what makes the
+console reachable at all.
+
+This command rewrites the file, so it resets every variable it does not list. Substitute the
+mode you chose in [Administrator authentication](#administrator-authentication) — an `open`
+deployment must write `open` here, or this step silently puts it back into `tailscale`. If you
+already added the `CREDENTIAL_CONSOLE_CODEX_*` lines from
+[Codex member self-service](#codex-member-self-service), re-add them afterwards and restart the
+service again — the console fails closed and simply hides Codex self-service when any of the
+three is missing.
 
 ```bash
 sudo sh -c 'umask 077; printf "%s\n" \
   "CREDENTIAL_CONSOLE_PUBLIC_URL=https://<console-host>.<your-tailnet>.ts.net" \
   "CREDENTIAL_CONSOLE_CLAUDE_GATEWAY_URL=https://<console-host>.<your-tailnet>.ts.net:10000/claude" \
-  "CREDENTIAL_CONSOLE_ADMIN_AUTH=tailscale" \
+  "CREDENTIAL_CONSOLE_ADMIN_AUTH=<tailscale-or-open>" \
   "CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS=3600000" \
   > /etc/credential-console.env'
 sudo systemctl restart credential-console
 ```
+
+Confirm the mode the service actually resolved afterwards with
+`curl -fsS http://127.0.0.1:9080/health`.
 
 Tailnet policy should restrict access to the intended member group and this host. In
 Tailscale administrator-auth mode, that policy is the administrator authorization boundary.
@@ -264,7 +383,10 @@ whole console. In `CREDENTIAL_CONSOLE_ADMIN_AUTH=tailscale` mode the server acce
 from it, because Tailscale Serve is what strips a spoofed copy of that header. A reverse proxy
 is always a loopback peer, so unless it clears the header itself, any client that sends
 `Tailscale-User-Login` becomes an administrator. `X-Forwarded-For` is trusted from loopback in
-the same way and keys the login-attempt limiter.
+the same way and keys the public gateway's failed-authentication limiter.
+
+`CREDENTIAL_CONSOLE_ADMIN_AUTH=open` has no header to spoof because it checks nothing; publishing
+that listener publishes credential issuance and revocation to whoever reaches it.
 
 If you nevertheless terminate TLS with your own proxy, mount only `/claude`, and clear both
 headers on the way in — with nginx, `proxy_set_header Tailscale-User-Login "";` and

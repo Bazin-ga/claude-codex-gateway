@@ -21,9 +21,10 @@ enrollment key `set-enrollment-key.js` prints.
 
 - Node ≥ 20. Nothing else: all three packages are dependency-free, so there is no
   `npm install` step.
-- One `auth.json` produced by a human `codex login` on a machine that can reach ChatGPT.
-  It must be a subscription login — `auth_mode: "chatgpt"` with a non-empty
-  `tokens.refresh_token`. `seed.js` refuses anything else.
+- One `auth.json` for the subscription account, produced either by a human `codex login` on a
+  machine that can reach ChatGPT or by the credential console's Codex authorization page
+  (see `credential-console/DEPLOY.md`). It must be a subscription login — `auth_mode: "chatgpt"`
+  with a non-empty `tokens.refresh_token`. `seed.js` refuses anything else.
 - **Do not run `codex login` on the center host.** It wipes the existing credential
   *before* waiting for authorization, so an interrupted login destroys it with no
   recovery. The center never needs the codex CLI.
@@ -123,8 +124,9 @@ access token's expiry.
 > single-use: the moment the center performs its first refresh, the token in that file is
 > permanently dead. Copying it somewhere "just in case" gives you a file that looks like a
 > credential and is not one. From this point the only live credential is
-> `$CODEX_CRED_HOME/secret/credential.json`, and the only recovery from losing it is a
-> fresh human `codex login` followed by another seed.
+> `$CODEX_CRED_HOME/secret/credential.json`, and the only recovery from losing it is a fresh
+> authorization — `codex login` on a machine that can reach ChatGPT, or the credential
+> console's Codex authorization page — followed by another seed.
 
 `seed.js` leaves the source file untouched and publishes `public/current.json` immediately,
 so the dispenser has something to serve before the first refresh ever runs.
@@ -478,8 +480,9 @@ is not the problem — re-check the client's egress to `chatgpt.com/backend-api/
 
 **A broken refresh chain.** Symptom: `refresh.js` alerts `critical`, and every client will
 expire together within ~10 days. Previous credential generations are retained in
-`$CODEX_CRED_HOME/secret/` for inspection. Recovery is a fresh human `codex login` on any
-machine that can reach ChatGPT, followed by `seed.js` again on the center.
+`$CODEX_CRED_HOME/secret/` for inspection. Recovery is a fresh authorization — either
+`codex login` on any machine that can reach ChatGPT, or the credential console's Codex
+authorization page — followed by `seed.js` again on the center.
 
 An ambiguous refresh — a timeout, a lost response, an unknown 4xx — leaves
 `secret/refresh-in-flight.json` behind as a persistent quarantine marker, and scheduled runs

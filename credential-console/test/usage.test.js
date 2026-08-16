@@ -99,3 +99,30 @@ test('hourly monitor caches only normalized usage metadata', async () => {
     monitor.stop();
   }
 });
+
+test('a Codex account awaiting authorization is not reported as a usage failure', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-codex-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  // What POST /accounts creates: registered, never authorized, no external home.
+  const account = await store.addAccount({ provider: 'codex', alias: 'codex-shared-1' });
+  const events = [];
+  const monitor = await new UsageMonitor({
+    store,
+    home,
+    refreshIntervalMs: 60_000,
+    log: (event, detail) => events.push({ event, detail }),
+    fetchImpl: async () => {
+      throw new Error('a Codex account with no home must not be fetched for');
+    },
+  }).init();
+  try {
+    await monitor.refresh();
+    assert.equal(monitor.snapshotForAccount(account.id).status, 'authorization_required');
+    assert.equal(
+      events.find((entry) => entry.event === 'account_usage_refresh_failed').detail.code,
+      'authorization_required',
+    );
+  } finally {
+    monitor.stop();
+  }
+});
