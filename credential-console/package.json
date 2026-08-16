@@ -1,0 +1,15 @@
+{
+  "name": "@claude-codex-gateway/credential-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-account credential control plane and per-device gateway for Codex and Claude Code.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

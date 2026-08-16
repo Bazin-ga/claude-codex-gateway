@@ -1,0 +1,22 @@
+[Unit]
+Description=Codex credential refresh
+Documentation=https://github.com/Bazin-ga/claude-codex-gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=codex-refresh
+Group=codex-credential
+Environment=CODEX_CRED_HOME=/var/lib/codex-credential
+# Uncomment to route refresh failures somewhere a human will see them.
+#Environment=CODEX_CRED_ALERT_WEBHOOK=https://example.invalid/hook
+ExecStart=NODE_PATH /opt/claude-codex-gateway/codex-credential/refresh-center/refresh.js
+
+# The refresh token is the one unrecoverable secret in this system; keep the
+# blast radius of a compromised process as small as the work allows.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/codex-credential

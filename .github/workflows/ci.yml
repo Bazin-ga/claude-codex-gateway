@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check scripts
+        shell: bash
+        run: |
+          find . -type f \( -name '*.js' -o -name '*.mjs' \) -print0 |
+            xargs -0 -r -n1 node --check
+          find . -type f -name '*.sh' -print0 |
+            xargs -0 -r -n1 bash -n
+      - name: Test codex credential components
+        if: ${{ hashFiles('codex-credential/**/package.json') != '' }}
+        shell: bash
+        run: |
+          npm test --prefix codex-credential/client-agent
+          bash codex-credential/client-agent/test/install-fallback.test.sh
+          npm test --prefix codex-credential/refresh-center
+          npm test --prefix codex-credential/token-dispenser
+      - name: Test credential console
+        shell: bash
+        run: cd credential-console && npm test -- test/*.test.js
+
+  windows-acl:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Exercise the real Windows credential ACL
+        shell: pwsh
+        run: node --test --test-name-pattern="Windows ACL applies" codex-credential/client-agent/test/pull.test.js

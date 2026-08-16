@@ -1,0 +1,102 @@
+#!/usr/bin/env node
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { CredentialStore } from './lib/store.js';
+import { acquireHomeLock } from './lib/home-lock.js';
+
+const HOME = process.env.CREDENTIAL_CONSOLE_HOME ?? '/var/lib/credential-console';
+
+function valueOf(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : null;
+}
+
+function usage() {
+  console.error(`usage:
+  node cli.js init-key
+  node cli.js init-admin --password-file <path>
+  node cli.js import-codex --alias <alias> --home <path> [--email <label>]
+  node cli.js list`);
+  process.exitCode = 2;
+}
+
+async function main() {
+  const command = process.argv[2];
+
+  if (!['init-key', 'init-admin', 'import-codex'].includes(command)) {
+    if (command === 'list') {
+      const store = await new CredentialStore(HOME).init();
+      console.log(JSON.stringify(store.publicAccounts(), null, 2));
+      return;
+    }
+    return usage();
+  }
+
+  const lock = await acquireHomeLock(HOME, { role: `cli:${command}` });
+  try {
+    if (command === 'init-key') {
+      const keyPath = resolve(HOME, 'master.key');
+      const statePath = resolve(HOME, 'state.json');
+      try {
+        await readFile(keyPath);
+        throw new Error(`master key already exists at ${keyPath}; refusing to overwrite it`);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      try {
+        const state = JSON.parse(await readFile(statePath, 'utf8'));
+        const encryptedCollections = ['accounts', 'devices', 'enrollments', 'oauth_flows'];
+        if (encryptedCollections.some((collection) => state[collection]?.length > 0)) {
+          throw new Error(
+            'credential home already contains data encrypted under a different key; '
+            + 'a new key cannot decrypt it; restore master.key from backup instead',
+          );
+        }
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      try {
+        await new CredentialStore(HOME, { allowKeyInit: true }).init();
+      } catch (error) {
+        if (error.code === 'EEXIST') {
+          throw new Error(`master key already exists at ${keyPath}; refusing to overwrite it`);
+        }
+        throw error;
+      }
+      console.log(`master key created at ${keyPath}`);
+      return;
+    }
+
+    const store = await new CredentialStore(HOME).init();
+
+    if (command === 'init-admin') {
+      const passwordFile = valueOf('--password-file');
+      if (!passwordFile) return usage();
+      const password = (await readFile(resolve(passwordFile), 'utf8')).replace(/\r?\n$/, '');
+      await store.setAdminPassword(password);
+      console.log('administrator password configured');
+      return;
+    }
+
+    if (command === 'import-codex') {
+      const alias = valueOf('--alias');
+      const home = valueOf('--home');
+      if (!alias || !home) return usage();
+      const account = await store.addAccount({
+        provider: 'codex',
+        alias,
+        emailLabel: valueOf('--email') ?? '',
+        external: { kind: 'codex-credential', home: resolve(home) },
+      });
+      console.log(JSON.stringify({ id: account.id, alias: account.alias, provider: account.provider }));
+      return;
+    }
+  } finally {
+    await lock.release();
+  }
+}
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});

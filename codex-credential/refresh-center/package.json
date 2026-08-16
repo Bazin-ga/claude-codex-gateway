@@ -1,0 +1,15 @@
+{
+  "name": "@claude-codex-gateway/codex-refresh-center",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Holds the sole working Codex refresh token and keeps a fresh access token published for the dispenser.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "seed": "node seed.js",
+    "refresh": "node refresh.js",
+    "test": "node --test"
+  }
+}

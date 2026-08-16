@@ -1,0 +1,15 @@
+{
+  "name": "@claude-codex-gateway/codex-token-dispenser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Authenticated HTTPS endpoint serving short-lived Codex access tokens. Never reads a refresh token.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "add-client": "node add-client.js",
+    "test": "node --test"
+  }
+}

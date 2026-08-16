@@ -1,0 +1,36 @@
+[Unit]
+Description=Codex token dispenser
+Documentation=https://github.com/Bazin-ga/claude-codex-gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-dispenser
+Group=codex-credential
+Environment=CODEX_CRED_HOME=/var/lib/codex-credential
+Environment=CODEX_CRED_PORT=8443
+ExecStart=NODE_PATH /opt/claude-codex-gateway/codex-credential/token-dispenser/server.js
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Read-only by default: this process must never be able to alter the credential
+# it serves. It only ever needs public/, clients/, and tls/.
+ReadOnlyPaths=/var/lib/codex-credential
+# ...with one deliberate exception. Self-service enrollment records each minted
+# token in clients/clients.json, so that one directory must be writable. Scope it
+# as narrowly as possible: public/current.json — the credential itself — stays
+# read-only, so a compromised dispenser still cannot tamper with what it hands out
+# or forge a longer-lived one. It can only add or revoke client records, which is
+# exactly the authority enrollment requires and nothing more.
+ReadWritePaths=/var/lib/codex-credential/clients
+# Defense in depth on top of the separate Unix identity: even `/proc/<pid>/root`
+# cannot expose secret/ inside this unit's mount namespace.
+InaccessiblePaths=/var/lib/codex-credential/secret
+
+[Install]
+WantedBy=multi-user.target

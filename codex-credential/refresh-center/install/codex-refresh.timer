@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh the Codex credential daily
+Documentation=https://github.com/Bazin-ga/claude-codex-gateway
+
+[Timer]
+# Daily against a ~10-day token life: several consecutive failures can pass
+# before clients are affected, which is the slack the alerting needs to be useful.
+OnCalendar=daily
+# Spread the load off the top of the hour and survive a host that was asleep.
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
