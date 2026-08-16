@@ -1,5 +1,7 @@
 # claude-codex-gateway
 
+**English** | [简体中文](README.zh-CN.md)
+
 A self-hostable credential distribution centre for **Codex** (ChatGPT subscription) and
 **Claude Code** subscriptions.
 
