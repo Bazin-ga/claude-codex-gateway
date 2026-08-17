@@ -5,6 +5,10 @@ credential home read-only over the local filesystem. That is a convenience, not 
 console runs on any host that can reach the dispenser over the network, and the read-only import is
 simply unavailable when the Codex credential home is on a different machine.
 
+`credential-console` requires Node 22.5 or newer because its body-free request metrics use the
+built-in `node:sqlite` module. The shipped service suppresses Node 22's known experimental-module
+warning; it does not suppress application errors.
+
 ## Network
 
 The recommended deployment separates a private control plane from public, token-authenticated
@@ -65,6 +69,8 @@ page again. Back it up as described in
 Install the unit before any later command stops or starts the service:
 
 ```bash
+sudo -u credential-console /usr/bin/env node -e \
+  'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 5)) process.exit(1)'
 sudo install -m 0644 install/credential-console.service \
   /etc/systemd/system/credential-console.service
 sudo systemctl daemon-reload
@@ -407,12 +413,14 @@ headers on the way in — with nginx, `proxy_set_header Tailscale-User-Login "";
 
 Treat `master.key` and `state.json` as one recovery unit. A key from one backup combined with
 ciphertext from another decrypts nothing. `usage.json` is a regenerable quota cache and is not
-critical to recovery; include it in a point-in-time backup when it exists.
+critical to recovery. `metrics.sqlite` is the non-regenerable request-metadata history. Include
+both optional files in a point-in-time backup when they exist, and checkpoint the metrics WAL
+after stopping the service before copying the database.
 
 ### Create and transfer a backup
 
-1. Stop the service briefly and create a root-only snapshot of the recovery pair and, when it
-   exists, the quota cache. Replace
+1. Stop the service briefly, checkpoint and integrity-check the metrics database when present,
+   then create a root-only snapshot. Replace
    `<backup-id>` with a unique UTC timestamp or change identifier:
 
 ```bash
@@ -420,11 +428,27 @@ set -euo pipefail
 backup_id='<backup-id>'
 console_home=/var/lib/credential-console
 snapshot_dir=/var/backups/credential-console/snapshots/$backup_id
+service_was_running=0
+restart_on_exit() {
+  status=$?
+  trap - EXIT
+  if [ "$service_was_running" -eq 1 ]; then
+    if ! sudo systemctl start credential-console; then status=1; fi
+  fi
+  exit "$status"
+}
+trap restart_on_exit EXIT
+if sudo systemctl is-active --quiet credential-console; then service_was_running=1; fi
 sudo systemctl stop credential-console
 sudo install -d -o root -g root -m 0700 "$snapshot_dir"
 files=(master.key state.json)
 if sudo test -f "$console_home/usage.json"; then
   files+=(usage.json)
+fi
+if sudo test -f "$console_home/metrics.sqlite"; then
+  sudo -u credential-console env CREDENTIAL_CONSOLE_HOME="$console_home" \
+    node --no-warnings /opt/claude-codex-gateway/credential-console/cli.js checkpoint-metrics
+  files+=(metrics.sqlite)
 fi
 for file in "${files[@]}"; do
   sudo install -o root -g root -m 0600 "$console_home/$file" "$snapshot_dir/$file"
@@ -433,8 +457,12 @@ done
   | sudo tee "$snapshot_dir/SHA256SUMS" >/dev/null
 sudo chmod 0600 "$snapshot_dir/SHA256SUMS"
 (cd "$snapshot_dir" && sudo sha256sum --check SHA256SUMS)
-sudo systemctl start credential-console
-curl -fsS http://127.0.0.1:9080/health
+if [ "$service_was_running" -eq 1 ]; then
+  sudo systemctl start credential-console
+  service_was_running=0
+  curl -fsS http://127.0.0.1:9080/health
+fi
+trap - EXIT
 ```
 
 2. Copy the complete snapshot directory off the host into a root-only destination. A same-host
@@ -473,6 +501,12 @@ sudo install -o root -g root -m 0600 \
 if sudo test -f /srv/secure-backups/credential-console/"$backup_id"/usage.json; then
   sudo install -o root -g root -m 0600 \
     /srv/secure-backups/credential-console/"$backup_id"/usage.json "$verify_dir"/
+fi
+if sudo test -f /srv/secure-backups/credential-console/"$backup_id"/metrics.sqlite; then
+  sudo install -o root -g root -m 0600 \
+    /srv/secure-backups/credential-console/"$backup_id"/metrics.sqlite "$verify_dir"/
+  sudo env CREDENTIAL_CONSOLE_HOME="$verify_dir" \
+    node --no-warnings /opt/claude-codex-gateway/credential-console/cli.js checkpoint-metrics
 fi
 sudo env VERIFY_DIR="$verify_dir" \
   STORE_MODULE=/opt/claude-codex-gateway/credential-console/lib/store.js \
@@ -555,7 +589,18 @@ backup_id='<verified-backup-id>'
 restore_source=/srv/secure-backups/credential-console/$backup_id
 rollback_id=$(date -u +%Y%m%dT%H%M%SZ)
 rollback_dir=/var/backups/credential-console/pre-restore-$rollback_id
+restore_restart_pending=0
+restart_restore_on_exit() {
+  status=$?
+  trap - EXIT
+  if [ "$restore_restart_pending" -eq 1 ]; then
+    if ! sudo systemctl start credential-console; then status=1; fi
+  fi
+  exit "$status"
+}
+trap restart_restore_on_exit EXIT
 sudo systemctl stop credential-console
+restore_restart_pending=1
 sudo install -d -o root -g root -m 0700 "$rollback_dir"
 sudo install -o root -g root -m 0600 \
   /var/lib/credential-console/{master.key,state.json} "$rollback_dir"/
@@ -563,10 +608,17 @@ if sudo test -f /var/lib/credential-console/usage.json; then
   sudo install -o root -g root -m 0600 \
     /var/lib/credential-console/usage.json "$rollback_dir"/
 fi
+if sudo test -f /var/lib/credential-console/metrics.sqlite; then
+  sudo -u credential-console env CREDENTIAL_CONSOLE_HOME=/var/lib/credential-console \
+    node --no-warnings /opt/claude-codex-gateway/credential-console/cli.js checkpoint-metrics
+  sudo install -o root -g root -m 0600 \
+    /var/lib/credential-console/metrics.sqlite "$rollback_dir"/
+fi
 ```
 
 2. Restore `master.key` and `state.json` as the matched pair from that single backup. Restore
-   `usage.json` when available, or omit it and allow the service to regenerate the cache:
+   `usage.json` and `metrics.sqlite` when available. Remove stale SQLite sidecars before checking
+   the restored database and starting the service:
 
 ```bash
 set -euo pipefail
@@ -578,15 +630,40 @@ if sudo test -f "$restore_source/usage.json"; then
   sudo install -o credential-console -g credential-console -m 0600 \
     "$restore_source/usage.json" /var/lib/credential-console/usage.json
 fi
+if sudo test -f "$restore_source/metrics.sqlite"; then
+  sudo install -o credential-console -g credential-console -m 0600 \
+    "$restore_source/metrics.sqlite" /var/lib/credential-console/metrics.sqlite
+  sudo rm -f /var/lib/credential-console/metrics.sqlite-wal \
+    /var/lib/credential-console/metrics.sqlite-shm
+  sudo -u credential-console env CREDENTIAL_CONSOLE_HOME=/var/lib/credential-console \
+    node --no-warnings /opt/claude-codex-gateway/credential-console/cli.js checkpoint-metrics
+else
+  sudo rm -f /var/lib/credential-console/metrics.sqlite \
+    /var/lib/credential-console/metrics.sqlite-wal \
+    /var/lib/credential-console/metrics.sqlite-shm
+fi
 sudo systemctl start credential-console
 curl -fsS http://127.0.0.1:9080/health
+restore_restart_pending=0
+trap - EXIT
 ```
 
 3. If health or functional checks fail, roll back to the pre-restore matched pair:
 
 ```bash
 set -euo pipefail
+rollback_restart_pending=0
+restart_rollback_on_exit() {
+  status=$?
+  trap - EXIT
+  if [ "$rollback_restart_pending" -eq 1 ]; then
+    if ! sudo systemctl start credential-console; then status=1; fi
+  fi
+  exit "$status"
+}
+trap restart_rollback_on_exit EXIT
 sudo systemctl stop credential-console
+rollback_restart_pending=1
 sudo install -o credential-console -g credential-console -m 0600 \
   "$rollback_dir/master.key" /var/lib/credential-console/master.key
 sudo install -o credential-console -g credential-console -m 0600 \
@@ -595,8 +672,22 @@ if sudo test -f "$rollback_dir/usage.json"; then
   sudo install -o credential-console -g credential-console -m 0600 \
     "$rollback_dir/usage.json" /var/lib/credential-console/usage.json
 fi
+if sudo test -f "$rollback_dir/metrics.sqlite"; then
+  sudo install -o credential-console -g credential-console -m 0600 \
+    "$rollback_dir/metrics.sqlite" /var/lib/credential-console/metrics.sqlite
+  sudo rm -f /var/lib/credential-console/metrics.sqlite-wal \
+    /var/lib/credential-console/metrics.sqlite-shm
+  sudo -u credential-console env CREDENTIAL_CONSOLE_HOME=/var/lib/credential-console \
+    node --no-warnings /opt/claude-codex-gateway/credential-console/cli.js checkpoint-metrics
+else
+  sudo rm -f /var/lib/credential-console/metrics.sqlite \
+    /var/lib/credential-console/metrics.sqlite-wal \
+    /var/lib/credential-console/metrics.sqlite-shm
+fi
 sudo systemctl start credential-console
 curl -fsS http://127.0.0.1:9080/health
+rollback_restart_pending=0
+trap - EXIT
 ```
 
 ## Verification

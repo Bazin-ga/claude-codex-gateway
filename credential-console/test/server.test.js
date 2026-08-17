@@ -53,7 +53,7 @@ async function fixture({
     refreshAccount: async (accountId) => usageSnapshot(store.accountById(accountId)),
     stop() {},
   };
-  const { server, sessionCount } = await createCredentialConsole({
+  const { server, requestMetrics, sessionCount } = await createCredentialConsole({
     store,
     usageMonitor,
     adminAuth,
@@ -70,6 +70,7 @@ async function fixture({
     baseUrl,
     home,
     server,
+    requestMetrics,
     sessionCount,
     store,
     upstream,
@@ -1695,6 +1696,122 @@ test('rejects CSRF bypass and unsupported gateway paths', async () => {
     assert.equal(app.upstreamRequests.length, 0);
   } finally {
     await app.close();
+  }
+});
+
+test('request metrics page attributes the device label and excludes count_tokens from consumption', async () => {
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'metrics-account',
+      credential: { oauth_token: 'metrics-provider-token' },
+    });
+    const issued = await app.store.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'self-asserted-member',
+      deviceName: 'metrics-device',
+    });
+    const promptMarker = 'body-marker-that-must-never-enter-sqlite';
+    const ordinaryBody = JSON.stringify({
+      messages: [{ role: 'user', content: promptMarker }],
+      model: 'claude-metrics-model',
+      stream: true,
+    });
+    const ordinary = await fetch(`${app.baseUrl}/claude/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': issued.token,
+        'Content-Type': 'application/json',
+      },
+      body: ordinaryBody,
+    });
+    assert.equal(ordinary.status, 200);
+    await ordinary.arrayBuffer();
+
+    const countTokens = await fetch(`${app.baseUrl}/claude/v1/messages/count_tokens?beta=1`, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': issued.token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'claude-metrics-model', messages: [] }),
+    });
+    assert.equal(countTokens.status, 200);
+    await countTokens.arrayBuffer();
+    assert.equal(app.requestMetrics.flush().written, 2);
+
+    assert.equal(app.requestMetrics.queryTotals({ scope: 'all' }).requestCount, 2);
+    assert.equal(app.requestMetrics.queryTotals({ scope: 'consumption' }).requestCount, 1);
+    assert.equal(
+      app.requestMetrics.queryTotals({ scope: 'all', deviceId: issued.device.id }).requestCount,
+      2,
+    );
+    assert.deepEqual(
+      app.requestMetrics.queryBreakdown({ by: 'member', scope: 'all' })
+        .map(({ groupValue, requestCount }) => ({ groupValue, requestCount })),
+      [{ groupValue: 'self-asserted-member', requestCount: 2 }],
+    );
+
+    const metrics = await fetch(
+      `${app.baseUrl}/metrics?machine_id=device:${encodeURIComponent(issued.device.id)}&member_label=self-asserted-member&account_id=${encodeURIComponent(account.id)}&model=claude-metrics-model&hours=24`,
+    );
+    assert.equal(metrics.status, 200);
+    const html = await metrics.text();
+    assert.match(html, /data-i18n="metrics-total-requests">All requests<\/span><strong>2<\/strong>/);
+    assert.match(html, /data-i18n="metrics-consumption-requests">Consumption requests<\/span><strong>1<\/strong>/);
+    assert.match(html, /value="self-asserted-member" selected/);
+    assert.match(html, /value="claude-metrics-model" selected/);
+    assert.match(html, /self-entered and unverified/);
+    assert.match(html, /never use them for accountability or billing/);
+    assert.equal(html.includes(promptMarker), false);
+    assert.equal(html.includes(issued.token), false);
+    const appScript = await (await fetch(`${app.baseUrl}/assets/app.js`)).text();
+    const metricsTranslationKeys = new Set(
+      [...html.matchAll(/data-i18n="(metrics-[a-z0-9-]+)"/g)].map((match) => match[1]),
+    );
+    assert.ok(metricsTranslationKeys.size > 20);
+    for (const key of metricsTranslationKeys) {
+      assert.match(appScript, new RegExp(`'${key}':`), `missing Chinese translation for ${key}`);
+    }
+
+    const databaseBytes = await readFile(join(app.home, 'metrics.sqlite'));
+    const walBytes = await readFile(join(app.home, 'metrics.sqlite-wal')).catch(() => Buffer.alloc(0));
+    const persisted = Buffer.concat([databaseBytes, walBytes]).toString('utf8');
+    assert.equal(persisted.includes(promptMarker), false);
+    assert.equal(persisted.includes(issued.token), false);
+    assert.equal(persisted.includes('metrics-provider-token'), false);
+  } finally {
+    await app.close();
+  }
+});
+
+test('metrics initialization failure is visible but does not prevent the console from serving', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-init-failure-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  await mkdir(join(home, 'metrics.sqlite'));
+  const created = await createCredentialConsole({
+    store,
+    usageMonitor: {
+      snapshotForAccount: () => null,
+      refreshAccount: async () => null,
+      stop() {},
+    },
+    adminAuth: 'open',
+    cookieSecure: false,
+    publicBaseUrl: 'http://credential-console.test',
+  });
+  const baseUrl = await listen(created.server);
+  try {
+    assert.equal(created.metricsInitFailed, true);
+    assert.equal(created.requestMetrics, null);
+    const health = await fetch(`${baseUrl}/health`);
+    assert.equal(health.status, 200);
+    const page = await fetch(`${baseUrl}/metrics`);
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /data-i18n="metrics-unavailable"/);
+  } finally {
+    await new Promise((resolve) => created.server.close(resolve));
   }
 });
 

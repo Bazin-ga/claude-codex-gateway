@@ -17,6 +17,7 @@ import {
 import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
+import { MetricsStore } from './lib/metrics.js';
 import { UsageMonitor } from './lib/usage.js';
 import {
   createClaudeAuthorizationRequest,
@@ -41,6 +42,7 @@ import {
   codexAuthorizationView,
   codexConfiguredView,
   codexCredentialView,
+  metricsView,
 } from './lib/views.js';
 import { requestEnrollment as requestCodexEnrollment } from '../codex-credential/client-agent/enroll.js';
 
@@ -200,6 +202,24 @@ async function codexClientsFor(account) {
 
 export async function createCredentialConsole(options = {}) {
   const store = options.store ?? await new CredentialStore(options.home ?? HOME).init();
+  const metricsHome = options.home ?? store.home ?? HOME;
+  let requestMetrics = null;
+  let metricsInitFailed = false;
+  if (Object.hasOwn(options, 'requestMetrics')) {
+    requestMetrics = options.requestMetrics;
+  } else {
+    try {
+      requestMetrics = await new MetricsStore({
+        home: metricsHome,
+        log,
+      }).init();
+    } catch (error) {
+      metricsInitFailed = true;
+      log('metrics_init_failed', {
+        code: error?.code ?? error?.name ?? 'unknown',
+      });
+    }
+  }
   const usageMonitor = options.usageMonitor ?? await new UsageMonitor({
     store,
     home: options.home ?? store.home ?? HOME,
@@ -391,6 +411,121 @@ export async function createCredentialConsole(options = {}) {
     return known;
   }
 
+  function metricsPage(url) {
+    const allowedHours = new Set([24, 168, 720]);
+    const requestedHours = Number(url.searchParams.get('hours'));
+    const hours = allowedHours.has(requestedHours) ? requestedHours : 24;
+    const now = Date.now();
+    const fromMs = now - hours * 60 * 60_000;
+    const machineSelection = String(url.searchParams.get('machine_id') ?? '').slice(0, 256);
+    const memberLabel = String(url.searchParams.get('member_label') ?? '').slice(0, 160);
+    const accountId = String(url.searchParams.get('account_id') ?? '').slice(0, 128);
+    const model = String(url.searchParams.get('model') ?? '').slice(0, 256);
+    let machineId = null;
+    let deviceId = null;
+    let unattributedMachine = false;
+    if (machineSelection === '__unattributed__') unattributedMachine = true;
+    else if (machineSelection.startsWith('machine:')) machineId = machineSelection.slice('machine:'.length);
+    else if (machineSelection.startsWith('device:')) deviceId = machineSelection.slice('device:'.length);
+    else if (machineSelection) machineId = machineSelection;
+
+    const filters = {
+      fromMs,
+      toMs: now + 1,
+      ...(machineId ? { machineId } : {}),
+      ...(deviceId ? { deviceId } : {}),
+      ...(unattributedMachine ? { unattributedMachine: true } : {}),
+      ...(memberLabel ? { memberLabel } : {}),
+      ...(accountId ? { accountId } : {}),
+      ...(model ? { model } : {}),
+    };
+    const viewFilters = {
+      hours,
+      machineId: unattributedMachine ? '' : machineSelection,
+      unattributedMachine,
+      memberLabel,
+      accountId,
+      model,
+    };
+    const empty = {
+      filters: viewFilters,
+      options: { machines: [], members: [], accounts: [], models: [] },
+      totals: { all: 0, consumption: 0 },
+      hourly: [],
+      metricsAvailable: false,
+      droppedMetrics: 0,
+      error: null,
+    };
+    if (!requestMetrics?.queryTotals
+      || !requestMetrics?.queryHourly
+      || !requestMetrics?.queryBreakdown) {
+      return empty;
+    }
+
+    try {
+      // A dashboard read may flush one queued batch: this is outside every
+      // proxy completion callback, so request delivery never waits on SQLite.
+      requestMetrics.flush?.();
+      const allTotals = requestMetrics.queryTotals({ ...filters, scope: 'all' });
+      const consumptionTotals = requestMetrics.queryTotals({ ...filters, scope: 'consumption' });
+      const hourly = requestMetrics.queryHourly({ ...filters, scope: 'all' });
+      const dimensions = { fromMs, toMs: now + 1, scope: 'all' };
+      const deviceById = new Map(store.publicDevices().map((device) => [device.id, device]));
+      const accountById = new Map(store.publicAccounts().map((account) => [account.id, account]));
+      const machineRows = requestMetrics.queryBreakdown({ by: 'machine', ...dimensions });
+      const deviceRows = requestMetrics.queryBreakdown({ by: 'device', ...dimensions });
+      const memberRows = requestMetrics.queryBreakdown({ by: 'member', ...dimensions });
+      const accountRows = requestMetrics.queryBreakdown({ by: 'account', ...dimensions });
+      const modelRows = requestMetrics.queryBreakdown({ by: 'model', ...dimensions });
+      return {
+        filters: viewFilters,
+        options: {
+          machines: [
+            ...machineRows.filter((row) => row.groupValue).map((row) => ({
+              value: `machine:${row.groupValue}`,
+              label: `Machine ${row.groupValue}`,
+            })),
+            ...deviceRows.filter((row) => row.groupValue).map((row) => {
+              const device = deviceById.get(row.groupValue);
+              return {
+                value: `device:${row.groupValue}`,
+                label: device
+                  ? `${device.member_label} · ${device.name} · credential ${row.groupValue}`
+                  : `Credential ${row.groupValue}`,
+              };
+            }),
+          ],
+          members: memberRows.filter((row) => row.groupValue).map((row) => ({
+            value: row.groupValue,
+            label: row.groupValue,
+          })),
+          accounts: accountRows.filter((row) => row.groupValue).map((row) => ({
+            value: row.groupValue,
+            label: accountById.get(row.groupValue)?.alias ?? row.groupValue,
+          })),
+          models: modelRows.filter((row) => row.groupValue).map((row) => ({
+            value: row.groupValue,
+            label: row.groupValue,
+          })),
+        },
+        totals: {
+          all: allTotals.requestCount,
+          consumption: consumptionTotals.requestCount,
+        },
+        hourly,
+        metricsAvailable: true,
+        droppedMetrics: requestMetrics.stats?.dropped ?? 0,
+        error: null,
+      };
+    } catch (error) {
+      log('metrics_query_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+      return {
+        ...empty,
+        error: 'Request metrics could not be read.',
+      };
+    }
+  }
+
   async function handler(req, res) {
     const url = new URL(req.url, publicBaseUrl);
     const path = url.pathname;
@@ -399,7 +534,18 @@ export async function createCredentialConsole(options = {}) {
       await handleClaudeProxy(req, res, {
         store,
         upstreamBaseUrl: options.claudeUpstreamBaseUrl,
+        requestMetrics,
       });
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/metrics') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      sendHtml(res, 200, metricsView({
+        ...metricsPage(url),
+        openMode,
+      }));
       return;
     }
 
@@ -529,6 +675,51 @@ const translations = {
   'no-merge-targets': '还没有任何机器上报过句柄，因此没有可归入的对象。',
   'codex-legacy-note': '这条 Codex 凭据没有机器句柄：要么它登记于机器句柄出现之前——那台机器上的代理会在下次登记时上报句柄；要么它是本控制台代为签发的——那种凭据永远不会上报，因为生成的安装脚本运行的是 pull.js，不含 enroll.js。无论哪种情况，控制台只读取 dispenser 的注册表，无法把句柄写进去。',
   'codex-inventory-unavailable': '至少有一个凭据目录的 Codex 机器列表读不到，因此只有 dispenser 知道的机器不会出现在这个列表里。',
+  'metrics-dashboard-link': '查看请求指标',
+  'metrics-label': '请求指标',
+  'metrics-heading': 'Claude 网关请求指标',
+  'metrics-intro': '本页只展示请求元数据；当前阶段不会存储请求正文或回复正文。',
+  'metrics-attribution-disclaimer': '使用者标签由本人填写，未经验证；只能用于观察用量趋势，不得作为追责或计费依据。',
+  'metrics-filter-heading': '筛选请求指标',
+  'metrics-filter-machine': '机器',
+  'metrics-filter-member': '使用者标签',
+  'metrics-filter-account': '账号',
+  'metrics-filter-model': '模型',
+  'metrics-filter-hours': '时间范围',
+  'metrics-all-machines': '全部机器',
+  'metrics-all-members': '全部使用者',
+  'metrics-all-accounts': '全部账号',
+  'metrics-all-models': '全部模型',
+  'metrics-unattributed-machine': '未归属（没有机器句柄）',
+  'metrics-hours-24': '最近 24 小时',
+  'metrics-hours-168': '最近 7 天',
+  'metrics-hours-720': '最近 30 天',
+  'metrics-apply-filters': '应用筛选',
+  'metrics-reset-filters': '重置筛选',
+  'metrics-unavailable': '请求指标暂时不可用。',
+  'metrics-incomplete': '部分请求元数据未能保存，图表可能不完整。',
+  'metrics-error': '指标页面无法载入数据。',
+  'metrics-total-requests': '全部请求',
+  'metrics-consumption-requests': '消耗请求',
+  'metrics-request-volume': '每小时请求量',
+  'metrics-request-volume-description': '每小时全部请求、成功请求与错误请求的数量。',
+  'metrics-latency': '每小时请求延迟',
+  'metrics-latency-description': '每小时平均首字节时间与请求总耗时，单位为毫秒。',
+  'metrics-no-data': '所选时间范围内没有匹配的请求数据。',
+  'metrics-series-total': '全部请求',
+  'metrics-series-success': '成功请求',
+  'metrics-series-error': '错误请求',
+  'metrics-series-ttfb': '平均首字节时间（毫秒）',
+  'metrics-series-duration': '平均总耗时（毫秒）',
+  'metrics-hourly-table': '每小时明细',
+  'metrics-hour': '小时（UTC）',
+  'metrics-request-count': '请求数',
+  'metrics-success-count': '成功数',
+  'metrics-error-count': '错误数',
+  'metrics-request-bytes': '请求字节数',
+  'metrics-response-bytes': '响应字节数',
+  'metrics-avg-ttfb': '平均首字节时间（毫秒）',
+  'metrics-avg-duration': '平均总耗时（毫秒）',
   'choose-codex-platform': '选择这台设备的操作系统',
   'one-platform-only': '请只在刚登记的这台设备上选择一种安装器使用，不要把这些脚本复用到其他机器。',
   'view-script': '查看脚本',
@@ -1309,9 +1500,27 @@ document.addEventListener('click', async (event) => {
   server.once('close', () => {
     clearInterval(cleanupTimer);
     usageMonitor.stop?.();
+    try {
+      const closing = requestMetrics?.close?.();
+      if (closing && typeof closing.then === 'function') {
+        closing.catch((error) => log('metrics_close_failed', {
+          code: error?.code ?? error?.name ?? 'unknown',
+        }));
+      }
+    } catch (error) {
+      log('metrics_close_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+    }
   });
   // sessionCount is exposed only so a test can prove the map stays bounded.
-  return { server, store, handler, usageMonitor, sessionCount: () => sessions.size };
+  return {
+    server,
+    store,
+    handler,
+    usageMonitor,
+    requestMetrics,
+    metricsInitFailed,
+    sessionCount: () => sessions.size,
+  };
 }
 
 async function main() {
@@ -1360,6 +1569,13 @@ async function main() {
     }
     const created = await createCredentialConsole({ tls });
     ({ server } = created);
+    const metricsEnabled = Boolean(created.requestMetrics);
+    log('privacy_metadata_recording', {
+      enabled: metricsEnabled,
+      detail: metricsEnabled
+        ? 'proxied Claude request metadata is stored and visible to every console member; member labels are self-entered and unverified and must not be used for accountability or billing; request and response bodies are not stored'
+        : 'request metadata recording is unavailable, so requests are not currently being stored; request and response bodies are not stored',
+    });
     server.once('close', () => {
       releaseHomeLock().catch((error) => console.error(error.stack ?? error.message));
     });

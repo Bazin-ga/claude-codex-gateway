@@ -2,6 +2,11 @@
 
 Multi-account control plane for subscription-backed Codex and Claude Code access.
 
+> **Telemetry notice:** every proxied Claude gateway request produces a persistent metadata row
+> that is visible to every member who can reach the console. It includes routing, model, status,
+> timing, and byte-count fields, but never request or response bodies. Member labels are
+> self-entered and unverified, so the metrics must not be used for accountability or billing.
+
 It solves two related operational problems:
 
 1. provider account owners should authorize an account once, not once per workspace or device;
@@ -55,7 +60,8 @@ V1 implements:
   and weekly windows whenever the provider reports them;
 - tailnet-member Codex self-enrollment with self-contained macOS, Linux, and Windows installers
   that use the public dispenser and do not fetch files from the private console;
-- structured metadata-only request logs.
+- persistent, body-free per-request metrics in a separate SQLite database, with server-rendered
+  charts and filters.
 
 V1 deliberately does **not**:
 
@@ -357,7 +363,11 @@ reassigned. There is no un-merge — revoke the credential instead.
   returns a fixed response; every other path requires a valid device token.
 - The public gateway rate-limits failed authentication by source IP and applies per-device
   request and concurrency budgets after authentication.
-- Prompt and response bodies are streamed and never logged.
+- Prompt and response bodies are streamed and never logged or persisted. Routing, model, status,
+  timing, and byte-count metadata is persisted in `metrics.sqlite` and visible on `/metrics`.
+- TTFB is measured when the upstream response headers arrive (the first HTTP response bytes).
+  Request and response byte counts are raw body bytes observed by the gateway; an interrupted row
+  therefore contains the partial count observed before the terminal event.
 - Revocation is checked on every request.
 - The server refuses a non-loopback bind without TLS. Production runs loopback-only behind
   Tailscale Serve.
@@ -419,6 +429,17 @@ for that home.
 
 There is no administrator credential to bootstrap. The console identifies administrators from
 Tailscale, or not at all — see [Runtime configuration](#runtime-configuration).
+
+After stopping the service, checkpoint and integrity-check the request-metrics database before a
+file-level backup:
+
+```bash
+export CREDENTIAL_CONSOLE_HOME=/var/lib/credential-console
+node --no-warnings cli.js checkpoint-metrics
+```
+
+The command is a no-op when `metrics.sqlite` does not exist. It refuses a busy checkpoint or a
+failed SQLite integrity check; do not copy only the main database file after either failure.
 
 Import an existing Codex credential service:
 

@@ -20,6 +20,9 @@ refresh-in-flight.json
 # runtime state — machine-specific, may contain tokens or usage data
 state.json
 usage.json
+metrics.sqlite
+metrics.sqlite-wal
+metrics.sqlite-shm
 var/
 data/
 deploy/local/

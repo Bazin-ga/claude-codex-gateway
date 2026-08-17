@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { CredentialStore } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
@@ -15,6 +15,7 @@ function usage() {
   console.error(`usage:
   node cli.js init-key
   node cli.js import-codex --alias <alias> --home <path> [--email <label>]
+  node cli.js checkpoint-metrics
   node cli.js list`);
   process.exitCode = 2;
 }
@@ -22,7 +23,7 @@ function usage() {
 async function main() {
   const command = process.argv[2];
 
-  if (!['init-key', 'import-codex'].includes(command)) {
+  if (!['init-key', 'import-codex', 'checkpoint-metrics'].includes(command)) {
     if (command === 'list') {
       const store = await new CredentialStore(HOME).init();
       console.log(JSON.stringify(store.publicAccounts(), null, 2));
@@ -33,6 +34,36 @@ async function main() {
 
   const lock = await acquireHomeLock(HOME, { role: `cli:${command}` });
   try {
+    if (command === 'checkpoint-metrics') {
+      const metricsPath = resolve(HOME, 'metrics.sqlite');
+      try {
+        await access(metricsPath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        console.log(`metrics database not present at ${metricsPath}; nothing to checkpoint`);
+        return;
+      }
+      const { MetricsStore } = await import('./lib/metrics.js');
+      const metrics = await new MetricsStore({
+        home: HOME,
+        flushIntervalMs: 60_000,
+      }).init();
+      let integrityPassed = false;
+      try {
+        metrics.integrityCheck();
+        integrityPassed = true;
+        const checkpoint = metrics.checkpoint();
+        console.log(JSON.stringify({
+          database: metricsPath,
+          integrity: 'ok',
+          checkpoint,
+        }));
+      } finally {
+        metrics.close({ checkpoint: integrityPassed });
+      }
+      return;
+    }
+
     if (command === 'init-key') {
       const keyPath = resolve(HOME, 'master.key');
       const statePath = resolve(HOME, 'state.json');

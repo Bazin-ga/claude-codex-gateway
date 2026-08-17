@@ -2,7 +2,8 @@
 
 ## Run the tests before opening a PR
 
-Four suites. All four must pass. Node ≥ 20.
+Four suites. All four must pass. Use Node ≥ 22.5 to run the complete repository suite because
+`credential-console` uses built-in SQLite; the three Codex-only packages still support Node ≥ 20.
 
 ```bash
 npm test --prefix codex-credential/client-agent

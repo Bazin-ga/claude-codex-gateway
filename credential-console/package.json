@@ -5,11 +5,11 @@
   "type": "module",
   "description": "Multi-account credential control plane and per-device gateway for Codex and Claude Code.",
   "scripts": {
-    "start": "node server.js",
-    "test": "node --test",
-    "check": "node --check server.js && node --check cli.js"
+    "start": "node --no-warnings server.js",
+    "test": "node --no-warnings --test",
+    "check": "node --no-warnings --check server.js && node --no-warnings --check cli.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5.0"
   }
 }

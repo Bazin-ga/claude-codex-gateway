@@ -2,6 +2,10 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+> **Telemetry notice:** `credential-console` records metadata for every proxied Claude gateway
+> request and makes those metrics visible to every member who can reach the console. Request and
+> response bodies are not stored by this release.
+
 A self-hostable credential distribution centre for **Codex** (ChatGPT subscription) and
 **Claude Code** subscriptions.
 
@@ -86,8 +90,8 @@ The two families are independent. Deploying `codex-credential` alone is a comple
 
 ## Requirements
 
-- **Node ≥ 20** on the centre host and on every client machine. There are no runtime npm
-  dependencies.
+- **Node ≥ 22.5** on a centre host that runs `credential-console`; the Codex-only centre and
+  client agents require **Node ≥ 20**. There are no runtime npm dependencies.
 - A centre host with **direct egress** to `auth.openai.com` — some networks answer `403`
   there, and such a host cannot serve as the centre. Verify with a deliberately invalid
   refresh before committing to a host.
@@ -125,8 +129,8 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
   Claude gateway allowlists paths, strips the device authorization header before attaching the
   provider credential, rate-limits failed authentication by source IP, and applies per-device
   request and concurrency budgets.
-- **No prompt logging.** Request and response bodies are streamed and never logged; logs carry
-  metadata only.
+- **Body-free request telemetry.** The Claude gateway persists request metadata for shared
+  metrics. Request and response bodies are streamed and are neither logged nor stored.
 - **The centre is a high-value host by design.** A root compromise of the centre can recover
   all active provider credentials. Keep OS access narrow, patch it, and keep an emergency
   service-stop and provider-token revocation procedure.

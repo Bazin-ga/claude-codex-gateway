@@ -125,6 +125,33 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .installer-panel summary { cursor: pointer; color: var(--green); font-weight: 750; }
 .installer-panel pre { max-height: 320px; font-size: 12px; }
 .run-command { background: #e9efea; border-radius: 10px; padding: 12px 14px; font-family: "SFMono-Regular", Consolas, monospace; word-break: break-all; }
+.metrics-heading { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.metrics-filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; align-items: end; }
+.metrics-filter-heading { grid-column: 1 / -1; margin: 0; }
+.metrics-filters label { margin-bottom: 0; }
+.metrics-filters .filter-actions { display: flex; gap: 8px; align-items: center; }
+.metrics-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.metrics-summary .summary { grid-column: auto; }
+.metrics-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.metrics-chart { min-width: 0; border: 1px solid var(--line); border-radius: 14px; padding: 14px; background: #fbfcf9; }
+.metrics-chart h3 { margin: 0 0 10px; font-size: 16px; }
+.metrics-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+.metrics-chart .metrics-grid-line { stroke: var(--line); stroke-width: 1; }
+.metrics-chart .metrics-axis { fill: var(--muted); font-size: 11px; }
+.metrics-chart .metrics-line { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+.metrics-chart .metrics-line.total, .metrics-chart .metrics-swatch.total { stroke: var(--green); background: var(--green); }
+.metrics-chart .metrics-line.success, .metrics-chart .metrics-swatch.success { stroke: var(--blue); background: var(--blue); }
+.metrics-chart .metrics-line.error, .metrics-chart .metrics-swatch.error { stroke: var(--red); background: var(--red); }
+.metrics-chart .metrics-line.ttfb, .metrics-chart .metrics-swatch.ttfb { stroke: var(--amber); background: var(--amber); }
+.metrics-chart .metrics-line.duration, .metrics-chart .metrics-swatch.duration { stroke: var(--ink); background: var(--ink); }
+.metrics-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
+.metrics-legend-item { display: inline-flex; gap: 6px; align-items: center; }
+.metrics-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.metrics-empty { color: var(--muted); padding: 10px 0 0; }
+.metrics-table th, .metrics-table td { font-size: 12px; padding: 9px 8px; }
+.metrics-table-wrap { overflow-x: auto; }
+.metrics-attribution-notice { margin: 0; }
+.metrics-attribution-notice p { margin: 0; }
 @media (max-width: 800px) {
   .summary, .split { grid-column: span 12; }
   .topbar { align-items: flex-start; }
@@ -133,7 +160,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .identity-chip { white-space: normal; }
   .provider-grid, .member-form, .member-form.codex-form,
   .member-form.with-label, .member-form.codex-form.with-label,
-  .merge-form { grid-template-columns: 1fr; }
+  .merge-form, .metrics-filters, .metrics-chart-grid { grid-template-columns: 1fr; }
 }
 `;
 
@@ -434,6 +461,353 @@ function machineEntryView(entry, { accounts, csrf, machineOptions }) {
   </article>`;
 }
 
+const METRICS_HOUR_OPTIONS = Object.freeze([
+  { value: 24, label: 'Last 24 hours', i18n: 'metrics-hours-24' },
+  { value: 168, label: 'Last 7 days', i18n: 'metrics-hours-168' },
+  { value: 720, label: 'Last 30 days', i18n: 'metrics-hours-720' },
+]);
+const UNATTRIBUTED_MACHINE_VALUE = '__unattributed__';
+
+function finiteMetricNumber(value, { min = 0, max = Number.MAX_SAFE_INTEGER, fallback = 0 } = {}) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function metricCount(value) {
+  return Math.round(finiteMetricNumber(value, { max: 9_000_000_000_000_000 }));
+}
+
+function metricDuration(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return Math.min(9_000_000_000_000_000, numeric);
+}
+
+function metricDisplayNumber(value, { decimals = 0 } = {}) {
+  const numeric = finiteMetricNumber(value, { max: 9_000_000_000_000_000 });
+  if (decimals === 0) return Math.round(numeric).toLocaleString('en-US');
+  return numeric.toLocaleString('en-US', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+}
+
+function metricHourLabel(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  const date = new Date(numeric);
+  if (!Number.isFinite(date.getTime())) return '—';
+  return `${date.toISOString().slice(0, 16).replace('T', ' ')}Z`;
+}
+
+function normalizeMetricRows(hourly) {
+  if (!Array.isArray(hourly)) return [];
+  return hourly.map((row) => ({
+    hourBucketMs: Number(row?.hourBucketMs),
+    requestCount: metricCount(row?.requestCount),
+    successCount: metricCount(row?.successCount),
+    errorCount: metricCount(row?.errorCount),
+    totalRequestBytes: metricCount(row?.totalRequestBytes),
+    totalResponseBytes: metricCount(row?.totalResponseBytes),
+    avgTtfbMs: metricDuration(row?.avgTtfbMs),
+    avgDurationMs: metricDuration(row?.avgDurationMs),
+  }));
+}
+
+function metricOption(value, label, selected, { i18n = null } = {}) {
+  const normalizedValue = String(value ?? '');
+  const text = String(label ?? normalizedValue);
+  const selectedAttribute = normalizedValue === selected ? ' selected' : '';
+  const translationAttribute = i18n ? ` data-i18n="${escapeHtml(i18n)}"` : '';
+  return `<option value="${escapeHtml(normalizedValue)}"${selectedAttribute}${translationAttribute}>${escapeHtml(text)}</option>`;
+}
+
+function metricOptions(values, selected, allLabel, allI18n) {
+  const options = Array.isArray(values) ? values : [];
+  const seen = new Set();
+  const rendered = [metricOption('', allLabel, selected, { i18n: allI18n })];
+  for (const option of options) {
+    const value = String(option?.value ?? '');
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    rendered.push(metricOption(value, option?.label, selected));
+  }
+  if (selected && !seen.has(selected)) {
+    rendered.push(metricOption(selected, selected, selected));
+  }
+  return rendered.join('');
+}
+
+function metricMachineOptions(values, selected, unattributedMachine) {
+  const options = Array.isArray(values) ? values : [];
+  const seen = new Set();
+  const selectedMachine = selected || '';
+  const effectiveSelected = unattributedMachine ? UNATTRIBUTED_MACHINE_VALUE : selectedMachine;
+  const rendered = [metricOption('', 'All machines', effectiveSelected, { i18n: 'metrics-all-machines' })];
+  for (const option of options) {
+    const value = String(option?.value ?? '');
+    if (!value || value === UNATTRIBUTED_MACHINE_VALUE || seen.has(value)) continue;
+    seen.add(value);
+    rendered.push(metricOption(value, option?.label, effectiveSelected));
+  }
+  if (selectedMachine && !seen.has(selectedMachine)) {
+    rendered.push(metricOption(selectedMachine, selectedMachine, effectiveSelected));
+  }
+  rendered.push(metricOption(
+    UNATTRIBUTED_MACHINE_VALUE,
+    'Unattributed (no machine handle)',
+    effectiveSelected,
+    { i18n: 'metrics-unattributed-machine' },
+  ));
+  return rendered.join('');
+}
+
+function metricSvgNumber(value) {
+  const numeric = finiteMetricNumber(value, { max: 9_000_000_000_000_000 });
+  return Number(numeric.toFixed(2));
+}
+
+function metricPolyline(rows, getter, maxValue, plot) {
+  if (!rows.length) return '';
+  const denominator = Math.max(rows.length - 1, 1);
+  return rows.map((row, index) => {
+    const value = finiteMetricNumber(getter(row), { max: maxValue });
+    const x = plot.left + (plot.width * index) / denominator;
+    const y = plot.top + plot.height - (plot.height * value) / Math.max(maxValue, 1);
+    return `${index === 0 ? 'M' : 'L'} ${metricSvgNumber(x)} ${metricSvgNumber(y)}`;
+  }).join(' ');
+}
+
+function metricSvgChart({
+  id,
+  title,
+  titleI18n,
+  description,
+  descriptionI18n,
+  emptyI18n,
+  emptyText,
+  rows,
+  series,
+  maxValue = null,
+  formatValue = metricDisplayNumber,
+}) {
+  const titleId = `${id}-title`;
+  const descriptionId = `${id}-description`;
+  const width = 720;
+  const height = 260;
+  const plot = { left: 54, top: 24, width: 644, height: 184 };
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const values = safeRows.flatMap((row) => series.map((entry) => (
+    finiteMetricNumber(entry.getter(row), { max: 9_000_000_000_000_000 })
+  )));
+  const scale = Math.max(1, finiteMetricNumber(maxValue ?? Math.max(...values, 0), {
+    max: 9_000_000_000_000_000,
+  }));
+  const titleAttribute = titleI18n ? ` data-i18n="${escapeHtml(titleI18n)}"` : '';
+  const descriptionAttribute = descriptionI18n ? ` data-i18n="${escapeHtml(descriptionI18n)}"` : '';
+  const labelledBy = `${titleId} ${descriptionId}`;
+  const commonStart = `<svg role="img" aria-labelledby="${escapeHtml(labelledBy)}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+    <title id="${escapeHtml(titleId)}"${titleAttribute}>${escapeHtml(title)}</title>
+    <desc id="${escapeHtml(descriptionId)}"${descriptionAttribute}>${escapeHtml(description)}</desc>`;
+  if (!safeRows.length) {
+    return `${commonStart}
+    <text class="metrics-axis" x="${width / 2}" y="${height / 2}" text-anchor="middle" data-i18n="${escapeHtml(emptyI18n)}">${escapeHtml(emptyText)}</text>
+  </svg>`;
+  }
+
+  const tickValues = [0, scale / 2, scale];
+  const grid = tickValues.map((value) => {
+    const y = plot.top + plot.height - (plot.height * value) / scale;
+    return `<line class="metrics-grid-line" x1="${plot.left}" x2="${plot.left + plot.width}" y1="${metricSvgNumber(y)}" y2="${metricSvgNumber(y)}"></line>
+      <text class="metrics-axis" x="${plot.left - 8}" y="${metricSvgNumber(y + 4)}" text-anchor="end">${escapeHtml(formatValue(value))}</text>`;
+  }).join('');
+  const firstLabel = metricHourLabel(safeRows[0].hourBucketMs);
+  const lastLabel = metricHourLabel(safeRows[safeRows.length - 1].hourBucketMs);
+  const xLabels = safeRows.length === 1
+    ? `<text class="metrics-axis" x="${plot.left}" y="${height - 12}" text-anchor="middle">${escapeHtml(firstLabel)}</text>`
+    : `<text class="metrics-axis" x="${plot.left}" y="${height - 12}" text-anchor="start">${escapeHtml(firstLabel)}</text>
+      <text class="metrics-axis" x="${plot.left + plot.width}" y="${height - 12}" text-anchor="end">${escapeHtml(lastLabel)}</text>`;
+  const paths = series.map((entry) => `<path class="metrics-line ${escapeHtml(entry.className)}" d="${escapeHtml(metricPolyline(safeRows, entry.getter, scale, plot))}"></path>`).join('');
+  return `${commonStart}
+    ${grid}
+    <line class="metrics-grid-line" x1="${plot.left}" x2="${plot.left}" y1="${plot.top}" y2="${plot.top + plot.height}"></line>
+    <line class="metrics-grid-line" x1="${plot.left}" x2="${plot.left + plot.width}" y1="${plot.top + plot.height}" y2="${plot.top + plot.height}"></line>
+    ${paths}
+    ${xLabels}
+  </svg>`;
+}
+
+function metricLegend(series) {
+  return `<div class="metrics-legend">
+    ${series.map((entry) => `<span class="metrics-legend-item"><span class="metrics-swatch ${escapeHtml(entry.className)}" aria-hidden="true"></span><span data-i18n="${escapeHtml(entry.i18n)}">${escapeHtml(entry.label)}</span></span>`).join('')}
+  </div>`;
+}
+
+function metricsTable(rows) {
+  const body = rows.length
+    ? rows.map((row) => `<tr>
+        <td>${escapeHtml(metricHourLabel(row.hourBucketMs))}</td>
+        <td>${escapeHtml(metricDisplayNumber(row.requestCount))}</td>
+        <td>${escapeHtml(metricDisplayNumber(row.successCount))}</td>
+        <td>${escapeHtml(metricDisplayNumber(row.errorCount))}</td>
+        <td>${escapeHtml(metricDisplayNumber(row.totalRequestBytes))}</td>
+        <td>${escapeHtml(metricDisplayNumber(row.totalResponseBytes))}</td>
+        <td>${row.avgTtfbMs === null ? '—' : escapeHtml(metricDisplayNumber(row.avgTtfbMs, { decimals: 1 }))}</td>
+        <td>${row.avgDurationMs === null ? '—' : escapeHtml(metricDisplayNumber(row.avgDurationMs, { decimals: 1 }))}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="8" class="empty" data-i18n="metrics-no-data">No matching request data for this period.</td></tr>';
+  return `<div class="metrics-table-wrap">
+    <table class="metrics-table">
+      <thead><tr>
+        <th data-i18n="metrics-hour">Hour (UTC)</th>
+        <th data-i18n="metrics-request-count">Requests</th>
+        <th data-i18n="metrics-success-count">Successes</th>
+        <th data-i18n="metrics-error-count">Errors</th>
+        <th data-i18n="metrics-request-bytes">Request bytes</th>
+        <th data-i18n="metrics-response-bytes">Response bytes</th>
+        <th data-i18n="metrics-avg-ttfb">Avg TTFB (ms)</th>
+        <th data-i18n="metrics-avg-duration">Avg duration (ms)</th>
+      </tr></thead>
+      <tbody>${body}</tbody>
+    </table>
+  </div>`;
+}
+
+export function metricsView({
+  filters = {},
+  options = {},
+  totals = {},
+  hourly = [],
+  openMode = false,
+  metricsAvailable = true,
+  droppedMetrics = 0,
+  error = null,
+}) {
+  const selectedHours = Number(filters.hours);
+  const hours = METRICS_HOUR_OPTIONS.some((option) => option.value === selectedHours)
+    ? selectedHours
+    : METRICS_HOUR_OPTIONS[0].value;
+  const selectedMachine = String(filters.machineId ?? '');
+  const selectedMember = String(filters.memberLabel ?? '');
+  const selectedAccount = String(filters.accountId ?? '');
+  const selectedModel = String(filters.model ?? '');
+  const unattributedMachine = Boolean(filters.unattributedMachine);
+  const rows = normalizeMetricRows(hourly);
+  const allTotal = metricCount(totals.all);
+  const consumptionTotal = metricCount(totals.consumption);
+  const requestSeries = [
+    { className: 'total', i18n: 'metrics-series-total', label: 'All requests', getter: (row) => row.requestCount },
+    { className: 'success', i18n: 'metrics-series-success', label: 'Successful requests', getter: (row) => row.successCount },
+    { className: 'error', i18n: 'metrics-series-error', label: 'Error requests', getter: (row) => row.errorCount },
+  ];
+  const latencySeries = [
+    { className: 'ttfb', i18n: 'metrics-series-ttfb', label: 'Average TTFB (ms)', getter: (row) => row.avgTtfbMs ?? 0 },
+    { className: 'duration', i18n: 'metrics-series-duration', label: 'Average duration (ms)', getter: (row) => row.avgDurationMs ?? 0 },
+  ];
+  const requestChart = metricSvgChart({
+    id: 'metrics-requests-chart',
+    title: 'Hourly request volume',
+    titleI18n: 'metrics-request-volume',
+    description: 'Hourly all-request, successful-request, and error counts.',
+    descriptionI18n: 'metrics-request-volume-description',
+    emptyI18n: 'metrics-no-data',
+    emptyText: 'No matching request data for this period.',
+    rows,
+    series: requestSeries,
+    formatValue: (value) => metricDisplayNumber(value),
+  });
+  const latencyChart = metricSvgChart({
+    id: 'metrics-latency-chart',
+    title: 'Hourly request latency',
+    titleI18n: 'metrics-latency',
+    description: 'Hourly average time to first byte and total request duration in milliseconds.',
+    descriptionI18n: 'metrics-latency-description',
+    emptyI18n: 'metrics-no-data',
+    emptyText: 'No matching request data for this period.',
+    rows,
+    series: latencySeries,
+    formatValue: (value) => metricDisplayNumber(value, { decimals: 1 }),
+  });
+  const availabilityNotice = !metricsAvailable
+    ? '<div class="notice error" role="status"><span data-i18n="metrics-unavailable">Request metrics are temporarily unavailable.</span></div>'
+    : '';
+  const dropped = metricCount(droppedMetrics);
+  const droppedNotice = dropped > 0
+    ? `<div class="notice error" role="status"><span data-i18n="metrics-incomplete">Some request metadata could not be stored; charts may be incomplete.</span> <strong>${escapeHtml(metricDisplayNumber(dropped))}</strong></div>`
+    : '';
+  const errorNotice = error
+    ? `<div class="notice error" role="alert"><span data-i18n="metrics-error">The metrics page could not load its data.</span><br><span class="tiny">${escapeHtml(error)}</span></div>`
+    : '';
+  const hourOptions = METRICS_HOUR_OPTIONS.map((option) => metricOption(
+    option.value,
+    option.label,
+    String(hours),
+    { i18n: option.i18n },
+  )).join('');
+  return layout('Request metrics', `
+    <section class="stack">
+      ${availabilityNotice}
+      ${droppedNotice}
+      ${errorNotice}
+      <div class="metrics-heading">
+        <div>
+          <span class="badge stored" data-i18n="metrics-label">Request metrics</span>
+          <h1 data-i18n="metrics-heading">Claude gateway request metrics</h1>
+          <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not stored by this phase.</p>
+        </div>
+        <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+      </div>
+      <div class="notice error metrics-attribution-notice" role="note">
+        <p data-i18n="metrics-attribution-disclaimer">Member labels are self-entered and unverified. Use them only to observe usage trends; never use them for accountability or billing.</p>
+      </div>
+      <form method="get" action="/metrics" class="card metrics-filters">
+        <h2 class="metrics-filter-heading" data-i18n="metrics-filter-heading">Filter request metrics</h2>
+        <label><span data-i18n="metrics-filter-machine">Machine</span>
+          <select name="machine_id">${metricMachineOptions(options.machines, selectedMachine, unattributedMachine)}</select>
+        </label>
+        <label><span data-i18n="metrics-filter-member">Member label</span>
+          <select name="member_label">${metricOptions(options.members, selectedMember, 'All members', 'metrics-all-members')}</select>
+        </label>
+        <label><span data-i18n="metrics-filter-account">Account</span>
+          <select name="account_id">${metricOptions(options.accounts, selectedAccount, 'All accounts', 'metrics-all-accounts')}</select>
+        </label>
+        <label><span data-i18n="metrics-filter-model">Model</span>
+          <select name="model">${metricOptions(options.models, selectedModel, 'All models', 'metrics-all-models')}</select>
+        </label>
+        <label><span data-i18n="metrics-filter-hours">Period</span>
+          <select name="hours">${hourOptions}</select>
+        </label>
+        <div class="filter-actions">
+          <button type="submit" data-i18n="metrics-apply-filters">Apply filters</button>
+          <a class="button secondary" href="/metrics" data-i18n="metrics-reset-filters">Reset filters</a>
+        </div>
+      </form>
+      <div class="metrics-summary">
+        <article class="card summary"><span class="muted" data-i18n="metrics-total-requests">All requests</span><strong>${escapeHtml(metricDisplayNumber(allTotal))}</strong></article>
+        <article class="card summary"><span class="muted" data-i18n="metrics-consumption-requests">Consumption requests</span><strong>${escapeHtml(metricDisplayNumber(consumptionTotal))}</strong></article>
+      </div>
+      <div class="metrics-chart-grid">
+        <article class="metrics-chart">
+          <h2 data-i18n="metrics-request-volume">Hourly request volume</h2>
+          ${requestChart}
+          ${metricLegend(requestSeries)}
+        </article>
+        <article class="metrics-chart">
+          <h2 data-i18n="metrics-latency">Hourly request latency</h2>
+          ${latencyChart}
+          ${metricLegend(latencySeries)}
+        </article>
+      </div>
+      <article class="card">
+        <h2 data-i18n="metrics-hourly-table">Hourly details</h2>
+        ${metricsTable(rows)}
+      </article>
+    </section>
+  `, { openMode });
+}
+
 export function dashboardView({
   accounts,
   devices,
@@ -572,6 +946,7 @@ export function dashboardView({
           <span class="badge stored" data-i18n="admin-zone">Administrator area</span>
           <h2 data-i18n="admin-heading">Accounts, devices, and exceptional enrollment</h2>
           <p class="muted" data-i18n="admin-intro">Use this area to add provider accounts once, inspect devices, and revoke access. Routine member setup happens above.</p>
+          <a class="button secondary" href="/metrics" data-i18n="metrics-dashboard-link">View request metrics</a>
         </div>
         <section class="grid">
           <article class="card summary"><span class="muted" data-i18n="accounts">Accounts</span><strong>${accounts.length}</strong></article>

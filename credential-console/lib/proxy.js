@@ -1,6 +1,9 @@
 import http from 'node:http';
 import https from 'node:https';
+import { performance } from 'node:perf_hooks';
+import { Transform } from 'node:stream';
 import { bearerToken, sendJson } from './http.js';
+import { createRequestMetadataTee } from './request-metadata.js';
 
 const ALLOWED_PATHS = new Set([
   '/v1/messages',
@@ -15,8 +18,45 @@ const authFailures = new Map();
 const deviceRequests = new Map();
 const deviceConcurrency = new Map();
 
+function passthroughCounter({ maxBytes = null } = {}) {
+  let bytes = 0;
+  const stream = new Transform({
+    transform(chunk, encoding, callback) {
+      bytes += chunk.length;
+      if (maxBytes !== null && bytes > maxBytes) {
+        const error = new Error('request body too large');
+        error.code = 'ERR_REQUEST_BODY_TOO_LARGE';
+        callback(error);
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+  return { stream, bytes: () => bytes };
+}
+
 function log(event, detail = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...detail }));
+}
+
+function enqueueMetricSafely(requestMetrics, row, { accountId, deviceId }) {
+  if (!requestMetrics?.enqueueRequest) return;
+  try {
+    const result = requestMetrics.enqueueRequest(row);
+    if (result && typeof result.then === 'function') {
+      result.catch((error) => log('metrics_enqueue_failed', {
+        account_id: accountId,
+        device_id: deviceId,
+        code: error?.code ?? error?.name ?? 'unknown',
+      }));
+    }
+  } catch (error) {
+    log('metrics_enqueue_failed', {
+      account_id: accountId,
+      device_id: deviceId,
+      code: error?.code ?? error?.name ?? 'unknown',
+    });
+  }
 }
 
 function sourceIp(req) {
@@ -94,6 +134,8 @@ function deviceToken(req) {
 export async function handleClaudeProxy(req, res, {
   store,
   upstreamBaseUrl = 'https://api.anthropic.com',
+  requestMetrics = null,
+  metadataTeeFactory = createRequestMetadataTee,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
   const upstreamPath = requestUrl.pathname.slice('/claude'.length);
@@ -121,17 +163,43 @@ export async function handleClaudeProxy(req, res, {
     return;
   }
 
+  const authenticatedAtMs = Date.now();
+  const authenticatedAtMonotonic = performance.now();
   const account = store.accountById(device.account_id);
+  const recordRejected = (statusCode, outcome = 'rejected') => {
+    enqueueMetricSafely(requestMetrics, {
+      startedAtMs: authenticatedAtMs,
+      method: req.method ?? 'UNKNOWN',
+      path: upstreamPath,
+      deviceId: device.id,
+      machineId: device.machine_id ?? null,
+      memberLabel: device.member_label,
+      accountId: device.account_id,
+      accountAlias: account?.alias ?? 'unavailable',
+      model: null,
+      stream: null,
+      statusCode,
+      outcome,
+      ttfbMs: null,
+      durationMs: Math.max(0, Math.round(performance.now() - authenticatedAtMonotonic)),
+      requestBytes: 0,
+      responseBytes: 0,
+      upstreamRequestId: null,
+    }, { accountId: device.account_id, deviceId: device.id });
+  };
   if (!account || account.provider !== 'claude' || account.status === 'disabled') {
+    recordRejected(403);
     sendJson(res, 403, { type: 'error', error: { type: 'permission_error', message: 'account unavailable' } });
     return;
   }
   if (account.expires_at && Date.parse(account.expires_at) <= Date.now()) {
+    recordRejected(503);
     sendJson(res, 503, { type: 'error', error: { type: 'authentication_error', message: 'account credential expired' } });
     return;
   }
 
   if (!ALLOWED_PATHS.has(upstreamPath)) {
+    recordRejected(404);
     sendJson(res, 404, { type: 'error', error: { type: 'not_found_error', message: 'unsupported gateway path' } });
     return;
   }
@@ -145,16 +213,19 @@ export async function handleClaudeProxy(req, res, {
       device_id: device.id,
       error: error.message,
     });
+    recordRejected(503);
     sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: 'credential unavailable' } });
     return;
   }
   if (!credential?.oauth_token) {
+    recordRejected(503);
     sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: 'account login required' } });
     return;
   }
 
   if (rateLimited(deviceRequests, device.id, DEVICE_REQUEST_LIMIT)) {
     log('claude_proxy_device_rate_limited', { device_id: device.id });
+    recordRejected(429);
     sendJson(
       res,
       429,
@@ -166,6 +237,7 @@ export async function handleClaudeProxy(req, res, {
   const activeRequests = deviceConcurrency.get(device.id) ?? 0;
   if (activeRequests >= DEVICE_CONCURRENCY_LIMIT) {
     log('claude_proxy_device_concurrency_limited', { device_id: device.id, active: activeRequests });
+    recordRejected(429);
     sendJson(
       res,
       429,
@@ -196,14 +268,81 @@ export async function handleClaudeProxy(req, res, {
   delete headers['x-api-key'];
   const declaredLength = Number(req.headers['content-length'] ?? 0);
   if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
-    sendJson(res, 413, { type: 'error', error: { type: 'invalid_request_error', message: 'request body too large' } });
+    recordRejected(413, 'request_too_large');
+    res.once('finish', () => {
+      if (!req.destroyed) req.destroy();
+    });
+    sendJson(
+      res,
+      413,
+      { type: 'error', error: { type: 'invalid_request_error', message: 'request body too large' } },
+      { Connection: 'close' },
+    );
     return;
   }
 
-  const startedAt = Date.now();
-  let bytes = 0;
+  const startedAtMs = Date.now();
+  const startedAtMonotonic = performance.now();
+  const requestMetadata = metadataTeeFactory();
+  const requestLimit = passthroughCounter({ maxBytes: MAX_REQUEST_BYTES });
+  const responseCounter = passthroughCounter();
   let settled = false;
   let upstreamTtfbMs = null;
+  let upstreamStatus = null;
+  let upstreamRequestId = null;
+  let upstreamEnded = false;
+  let activeUpstreamRes = null;
+  let clientAborted = false;
+  let metricFinalized = false;
+  let pendingOutcome = null;
+  let requestBodyFinished = false;
+  let responseFinished = false;
+
+  const finalizeMetric = (outcome, statusCode = upstreamStatus) => {
+    if (metricFinalized) return;
+    metricFinalized = true;
+    let metadata = {
+      requestBytes: requestLimit.bytes(),
+      model: null,
+      stream: null,
+    };
+    try {
+      metadata = { ...metadata, ...requestMetadata.snapshot() };
+    } catch (error) {
+      log('request_metadata_snapshot_failed', {
+        account_id: account.id,
+        device_id: device.id,
+        code: error?.code ?? error?.name ?? 'unknown',
+      });
+    }
+    enqueueMetricSafely(requestMetrics, {
+      startedAtMs,
+      method: req.method ?? 'UNKNOWN',
+      path: upstreamPath,
+      deviceId: device.id,
+      machineId: device.machine_id ?? null,
+      memberLabel: device.member_label,
+      accountId: account.id,
+      accountAlias: account.alias,
+      model: metadata.model ?? null,
+      stream: typeof metadata.stream === 'boolean' ? metadata.stream : null,
+      statusCode: Number.isInteger(statusCode) ? statusCode : null,
+      outcome,
+      ttfbMs: upstreamTtfbMs,
+      durationMs: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+      requestBytes: Number.isSafeInteger(metadata.requestBytes)
+        ? metadata.requestBytes
+        : requestLimit.bytes(),
+      responseBytes: responseCounter.bytes(),
+      upstreamRequestId,
+    }, { accountId: account.id, deviceId: device.id });
+  };
+
+  const finalizeCompletedWhenReady = () => {
+    if (!responseFinished || !requestBodyFinished || metricFinalized) return;
+    finalizeMetric(pendingOutcome ?? 'completed', res.statusCode);
+  };
+
   const upstreamReq = transport.request(
     upstream,
     {
@@ -213,24 +352,20 @@ export async function handleClaudeProxy(req, res, {
     },
     (upstreamRes) => {
       settled = true;
-      upstreamTtfbMs = Date.now() - startedAt;
+      activeUpstreamRes = upstreamRes;
+      upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
       const status = upstreamRes.statusCode ?? 502;
+      upstreamStatus = status;
+      const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
+      upstreamRequestId = typeof requestId === 'string' ? requestId : null;
       res.writeHead(status, {
         ...responseHeaders(upstreamRes.headers),
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
       });
-      upstreamRes.pipe(res);
+      upstreamRes.pipe(responseCounter.stream).pipe(res);
       upstreamRes.on('end', () => {
-        log('claude_proxy_complete', {
-          account_id: account.id,
-          account_alias: account.alias,
-          device_id: device.id,
-          member_label: device.member_label,
-          status,
-          upstream_ttfb_ms: upstreamTtfbMs,
-          duration_ms: Date.now() - startedAt,
-        });
+        upstreamEnded = true;
         store.markDeviceSeen(device.id).catch(() => {});
         if (status >= 200 && status < 400) {
           store.updateAccountHealth(account.id, { success: true }).catch(() => {});
@@ -241,16 +376,56 @@ export async function handleClaudeProxy(req, res, {
           }).catch(() => {});
         }
       });
+
+      const failResponse = (error) => {
+        if (upstreamEnded || clientAborted || metricFinalized
+          || pendingOutcome === 'upstream_error_after_headers') return;
+        pendingOutcome = 'upstream_error_after_headers';
+        log('claude_proxy_failed', {
+          account_id: account.id,
+          device_id: device.id,
+          code: error?.code ?? error?.name ?? 'upstream_response_incomplete',
+          duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+        });
+        if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
+      };
+      upstreamRes.once('aborted', () => failResponse(new Error('upstream response aborted')));
+      upstreamRes.once('error', failResponse);
+      upstreamRes.once('close', () => {
+        if (!upstreamEnded && !upstreamRes.complete) {
+          failResponse(new Error('upstream response closed before completion'));
+        }
+      });
     },
   );
 
   upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('upstream request timed out')));
   upstreamReq.on('error', (error) => {
+    if (clientAborted || metricFinalized || upstreamEnded) return;
+    if (error.code === 'ERR_REQUEST_BODY_TOO_LARGE') {
+      pendingOutcome = 'request_too_large';
+      if (!res.headersSent) {
+        res.once('finish', () => {
+          if (!req.destroyed) req.destroy();
+        });
+        sendJson(res, 413, {
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'request body too large' },
+        }, { Connection: 'close' });
+      } else if (!res.destroyed) {
+        res.destroy(error);
+      }
+      return;
+    }
+    if (pendingOutcome?.startsWith('upstream_error')) return;
+    pendingOutcome = settled
+      ? 'upstream_error_after_headers'
+      : 'upstream_error_before_headers';
     log('claude_proxy_failed', {
       account_id: account.id,
       device_id: device.id,
-      error: error.message,
-      duration_ms: Date.now() - startedAt,
+      code: error.code ?? error.name ?? 'unknown',
+      duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
     });
     if (!settled && !res.headersSent) {
       sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: 'gateway upstream failure' } });
@@ -259,12 +434,56 @@ export async function handleClaudeProxy(req, res, {
     }
   });
 
-  req.on('data', (chunk) => {
-    bytes += chunk.length;
-    if (bytes > MAX_REQUEST_BYTES) {
-      upstreamReq.destroy(new Error('request body too large'));
-      req.destroy();
+  res.once('finish', () => {
+    responseFinished = true;
+    const outcome = pendingOutcome ?? (upstreamEnded ? 'completed' : 'gateway_response');
+    const statusCode = Number.isInteger(res.statusCode) ? res.statusCode : upstreamStatus;
+    if (outcome === 'completed') finalizeCompletedWhenReady();
+    else finalizeMetric(outcome, statusCode);
+    if (outcome === 'completed') {
+      log('claude_proxy_complete', {
+        account_id: account.id,
+        account_alias: account.alias,
+        device_id: device.id,
+        member_label: device.member_label,
+        status: upstreamStatus,
+        upstream_ttfb_ms: upstreamTtfbMs,
+        duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+      });
     }
   });
-  req.pipe(upstreamReq);
+  res.once('close', () => {
+    if (res.writableFinished || metricFinalized) return;
+    if (!pendingOutcome) pendingOutcome = 'client_aborted';
+    if (pendingOutcome === 'client_aborted') clientAborted = true;
+    finalizeMetric(pendingOutcome, upstreamStatus);
+    if (!upstreamReq.destroyed) upstreamReq.destroy();
+    if (activeUpstreamRes && !activeUpstreamRes.destroyed) activeUpstreamRes.destroy();
+  });
+  req.once('aborted', () => {
+    if (metricFinalized) return;
+    clientAborted = true;
+    pendingOutcome = 'client_aborted';
+    finalizeMetric(pendingOutcome, upstreamStatus);
+    if (!upstreamReq.destroyed) upstreamReq.destroy();
+    if (activeUpstreamRes && !activeUpstreamRes.destroyed) activeUpstreamRes.destroy();
+  });
+
+  requestLimit.stream.once('error', (error) => {
+    if (error.code !== 'ERR_REQUEST_BODY_TOO_LARGE') return;
+    pendingOutcome = 'request_too_large';
+    req.unpipe(requestMetadata.stream);
+    requestMetadata.stream.destroy();
+    if (res.writableFinished) {
+      finalizeMetric(pendingOutcome, upstreamStatus);
+      if (!req.destroyed) req.destroy();
+    } else if (!upstreamReq.destroyed) {
+      upstreamReq.destroy(error);
+    }
+  });
+  requestLimit.stream.once('finish', () => {
+    requestBodyFinished = true;
+    finalizeCompletedWhenReady();
+  });
+  req.pipe(requestMetadata.stream).pipe(requestLimit.stream).pipe(upstreamReq);
 }
