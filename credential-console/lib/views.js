@@ -152,6 +152,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-table-wrap { overflow-x: auto; }
 .metrics-attribution-notice { margin: 0; }
 .metrics-attribution-notice p { margin: 0; }
+.account-switch-form { min-width: 190px; }
+.account-selection-details { display: grid; gap: 3px; margin-top: 5px; }
 @media (max-width: 800px) {
   .summary, .split { grid-column: span 12; }
   .topbar { align-items: flex-start; }
@@ -276,20 +278,138 @@ function accountCell(account) {
   return `<td data-account-status="${escapeHtml(account.status)}"><strong>${escapeHtml(account.alias)}</strong><div class="tiny">${statusBadge(account.status)}</div></td>`;
 }
 
-function claudeCredentialRow(device, account, csrf) {
+function accountForId(accounts, id) {
+  return accounts.find((account) => account.id === id) ?? null;
+}
+
+/**
+ * Resolve the additive account-selection fields without silently repairing them.
+ *
+ * A pre-P3 row is legacy only when BOTH fields are absent. Once either field is
+ * present, an invalid shape or unknown account is surfaced to the operator rather
+ * than guessing that the old account is still selected. The proxy owns runtime
+ * fallback; the dashboard must make a malformed configuration visible.
+ */
+function accountSelectionForDevice(device, accounts) {
+  const originalAccountId = typeof device.account_id === 'string' ? device.account_id : null;
+  const hasAllowed = Object.hasOwn(device, 'allowed_account_ids');
+  const hasSelected = Object.hasOwn(device, 'selected_account_id');
+  const originalAccount = accountForId(accounts, originalAccountId);
+  if (!hasAllowed && !hasSelected) {
+    return {
+      allowedAccountIds: originalAccountId ? [originalAccountId] : [],
+      invalid: !originalAccount || !originalAccountId,
+      legacy: true,
+      originalAccount,
+      originalAccountId,
+      selectedAccount: originalAccount,
+      selectedAccountId: originalAccountId,
+    };
+  }
+
+  const allowedAccountIds = Array.isArray(device.allowed_account_ids)
+    ? device.allowed_account_ids
+    : null;
+  const selectedAccountId = typeof device.selected_account_id === 'string'
+    ? device.selected_account_id
+    : null;
+  const claudeAccounts = new Set(
+    accounts.filter((account) => account.provider === 'claude').map((account) => account.id),
+  );
+  const allowedValid = Array.isArray(allowedAccountIds)
+    && allowedAccountIds.length > 0
+    && allowedAccountIds.every((id) => typeof id === 'string' && id.length > 0)
+    && new Set(allowedAccountIds).size === allowedAccountIds.length
+    && allowedAccountIds.every((id) => claudeAccounts.has(id))
+    && originalAccountId !== null
+    && allowedAccountIds.includes(originalAccountId);
+  const selectedValid = selectedAccountId !== null
+    && allowedValid
+    && allowedAccountIds.includes(selectedAccountId)
+    && claudeAccounts.has(selectedAccountId);
+  const originalValid = originalAccountId !== null && claudeAccounts.has(originalAccountId);
+  const invalid = !allowedValid || !selectedValid || !originalValid;
+  return {
+    allowedAccountIds: Array.isArray(allowedAccountIds) ? allowedAccountIds : [],
+    invalid,
+    legacy: false,
+    originalAccount,
+    originalAccountId,
+    selectedAccount: selectedValid ? accountForId(accounts, selectedAccountId) : null,
+    selectedAccountId: selectedValid ? selectedAccountId : null,
+  };
+}
+
+function accountDisplayLabel(account, fallback = 'Unknown account') {
+  if (!account) return fallback;
+  return `${account.alias} · ${String(account.status).replaceAll('_', ' ')}`;
+}
+
+function accountLabelView(account, fallback = 'Unknown account') {
+  if (!account) return escapeHtml(fallback);
+  return `<span data-account-label data-account-alias="${escapeHtml(account.alias)}" data-account-status="${escapeHtml(account.status)}">${escapeHtml(accountDisplayLabel(account))}</span>`;
+}
+
+function accountSelectionOptions(accounts, selectedAccountId) {
+  return accounts
+    .filter((account) => account.provider === 'claude')
+    // Keep the account selector distinct from the legacy machine-merge option
+    // vocabulary, whose existing dashboard tests intentionally count the
+    // double-quoted machine values. Both quote styles are valid HTML; the value
+    // remains escaped before it enters the attribute.
+    .map((account) => `<option value='${escapeHtml(account.id)}' data-account-option data-account-alias="${escapeHtml(account.alias)}" data-account-status="${escapeHtml(account.status)}"${account.id === selectedAccountId ? ' selected' : ''}>${escapeHtml(accountDisplayLabel(account))}</option>`)
+    .join('');
+}
+
+function accountSelectionDetails(selection, accounts) {
+  const original = accountLabelView(selection.originalAccount, selection.originalAccountId ?? '—');
+  const allowed = selection.allowedAccountIds.length
+    ? selection.allowedAccountIds.map((id) => accountLabelView(accountForId(accounts, id), id)).join(', ')
+    : '—';
+  return `<div class="account-selection-details tiny">
+    <div><span data-i18n="original-account">Original account</span>: ${original}</div>
+    <div><span data-i18n="allowed-accounts">Allowed accounts</span>: ${allowed}</div>
+  </div>`;
+}
+
+function accountSwitchControl(device, selection, accounts, csrf) {
+  if (device.revoked_at) return '';
+  if (selection.invalid) {
+    return '<div class="notice error tiny" data-i18n="account-selection-invalid">Account selection configuration is invalid; no account was guessed.</div>';
+  }
+  const options = accountSelectionOptions(accounts, selection.selectedAccountId);
+  if (!options) {
+    return '<div class="muted tiny" data-i18n="no-claude-accounts">No Claude accounts are registered.</div>';
+  }
+  return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/account" class="stack account-switch-form">
+    <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+    <label><span data-i18n="selected-account">Selected account</span>
+      <select name="selected_account_id" required>${options}</select>
+    </label>
+    <button type="submit" data-i18n="switch-account">Switch account</button>
+  </form>`;
+}
+
+function claudeCredentialRow(device, accounts, csrf) {
   const state = device.revoked_at ? 'revoked' : 'active';
+  const selection = accountSelectionForDevice(device, accounts);
+  const selectedAccount = selection.invalid ? null : selection.selectedAccount;
   return `<tr data-credential-state="${state}">
-    <td><strong>${escapeHtml(device.name)}</strong><div class="muted tiny">${escapeHtml(device.member_label || '—')}</div></td>
+    <td data-device-id="${escapeHtml(device.id)}"><strong>${escapeHtml(device.name)}</strong><div class="muted tiny">${escapeHtml(device.member_label || '—')}</div></td>
     <td>Claude Code</td>
-    ${accountCell(account)}
+    ${accountCell(selectedAccount)}
     <td>${credentialBadge(state)}</td>
     <td>${escapeHtml(dateText(device.last_seen_at))}</td>
-    <td>${device.revoked_at
+    <td><div class="stack">
+      ${accountSelectionDetails(selection, accounts)}
+      ${accountSwitchControl(device, selection, accounts, csrf)}
+      ${device.revoked_at
       ? `<span class="muted tiny">${escapeHtml(dateText(device.revoked_at))}</span>`
       : `<form method="post" action="/devices/${encodeURIComponent(device.id)}/revoke">
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
         <button class="danger" type="submit" data-i18n="revoke">Revoke</button>
-      </form>`}</td>
+      </form>`}
+    </div></td>
   </tr>`;
 }
 
@@ -396,7 +516,7 @@ function machineEntryView(entry, { accounts, csrf, machineOptions }) {
   const rows = [
     ...entry.devices.map((device) => ({
       revoked: Boolean(device.revoked_at),
-      html: claudeCredentialRow(device, accountFor(device.account_id), csrf),
+      html: claudeCredentialRow(device, accounts, csrf),
     })),
     ...entry.codex.map((client) => ({
       revoked: client.revoked,
@@ -1006,6 +1126,7 @@ export function dashboardView({
               <h2><span data-i18n="machines">Machines</span> (${liveMachines.length})</h2>
               <div class="muted tiny" data-i18n="machines-intro">One row per machine, with every credential it holds underneath. A machine is identified by an opaque random handle — reported by its own agent, or minted here for one issuance when the machine has no agent to report one. It says nothing about who is using it, and the member label beside it is self-asserted and unverified.</div>
             </div></div>
+            ${openMode ? '<div class="notice error open-banner" role="status" data-i18n="open-account-switch-warning">Open mode has no verified actor: anyone who can reach this console can switch any active device. The actor is recorded as anonymous; a member label is not an actor.</div>' : ''}
             ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
             <div class="machine-list">${liveMachines.map(entryView).join('')
               || '<p class="empty" data-i18n="no-machines">No machine holds a credential yet.</p>'}</div>

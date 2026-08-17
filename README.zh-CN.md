@@ -32,7 +32,8 @@ distribution centre）。
 
 `credential-console` 把 Claude OAuth token 加密存放在磁盘上（encrypted at rest），并且不让
 它们离开这台主机。设备用每设备独立的 token 向网关认证；网关剥掉该 token，再向上游附上服务商
-凭证。
+当前为该设备选择、并保存在服务端的凭证。设备可以查看自己的状态，并在管理员已允许的账号之间
+切换；不需要新凭证，也不能查看或修改其他设备。
 
 ```
                               ┌──────────────────────────────────────────┐
@@ -78,7 +79,7 @@ distribution centre）。
 | 组件族 | 内容 | 文档 |
 |---|---|---|
 | [`codex-credential/`](codex-credential/) | `refresh-center`、`token-dispenser`、`client-agent`。把一份 Codex 凭证分发给多台机器，且各台机器之间不会互相挤掉。 | [README](codex-credential/README.md) · [DEPLOY](codex-credential/DEPLOY.md) |
-| [`credential-console/`](credential-console/) | 多账号控制平面、按设备注册、加密的 Claude OAuth 存储、隔离凭证的 Claude 网关。以只读方式导入已有的 `codex-credential` home 目录，也可以自己完成 Codex 账号授权。 | [README](credential-console/README.md) · [DEPLOY](credential-console/DEPLOY.md) |
+| [`credential-console/`](credential-console/) | 多账号控制平面、按设备注册与账号切换、加密的 Claude OAuth 存储、隔离凭证的 Claude 网关。以只读方式导入已有的 `codex-credential` home 目录，也可以自己完成 Codex 账号授权。 | [README](credential-console/README.md) · [DEPLOY](credential-console/DEPLOY.md) |
 
 两个组件族相互独立。只部署 `codex-credential` 本身就是一套完整方案；`credential-console`
 在其之上增加 Claude 账号、一套 UI 和自助注册。
@@ -117,7 +118,8 @@ distribution centre）。
   任何代码路径都不可能返回 `refresh_token`。注册处理逻辑从不打开已发布的凭证，所以注册密钥
   （enrollment key）即便泄露，也只能签发机器 token，别的什么都做不了。
 - **每设备独立凭证。** 每台机器、每个成员设备都有自己的 bearer token，只以 SHA-256 摘要形式
-  存储，可以单独吊销，并在每次请求时校验。
+  存储，可以单独吊销，并在每次请求时校验。同一 token 也用于只能操作自身的控制 API，不能查看
+  或切换其他设备。
 - **平面分离。** 控制平面私有；只有经过 token 认证的数据平面对外公开。Claude 网关按白名单
   放行路径，在附上服务商凭证之前先剥掉设备的 authorization 头，按来源 IP 对认证失败限流，
   并对每个设备施加请求量和并发额度。

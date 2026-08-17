@@ -43,6 +43,8 @@ V1 implements:
 - one-time, 30-minute device enrollment links;
 - tailnet-member self-service issuance for Claude Code devices, with no console sign-in step;
 - distinct, revocable device tokens;
+- server-side account selection from the next request, with a CSRF-protected selector on each
+  Claude credential and a device-token-authenticated, self-only machine control API;
 - an optional opaque machine handle on a device record, and a dashboard that reads the device
   list as a machine inventory: one row per machine, its Claude and Codex credentials nested
   underneath, revoked ones collapsed, and rows without a handle flagged and one click from
@@ -248,9 +250,10 @@ replace network egress.
 ## Machine inventory
 
 A device row records one credential *issuance*, not a machine. It is identified by a
-self-asserted member label plus a name somebody typed; revoking it only marks the row; and
-`account_id` is fixed at issuance, so moving a machine to another account appends a second
-row. The flat list therefore only ever grew, and could not answer "what machines are there".
+self-asserted member label plus a name somebody typed; revoking it only marks the row. Its
+original `account_id` remains immutable, while additive policy fields select another allowed
+account without issuing a new token. Older deployments had no policy fields, so moving a machine
+to another account appended a second row and the flat list only ever grew.
 
 The dashboard groups it by the opaque handle a machine's own agent reports
 ([`../codex-credential/client-agent/lib/machine-id.js`](../codex-credential/client-agent/lib/machine-id.js)).
@@ -311,6 +314,35 @@ handle is already where it is being asked to go, so a repeated submission writes
 records nothing; a row carrying a *different* handle is refused outright rather than
 reassigned. There is no un-merge — revoke the credential instead.
 
+## Server-side account switching
+
+Every active Claude credential row has its own account selector. The CSRF-protected console action
+adds the chosen registered Claude account to that exact device's allowlist and selects it; it never
+changes the immutable original `account_id`, reissues the device token, re-encrypts a provider
+credential, or touches another row sharing the same machine handle. The next request resolves the
+new selection. A request already in flight keeps the account it resolved at its start.
+
+Device rows written before this feature have neither `allowed_account_ids` nor
+`selected_account_id` and continue to use their original account without being rewritten. Once
+either policy field exists, malformed or inconsistent policy is surfaced as an error rather than
+silently guessed. A selected account that is registered but not yet authorized remains selected;
+the gateway then returns its existing account-login-required response.
+
+The machine control API lives under the same token-authenticated `/claude` runtime mount:
+
+```text
+GET  /claude/control/v1/status
+POST /claude/control/v1/account
+     {"account_id":"<allowed-account-id>"}
+```
+
+It accepts the device's existing `Authorization: Bearer` or `X-Api-Key` token, checks revocation on
+every call, derives the target device exclusively from that token, and never accepts a device ID in
+the URL or body. The status response is a safe device/account summary without tokens, digests,
+credentials or audit history. A machine may switch only among accounts already granted from the
+console. There is deliberately no machine-control enroll endpoint: a new machine still receives
+its first device token through the existing console self-service page.
+
 ## Security boundaries
 
 - `master.key`, `state.json`, and the data directory are mode 600/700.
@@ -321,10 +353,10 @@ reassigned. There is no un-merge — revoke the credential instead.
   deployment refuses a request that carries no tailnet identity rather than serving it.
 - `open` administrator-auth mode has no authentication at all: no identity of any kind. Every
   client that can open the console is an administrator and can add accounts, issue device
-  credentials, and revoke them. Reaching the console is then the entire authorization boundary,
+  credentials, switch any active Claude device, and revoke them. Reaching the console is then the entire authorization boundary,
   so it belongs only on a private overlay network whose membership you already control. Every
-  page states this, `/health` reports `admin_configured: false`, and audit entries in this mode
-  record the self-asserted member label, not a verified identity. It follows that the
+  page states this, `/health` reports `admin_configured: false`, and account-switch audit entries in
+  this mode record `anonymous`; the self-asserted member label is attribution, not an actor. It follows that the
   per-administrator binding on Claude and Codex authorization sessions is a no-op here: with no
   identity to bind to, every visitor is recorded as the same `administrator`, so any visitor can
   complete an authorization another visitor started. PKCE, the single live session, and the

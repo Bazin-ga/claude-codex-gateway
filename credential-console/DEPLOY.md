@@ -311,7 +311,8 @@ sudo tailscale serve --bg http://127.0.0.1:9080
 sudo tailscale serve status
 ```
 
-Publish only the Claude runtime gateway on the separate public Funnel port:
+Publish only the token-authenticated Claude runtime gateway and its self-only machine control API
+on the separate public Funnel port:
 
 ```bash
 sudo tailscale funnel --bg --https=10000 --set-path=/claude http://127.0.0.1:9080/claude
@@ -321,6 +322,21 @@ sudo tailscale funnel status
 The `/claude` suffix on both sides is intentional. `--set-path` strips the public mount
 prefix before proxying; adding it to the target preserves the path expected by the
 credential console (`/claude/v1/...`).
+
+The same mount intentionally includes two device-token-authenticated control endpoints:
+
+```text
+GET  https://<console-host>.<your-tailnet>.ts.net:10000/claude/control/v1/status
+POST https://<console-host>.<your-tailnet>.ts.net:10000/claude/control/v1/account
+     Authorization: Bearer <device-token>
+     Content-Type: application/json
+     {"account_id":"<allowed-account-id>"}
+```
+
+They derive the device exclusively from its existing token, check revocation on every call and
+cannot read or modify any other device. There is no control-API enroll route; first-time issuance
+stays on the tailnet-only console page. The account selector in that page remains CSRF-protected;
+the bearer-token API does not use console cookies or CSRF.
 
 Port 443 remains Serve-only and private. Port 10000 is Funnel-only and public, with only the
 `/claude` mount configured; Funnel traffic does not carry Tailscale identity headers. Never

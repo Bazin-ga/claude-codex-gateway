@@ -1815,6 +1815,232 @@ test('metrics initialization failure is visible but does not prevent the console
   }
 });
 
+test('P3 console and machine API switch only the authenticated device from the next request', async () => {
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const primary = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'p3-primary',
+      credential: { oauth_token: 'p3-primary-upstream-token' },
+    });
+    const secondary = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'p3-secondary',
+      credential: { oauth_token: 'p3-secondary-upstream-token' },
+    });
+    const placeholder = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'p3-placeholder',
+      emailLabel: 'placeholder@example.test',
+    });
+    const first = await app.store.issueDeviceCredential({
+      accountId: primary.id,
+      memberLabel: 'p3-member-a',
+      deviceName: 'p3-device-a',
+    });
+    const second = await app.store.issueDeviceCredential({
+      accountId: primary.id,
+      memberLabel: 'p3-member-b',
+      deviceName: 'p3-device-b',
+    });
+    const legacySecond = app.store.state.devices.find((device) => device.id === second.device.id);
+    delete legacySecond.allowed_account_ids;
+    delete legacySecond.selected_account_id;
+    await app.store.persist();
+
+    const dashboard = await fetch(`${app.baseUrl}/`);
+    const cookie = cookieFrom(dashboard);
+    const dashboardHtml = await dashboard.text();
+    const csrf = csrfFrom(dashboardHtml);
+    assert.match(dashboardHtml, new RegExp(`action="/devices/${first.device.id}/account"`));
+    assert.match(dashboardHtml, new RegExp(`action="/devices/${second.device.id}/account"`));
+    assert.match(dashboardHtml, /data-i18n="open-account-switch-warning"/);
+    const appScript = await (await fetch(`${app.baseUrl}/assets/app.js`)).text();
+    for (const key of [
+      'original-account',
+      'allowed-accounts',
+      'selected-account',
+      'switch-account',
+      'account-selection-invalid',
+      'no-claude-accounts',
+      'open-account-switch-warning',
+    ]) {
+      assert.match(appScript, new RegExp(`'${key}':`), `missing Chinese translation for ${key}`);
+    }
+    assert.match(appScript, /\[data-account-option\], \[data-account-label\]/);
+    assert.match(appScript, /translations\[key\]/);
+    const configure = (deviceId, accountId, csrfValue = csrf) => fetch(
+      `${app.baseUrl}/devices/${deviceId}/account`,
+      {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          Cookie: cookie,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          csrf: csrfValue,
+          selected_account_id: accountId,
+        }),
+      },
+    );
+    const proxy = (token, marker) => fetch(`${app.baseUrl}/claude/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'p3-model', messages: [{ role: 'user', content: marker }] }),
+    });
+
+    const badCsrf = await configure(first.device.id, secondary.id, 'wrong');
+    assert.equal(badCsrf.status, 403);
+    assert.equal(app.store.resolveDeviceAccount(first.device.id).effective_account_id, primary.id);
+
+    const toSecondary = await configure(first.device.id, secondary.id);
+    assert.equal(toSecondary.status, 303);
+    const configured = app.store.deviceAccountSummary(first.device.id);
+    assert.equal(configured.original_account_id, primary.id);
+    assert.equal(configured.selected_account_id, secondary.id);
+    assert.deepEqual(configured.allowed_account_ids, [primary.id, secondary.id]);
+    assert.equal(app.store.resolveDeviceAccount(second.device.id).effective_account_id, primary.id);
+
+    const throughSecondary = await proxy(first.token, 'through-secondary');
+    assert.equal(throughSecondary.status, 200);
+    await throughSecondary.arrayBuffer();
+    assert.equal(
+      app.upstreamRequests.at(-1).authorization,
+      'Bearer p3-secondary-upstream-token',
+    );
+
+    const statusResponse = await fetch(`${app.baseUrl}/claude/control/v1/status`, {
+      headers: { 'X-Api-Key': first.token },
+    });
+    assert.equal(statusResponse.status, 200);
+    const status = await statusResponse.json();
+    assert.equal(status.device_id, first.device.id);
+    assert.equal(status.machine_id, null);
+    assert.equal(status.device_name, 'p3-device-a');
+    assert.equal(status.original_account_id, primary.id);
+    assert.equal(status.account_id, secondary.id);
+    assert.equal(status.selected_account_id, secondary.id);
+    assert.deepEqual(status.allowed_account_ids, [primary.id, secondary.id]);
+    assert.equal(JSON.stringify(status).includes(first.token), false);
+    assert.equal(JSON.stringify(status).includes('upstream-token'), false);
+
+    const backToPrimary = await fetch(`${app.baseUrl}/claude/control/v1/account`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${first.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ account_id: primary.id }),
+    });
+    assert.equal(backToPrimary.status, 200);
+    assert.equal((await backToPrimary.json()).account_id, primary.id);
+    const throughPrimary = await proxy(first.token, 'through-primary');
+    assert.equal(throughPrimary.status, 200);
+    await throughPrimary.arrayBuffer();
+    assert.equal(app.upstreamRequests.at(-1).authorization, 'Bearer p3-primary-upstream-token');
+
+    const secondStatus = await fetch(`${app.baseUrl}/claude/control/v1/status`, {
+      headers: { 'X-Api-Key': second.token },
+    });
+    assert.equal(secondStatus.status, 200);
+    const secondSummary = await secondStatus.json();
+    assert.equal(secondSummary.device_id, second.device.id);
+    assert.equal(secondSummary.account_id, primary.id);
+    assert.equal(secondSummary.selected_account_id, primary.id);
+    assert.deepEqual(secondSummary.allowed_account_ids, [primary.id]);
+    assert.equal(app.store.resolveDeviceAccount(second.device.id).effective_account_id, primary.id);
+    const secondForbidden = await fetch(`${app.baseUrl}/claude/control/v1/account`, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': second.token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ account_id: secondary.id }),
+    });
+    assert.equal(secondForbidden.status, 403);
+    const legacyProxy = await proxy(second.token, 'legacy-fallback-primary');
+    assert.equal(legacyProxy.status, 200);
+    await legacyProxy.arrayBuffer();
+    assert.equal(app.upstreamRequests.at(-1).authorization, 'Bearer p3-primary-upstream-token');
+    assert.equal(Object.hasOwn(legacySecond, 'allowed_account_ids'), false);
+    assert.equal(Object.hasOwn(legacySecond, 'selected_account_id'), false);
+    const crossTargetBody = await fetch(`${app.baseUrl}/claude/control/v1/account`, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': first.token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ account_id: secondary.id, device_id: second.device.id }),
+    });
+    assert.equal(crossTargetBody.status, 400);
+    assert.equal(app.store.resolveDeviceAccount(second.device.id).effective_account_id, primary.id);
+
+    const toPlaceholder = await configure(first.device.id, placeholder.id);
+    assert.equal(toPlaceholder.status, 303);
+    const upstreamBeforePlaceholder = app.upstreamRequests.length;
+    const unavailable = await proxy(first.token, 'placeholder-must-not-proxy');
+    assert.equal(unavailable.status, 503);
+    assert.equal(app.upstreamRequests.length, upstreamBeforePlaceholder);
+    assert.equal(app.store.resolveDeviceAccount(first.device.id).effective_account_id, placeholder.id);
+
+    const restorePrimary = await configure(first.device.id, primary.id);
+    assert.equal(restorePrimary.status, 303);
+    const restored = await proxy(first.token, 'restored-primary');
+    assert.equal(restored.status, 200);
+    await restored.arrayBuffer();
+    assert.equal(app.upstreamRequests.at(-1).authorization, 'Bearer p3-primary-upstream-token');
+    assert.equal(app.store.deviceByToken(first.token).id, first.device.id);
+    await app.store.deleteAccount(placeholder.id);
+    assert.deepEqual(
+      app.store.deviceAccountSummary(first.device.id).allowed_account_ids,
+      [primary.id, secondary.id],
+    );
+
+    app.requestMetrics.flush();
+    assert.equal(
+      app.requestMetrics.queryTotals({ scope: 'all', accountId: secondary.id }).requestCount,
+      1,
+    );
+    assert.equal(
+      app.requestMetrics.queryTotals({ scope: 'all', accountId: primary.id }).requestCount,
+      3,
+    );
+    assert.equal(
+      app.requestMetrics.queryTotals({ scope: 'all', accountId: placeholder.id }).requestCount,
+      1,
+    );
+
+    const configureAudit = app.store.state.audit.find((event) => (
+      event.event === 'device_account_configured'
+      && event.next_account_id === secondary.id
+    ));
+    assert.equal(configureAudit.actor, 'anonymous');
+    assert.equal(configureAudit.actor_kind, 'console');
+    const apiAudit = app.store.state.audit.find((event) => (
+      event.event === 'device_account_switched'
+      && event.next_account_id === primary.id
+    ));
+    assert.equal(apiAudit.actor, `device:${first.device.id}`);
+    assert.equal(apiAudit.actor_device_id, first.device.id);
+
+    await app.store.revokeDevice(first.device.id);
+    const revokedStatus = await fetch(`${app.baseUrl}/claude/control/v1/status`, {
+      headers: { 'X-Api-Key': first.token },
+    });
+    assert.equal(revokedStatus.status, 401);
+    const unaffected = await fetch(`${app.baseUrl}/claude/control/v1/status`, {
+      headers: { 'X-Api-Key': second.token },
+    });
+    assert.equal(unaffected.status, 200);
+  } finally {
+    await app.close();
+  }
+});
+
 test('public Claude gateway rate-limits repeated authentication failures by source IP', async () => {
   const app = await fixture();
   try {

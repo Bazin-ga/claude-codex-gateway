@@ -779,3 +779,391 @@ test('an account that never authorized can be deleted, one holding a credential 
 
   await assert.rejects(store.deleteAccount('no-such-id'), /account not found/);
 });
+
+test('P3 policy fields are additive and switching is isolated to the exact device row', async () => {
+  const { store } = await newStore();
+  const primary = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-primary',
+    credential: { oauth_token: 'p3-primary-token' },
+  });
+  const secondary = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-secondary',
+    credential: { oauth_token: 'p3-secondary-token' },
+  });
+  const machineId = 'p3-shared-machine-1234';
+  const first = await store.issueDeviceCredential({
+    accountId: primary.id,
+    memberLabel: 'same-member',
+    deviceName: 'first-device',
+    machineId,
+  });
+  const second = await store.issueDeviceCredential({
+    accountId: secondary.id,
+    memberLabel: 'same-member',
+    deviceName: 'second-device',
+    machineId,
+  });
+  const firstDigest = store.state.devices.find((row) => row.id === first.device.id).token_sha256;
+  const secondDigest = store.state.devices.find((row) => row.id === second.device.id).token_sha256;
+
+  assert.deepEqual(first.device.allowed_account_ids, [primary.id]);
+  assert.equal(first.device.selected_account_id, primary.id);
+  assert.deepEqual(store.resolveDeviceAccount(first.device).allowed_account_ids, [primary.id]);
+  assert.equal(store.resolveDeviceAccount(second.device).effective_account_id, secondary.id);
+
+  const configured = await store.configureDeviceAccount({
+    deviceId: first.device.id,
+    selectedAccountId: secondary.id,
+    actor: 'console-operator',
+    actorType: 'console',
+  });
+  assert.deepEqual(configured.allowed_account_ids, [primary.id, secondary.id]);
+  assert.equal(configured.selected_account_id, secondary.id);
+  assert.equal(store.state.devices.find((row) => row.id === first.device.id).account_id, primary.id);
+  assert.equal(store.state.devices.find((row) => row.id === first.device.id).token_sha256, firstDigest);
+  assert.equal(store.state.devices.find((row) => row.id === second.device.id).token_sha256, secondDigest);
+  assert.deepEqual(store.accountCredential(primary.id), { oauth_token: 'p3-primary-token' });
+  assert.deepEqual(store.accountCredential(secondary.id), { oauth_token: 'p3-secondary-token' });
+  assert.equal(store.publicAccounts().find((account) => account.id === primary.id).active_devices, 0);
+  assert.equal(store.publicAccounts().find((account) => account.id === secondary.id).active_devices, 2);
+
+  await assert.rejects(
+    store.switchDeviceAccount({
+      deviceId: first.device.id,
+      selectedAccountId: primary.id,
+      actorDeviceId: second.device.id,
+    }),
+    (error) => error.message.includes('own device') && error.code === 'DEVICE_SCOPE',
+  );
+
+  const switchedBack = await store.switchDeviceAccount({
+    deviceId: first.device.id,
+    selectedAccountId: primary.id,
+    actorDeviceId: first.device.id,
+  });
+  assert.equal(switchedBack.effective_account_id, primary.id);
+  assert.equal(store.resolveDeviceAccount(second.device.id).effective_account_id, secondary.id);
+  assert.equal(store.publicAccounts().find((account) => account.id === primary.id).active_devices, 1);
+  assert.equal(store.publicAccounts().find((account) => account.id === secondary.id).active_devices, 1);
+  await assert.rejects(
+    store.switchDeviceAccount({
+      deviceId: second.device.id,
+      selectedAccountId: primary.id,
+      actorDeviceId: second.device.id,
+    }),
+    (error) => error.message.includes('not allowed') && error.code === 'ACCOUNT_NOT_ALLOWED',
+  );
+  const failure = store.state.audit.at(-1);
+  assert.equal(failure.event, 'device_account_switch_failed');
+  assert.equal(failure.actor_kind, 'device_token');
+  assert.equal(failure.device_id, second.device.id);
+  assert.equal(failure.machine_id, machineId);
+  assert.equal(failure.previous_account_id, secondary.id);
+  assert.equal(failure.next_account_id, primary.id);
+  assert.equal(failure.outcome, 'failure');
+  assert.deepEqual(failure.allowed_added, null);
+  assert.equal(JSON.stringify(failure).includes('p3-primary-token'), false);
+});
+
+test('legacy rows fallback only when both policy fields are absent and are not rewritten', async () => {
+  const { home, store } = await newStore();
+  const account = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-legacy',
+    credential: { oauth_token: 'p3-legacy-token' },
+  });
+  const issued = await store.issueDeviceCredential({
+    accountId: account.id,
+    memberLabel: 'legacy-member',
+    deviceName: 'legacy-device',
+  });
+  const row = store.state.devices.find((device) => device.id === issued.device.id);
+  delete row.allowed_account_ids;
+  delete row.selected_account_id;
+  const statePath = join(home, 'state.json');
+  await store.persist();
+  const before = await readFile(statePath);
+  const reopened = await new CredentialStore(home).init();
+
+  const resolved = reopened.resolveDeviceAccount(issued.device.id);
+  assert.equal(resolved.source, 'legacy');
+  assert.equal(resolved.effective_account_id, account.id);
+  assert.equal(reopened.deviceAccountSummary(issued.device.id).selected_account_id, account.id);
+  assert.equal(reopened.deviceByToken(issued.token).id, issued.device.id);
+  assert.deepEqual(reopened.accountCredential(account.id), { oauth_token: 'p3-legacy-token' });
+  assert.deepEqual(await readFile(statePath), before);
+});
+
+test('partial, malformed, unknown, non-Claude, and not-allowed policies are explicit errors', async () => {
+  const { store } = await newStore();
+  const claude = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-policy-claude',
+    credential: { oauth_token: 'p3-policy-token' },
+  });
+  const codex = await store.addAccount({ provider: 'codex', alias: 'p3-policy-codex' });
+  const issued = await store.issueDeviceCredential({
+    accountId: claude.id,
+    memberLabel: 'policy-member',
+    deviceName: 'policy-device',
+  });
+  const row = store.state.devices.find((device) => device.id === issued.device.id);
+
+  delete row.selected_account_id;
+  assert.throws(() => store.resolveDeviceAccount(row), /policy is incomplete/);
+  row.selected_account_id = claude.id;
+  row.allowed_account_ids = [claude.id, claude.id];
+  assert.throws(() => store.resolveDeviceAccount(row), /duplicates/);
+  row.allowed_account_ids = [claude.id, 'p3-unknown-account'];
+  assert.throws(() => store.resolveDeviceAccount(row), /was not found/);
+  row.allowed_account_ids = [claude.id, codex.id];
+  assert.throws(() => store.resolveDeviceAccount(row), /not a Claude account/);
+  row.allowed_account_ids = [claude.id];
+  row.selected_account_id = codex.id;
+  assert.throws(() => store.resolveDeviceAccount(row), /not allowed/);
+});
+
+test('deleting an unrelated account does not clear a malformed or partial device policy', async () => {
+  const { store } = await newStore();
+  const owner = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-unrelated-owner',
+    credential: { oauth_token: 'p3-unrelated-owner-token' },
+  });
+  const unrelated = await store.addAccount({ provider: 'claude', alias: 'p3-unrelated-pending' });
+  const issued = await store.issueDeviceCredential({
+    accountId: owner.id,
+    memberLabel: 'unrelated-member',
+    deviceName: 'unrelated-device',
+  });
+  const row = store.state.devices.find((device) => device.id === issued.device.id);
+  row.allowed_account_ids = 'malformed-policy';
+  delete row.selected_account_id;
+  await store.deleteAccount(unrelated.id);
+  assert.equal(store.accountById(unrelated.id), null);
+  assert.equal(row.allowed_account_ids, 'malformed-policy');
+  assert.equal(Object.hasOwn(row, 'selected_account_id'), false);
+});
+
+test('console can select login_required placeholder, machine switch requires usable target, and delete prunes it', async () => {
+  const { store } = await newStore();
+  const good = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-good-account',
+    credential: { oauth_token: 'p3-good-token' },
+  });
+  const pending = await store.addAccount({ provider: 'claude', alias: 'p3-pending-account' });
+  const issued = await store.issueDeviceCredential({
+    accountId: good.id,
+    memberLabel: 'pending-member',
+    deviceName: 'pending-device',
+  });
+
+  const selectedPending = await store.configureDeviceAccount({
+    deviceId: issued.device.id,
+    selectedAccountId: pending.id,
+    actor: 'console-admin',
+  });
+  assert.equal(selectedPending.effective_account_id, pending.id);
+  assert.equal(selectedPending.account.has_credential, false);
+  await assert.rejects(
+    store.switchDeviceAccount({
+      deviceId: issued.device.id,
+      selectedAccountId: pending.id,
+      actorDeviceId: issued.device.id,
+    }),
+    (error) => error.message.includes('no stored credential') && error.code === 'ACCOUNT_UNAVAILABLE',
+  );
+  await assert.rejects(store.deleteAccount(pending.id), /selected by active device/);
+
+  await store.configureDeviceAccount({
+    deviceId: issued.device.id,
+    selectedAccountId: good.id,
+    actor: 'console-admin',
+  });
+  await store.deleteAccount(pending.id);
+  assert.equal(store.accountById(pending.id), null);
+  const after = store.state.devices.find((device) => device.id === issued.device.id);
+  assert.deepEqual(after.allowed_account_ids, [good.id]);
+  assert.equal(after.selected_account_id, good.id);
+  assert.equal(store.resolveDeviceAccount(issued.device.id).effective_account_id, good.id);
+  const deletion = store.state.audit.findLast((event) => event.event === 'account_deleted');
+  assert.deepEqual(deletion.device_account_policies_pruned, [issued.device.id]);
+});
+
+test('revoked devices cannot resolve, configure, or switch account policy', async () => {
+  const { store } = await newStore();
+  const account = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-revoked-account',
+    credential: { oauth_token: 'p3-revoked-token' },
+  });
+  const issued = await store.issueDeviceCredential({
+    accountId: account.id,
+    memberLabel: 'revoked-member',
+    deviceName: 'revoked-device',
+  });
+  await store.revokeDevice(issued.device.id);
+  assert.throws(() => store.resolveDeviceAccount(issued.device.id), /revoked/);
+  assert.throws(() => store.deviceAccountSummary(issued.device.id), /revoked/);
+  await assert.rejects(
+    store.configureDeviceAccount({ deviceId: issued.device.id, selectedAccountId: account.id }),
+    /revoked/,
+  );
+  await assert.rejects(
+    store.switchDeviceAccount({
+      deviceId: issued.device.id,
+      selectedAccountId: account.id,
+      actorDeviceId: issued.device.id,
+    }),
+    /revoked/,
+  );
+});
+
+test('persist failure rolls back device policy and audit fields while recording failure', async () => {
+  const { home, store } = await newStore();
+  const first = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-rollback-first',
+    credential: { oauth_token: 'p3-rollback-first-token' },
+  });
+  const second = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-rollback-second',
+    credential: { oauth_token: 'p3-rollback-second-token' },
+  });
+  const issued = await store.issueDeviceCredential({
+    accountId: first.id,
+    memberLabel: 'rollback-member',
+    deviceName: 'rollback-device',
+  });
+  const rowBefore = { ...store.state.devices.find((device) => device.id === issued.device.id) };
+  const auditBefore = store.state.audit.length;
+  const originalPersist = store.persist.bind(store);
+  let persistCalls = 0;
+  store.persist = async () => {
+    persistCalls += 1;
+    if (persistCalls === 1) throw new Error('synthetic persist failure');
+    return originalPersist();
+  };
+
+  await assert.rejects(
+    store.configureDeviceAccount({
+      deviceId: issued.device.id,
+      selectedAccountId: second.id,
+      actor: 'rollback-admin',
+    }),
+    /synthetic persist failure/,
+  );
+  store.persist = originalPersist;
+  const rowAfter = store.state.devices.find((device) => device.id === issued.device.id);
+  assert.deepEqual(rowAfter.allowed_account_ids, rowBefore.allowed_account_ids);
+  assert.equal(rowAfter.selected_account_id, rowBefore.selected_account_id);
+  assert.equal(rowAfter.account_id, first.id);
+  assert.equal(rowAfter.token_sha256, rowBefore.token_sha256);
+  assert.deepEqual(store.accountCredential(first.id), { oauth_token: 'p3-rollback-first-token' });
+  assert.deepEqual(store.accountCredential(second.id), { oauth_token: 'p3-rollback-second-token' });
+  assert.equal(store.state.audit.length, auditBefore + 1);
+  const failure = store.state.audit.at(-1);
+  assert.equal(failure.event, 'device_account_configure_failed');
+  assert.equal(failure.outcome, 'failure');
+  assert.equal(failure.actor_kind, 'console');
+  assert.equal(failure.device_id, issued.device.id);
+  assert.equal(failure.previous_account_id, first.id);
+  assert.equal(failure.next_account_id, second.id);
+  assert.equal(failure.allowed_added, null);
+
+  const reopened = await new CredentialStore(home).init();
+  assert.equal(reopened.resolveDeviceAccount(issued.device.id).effective_account_id, first.id);
+  assert.equal(reopened.state.audit.at(-1).event, 'device_account_configure_failed');
+});
+
+test('proxy-facing reads keep the committed account until a policy persist succeeds', async () => {
+  const { store } = await newStore();
+  const first = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-visible-first',
+    credential: { oauth_token: 'p3-visible-first-token' },
+  });
+  const second = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-visible-second',
+    credential: { oauth_token: 'p3-visible-second-token' },
+  });
+  const issued = await store.issueDeviceCredential({
+    accountId: first.id,
+    memberLabel: 'visible-member',
+    deviceName: 'visible-device',
+  });
+  const originalPersist = store.persist.bind(store);
+  let releasePersist;
+  let enteredPersist;
+  const persistEntered = new Promise((resolve) => { enteredPersist = resolve; });
+  store.persist = async () => {
+    enteredPersist();
+    await new Promise((resolve) => { releasePersist = resolve; });
+    await originalPersist();
+  };
+
+  const configuring = store.configureDeviceAccount({
+    deviceId: issued.device.id,
+    selectedAccountId: second.id,
+    actor: 'delayed-writer',
+  });
+  await persistEntered;
+  assert.equal(store.resolveDeviceAccount(issued.device.id).effective_account_id, first.id);
+  assert.equal(
+    store.publicDevices().find((device) => device.id === issued.device.id).selected_account_id,
+    first.id,
+  );
+  releasePersist();
+  const configured = await configuring;
+  store.persist = originalPersist;
+  assert.equal(configured.effective_account_id, second.id);
+  assert.equal(store.resolveDeviceAccount(issued.device.id).effective_account_id, second.id);
+});
+
+test('deleteAccount restores account, policies, and audit when persistence fails', async () => {
+  const { home, store } = await newStore();
+  const primary = await store.addAccount({
+    provider: 'claude',
+    alias: 'p3-delete-primary',
+    credential: { oauth_token: 'p3-delete-primary-token' },
+  });
+  const pending = await store.addAccount({ provider: 'claude', alias: 'p3-delete-pending' });
+  const issued = await store.issueDeviceCredential({
+    accountId: primary.id,
+    memberLabel: 'delete-member',
+    deviceName: 'delete-device',
+  });
+  await store.configureDeviceAccount({
+    deviceId: issued.device.id,
+    selectedAccountId: pending.id,
+    actor: 'delete-test',
+  });
+  await store.configureDeviceAccount({
+    deviceId: issued.device.id,
+    selectedAccountId: primary.id,
+    actor: 'delete-test',
+  });
+  const beforeState = structuredClone(store.state);
+  const beforeDisk = await readFile(join(home, 'state.json'));
+  const originalPersist = store.persist.bind(store);
+  store.persist = async () => { throw new Error('synthetic delete persist failure'); };
+  await assert.rejects(store.deleteAccount(pending.id), /synthetic delete persist failure/);
+  store.persist = originalPersist;
+
+  assert.deepEqual(store.state, beforeState);
+  assert.deepEqual(await readFile(join(home, 'state.json')), beforeDisk);
+  assert.equal(store.accountById(pending.id).id, pending.id);
+  assert.deepEqual(
+    store.state.devices.find((device) => device.id === issued.device.id).allowed_account_ids,
+    [primary.id, pending.id],
+  );
+  assert.equal(
+    store.state.devices.find((device) => device.id === issued.device.id).selected_account_id,
+    primary.id,
+  );
+});

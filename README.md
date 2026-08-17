@@ -37,7 +37,9 @@ centre's token away.
 
 `credential-console` keeps Claude OAuth tokens encrypted at rest and never lets them leave the
 host. Devices authenticate to a gateway with a per-device token; the gateway strips that token
-and attaches the provider credential upstream.
+and attaches the device's currently selected, server-held provider credential upstream. A device
+can inspect its own status and switch among accounts an administrator has allowed, without a new
+credential or access to any other device.
 
 ```
                               ┌──────────────────────────────────────────┐
@@ -83,7 +85,7 @@ face the public internet.
 | Family | Contents | Docs |
 |---|---|---|
 | [`codex-credential/`](codex-credential/) | `refresh-center`, `token-dispenser`, `client-agent`. Distributes one Codex credential to many machines without mutual eviction. | [README](codex-credential/README.md) · [DEPLOY](codex-credential/DEPLOY.md) |
-| [`credential-console/`](credential-console/) | Multi-account control plane, per-device enrollment, encrypted Claude OAuth storage, credential-isolating Claude gateway. Imports an existing `codex-credential` home read-only, and can authorize a Codex account itself. | [README](credential-console/README.md) · [DEPLOY](credential-console/DEPLOY.md) |
+| [`credential-console/`](credential-console/) | Multi-account control plane, per-device enrollment and account switching, encrypted Claude OAuth storage, credential-isolating Claude gateway. Imports an existing `codex-credential` home read-only, and can authorize a Codex account itself. | [README](credential-console/README.md) · [DEPLOY](credential-console/DEPLOY.md) |
 
 The two families are independent. Deploying `codex-credential` alone is a complete story;
 `credential-console` adds Claude accounts, a UI, and self-service enrollment on top.
@@ -124,7 +126,8 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
   so no code path through it can return one. The enrollment handler never opens the published
   credential, so a leaked enrollment key mints machine tokens and nothing else.
 - **Per-device credentials.** Every machine and every member device gets its own bearer token,
-  stored only as a SHA-256 digest, independently revocable, checked on every request.
+  stored only as a SHA-256 digest, independently revocable, checked on every request. The same
+  token authenticates a self-only control API; it cannot inspect or switch another device.
 - **Split planes.** Control plane private; only token-authenticated data planes public. The
   Claude gateway allowlists paths, strips the device authorization header before attaching the
   provider credential, rate-limits failed authentication by source IP, and applies per-device

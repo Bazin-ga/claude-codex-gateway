@@ -277,6 +277,61 @@ test('a normal early upstream response waits for the request tee before recordin
   assert.equal(sink.rows.length, 1);
 });
 
+test('an in-flight request keeps its resolved account while the next request uses a switch', async (t) => {
+  const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
+  const device = {
+    ...DEVICE,
+    account_id: 'account-a',
+    allowed_account_ids: ['account-a', 'account-b'],
+    selected_account_id: 'account-a',
+  };
+  const accounts = new Map([
+    ['account-a', { ...ACCOUNT, id: 'account-a', alias: 'account-a' }],
+    ['account-b', { ...ACCOUNT, id: 'account-b', alias: 'account-b' }],
+  ]);
+  const store = {
+    deviceByToken: (token) => token === DEVICE_TOKEN ? device : null,
+    resolveDeviceAccount: () => {
+      const account = accounts.get(device.selected_account_id);
+      return { account, effective_account_id: account.id };
+    },
+    accountCredential: (id) => ({ oauth_token: `upstream-${id}` }),
+    markDeviceSeen: async () => {},
+    updateAccountHealth: async () => {},
+  };
+  const authorizations = [];
+  const releases = [];
+  const { proxyUrl } = await startHarness(t, {
+    requestMetrics: sink,
+    store,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      authorizations.push(req.headers.authorization);
+      await new Promise((resolve) => releases.push(resolve));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+    },
+  });
+
+  const first = fetchMetricResponse(
+    `${proxyUrl}/claude/v1/messages`,
+    Buffer.from('{"model":"before-switch"}'),
+  );
+  await waitFor(() => authorizations.length === 1);
+  device.selected_account_id = 'account-b';
+  const second = fetchMetricResponse(
+    `${proxyUrl}/claude/v1/messages`,
+    Buffer.from('{"model":"after-switch"}'),
+  );
+  await waitFor(() => authorizations.length === 2);
+  for (const release of releases) release();
+  assert.equal((await first).status, 200);
+  assert.equal((await second).status, 200);
+  assert.deepEqual(authorizations, ['Bearer upstream-account-a', 'Bearer upstream-account-b']);
+  await waitFor(() => sink.rows.length === 2);
+  assert.deepEqual(sink.rows.map((row) => row.accountId).sort(), ['account-a', 'account-b']);
+});
+
 for (const [label, requestMetrics] of [
   ['synchronous throw', { enqueueRequest() { throw new Error('sink unavailable'); } }],
   ['asynchronous reject', { enqueueRequest() { return Promise.reject(new Error('sink unavailable')); } }],

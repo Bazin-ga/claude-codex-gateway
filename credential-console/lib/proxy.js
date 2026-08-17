@@ -2,7 +2,8 @@ import http from 'node:http';
 import https from 'node:https';
 import { performance } from 'node:perf_hooks';
 import { Transform } from 'node:stream';
-import { bearerToken, sendJson } from './http.js';
+import { sendJson } from './http.js';
+import { deviceToken } from './device-auth.js';
 import { createRequestMetadataTee } from './request-metadata.js';
 
 const ALLOWED_PATHS = new Set([
@@ -122,15 +123,6 @@ function responseHeaders(headers) {
   );
 }
 
-function deviceToken(req) {
-  const bearer = bearerToken(req);
-  const apiKey = typeof req.headers['x-api-key'] === 'string'
-    ? req.headers['x-api-key']
-    : null;
-  if (bearer && apiKey && bearer !== apiKey) return null;
-  return bearer ?? apiKey;
-}
-
 export async function handleClaudeProxy(req, res, {
   store,
   upstreamBaseUrl = 'https://api.anthropic.com',
@@ -165,7 +157,23 @@ export async function handleClaudeProxy(req, res, {
 
   const authenticatedAtMs = Date.now();
   const authenticatedAtMonotonic = performance.now();
-  const account = store.accountById(device.account_id);
+  let accountId = device.account_id;
+  let account = null;
+  let accountResolutionError = null;
+  try {
+    if (typeof store.resolveDeviceAccount === 'function') {
+      const resolved = store.resolveDeviceAccount(device);
+      accountId = resolved.effective_account_id;
+      account = resolved.account;
+    } else {
+      account = store.accountById(device.account_id);
+    }
+  } catch (error) {
+    accountResolutionError = error;
+    if (typeof device.selected_account_id === 'string' && device.selected_account_id) {
+      accountId = device.selected_account_id;
+    }
+  }
   const recordRejected = (statusCode, outcome = 'rejected') => {
     enqueueMetricSafely(requestMetrics, {
       startedAtMs: authenticatedAtMs,
@@ -174,7 +182,7 @@ export async function handleClaudeProxy(req, res, {
       deviceId: device.id,
       machineId: device.machine_id ?? null,
       memberLabel: device.member_label,
-      accountId: device.account_id,
+      accountId,
       accountAlias: account?.alias ?? 'unavailable',
       model: null,
       stream: null,
@@ -185,8 +193,21 @@ export async function handleClaudeProxy(req, res, {
       requestBytes: 0,
       responseBytes: 0,
       upstreamRequestId: null,
-    }, { accountId: device.account_id, deviceId: device.id });
+    }, { accountId, deviceId: device.id });
   };
+  if (accountResolutionError) {
+    log('claude_proxy_device_account_invalid', {
+      device_id: device.id,
+      account_id: accountId,
+      code: accountResolutionError.code ?? accountResolutionError.name ?? 'unknown',
+    });
+    recordRejected(503);
+    sendJson(res, 503, {
+      type: 'error',
+      error: { type: 'api_error', message: 'device account configuration unavailable' },
+    });
+    return;
+  }
   if (!account || account.provider !== 'claude' || account.status === 'disabled') {
     recordRejected(403);
     sendJson(res, 403, { type: 'error', error: { type: 'permission_error', message: 'account unavailable' } });

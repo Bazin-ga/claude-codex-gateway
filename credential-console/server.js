@@ -17,6 +17,7 @@ import {
 import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
+import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
 import { UsageMonitor } from './lib/usage.js';
 import {
@@ -530,6 +531,11 @@ export async function createCredentialConsole(options = {}) {
     const url = new URL(req.url, publicBaseUrl);
     const path = url.pathname;
 
+    if (path.startsWith(MACHINE_CONTROL_PREFIX)) {
+      await handleMachineControl(req, res, { store, log });
+      return;
+    }
+
     if (path.startsWith('/claude/')) {
       await handleClaudeProxy(req, res, {
         store,
@@ -675,6 +681,13 @@ const translations = {
   'no-merge-targets': '还没有任何机器上报过句柄，因此没有可归入的对象。',
   'codex-legacy-note': '这条 Codex 凭据没有机器句柄：要么它登记于机器句柄出现之前——那台机器上的代理会在下次登记时上报句柄；要么它是本控制台代为签发的——那种凭据永远不会上报，因为生成的安装脚本运行的是 pull.js，不含 enroll.js。无论哪种情况，控制台只读取 dispenser 的注册表，无法把句柄写进去。',
   'codex-inventory-unavailable': '至少有一个凭据目录的 Codex 机器列表读不到，因此只有 dispenser 知道的机器不会出现在这个列表里。',
+  'original-account': '原始账号',
+  'allowed-accounts': '允许切换的账号',
+  'selected-account': '当前所选账号',
+  'switch-account': '切换账号',
+  'account-selection-invalid': '账号选择配置无效；系统没有擅自猜测账号。',
+  'no-claude-accounts': '尚未登记 Claude 账号。',
+  'open-account-switch-warning': 'Open 模式没有可验证的操作人：任何能访问控制台的人都可以切换任意有效设备。操作人记录为 anonymous；成员标签不代表操作人。',
   'metrics-dashboard-link': '查看请求指标',
   'metrics-label': '请求指标',
   'metrics-heading': 'Claude 网关请求指标',
@@ -760,6 +773,14 @@ function applyLanguage(language) {
     element.textContent = selected === 'zh'
       ? (translations[element.dataset.i18n] ?? element.dataset.i18nEn)
       : element.dataset.i18nEn;
+  });
+  document.querySelectorAll('[data-account-option], [data-account-label]').forEach((element) => {
+    const alias = element.dataset.accountAlias ?? '';
+    const status = element.dataset.accountStatus ?? '';
+    const key = 'status-' + status.replaceAll('_', '-');
+    const englishStatus = status.replaceAll('_', ' ');
+    const translatedStatus = selected === 'zh' ? (translations[key] ?? englishStatus) : englishStatus;
+    element.textContent = alias + ' · ' + translatedStatus;
   });
   document.querySelectorAll('[data-placeholder-en]').forEach((element) => {
     element.placeholder = selected === 'zh'
@@ -1416,6 +1437,42 @@ document.addEventListener('click', async (event) => {
         });
         redirect(res, '/');
       } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+
+    const switchAccountParams = routeMatch(path, '/devices/:id/account');
+    if (req.method === 'POST' && switchAccountParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const actor = session.admin_identity ?? 'anonymous';
+      try {
+        const summary = await store.configureDeviceAccount({
+          deviceId: switchAccountParams.id,
+          selectedAccountId: String(form.selected_account_id ?? ''),
+          actor,
+          actorType: 'console',
+        });
+        log('device_account_configured', {
+          device_id: summary.device_id,
+          machine_id: summary.machine_id,
+          original_account_id: summary.original_account_id,
+          selected_account_id: summary.selected_account_id,
+          actor,
+        });
+        redirect(res, '/');
+      } catch (error) {
+        log('device_account_configuration_failed', {
+          device_id: switchAccountParams.id,
+          actor,
+          code: error.code ?? error.name ?? 'unknown',
+        });
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }
       return;

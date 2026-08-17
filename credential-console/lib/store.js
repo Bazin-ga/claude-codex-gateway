@@ -38,6 +38,12 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function storeError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
 // A state.json written before the administrator-password mode was removed still
 // carries an `admin` record. Nothing reads it any more; it is left untouched
 // rather than migrated away, so a rollback finds the file it wrote.
@@ -77,6 +83,10 @@ function buildDevice({ account, memberLabel, deviceName, machineId = null }) {
     device: {
       id: randomToken(12),
       account_id: account.id,
+      // P3 policy fields are additive. Rows written before P3 have neither
+      // field and are intentionally handled as legacy by the resolver.
+      allowed_account_ids: [account.id],
+      selected_account_id: account.id,
       member_label: String(memberLabel ?? '').slice(0, 160),
       name: deviceName,
       // Optional and written only when the caller has one. A row without it is
@@ -161,6 +171,7 @@ export class CredentialStore {
     this.state = null;
     this.masterKey = null;
     this.queue = Promise.resolve();
+    this.pendingDeviceAccountFields = new Map();
   }
 
   async init() {
@@ -225,9 +236,17 @@ export class CredentialStore {
       last_failure_at: account.last_failure_at ?? null,
       last_failure: account.last_failure ?? null,
       external: account.external ? { kind: account.external.kind } : null,
-      active_devices: this.state.devices.filter(
-        (device) => device.account_id === account.id && !device.revoked_at,
-      ).length,
+      active_devices: this.state.devices.filter((device) => {
+        if (device.revoked_at) return false;
+        try {
+          return this.#deviceAccountPolicy(device).selectedAccountId === account.id;
+        } catch {
+          // A malformed explicit policy has no trustworthy effective account;
+          // the dashboard surfaces that row as invalid instead of counting it
+          // under an account it may not use.
+          return false;
+        }
+      }).length,
     }));
   }
 
@@ -239,6 +258,389 @@ export class CredentialStore {
     const account = this.accountById(id);
     if (!account?.credential) return null;
     return decryptJson(this.masterKey, account.credential, `account:${id}:credential:v1`);
+  }
+
+  #deviceRecord(deviceOrId) {
+    const id = typeof deviceOrId === 'string' ? deviceOrId : deviceOrId?.id;
+    if (typeof id !== 'string' || !id) {
+      throw storeError('device id is required', 'DEVICE_CONFIGURATION_INVALID');
+    }
+    const device = this.state.devices.find((entry) => entry.id === id);
+    if (!device) throw storeError('device not found', 'DEVICE_CONFIGURATION_INVALID');
+    return device;
+  }
+
+  #deviceAccountPolicy(device) {
+    const pending = this.pendingDeviceAccountFields.get(device.id);
+    if (pending) {
+      device = { ...device };
+      if (pending.hasAllowed) device.allowed_account_ids = pending.allowedAccountIds;
+      else delete device.allowed_account_ids;
+      if (pending.hasSelected) device.selected_account_id = pending.selectedAccountId;
+      else delete device.selected_account_id;
+    }
+    const hasAllowed = Object.hasOwn(device, 'allowed_account_ids');
+    const hasSelected = Object.hasOwn(device, 'selected_account_id');
+    if (!hasAllowed && !hasSelected) {
+      return {
+        legacy: true,
+        allowedAccountIds: [device.account_id],
+        selectedAccountId: device.account_id,
+      };
+    }
+    if (!hasAllowed || !hasSelected) {
+      throw storeError('device account policy is incomplete', 'DEVICE_CONFIGURATION_INVALID');
+    }
+    if (!Array.isArray(device.allowed_account_ids) || device.allowed_account_ids.length === 0) {
+      throw storeError('device account policy allowlist is invalid', 'DEVICE_CONFIGURATION_INVALID');
+    }
+    const allowedAccountIds = device.allowed_account_ids.map((id) => {
+      if (typeof id !== 'string' || !id || id.length > 128) {
+        throw storeError(
+          'device account policy contains an invalid account id',
+          'DEVICE_CONFIGURATION_INVALID',
+        );
+      }
+      const account = this.accountById(id);
+      if (!account) {
+        throw storeError(
+          `device account policy account ${id} was not found`,
+          'DEVICE_CONFIGURATION_INVALID',
+        );
+      }
+      if (account.provider !== 'claude') {
+        throw storeError(
+          `device account policy account ${id} is not a Claude account`,
+          'DEVICE_CONFIGURATION_INVALID',
+        );
+      }
+      return id;
+    });
+    if (new Set(allowedAccountIds).size !== allowedAccountIds.length) {
+      throw storeError(
+        'device account policy allowlist contains duplicates',
+        'DEVICE_CONFIGURATION_INVALID',
+      );
+    }
+    if (!allowedAccountIds.includes(device.account_id)) {
+      throw storeError(
+        'device account policy must retain the original account',
+        'DEVICE_CONFIGURATION_INVALID',
+      );
+    }
+    if (typeof device.selected_account_id !== 'string' || !device.selected_account_id) {
+      throw storeError(
+        'device account policy selected account is invalid',
+        'DEVICE_CONFIGURATION_INVALID',
+      );
+    }
+    if (!allowedAccountIds.includes(device.selected_account_id)) {
+      throw storeError(
+        'device account policy selected account is not allowed',
+        'DEVICE_CONFIGURATION_INVALID',
+      );
+    }
+    return {
+      legacy: false,
+      allowedAccountIds,
+      selectedAccountId: device.selected_account_id,
+    };
+  }
+
+  #captureDeviceAccountFields(device) {
+    return {
+      hasAllowed: Object.hasOwn(device, 'allowed_account_ids'),
+      hasSelected: Object.hasOwn(device, 'selected_account_id'),
+      allowedAccountIds: Array.isArray(device.allowed_account_ids)
+        ? [...device.allowed_account_ids]
+        : device.allowed_account_ids,
+      selectedAccountId: device.selected_account_id,
+      audit: [...this.state.audit],
+    };
+  }
+
+  #restoreDeviceAccountFields(device, before) {
+    if (before.hasAllowed) device.allowed_account_ids = before.allowedAccountIds;
+    else delete device.allowed_account_ids;
+    if (before.hasSelected) device.selected_account_id = before.selectedAccountId;
+    else delete device.selected_account_id;
+    this.state.audit = before.audit;
+  }
+
+  #auditActor({ actor = null, actorType = 'console', actorDeviceId = null }) {
+    const actorKind = actorType === 'device_token' ? 'device_token' : 'console';
+    const fallback = actorKind === 'device_token'
+      ? `device:${actorDeviceId ?? 'unknown'}`
+      : 'administrator';
+    return {
+      actor_kind: actorKind,
+      actor: String(actor ?? fallback).slice(0, 160),
+      actor_device_id: actorDeviceId ?? null,
+    };
+  }
+
+  #deviceAccountAudit({
+    device = null,
+    previousAccountId = null,
+    nextAccountId = null,
+    outcome,
+    reason = null,
+    allowedAdded = null,
+    actor = null,
+    actorType = 'console',
+    actorDeviceId = null,
+  }) {
+    return {
+      ...this.#auditActor({ actor, actorType, actorDeviceId }),
+      device_id: device?.id ?? null,
+      machine_id: device?.machine_id ?? null,
+      previous_account_id: previousAccountId,
+      next_account_id: nextAccountId,
+      outcome,
+      reason: reason ? String(reason).slice(0, 240) : null,
+      allowed_added: allowedAdded ?? null,
+    };
+  }
+
+  async #persistDeviceAccountFailure({
+    device,
+    previousAccountId,
+    nextAccountId,
+    error,
+    event,
+    actor,
+    actorType,
+    actorDeviceId,
+  }) {
+    const auditBefore = [...this.state.audit];
+    this.audit(event, this.#deviceAccountAudit({
+      device,
+      previousAccountId,
+      nextAccountId,
+      outcome: 'failure',
+      reason: error.message,
+      actor,
+      actorType,
+      actorDeviceId,
+    }));
+    try {
+      await this.persist();
+    } catch {
+      this.state.audit = auditBefore;
+    }
+  }
+
+  #assertDeviceMutable(device) {
+    if (device.revoked_at) throw storeError('device is revoked', 'DEVICE_CONFIGURATION_INVALID');
+  }
+
+  #assertSwitchableAccount(account) {
+    if (!account) throw storeError('target account not found', 'DEVICE_CONFIGURATION_INVALID');
+    if (account.provider !== 'claude') {
+      throw storeError('target account is not a Claude account', 'DEVICE_CONFIGURATION_INVALID');
+    }
+    if (!account.credential) throw storeError('target account has no stored credential', 'ACCOUNT_UNAVAILABLE');
+    if (account.status === 'disabled') throw storeError('target account is disabled', 'ACCOUNT_UNAVAILABLE');
+    if (account.expires_at && Date.parse(account.expires_at) <= Date.now()) {
+      throw storeError('target account credential is expired', 'ACCOUNT_UNAVAILABLE');
+    }
+    try {
+      if (!this.accountCredential(account.id)?.oauth_token) {
+        throw storeError('target account has no stored credential', 'ACCOUNT_UNAVAILABLE');
+      }
+    } catch (error) {
+      if (error.code === 'ACCOUNT_UNAVAILABLE') throw error;
+      throw storeError('target account credential is unavailable', 'ACCOUNT_UNAVAILABLE');
+    }
+  }
+
+  /**
+   * Resolve the exact device row's account policy. A legacy row is the only
+   * case where missing fields fall back silently; partial or malformed P3
+   * fields are explicit state errors so a bad migration cannot route traffic
+   * to an arbitrary account.
+   */
+  resolveDeviceAccount(deviceOrId) {
+    const device = this.#deviceRecord(deviceOrId);
+    if (device.revoked_at) throw storeError('device is revoked', 'DEVICE_CONFIGURATION_INVALID');
+    const policy = this.#deviceAccountPolicy(device);
+    const account = this.accountById(policy.selectedAccountId);
+    if (!account) {
+      throw storeError(
+        `selected account ${policy.selectedAccountId} was not found`,
+        'DEVICE_CONFIGURATION_INVALID',
+      );
+    }
+    return {
+      device,
+      account,
+      original_account_id: device.account_id,
+      allowed_account_ids: [...policy.allowedAccountIds],
+      selected_account_id: policy.selectedAccountId,
+      effective_account_id: account.id,
+      source: policy.legacy ? 'legacy' : 'selected',
+    };
+  }
+
+  deviceAccountSummary(deviceId) {
+    const resolved = this.resolveDeviceAccount(deviceId);
+    const { account } = resolved;
+    return {
+      device_id: resolved.device.id,
+      machine_id: resolved.device.machine_id ?? null,
+      member_label: resolved.device.member_label,
+      device_name: resolved.device.name,
+      original_account_id: resolved.original_account_id,
+      allowed_account_ids: resolved.allowed_account_ids,
+      selected_account_id: resolved.selected_account_id,
+      effective_account_id: resolved.effective_account_id,
+      source: resolved.source,
+      account: {
+        id: account.id,
+        alias: account.alias,
+        provider: account.provider,
+        status: account.status,
+        expires_at: account.expires_at ?? null,
+        has_credential: Boolean(account.credential),
+      },
+    };
+  }
+
+  async configureDeviceAccount({
+    deviceId,
+    selectedAccountId,
+    actor = null,
+    actorType = 'console',
+  }) {
+    return this.serialized(async () => {
+      let device = null;
+      let before = null;
+      try {
+        device = this.#deviceRecord(deviceId);
+        before = this.#captureDeviceAccountFields(device);
+        this.pendingDeviceAccountFields.set(device.id, before);
+        this.#assertDeviceMutable(device);
+        if (actorType !== 'console') throw storeError('console policy is required', 'DEVICE_CONFIGURATION_INVALID');
+        if (typeof selectedAccountId !== 'string' || !selectedAccountId) {
+          throw storeError('selected account id is required', 'DEVICE_CONFIGURATION_INVALID');
+        }
+        const account = this.accountById(selectedAccountId);
+        if (!account) throw storeError('target account not found', 'DEVICE_CONFIGURATION_INVALID');
+        if (account.provider !== 'claude') {
+          throw storeError('target account is not a Claude account', 'DEVICE_CONFIGURATION_INVALID');
+        }
+        const policy = this.#deviceAccountPolicy(device);
+        const allowed = [...policy.allowedAccountIds];
+        const allowedAdded = allowed.includes(selectedAccountId) ? [] : [selectedAccountId];
+        allowed.push(...allowedAdded);
+        device.allowed_account_ids = allowed;
+        device.selected_account_id = selectedAccountId;
+        const outcome = policy.selectedAccountId === selectedAccountId && allowedAdded.length === 0
+          ? 'noop'
+          : 'success';
+        this.audit('device_account_configured', this.#deviceAccountAudit({
+          device,
+          previousAccountId: policy.selectedAccountId,
+          nextAccountId: selectedAccountId,
+          outcome,
+          allowedAdded,
+          actor,
+          actorType,
+        }));
+        try {
+          await this.persist();
+        } catch (error) {
+          this.#restoreDeviceAccountFields(device, before);
+          throw error;
+        }
+        this.pendingDeviceAccountFields.delete(device.id);
+        return this.deviceAccountSummary(device.id);
+      } catch (error) {
+        if (device && before) {
+          this.#restoreDeviceAccountFields(device, before);
+          this.pendingDeviceAccountFields.delete(device.id);
+          await this.#persistDeviceAccountFailure({
+            device,
+            previousAccountId: typeof device.selected_account_id === 'string'
+              ? device.selected_account_id
+              : device.account_id,
+            nextAccountId: selectedAccountId,
+            error,
+            event: 'device_account_configure_failed',
+            actor,
+            actorType,
+          });
+        }
+        throw error;
+      }
+    });
+  }
+
+  async switchDeviceAccount({ deviceId, selectedAccountId, actorDeviceId }) {
+    return this.serialized(async () => {
+      let device = null;
+      let before = null;
+      try {
+        device = this.#deviceRecord(deviceId);
+        before = this.#captureDeviceAccountFields(device);
+        this.pendingDeviceAccountFields.set(device.id, before);
+        this.#assertDeviceMutable(device);
+        if (actorDeviceId !== device.id) {
+          throw storeError(
+            'device token may only operate its own device',
+            'DEVICE_SCOPE',
+          );
+        }
+        if (typeof selectedAccountId !== 'string' || !selectedAccountId) {
+          throw storeError('selected account id is required', 'DEVICE_CONFIGURATION_INVALID');
+        }
+        const policy = this.#deviceAccountPolicy(device);
+        if (!policy.allowedAccountIds.includes(selectedAccountId)) {
+          throw storeError('target account is not allowed for this device', 'ACCOUNT_NOT_ALLOWED');
+        }
+        const account = this.accountById(selectedAccountId);
+        this.#assertSwitchableAccount(account);
+        const outcome = policy.selectedAccountId === selectedAccountId ? 'noop' : 'success';
+        device.allowed_account_ids = [...policy.allowedAccountIds];
+        device.selected_account_id = selectedAccountId;
+        this.audit('device_account_switched', this.#deviceAccountAudit({
+          device,
+          previousAccountId: policy.selectedAccountId,
+          nextAccountId: selectedAccountId,
+          outcome,
+          allowedAdded: [],
+          actor: `device:${actorDeviceId}`,
+          actorType: 'device_token',
+          actorDeviceId,
+        }));
+        try {
+          await this.persist();
+        } catch (error) {
+          this.#restoreDeviceAccountFields(device, before);
+          throw error;
+        }
+        this.pendingDeviceAccountFields.delete(device.id);
+        return this.deviceAccountSummary(device.id);
+      } catch (error) {
+        if (device && before) {
+          this.#restoreDeviceAccountFields(device, before);
+          this.pendingDeviceAccountFields.delete(device.id);
+          await this.#persistDeviceAccountFailure({
+            device,
+            previousAccountId: typeof device.selected_account_id === 'string'
+              ? device.selected_account_id
+              : device.account_id,
+            nextAccountId: selectedAccountId,
+            error,
+            event: 'device_account_switch_failed',
+            actor: `device:${actorDeviceId ?? 'unknown'}`,
+            actorType: 'device_token',
+            actorDeviceId,
+          });
+        }
+        throw error;
+      }
+    });
   }
 
   async addAccount({
@@ -305,15 +707,51 @@ export class CredentialStore {
       if (attached) {
         throw new Error(`account still has ${attached} active device(s)`);
       }
-      this.state.accounts = this.state.accounts.filter((entry) => entry.id !== id);
-      // Half-finished authorization sessions and unredeemed enrollment links for a
-      // deleted account are unusable; leaving them would let a stale link resolve
-      // against a missing row.
-      this.state.oauth_flows = this.state.oauth_flows.filter((flow) => flow.account_id !== id);
-      this.state.enrollments = this.state.enrollments.filter((entry) => entry.account_id !== id);
-      this.audit('account_deleted', { account_id: id, provider: account.provider, alias: account.alias });
-      await this.persist();
-      return account;
+      const stateBefore = structuredClone(this.state);
+      try {
+        const prunedPolicies = [];
+        for (const device of this.state.devices) {
+          const hasAllowed = Object.hasOwn(device, 'allowed_account_ids');
+          const hasSelected = Object.hasOwn(device, 'selected_account_id');
+          if (!hasAllowed && !hasSelected) continue;
+          if (device.selected_account_id === id) {
+            if (!device.revoked_at) {
+              throw new Error(`account is selected by active device ${device.id}; switch it before deleting`);
+            }
+            delete device.allowed_account_ids;
+            delete device.selected_account_id;
+            prunedPolicies.push(device.id);
+            continue;
+          }
+          if (Array.isArray(device.allowed_account_ids)
+            && device.allowed_account_ids.includes(id)) {
+            const allowed = device.allowed_account_ids.filter((accountId) => accountId !== id);
+            if (allowed.length > 0 && hasSelected) device.allowed_account_ids = allowed;
+            else {
+              delete device.allowed_account_ids;
+              delete device.selected_account_id;
+            }
+            prunedPolicies.push(device.id);
+          }
+        }
+        this.state.accounts = this.state.accounts.filter((entry) => entry.id !== id);
+        // Half-finished authorization sessions and unredeemed enrollment links for a
+        // deleted account are unusable; leaving them would let a stale link resolve
+        // against a missing row.
+        this.state.oauth_flows = this.state.oauth_flows.filter((flow) => flow.account_id !== id);
+        this.state.enrollments = this.state.enrollments.filter((entry) => entry.account_id !== id);
+        this.audit('account_deleted', {
+          account_id: id,
+          provider: account.provider,
+          alias: account.alias,
+          device_account_policies_pruned: prunedPolicies,
+        });
+        await this.persist();
+        return account;
+      } catch (error) {
+        this.state = stateBefore;
+        throw error;
+      }
     });
   }
 
@@ -710,7 +1148,18 @@ export class CredentialStore {
   }
 
   publicDevices() {
-    return this.state.devices.map(({ token_sha256: _secret, ...device }) => ({ ...device }));
+    return this.state.devices.map((stored) => {
+      const pending = this.pendingDeviceAccountFields.get(stored.id);
+      const device = pending ? { ...stored } : stored;
+      if (pending) {
+        if (pending.hasAllowed) device.allowed_account_ids = pending.allowedAccountIds;
+        else delete device.allowed_account_ids;
+        if (pending.hasSelected) device.selected_account_id = pending.selectedAccountId;
+        else delete device.selected_account_id;
+      }
+      const { token_sha256: _secret, ...publicDevice } = device;
+      return { ...publicDevice };
+    });
   }
 
   /**
