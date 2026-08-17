@@ -3,7 +3,7 @@ import { chmod, mkdir, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 export const METRICS_FILENAME = 'metrics.sqlite';
-export const METRICS_SCHEMA_VERSION = 1;
+export const METRICS_SCHEMA_VERSION = 2;
 
 const HOUR_MS = 60 * 60 * 1000;
 const DEFAULT_BATCH_SIZE = 64;
@@ -21,6 +21,7 @@ const MAX_IDENTIFIER = 128;
 const MAX_MACHINE_ID = 128;
 const MAX_OUTCOME = 64;
 const MAX_UPSTREAM_REQUEST_ID = 256;
+const USAGE_STATES = Object.freeze(['unavailable', 'partial', 'complete']);
 
 const CREATE_SCHEMA_META = `
   CREATE TABLE IF NOT EXISTS schema_meta (
@@ -50,9 +51,28 @@ const CREATE_REQUEST_METRICS = `
     duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
     request_bytes INTEGER NOT NULL CHECK (request_bytes >= 0),
     response_bytes INTEGER NOT NULL CHECK (response_bytes >= 0),
-    upstream_request_id TEXT
+    upstream_request_id TEXT,
+    input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+    cache_creation_input_tokens INTEGER
+      CHECK (cache_creation_input_tokens IS NULL OR cache_creation_input_tokens >= 0),
+    cache_read_input_tokens INTEGER
+      CHECK (cache_read_input_tokens IS NULL OR cache_read_input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+    usage_state TEXT NOT NULL DEFAULT 'unavailable'
+      CHECK (usage_state IN ('unavailable', 'partial', 'complete'))
   )
 `;
+
+const V2_COLUMN_DEFINITIONS = Object.freeze({
+  input_tokens: 'INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0)',
+  cache_creation_input_tokens:
+    'INTEGER CHECK (cache_creation_input_tokens IS NULL OR cache_creation_input_tokens >= 0)',
+  cache_read_input_tokens:
+    'INTEGER CHECK (cache_read_input_tokens IS NULL OR cache_read_input_tokens >= 0)',
+  output_tokens: 'INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0)',
+  usage_state:
+    "TEXT NOT NULL DEFAULT 'unavailable' CHECK (usage_state IN ('unavailable', 'partial', 'complete'))",
+});
 
 const CREATE_INDEXES = [
   'CREATE INDEX IF NOT EXISTS request_metrics_started_idx ON request_metrics(started_at_ms)',
@@ -82,8 +102,13 @@ const INSERT_REQUEST = `
     duration_ms,
     request_bytes,
     response_bytes,
-    upstream_request_id
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    upstream_request_id,
+    input_tokens,
+    cache_creation_input_tokens,
+    cache_read_input_tokens,
+    output_tokens,
+    usage_state
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `;
 
 const AGGREGATE_SELECT = `
@@ -99,7 +124,23 @@ const AGGREGATE_SELECT = `
   COALESCE(SUM(request_bytes), 0) AS request_bytes,
   COALESCE(SUM(response_bytes), 0) AS response_bytes,
   AVG(ttfb_ms) AS avg_ttfb_ms,
-  AVG(duration_ms) AS avg_duration_ms
+  AVG(duration_ms) AS avg_duration_ms,
+  CASE WHEN COUNT(input_tokens) = 0 THEN NULL ELSE TOTAL(input_tokens) END AS input_tokens,
+  COUNT(input_tokens) AS input_tokens_known_count,
+  CASE WHEN COUNT(cache_creation_input_tokens) = 0
+    THEN NULL ELSE TOTAL(cache_creation_input_tokens) END AS cache_creation_input_tokens,
+  COUNT(cache_creation_input_tokens) AS cache_creation_input_tokens_known_count,
+  CASE WHEN COUNT(cache_read_input_tokens) = 0
+    THEN NULL ELSE TOTAL(cache_read_input_tokens) END AS cache_read_input_tokens,
+  COUNT(cache_read_input_tokens) AS cache_read_input_tokens_known_count,
+  CASE WHEN COUNT(output_tokens) = 0 THEN NULL ELSE TOTAL(output_tokens) END AS output_tokens,
+  COUNT(output_tokens) AS output_tokens_known_count,
+  COALESCE(SUM(CASE WHEN usage_state = 'complete' THEN 1 ELSE 0 END), 0)
+    AS usage_complete_count,
+  COALESCE(SUM(CASE WHEN usage_state = 'partial' THEN 1 ELSE 0 END), 0)
+    AS usage_partial_count,
+  COALESCE(SUM(CASE WHEN usage_state = 'unavailable' THEN 1 ELSE 0 END), 0)
+    AS usage_unavailable_count
 `;
 
 const AGGREGATE_ORDER = `
@@ -169,6 +210,40 @@ function normalizeRow(input) {
     throw new TypeError('statusCode must be between 100 and 999');
   }
 
+  const inputTokens = finiteInteger(input.inputTokens, 'inputTokens', { nullable: true });
+  const cacheCreationInputTokens = finiteInteger(
+    input.cacheCreationInputTokens,
+    'cacheCreationInputTokens',
+    { nullable: true },
+  );
+  const cacheReadInputTokens = finiteInteger(
+    input.cacheReadInputTokens,
+    'cacheReadInputTokens',
+    { nullable: true },
+  );
+  const outputTokens = finiteInteger(input.outputTokens, 'outputTokens', { nullable: true });
+  const hasUsage = [
+    inputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
+    outputTokens,
+  ].some((value) => value !== null);
+  const usageState = input.usageState === undefined
+    ? (hasUsage ? 'partial' : 'unavailable')
+    : input.usageState;
+  if (!USAGE_STATES.includes(usageState)) {
+    throw new TypeError('usageState must be unavailable, partial, or complete');
+  }
+  if (usageState === 'unavailable' && hasUsage) {
+    throw new TypeError('unavailable usageState requires all token counts to be null');
+  }
+  if (usageState === 'partial' && !hasUsage) {
+    throw new TypeError('partial usageState requires at least one token count');
+  }
+  if (usageState === 'complete' && (inputTokens === null || outputTokens === null)) {
+    throw new TypeError('complete usageState requires inputTokens and outputTokens');
+  }
+
   return {
     retryCount: 0,
     startedAtMs,
@@ -196,10 +271,26 @@ function normalizeRow(input) {
       MAX_UPSTREAM_REQUEST_ID,
       { emptyAsNull: true },
     ),
+    inputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
+    outputTokens,
+    usageState,
   };
 }
 
+function tokenAggregate(value) {
+  if (value === null || value === undefined) return { value: null, overflow: false };
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric < 0) return { value: null, overflow: true };
+  return { value: numeric, overflow: false };
+}
+
 function normalizeAggregateRow(row) {
+  const inputTokens = tokenAggregate(row.input_tokens);
+  const cacheCreationInputTokens = tokenAggregate(row.cache_creation_input_tokens);
+  const cacheReadInputTokens = tokenAggregate(row.cache_read_input_tokens);
+  const outputTokens = tokenAggregate(row.output_tokens);
   return {
     requestCount: Number(row.request_count),
     successCount: Number(row.success_count),
@@ -208,6 +299,23 @@ function normalizeAggregateRow(row) {
     totalResponseBytes: Number(row.response_bytes),
     avgTtfbMs: row.avg_ttfb_ms === null ? null : Number(row.avg_ttfb_ms),
     avgDurationMs: row.avg_duration_ms === null ? null : Number(row.avg_duration_ms),
+    totalInputTokens: inputTokens.value,
+    totalInputTokensKnownCount: Number(row.input_tokens_known_count),
+    totalCacheCreationInputTokens: cacheCreationInputTokens.value,
+    totalCacheCreationInputTokensKnownCount: Number(row.cache_creation_input_tokens_known_count),
+    totalCacheReadInputTokens: cacheReadInputTokens.value,
+    totalCacheReadInputTokensKnownCount: Number(row.cache_read_input_tokens_known_count),
+    totalOutputTokens: outputTokens.value,
+    totalOutputTokensKnownCount: Number(row.output_tokens_known_count),
+    usageCompleteCount: Number(row.usage_complete_count),
+    usagePartialCount: Number(row.usage_partial_count),
+    usageUnavailableCount: Number(row.usage_unavailable_count),
+    tokenTotalsOverflow: [
+      inputTokens,
+      cacheCreationInputTokens,
+      cacheReadInputTokens,
+      outputTokens,
+    ].some((entry) => entry.overflow),
   };
 }
 
@@ -279,6 +387,78 @@ function filterParams(filters) {
     filters.model, filters.model,
     filters.scope,
   ];
+}
+
+function requestMetricsTableExists(db) {
+  return Boolean(db.prepare(`
+    SELECT 1 AS present FROM sqlite_master
+    WHERE type = 'table' AND name = 'request_metrics'
+  `).get());
+}
+
+function requestMetricsColumnInfo(db) {
+  return new Map(
+    db.prepare('PRAGMA table_info(request_metrics)').all()
+      .map((column) => [column.name, column]),
+  );
+}
+
+function assertV2Columns(db) {
+  const columns = requestMetricsColumnInfo(db);
+  for (const [name, definition] of Object.entries(V2_COLUMN_DEFINITIONS)) {
+    const column = columns.get(name);
+    if (!column) throw new Error(`metrics schema is missing column ${name}`);
+    const expectedType = definition.startsWith('TEXT') ? 'TEXT' : 'INTEGER';
+    if (String(column.type).toUpperCase() !== expectedType) {
+      throw new Error(`metrics column ${name} has incompatible type ${column.type}`);
+    }
+    if (name === 'usage_state') {
+      if (column.notnull !== 1 || column.dflt_value !== "'unavailable'") {
+        throw new Error(`metrics column ${name} has incompatible null/default contract`);
+      }
+    } else if (column.notnull !== 0) {
+      throw new Error(`metrics column ${name} must be nullable`);
+    }
+  }
+  const tableSql = db.prepare(`
+    SELECT sql FROM sqlite_master
+    WHERE type = 'table' AND name = 'request_metrics'
+  `).get()?.sql;
+  const normalizedSql = String(tableSql ?? '').replace(/\s+/g, ' ').toLowerCase();
+  for (const name of [
+    'input_tokens',
+    'cache_creation_input_tokens',
+    'cache_read_input_tokens',
+    'output_tokens',
+  ]) {
+    const escaped = name.replaceAll('_', '[_]');
+    const constraint = new RegExp(
+      `${escaped} integer check \\( ?${escaped} is null or ${escaped} >= 0 ?\\)`,
+    );
+    if (!constraint.test(normalizedSql)) {
+      throw new Error(`metrics column ${name} is missing its non-negative CHECK constraint`);
+    }
+  }
+  if (!normalizedSql.includes(
+    "check (usage_state in ('unavailable', 'partial', 'complete'))",
+  )) {
+    throw new Error('metrics column usage_state is missing its CHECK constraint');
+  }
+}
+
+function migrateRequestMetricsToV2(db) {
+  if (!requestMetricsTableExists(db)) {
+    throw new Error('existing metrics database has no request_metrics table');
+  }
+  const columns = requestMetricsColumnInfo(db);
+  const partial = Object.keys(V2_COLUMN_DEFINITIONS).filter((name) => columns.has(name));
+  if (partial.length) {
+    throw new Error(`metrics schema v1 contains untrusted partial v2 columns: ${partial.join(', ')}`);
+  }
+  for (const [name, definition] of Object.entries(V2_COLUMN_DEFINITIONS)) {
+    db.exec(`ALTER TABLE request_metrics ADD COLUMN ${name} ${definition}`);
+  }
+  assertV2Columns(db);
 }
 
 export class MetricsStore {
@@ -412,25 +592,39 @@ export class MetricsStore {
           }
         }
         this.db.exec(CREATE_SCHEMA_META);
-        const existing = this.db.prepare(
+        const schemaMeta = this.db.prepare(
           'SELECT schema_version FROM schema_meta WHERE singleton = 1',
         ).get();
-        if (existing && !Number.isInteger(existing.schema_version)) {
+        if (databaseExisted && !schemaMeta) {
+          throw new Error('existing metrics database has no schema version row');
+        }
+        if (schemaMeta && !Number.isInteger(schemaMeta.schema_version)) {
           throw new Error('metrics schema_version is invalid');
         }
-        if (existing && existing.schema_version > METRICS_SCHEMA_VERSION) {
+        if (schemaMeta && schemaMeta.schema_version > METRICS_SCHEMA_VERSION) {
           throw new Error(
-            `metrics schema_version ${existing.schema_version} is newer than supported ${METRICS_SCHEMA_VERSION}`,
+            `metrics schema_version ${schemaMeta.schema_version} is newer than supported ${METRICS_SCHEMA_VERSION}`,
           );
         }
-        if (existing && existing.schema_version < METRICS_SCHEMA_VERSION) {
+        if (!schemaMeta) {
+          this.db.exec(CREATE_REQUEST_METRICS);
+          assertV2Columns(this.db);
+        } else if (schemaMeta.schema_version === 1) {
+          migrateRequestMetricsToV2(this.db);
+          this.db.prepare(`
+            UPDATE schema_meta
+            SET schema_version = ?, updated_at_ms = ?
+            WHERE singleton = 1
+          `).run(METRICS_SCHEMA_VERSION, this.#now());
+        } else if (schemaMeta.schema_version === METRICS_SCHEMA_VERSION) {
+          assertV2Columns(this.db);
+        } else {
           throw new Error(
-            `metrics schema_version ${existing.schema_version} cannot be migrated to ${METRICS_SCHEMA_VERSION}`,
+            `metrics schema_version ${schemaMeta.schema_version} cannot be migrated to ${METRICS_SCHEMA_VERSION}`,
           );
         }
-        this.db.exec(CREATE_REQUEST_METRICS);
         for (const sql of CREATE_INDEXES) this.db.exec(sql);
-        if (!existing) {
+        if (!schemaMeta) {
           this.db.prepare(`
             INSERT INTO schema_meta (singleton, schema_version, updated_at_ms)
             VALUES (1, ?, ?)
@@ -513,6 +707,11 @@ export class MetricsStore {
           row.requestBytes,
           row.responseBytes,
           row.upstreamRequestId,
+          row.inputTokens,
+          row.cacheCreationInputTokens,
+          row.cacheReadInputTokens,
+          row.outputTokens,
+          row.usageState,
         );
       }
       this.db.exec('COMMIT');

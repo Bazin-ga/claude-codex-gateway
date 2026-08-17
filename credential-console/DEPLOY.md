@@ -758,6 +758,20 @@ Browser checks:
     installer;
 15. in a deliberately private `open` test deployment, confirm the dashboard visibly warns that
     anyone reachable can read the live guide and its deployment/account metadata.
+16. open `/metrics` and confirm it displays separate input, cache-creation input, cache-read input,
+    and output token totals plus known-value counts, a dedicated hourly token SVG, and matching
+    hourly table columns;
+17. feed a fixture with complete, partial, unavailable, null, and known-zero usage values and
+    confirm the page labels partial totals as a lower bound, renders unknown as `—` rather than
+    zero, and leaves unknown hourly SVG points blank;
+18. confirm the token page states that it covers Claude gateway traffic only, excludes Codex, and
+    keeps the existing request/response-body-not-stored and open-mode visibility notices.
+
+The first start with token accounting migrates `metrics.sqlite` schema 1 to 2 transactionally.
+Take the normal checkpointed backup immediately before that start. If the code must be rolled back
+to a pre-token-accounting release, stop the console, restore the pre-upgrade `metrics.sqlite` only,
+remove `metrics.sqlite-wal` and `metrics.sqlite-shm`, then start the old code. Do not roll
+`master.key` or `state.json` back for a metrics-only rollback.
 
 For a real Claude account, have its owner complete the permanent owner-authorization page and
 run a bounded real turn from a newly enrolled client before adding more members. The permanent

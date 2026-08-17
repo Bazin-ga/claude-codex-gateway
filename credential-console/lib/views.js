@@ -138,8 +138,13 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-filters .filter-actions { display: flex; gap: 8px; align-items: center; }
 .metrics-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .metrics-summary .summary { grid-column: auto; }
+.metrics-token-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.metrics-token-summary .summary { grid-column: auto; }
+.metrics-token-summary .summary strong { word-break: break-word; }
+.metrics-token-known { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
 .metrics-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .metrics-chart { min-width: 0; border: 1px solid var(--line); border-radius: 14px; padding: 14px; background: #fbfcf9; }
+.metrics-chart-wide { grid-column: 1 / -1; }
 .metrics-chart h3 { margin: 0 0 10px; font-size: 16px; }
 .metrics-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
 .metrics-chart .metrics-grid-line { stroke: var(--line); stroke-width: 1; }
@@ -150,6 +155,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-chart .metrics-line.error, .metrics-chart .metrics-swatch.error { stroke: var(--red); background: var(--red); }
 .metrics-chart .metrics-line.ttfb, .metrics-chart .metrics-swatch.ttfb { stroke: var(--amber); background: var(--amber); }
 .metrics-chart .metrics-line.duration, .metrics-chart .metrics-swatch.duration { stroke: var(--ink); background: var(--ink); }
+.metrics-chart .metrics-line.input, .metrics-chart .metrics-swatch.input { stroke: var(--blue); background: var(--blue); }
+.metrics-chart .metrics-line.cache-create, .metrics-chart .metrics-swatch.cache-create { stroke: var(--amber); background: var(--amber); }
+.metrics-chart .metrics-line.cache-read, .metrics-chart .metrics-swatch.cache-read { stroke: var(--green); background: var(--green); }
+.metrics-chart .metrics-line.output, .metrics-chart .metrics-swatch.output { stroke: var(--red); background: var(--red); }
 .metrics-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
 .metrics-legend-item { display: inline-flex; gap: 6px; align-items: center; }
 .metrics-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
@@ -168,7 +177,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .identity-chip { white-space: normal; }
   .provider-grid, .member-form, .member-form.codex-form,
   .member-form.with-label, .member-form.codex-form.with-label,
-  .merge-form, .metrics-filters, .metrics-chart-grid { grid-template-columns: 1fr; }
+  .merge-form, .metrics-filters, .metrics-chart-grid, .metrics-token-summary { grid-template-columns: 1fr; }
+  .metrics-chart-wide { grid-column: auto; }
 }
 `;
 
@@ -604,6 +614,72 @@ function metricCount(value) {
   return Math.round(finiteMetricNumber(value, { max: 9_000_000_000_000_000 }));
 }
 
+function metricTokenNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return Math.min(9_000_000_000_000_000, Math.round(numeric));
+}
+
+function metricTokenKnownCount(source, totalField) {
+  const suffix = totalField.slice('total'.length);
+  const lowerCamel = `${suffix.slice(0, 1).toLowerCase()}${suffix.slice(1)}`;
+  for (const key of [`${totalField}KnownCount`, `${lowerCamel}KnownCount`]) {
+    if (Object.hasOwn(source ?? {}, key)) return metricCount(source[key]);
+  }
+  return 0;
+}
+
+function metricTokenText(value) {
+  return value === null ? '—' : metricDisplayNumber(value);
+}
+
+const TOKEN_METRIC_FIELDS = Object.freeze([
+  'totalInputTokens',
+  'totalCacheCreationInputTokens',
+  'totalCacheReadInputTokens',
+  'totalOutputTokens',
+]);
+
+const TOKEN_ROW_FIELDS = Object.freeze([
+  ...TOKEN_METRIC_FIELDS,
+  'totalInputTokensKnownCount',
+  'totalCacheCreationInputTokensKnownCount',
+  'totalCacheReadInputTokensKnownCount',
+  'totalOutputTokensKnownCount',
+  'usageUnavailableCount',
+  'usagePartialCount',
+  'usageCompleteCount',
+  'tokenApplicable',
+  'tokenTotalsOverflow',
+]);
+
+function emptyMetricRow(hourBucketMs) {
+  return {
+    hourBucketMs,
+    requestCount: 0,
+    successCount: 0,
+    errorCount: 0,
+    totalRequestBytes: 0,
+    totalResponseBytes: 0,
+    avgTtfbMs: null,
+    avgDurationMs: null,
+    totalInputTokens: null,
+    totalCacheCreationInputTokens: null,
+    totalCacheReadInputTokens: null,
+    totalOutputTokens: null,
+    totalInputTokensKnownCount: 0,
+    totalCacheCreationInputTokensKnownCount: 0,
+    totalCacheReadInputTokensKnownCount: 0,
+    totalOutputTokensKnownCount: 0,
+    usageUnavailableCount: 0,
+    usagePartialCount: 0,
+    usageCompleteCount: 0,
+    tokenApplicable: false,
+    tokenTotalsOverflow: false,
+  };
+}
+
 function metricDuration(value) {
   if (value === null || value === undefined || value === '') return null;
   const numeric = Number(value);
@@ -628,10 +704,10 @@ function metricHourLabel(value) {
   return `${date.toISOString().slice(0, 16).replace('T', ' ')}Z`;
 }
 
-function normalizeMetricRows(hourly) {
+function normalizeMetricRows(hourly, { tokenRows = false } = {}) {
   if (!Array.isArray(hourly)) return [];
   return hourly.map((row) => ({
-    hourBucketMs: Number(row?.hourBucketMs),
+    ...emptyMetricRow(Number(row?.hourBucketMs)),
     requestCount: metricCount(row?.requestCount),
     successCount: metricCount(row?.successCount),
     errorCount: metricCount(row?.errorCount),
@@ -639,7 +715,49 @@ function normalizeMetricRows(hourly) {
     totalResponseBytes: metricCount(row?.totalResponseBytes),
     avgTtfbMs: metricDuration(row?.avgTtfbMs),
     avgDurationMs: metricDuration(row?.avgDurationMs),
+    totalInputTokens: metricTokenNumber(row?.totalInputTokens),
+    totalCacheCreationInputTokens: metricTokenNumber(row?.totalCacheCreationInputTokens),
+    totalCacheReadInputTokens: metricTokenNumber(row?.totalCacheReadInputTokens),
+    totalOutputTokens: metricTokenNumber(row?.totalOutputTokens),
+    totalInputTokensKnownCount: metricTokenKnownCount(row, 'totalInputTokens'),
+    totalCacheCreationInputTokensKnownCount: metricTokenKnownCount(row, 'totalCacheCreationInputTokens'),
+    totalCacheReadInputTokensKnownCount: metricTokenKnownCount(row, 'totalCacheReadInputTokens'),
+    totalOutputTokensKnownCount: metricTokenKnownCount(row, 'totalOutputTokens'),
+    usageUnavailableCount: metricCount(row?.usageUnavailableCount),
+    usagePartialCount: metricCount(row?.usagePartialCount),
+    usageCompleteCount: metricCount(row?.usageCompleteCount),
+    tokenApplicable: tokenRows,
+    tokenTotalsOverflow: row?.tokenTotalsOverflow === true,
   }));
+}
+
+function normalizeMetricTokenTotals(totals) {
+  const source = totals ?? {};
+  return {
+    totalInputTokens: metricTokenNumber(source.totalInputTokens),
+    totalCacheCreationInputTokens: metricTokenNumber(source.totalCacheCreationInputTokens),
+    totalCacheReadInputTokens: metricTokenNumber(source.totalCacheReadInputTokens),
+    totalOutputTokens: metricTokenNumber(source.totalOutputTokens),
+    totalInputTokensKnownCount: metricTokenKnownCount(source, 'totalInputTokens'),
+    totalCacheCreationInputTokensKnownCount: metricTokenKnownCount(source, 'totalCacheCreationInputTokens'),
+    totalCacheReadInputTokensKnownCount: metricTokenKnownCount(source, 'totalCacheReadInputTokens'),
+    totalOutputTokensKnownCount: metricTokenKnownCount(source, 'totalOutputTokens'),
+    usageUnavailableCount: metricCount(source.usageUnavailableCount),
+    usagePartialCount: metricCount(source.usagePartialCount),
+    usageCompleteCount: metricCount(source.usageCompleteCount),
+    tokenTotalsOverflow: source.tokenTotalsOverflow === true,
+  };
+}
+
+function mergeMetricRows(requestRows, tokenRows) {
+  const rows = new Map();
+  for (const row of requestRows) rows.set(row.hourBucketMs, { ...row });
+  for (const row of tokenRows) {
+    const current = rows.get(row.hourBucketMs) ?? emptyMetricRow(row.hourBucketMs);
+    for (const field of TOKEN_ROW_FIELDS) current[field] = row[field];
+    rows.set(row.hourBucketMs, current);
+  }
+  return [...rows.values()].sort((left, right) => left.hourBucketMs - right.hourBucketMs);
 }
 
 function metricOption(value, label, selected, { i18n = null } = {}) {
@@ -698,12 +816,20 @@ function metricSvgNumber(value) {
 function metricPolyline(rows, getter, maxValue, plot) {
   if (!rows.length) return '';
   const denominator = Math.max(rows.length - 1, 1);
+  let open = false;
   return rows.map((row, index) => {
-    const value = finiteMetricNumber(getter(row), { max: maxValue });
+    const rawValue = getter(row);
+    if (rawValue === null || rawValue === undefined || rawValue === '') {
+      open = false;
+      return '';
+    }
+    const value = finiteMetricNumber(rawValue, { max: maxValue });
     const x = plot.left + (plot.width * index) / denominator;
     const y = plot.top + plot.height - (plot.height * value) / Math.max(maxValue, 1);
-    return `${index === 0 ? 'M' : 'L'} ${metricSvgNumber(x)} ${metricSvgNumber(y)}`;
-  }).join(' ');
+    const command = open ? 'L' : 'M';
+    open = true;
+    return `${command} ${metricSvgNumber(x)} ${metricSvgNumber(y)}`;
+  }).filter(Boolean).join(' ');
 }
 
 function metricSvgChart({
@@ -725,9 +851,10 @@ function metricSvgChart({
   const height = 260;
   const plot = { left: 54, top: 24, width: 644, height: 184 };
   const safeRows = Array.isArray(rows) ? rows : [];
-  const values = safeRows.flatMap((row) => series.map((entry) => (
-    finiteMetricNumber(entry.getter(row), { max: 9_000_000_000_000_000 })
-  )));
+  const values = safeRows.flatMap((row) => series
+    .map((entry) => entry.getter(row))
+    .filter((value) => value !== null && value !== undefined && value !== '')
+    .map((value) => finiteMetricNumber(value, { max: 9_000_000_000_000_000 })));
   const scale = Math.max(1, finiteMetricNumber(maxValue ?? Math.max(...values, 0), {
     max: 9_000_000_000_000_000,
   }));
@@ -737,7 +864,7 @@ function metricSvgChart({
   const commonStart = `<svg role="img" aria-labelledby="${escapeHtml(labelledBy)}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
     <title id="${escapeHtml(titleId)}"${titleAttribute}>${escapeHtml(title)}</title>
     <desc id="${escapeHtml(descriptionId)}"${descriptionAttribute}>${escapeHtml(description)}</desc>`;
-  if (!safeRows.length) {
+  if (!safeRows.length || !values.length) {
     return `${commonStart}
     <text class="metrics-axis" x="${width / 2}" y="${height / 2}" text-anchor="middle" data-i18n="${escapeHtml(emptyI18n)}">${escapeHtml(emptyText)}</text>
   </svg>`;
@@ -771,6 +898,78 @@ function metricLegend(series) {
   </div>`;
 }
 
+function tokenSummaryCard({ label, i18n, value, knownCount }) {
+  return `<article class="card summary">
+    <span class="muted" data-i18n="${escapeHtml(i18n)}">${escapeHtml(label)}</span>
+    <strong>${escapeHtml(metricTokenText(value))}</strong>
+    <span class="metrics-token-known"><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(knownCount))}</span>
+  </article>`;
+}
+
+function tokenCoverageNotice(totals) {
+  const hasAnyTotal = TOKEN_METRIC_FIELDS.some((field) => totals[field] !== null);
+  const hasUnknownTotal = TOKEN_METRIC_FIELDS.some((field) => totals[field] === null);
+  const complete = totals.usageCompleteCount;
+  const partial = totals.usagePartialCount;
+  const unavailable = totals.usageUnavailableCount;
+  const hasKnownValue = TOKEN_METRIC_FIELDS.some((field) => (
+    totals[`${field}KnownCount`] > 0
+  ));
+  let i18n = 'metrics-token-coverage-unavailable';
+  let text = 'Token usage is unavailable for this selection; — means unknown, not zero.';
+  let className = 'notice';
+  if (totals.tokenTotalsOverflow) {
+    if (partial > 0 || unavailable > 0) {
+      i18n = 'metrics-token-coverage-overflow-lower-bound';
+      text = 'At least one total is too large to display exactly, and partial or unavailable usage makes the visible sums lower bounds.';
+    } else {
+      i18n = 'metrics-token-coverage-overflow';
+      text = 'At least one token total is too large to display exactly; raw per-request counts remain stored.';
+    }
+    className = 'notice error';
+  } else if (hasAnyTotal && (partial > 0 || unavailable > 0)) {
+    i18n = 'metrics-token-coverage-lower-bound';
+    text = 'Token totals are a lower bound; partial or unavailable usage is not treated as zero.';
+    className = 'notice error';
+  } else if (complete > 0 && hasUnknownTotal) {
+    i18n = 'metrics-token-coverage-complete-with-unknown';
+    text = 'Usage records are complete, but — categories were not reported by the provider.';
+  } else if (hasAnyTotal && !hasUnknownTotal && (complete > 0 || hasKnownValue)) {
+    i18n = 'metrics-token-coverage-complete';
+    text = 'Token totals are exact for complete usage records.';
+    className = 'notice success';
+  }
+  return `<div class="${className} metrics-token-coverage" role="note">
+    <p><span data-i18n="${i18n}">${text}</span></p>
+    <p class="tiny">
+      <span data-i18n="metrics-token-complete-count">Complete</span>: ${escapeHtml(metricDisplayNumber(complete))}
+      · <span data-i18n="metrics-token-partial-count">Partial</span>: ${escapeHtml(metricDisplayNumber(partial))}
+      · <span data-i18n="metrics-token-unavailable-count">Unavailable</span>: ${escapeHtml(metricDisplayNumber(unavailable))}
+    </p>
+  </div>`;
+}
+
+function metricUsageCoverage(row) {
+  const allKnown = TOKEN_METRIC_FIELDS.every((field) => row[field] !== null);
+  if (!row.tokenApplicable) {
+    return '<span data-i18n="metrics-usage-not-applicable">Not applicable</span>';
+  }
+  if (row.tokenTotalsOverflow) {
+    return '<span data-i18n="metrics-usage-overflow">Too large to total exactly</span>';
+  }
+  if (row.usageCompleteCount > 0 && row.usagePartialCount === 0
+    && row.usageUnavailableCount === 0) {
+    return allKnown
+      ? '<span data-i18n="metrics-usage-complete">Complete</span>'
+      : '<span data-i18n="metrics-usage-complete-with-unknown">Complete / some categories unknown</span>';
+  }
+  if (TOKEN_METRIC_FIELDS.some((field) => row[field] !== null)
+    || row.usagePartialCount > 0) {
+    return '<span data-i18n="metrics-usage-partial">Partial / lower bound</span>';
+  }
+  return '<span data-i18n="metrics-usage-unavailable">Unavailable</span>';
+}
+
 function metricsTable(rows) {
   const body = rows.length
     ? rows.map((row) => `<tr>
@@ -782,8 +981,13 @@ function metricsTable(rows) {
         <td>${escapeHtml(metricDisplayNumber(row.totalResponseBytes))}</td>
         <td>${row.avgTtfbMs === null ? '—' : escapeHtml(metricDisplayNumber(row.avgTtfbMs, { decimals: 1 }))}</td>
         <td>${row.avgDurationMs === null ? '—' : escapeHtml(metricDisplayNumber(row.avgDurationMs, { decimals: 1 }))}</td>
+        <td>${escapeHtml(metricTokenText(row.totalInputTokens))}</td>
+        <td>${escapeHtml(metricTokenText(row.totalCacheCreationInputTokens))}</td>
+        <td>${escapeHtml(metricTokenText(row.totalCacheReadInputTokens))}</td>
+        <td>${escapeHtml(metricTokenText(row.totalOutputTokens))}</td>
+        <td>${metricUsageCoverage(row)}</td>
       </tr>`).join('')
-    : '<tr><td colspan="8" class="empty" data-i18n="metrics-no-data">No matching request data for this period.</td></tr>';
+    : '<tr><td colspan="13" class="empty" data-i18n="metrics-no-data">No matching request data for this period.</td></tr>';
   return `<div class="metrics-table-wrap">
     <table class="metrics-table">
       <thead><tr>
@@ -795,6 +999,11 @@ function metricsTable(rows) {
         <th data-i18n="metrics-response-bytes">Response bytes</th>
         <th data-i18n="metrics-avg-ttfb">Avg TTFB (ms)</th>
         <th data-i18n="metrics-avg-duration">Avg duration (ms)</th>
+        <th data-i18n="metrics-total-input-tokens">Input tokens</th>
+        <th data-i18n="metrics-total-cache-creation-input-tokens">Cache creation input tokens</th>
+        <th data-i18n="metrics-total-cache-read-input-tokens">Cache read input tokens</th>
+        <th data-i18n="metrics-total-output-tokens">Output tokens</th>
+        <th data-i18n="metrics-usage-coverage">Usage coverage</th>
       </tr></thead>
       <tbody>${body}</tbody>
     </table>
@@ -806,6 +1015,8 @@ export function metricsView({
   options = {},
   totals = {},
   hourly = [],
+  tokenTotals = {},
+  tokenHourly = [],
   openMode = false,
   metricsAvailable = true,
   droppedMetrics = 0,
@@ -820,7 +1031,10 @@ export function metricsView({
   const selectedAccount = String(filters.accountId ?? '');
   const selectedModel = String(filters.model ?? '');
   const unattributedMachine = Boolean(filters.unattributedMachine);
-  const rows = normalizeMetricRows(hourly);
+  const requestRows = normalizeMetricRows(hourly);
+  const tokenRows = normalizeMetricRows(tokenHourly, { tokenRows: true });
+  const rows = mergeMetricRows(requestRows, tokenRows);
+  const normalizedTokenTotals = normalizeMetricTokenTotals(tokenTotals);
   const allTotal = metricCount(totals.all);
   const consumptionTotal = metricCount(totals.consumption);
   const requestSeries = [
@@ -831,6 +1045,12 @@ export function metricsView({
   const latencySeries = [
     { className: 'ttfb', i18n: 'metrics-series-ttfb', label: 'Average TTFB (ms)', getter: (row) => row.avgTtfbMs ?? 0 },
     { className: 'duration', i18n: 'metrics-series-duration', label: 'Average duration (ms)', getter: (row) => row.avgDurationMs ?? 0 },
+  ];
+  const tokenSeries = [
+    { className: 'input', i18n: 'metrics-series-input-tokens', label: 'Input tokens', getter: (row) => row.totalInputTokens },
+    { className: 'cache-create', i18n: 'metrics-series-cache-creation-input-tokens', label: 'Cache creation input tokens', getter: (row) => row.totalCacheCreationInputTokens },
+    { className: 'cache-read', i18n: 'metrics-series-cache-read-input-tokens', label: 'Cache read input tokens', getter: (row) => row.totalCacheReadInputTokens },
+    { className: 'output', i18n: 'metrics-series-output-tokens', label: 'Output tokens', getter: (row) => row.totalOutputTokens },
   ];
   const requestChart = metricSvgChart({
     id: 'metrics-requests-chart',
@@ -855,6 +1075,18 @@ export function metricsView({
     rows,
     series: latencySeries,
     formatValue: (value) => metricDisplayNumber(value, { decimals: 1 }),
+  });
+  const tokenChart = metricSvgChart({
+    id: 'metrics-tokens-chart',
+    title: 'Hourly token usage',
+    titleI18n: 'metrics-token-trend',
+    description: 'Hourly input, cache creation, cache read, and output token totals; unknown values are omitted rather than treated as zero.',
+    descriptionI18n: 'metrics-token-trend-description',
+    emptyI18n: 'metrics-token-no-data',
+    emptyText: 'Token usage is unavailable; unknown values are not zero.',
+    rows: tokenRows,
+    series: tokenSeries,
+    formatValue: (value) => metricDisplayNumber(value),
   });
   const availabilityNotice = !metricsAvailable
     ? '<div class="notice error" role="status"><span data-i18n="metrics-unavailable">Request metrics are temporarily unavailable.</span></div>'
@@ -882,6 +1114,7 @@ export function metricsView({
           <span class="badge stored" data-i18n="metrics-label">Request metrics</span>
           <h1 data-i18n="metrics-heading">Claude gateway request metrics</h1>
           <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not stored by this phase.</p>
+          <p class="muted tiny" data-i18n="metrics-claude-only">Token accounting covers Claude gateway traffic only. Codex clients connect directly to their provider and are not included.</p>
         </div>
         <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
       </div>
@@ -914,6 +1147,13 @@ export function metricsView({
         <article class="card summary"><span class="muted" data-i18n="metrics-total-requests">All requests</span><strong>${escapeHtml(metricDisplayNumber(allTotal))}</strong></article>
         <article class="card summary"><span class="muted" data-i18n="metrics-consumption-requests">Consumption requests</span><strong>${escapeHtml(metricDisplayNumber(consumptionTotal))}</strong></article>
       </div>
+      ${tokenCoverageNotice(normalizedTokenTotals)}
+      <div class="metrics-token-summary">
+        ${tokenSummaryCard({ label: 'Input tokens', i18n: 'metrics-token-input', value: normalizedTokenTotals.totalInputTokens, knownCount: normalizedTokenTotals.totalInputTokensKnownCount })}
+        ${tokenSummaryCard({ label: 'Cache creation input tokens', i18n: 'metrics-token-cache-creation', value: normalizedTokenTotals.totalCacheCreationInputTokens, knownCount: normalizedTokenTotals.totalCacheCreationInputTokensKnownCount })}
+        ${tokenSummaryCard({ label: 'Cache read input tokens', i18n: 'metrics-token-cache-read', value: normalizedTokenTotals.totalCacheReadInputTokens, knownCount: normalizedTokenTotals.totalCacheReadInputTokensKnownCount })}
+        ${tokenSummaryCard({ label: 'Output tokens', i18n: 'metrics-token-output', value: normalizedTokenTotals.totalOutputTokens, knownCount: normalizedTokenTotals.totalOutputTokensKnownCount })}
+      </div>
       <div class="metrics-chart-grid">
         <article class="metrics-chart">
           <h2 data-i18n="metrics-request-volume">Hourly request volume</h2>
@@ -924,6 +1164,11 @@ export function metricsView({
           <h2 data-i18n="metrics-latency">Hourly request latency</h2>
           ${latencyChart}
           ${metricLegend(latencySeries)}
+        </article>
+        <article class="metrics-chart metrics-chart-wide">
+          <h2 data-i18n="metrics-token-trend">Hourly token usage</h2>
+          ${tokenChart}
+          ${metricLegend(tokenSeries)}
         </article>
       </div>
       <article class="card">

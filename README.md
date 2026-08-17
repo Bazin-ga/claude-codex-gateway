@@ -3,8 +3,8 @@
 **English** | [简体中文](README.zh-CN.md)
 
 > **Telemetry notice:** `credential-console` records metadata for every proxied Claude gateway
-> request and makes those metrics visible to every member who can reach the console. Request and
-> response bodies are not stored by this release.
+> request, including four provider-reported token counts, and makes those metrics visible to every
+> member who can reach the console. Request and response bodies are not stored by this release.
 
 A self-hostable credential distribution centre for **Codex** (ChatGPT subscription) and
 **Claude Code** subscriptions.
@@ -135,8 +135,9 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
   Claude gateway allowlists paths, strips the device authorization header before attaching the
   provider credential, rate-limits failed authentication by source IP, and applies per-device
   request and concurrency budgets.
-- **Body-free request telemetry.** The Claude gateway persists request metadata for shared
-  metrics. Request and response bodies are streamed and are neither logged nor stored.
+- **Body-free request telemetry.** The Claude gateway persists request metadata and separate input,
+  cache-creation input, cache-read input, and output token counts for shared metrics. Request and
+  response bodies are streamed and are neither logged nor stored.
 - **The centre is a high-value host by design.** A root compromise of the centre can recover
   all active provider credentials. Keep OS access narrow, patch it, and keep an emergency
   service-stop and provider-token revocation procedure.

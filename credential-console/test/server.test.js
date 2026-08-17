@@ -42,7 +42,15 @@ async function fixture({
       body,
     });
     res.writeHead(200, { 'Content-Type': 'application/json', 'request-id': 'upstream-request' });
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify({
+      ok: true,
+      usage: {
+        input_tokens: 7,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 3,
+        output_tokens: 5,
+      },
+    }));
   });
   const upstreamUrl = await listen(upstream);
 
@@ -1610,7 +1618,15 @@ test('admin can add account, issue enrollment, proxy traffic, and revoke one dev
       body: JSON.stringify({ model: 'claude-test', messages: [] }),
     });
     assert.equal(proxied.status, 200);
-    assert.deepEqual(await proxied.json(), { ok: true });
+    assert.deepEqual(await proxied.json(), {
+      ok: true,
+      usage: {
+        input_tokens: 7,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 3,
+        output_tokens: 5,
+      },
+    });
     assert.equal(app.upstreamRequests.length, 1);
     assert.equal(app.upstreamRequests[0].authorization, `Bearer ${masterToken}`);
     assert.equal(app.upstreamRequests[0].apiKey, undefined);
@@ -1746,6 +1762,9 @@ test('request metrics page attributes the device label and excludes count_tokens
 
     assert.equal(app.requestMetrics.queryTotals({ scope: 'all' }).requestCount, 2);
     assert.equal(app.requestMetrics.queryTotals({ scope: 'consumption' }).requestCount, 1);
+    assert.equal(app.requestMetrics.queryTotals({ scope: 'consumption' }).totalInputTokens, 7);
+    assert.equal(app.requestMetrics.queryTotals({ scope: 'consumption' }).totalOutputTokens, 5);
+    assert.equal(app.requestMetrics.queryTotals({ scope: 'consumption' }).usageCompleteCount, 1);
     assert.equal(
       app.requestMetrics.queryTotals({ scope: 'all', deviceId: issued.device.id }).requestCount,
       2,
@@ -1767,6 +1786,11 @@ test('request metrics page attributes the device label and excludes count_tokens
     assert.match(html, /value="claude-metrics-model" selected/);
     assert.match(html, /self-entered and unverified/);
     assert.match(html, /never use them for accountability or billing/);
+    assert.match(html, /data-i18n="metrics-token-coverage-complete"/);
+    assert.match(html, /data-i18n="metrics-claude-only"/);
+    assert.match(html, /id="metrics-tokens-chart-title"/);
+    assert.match(html, /data-i18n="metrics-token-input">Input tokens<\/span>\s*<strong>7<\/strong>/);
+    assert.match(html, /data-i18n="metrics-token-output">Output tokens<\/span>\s*<strong>5<\/strong>/);
     assert.equal(html.includes(promptMarker), false);
     assert.equal(html.includes(issued.token), false);
     const appScript = await (await fetch(`${app.baseUrl}/assets/app.js`)).text();

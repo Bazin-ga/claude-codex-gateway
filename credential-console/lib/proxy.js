@@ -5,6 +5,8 @@ import { Transform } from 'node:stream';
 import { sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
 import { createRequestMetadataTee } from './request-metadata.js';
+import { createResponseObservationTee } from './response-observation.js';
+import { createResponseUsageParser } from './response-usage.js';
 
 const ALLOWED_PATHS = new Set([
   '/v1/messages',
@@ -34,6 +36,71 @@ function passthroughCounter({ maxBytes = null } = {}) {
     },
   });
   return { stream, bytes: () => bytes };
+}
+
+function unavailableUsage() {
+  return {
+    inputTokens: null,
+    cacheCreationInputTokens: null,
+    cacheReadInputTokens: null,
+    outputTokens: null,
+    usageState: 'unavailable',
+  };
+}
+
+function responseUsageFormat(contentType) {
+  const mediaType = String(contentType ?? '').split(';', 1)[0].trim().toLowerCase();
+  if (mediaType === 'text/event-stream') return 'sse';
+  if (mediaType === 'application/json' || mediaType.endsWith('+json')) return 'json';
+  return null;
+}
+
+function usageObserver(parser) {
+  return {
+    write(chunk) {
+      const state = parser.push(chunk).parseState;
+      return !['invalid', 'limit', 'truncated'].includes(state);
+    },
+    end() { parser.finish(); },
+    abort() { parser.finish({ truncated: true }); },
+    snapshot() { return parser.snapshot(); },
+  };
+}
+
+function safeUsageSnapshot(observation) {
+  let snapshot;
+  try {
+    snapshot = observation?.snapshot?.();
+  } catch {
+    return unavailableUsage();
+  }
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    return unavailableUsage();
+  }
+  const token = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
+  const usage = {
+    inputTokens: token(snapshot.inputTokens),
+    cacheCreationInputTokens: token(snapshot.cacheCreationInputTokens),
+    cacheReadInputTokens: token(snapshot.cacheReadInputTokens),
+    outputTokens: token(snapshot.outputTokens),
+    usageState: ['unavailable', 'partial', 'complete'].includes(snapshot.usageState)
+      ? snapshot.usageState
+      : 'unavailable',
+  };
+  const known = [
+    usage.inputTokens,
+    usage.cacheCreationInputTokens,
+    usage.cacheReadInputTokens,
+    usage.outputTokens,
+  ].some((value) => value !== null);
+  if (!known) return unavailableUsage();
+  if (usage.usageState === 'complete'
+    && (usage.inputTokens === null || usage.outputTokens === null)) {
+    usage.usageState = 'partial';
+  } else if (usage.usageState === 'unavailable') {
+    usage.usageState = 'partial';
+  }
+  return usage;
 }
 
 function log(event, detail = {}) {
@@ -128,6 +195,8 @@ export async function handleClaudeProxy(req, res, {
   upstreamBaseUrl = 'https://api.anthropic.com',
   requestMetrics = null,
   metadataTeeFactory = createRequestMetadataTee,
+  responseObservationFactory = createResponseObservationTee,
+  responseUsageParserFactory = createResponseUsageParser,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
   const upstreamPath = requestUrl.pathname.slice('/claude'.length);
@@ -193,6 +262,7 @@ export async function handleClaudeProxy(req, res, {
       requestBytes: 0,
       responseBytes: 0,
       upstreamRequestId: null,
+      ...unavailableUsage(),
     }, { accountId, deviceId: device.id });
   };
   if (accountResolutionError) {
@@ -306,7 +376,8 @@ export async function handleClaudeProxy(req, res, {
   const startedAtMonotonic = performance.now();
   const requestMetadata = metadataTeeFactory();
   const requestLimit = passthroughCounter({ maxBytes: MAX_REQUEST_BYTES });
-  const responseCounter = passthroughCounter();
+  let responseObservation = null;
+  let responseUsageFinished = true;
   let settled = false;
   let upstreamTtfbMs = null;
   let upstreamStatus = null;
@@ -322,6 +393,7 @@ export async function handleClaudeProxy(req, res, {
   const finalizeMetric = (outcome, statusCode = upstreamStatus) => {
     if (metricFinalized) return;
     metricFinalized = true;
+    if (outcome !== 'completed') responseObservation?.abort?.(outcome);
     let metadata = {
       requestBytes: requestLimit.bytes(),
       model: null,
@@ -354,13 +426,14 @@ export async function handleClaudeProxy(req, res, {
       requestBytes: Number.isSafeInteger(metadata.requestBytes)
         ? metadata.requestBytes
         : requestLimit.bytes(),
-      responseBytes: responseCounter.bytes(),
+      responseBytes: responseObservation?.bytes?.() ?? 0,
       upstreamRequestId,
+      ...safeUsageSnapshot(responseObservation),
     }, { accountId: account.id, deviceId: device.id });
   };
 
   const finalizeCompletedWhenReady = () => {
-    if (!responseFinished || !requestBodyFinished || metricFinalized) return;
+    if (!responseFinished || !requestBodyFinished || !responseUsageFinished || metricFinalized) return;
     finalizeMetric(pendingOutcome ?? 'completed', res.statusCode);
   };
 
@@ -384,7 +457,47 @@ export async function handleClaudeProxy(req, res, {
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
       });
-      upstreamRes.pipe(responseCounter.stream).pipe(res);
+      const usageFormat = requestMetrics?.enqueueRequest
+        && upstreamPath === '/v1/messages' && status >= 200 && status < 400
+        ? responseUsageFormat(upstreamRes.headers['content-type'])
+        : null;
+      let observer = null;
+      if (usageFormat) {
+        try {
+          observer = usageObserver(responseUsageParserFactory({ format: usageFormat }));
+        } catch (error) {
+          log('response_usage_parser_init_failed', {
+            account_id: account.id,
+            device_id: device.id,
+            code: error?.code ?? error?.name ?? 'unknown',
+          });
+        }
+      }
+      responseUsageFinished = false;
+      try {
+        responseObservation = responseObservationFactory({
+          contentEncoding: upstreamRes.headers['content-encoding'],
+          observer,
+        });
+      } catch (error) {
+        log('response_observation_init_failed', {
+          account_id: account.id,
+          device_id: device.id,
+          code: error?.code ?? error?.name ?? 'unknown',
+        });
+        responseObservation = createResponseObservationTee();
+      }
+      Promise.resolve(responseObservation.done).then(
+        () => {
+          responseUsageFinished = true;
+          finalizeCompletedWhenReady();
+        },
+        () => {
+          responseUsageFinished = true;
+          finalizeCompletedWhenReady();
+        },
+      );
+      upstreamRes.pipe(responseObservation.stream).pipe(res);
       upstreamRes.on('end', () => {
         upstreamEnded = true;
         store.markDeviceSeen(device.id).catch(() => {});

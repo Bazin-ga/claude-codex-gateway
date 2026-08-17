@@ -456,6 +456,8 @@ export async function createCredentialConsole(options = {}) {
       options: { machines: [], members: [], accounts: [], models: [] },
       totals: { all: 0, consumption: 0 },
       hourly: [],
+      tokenTotals: {},
+      tokenHourly: [],
       metricsAvailable: false,
       droppedMetrics: 0,
       error: null,
@@ -473,6 +475,7 @@ export async function createCredentialConsole(options = {}) {
       const allTotals = requestMetrics.queryTotals({ ...filters, scope: 'all' });
       const consumptionTotals = requestMetrics.queryTotals({ ...filters, scope: 'consumption' });
       const hourly = requestMetrics.queryHourly({ ...filters, scope: 'all' });
+      const tokenHourly = requestMetrics.queryHourly({ ...filters, scope: 'consumption' });
       const dimensions = { fromMs, toMs: now + 1, scope: 'all' };
       const deviceById = new Map(store.publicDevices().map((device) => [device.id, device]));
       const accountById = new Map(store.publicAccounts().map((account) => [account.id, account]));
@@ -517,6 +520,8 @@ export async function createCredentialConsole(options = {}) {
           consumption: consumptionTotals.requestCount,
         },
         hourly,
+        tokenTotals: consumptionTotals,
+        tokenHourly,
         metricsAvailable: true,
         droppedMetrics: requestMetrics.stats?.dropped ?? 0,
         error: null,
@@ -726,6 +731,7 @@ const translations = {
   'metrics-label': '请求指标',
   'metrics-heading': 'Claude 网关请求指标',
   'metrics-intro': '本页只展示请求元数据；当前阶段不会存储请求正文或回复正文。',
+  'metrics-claude-only': 'Token 核算只覆盖 Claude 网关流量。Codex 客户端直接连接服务商，不在此统计范围内。',
   'metrics-attribution-disclaimer': '使用者标签由本人填写，未经验证；只能用于观察用量趋势，不得作为追责或计费依据。',
   'metrics-filter-heading': '筛选请求指标',
   'metrics-filter-machine': '机器',
@@ -758,6 +764,38 @@ const translations = {
   'metrics-series-error': '错误请求',
   'metrics-series-ttfb': '平均首字节时间（毫秒）',
   'metrics-series-duration': '平均总耗时（毫秒）',
+  'metrics-series-input-tokens': '输入 token',
+  'metrics-series-cache-creation-input-tokens': '缓存创建输入 token',
+  'metrics-series-cache-read-input-tokens': '缓存读取输入 token',
+  'metrics-series-output-tokens': '输出 token',
+  'metrics-token-input': '输入 token 总量',
+  'metrics-token-cache-creation': '缓存创建输入 token 总量',
+  'metrics-token-cache-read': '缓存读取输入 token 总量',
+  'metrics-token-output': '输出 token 总量',
+  'metrics-token-known-count': '已知值条数',
+  'metrics-token-coverage-complete': 'Token 总量来自完整的用量记录，可视为精确值。',
+  'metrics-token-coverage-complete-with-unknown': '用量记录完整，但 — 类别未由服务商报告。',
+  'metrics-token-coverage-lower-bound': 'Token 总量是下界；部分或不可用的用量不会被当作零。',
+  'metrics-token-coverage-unavailable': '所选范围的 token 用量不可用；— 表示未知，不是零。',
+  'metrics-token-coverage-overflow': '至少一类 token 总量过大，无法精确显示；每请求原始计数仍保留。',
+  'metrics-token-coverage-overflow-lower-bound': '至少一类总量过大，无法精确显示；同时部分或不可用记录使可见总和仍只是下界。',
+  'metrics-token-complete-count': '完整',
+  'metrics-token-partial-count': '部分',
+  'metrics-token-unavailable-count': '不可用',
+  'metrics-token-trend': '每小时 token 用量',
+  'metrics-token-trend-description': '每小时输入、缓存创建、缓存读取和输出 token 总量；未知值会留空，不会当作零。',
+  'metrics-token-no-data': '所选范围没有可用的 token 用量。',
+  'metrics-total-input-tokens': '输入 token',
+  'metrics-total-cache-creation-input-tokens': '缓存创建输入 token',
+  'metrics-total-cache-read-input-tokens': '缓存读取输入 token',
+  'metrics-total-output-tokens': '输出 token',
+  'metrics-usage-coverage': '用量覆盖情况',
+  'metrics-usage-complete': '完整',
+  'metrics-usage-complete-with-unknown': '完整 / 部分类别未知',
+  'metrics-usage-partial': '部分 / 下界',
+  'metrics-usage-unavailable': '不可用',
+  'metrics-usage-not-applicable': '不适用',
+  'metrics-usage-overflow': '总量过大，无法精确显示',
   'metrics-hourly-table': '每小时明细',
   'metrics-hour': '小时（UTC）',
   'metrics-request-count': '请求数',
@@ -1694,7 +1732,7 @@ async function main() {
     log('privacy_metadata_recording', {
       enabled: metricsEnabled,
       detail: metricsEnabled
-        ? 'proxied Claude request metadata is stored and visible to every console member; member labels are self-entered and unverified and must not be used for accountability or billing; request and response bodies are not stored'
+        ? 'proxied Claude request metadata, including four provider-reported token counts, is stored and visible to every console member; member labels are self-entered and unverified and must not be used for accountability or billing; request and response bodies are not stored'
         : 'request metadata recording is unavailable, so requests are not currently being stored; request and response bodies are not stored',
     });
     server.once('close', () => {

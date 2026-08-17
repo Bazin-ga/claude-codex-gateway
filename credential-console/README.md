@@ -4,7 +4,8 @@ Multi-account control plane for subscription-backed Codex and Claude Code access
 
 > **Telemetry notice:** every proxied Claude gateway request produces a persistent metadata row
 > that is visible to every member who can reach the console. It includes routing, model, status,
-> timing, and byte-count fields, but never request or response bodies. Member labels are
+> timing, byte-count, and four provider-reported token-count fields, but never request or response
+> bodies. Member labels are
 > self-entered and unverified, so the metrics must not be used for accountability or billing.
 
 It solves two related operational problems:
@@ -280,6 +281,42 @@ profile/installer; never repair a profile by copying a secret into it. An AI may
 secret-bearing installer locally only after the human explicitly authorizes that execution. It must
 not print, upload, or paste the installer, its secret, or secret-bearing output back into the
 conversation.
+
+## Claude token accounting
+
+The P5 token view extends the existing body-free request metrics for Claude gateway traffic only;
+Codex clients connect directly to their provider and are outside this accounting boundary. It shows
+four separate categories: input, cache-creation input, cache-read input, and output tokens. The
+`count_tokens` and `/v1/models` helper endpoints are not consumption records.
+
+The client-facing response remains the original encoded byte stream. One bounded observation tee
+decodes identity, gzip, brotli, or deflate only on the metrics side; decoder/parser failure or a
+global observation-budget limit disables token extraction for that response without changing its
+status, headers, bytes, or backpressure. Streaming `message_delta.usage` values are cumulative, so
+the last valid value replaces the earlier snapshot rather than being added to it. Non-streaming
+JSON uses the same nullable four-field contract.
+
+Each total is paired with a known-value count. A `0` means a measured known zero; `—` means the
+total is unknown, never zero. Complete, partial, and unavailable usage-record counts are shown next
+to the totals. If any usage record is partial or unavailable, the displayed token sum is explicitly
+a lower bound and unknown values are not silently filled in. A complete record may still have
+provider-null cache categories; those are labelled complete with category values unknown, not as a
+transport/parser failure. The hourly table repeats the four token columns and coverage state, while
+the separate token SVG leaves unknown hourly points blank instead of drawing them at zero. If a
+synthetic/lifetime aggregate exceeds JavaScript's exact-integer range,
+the page reports that overflow instead of rounding it or failing the entire metrics query; the
+per-request integer rows remain stored.
+
+The page remains body-free: request and response bodies are not stored or rendered. Metrics are
+visible to every member who can reach the console; in `open` mode that means anyone who can reach
+the private console. Self-entered member labels remain unverified and must not be used for
+accountability or billing.
+
+The first P5 start migrates `metrics.sqlite` from schema 1 to schema 2 in one transaction; old rows
+remain readable with unknown token values. A pre-P5 binary deliberately refuses the newer metrics
+schema. To roll code back, stop the console and restore only `metrics.sqlite` from the pre-upgrade
+checkpointed backup (removing its `-wal`/`-shm` sidecars); do not replace `master.key` or
+`state.json` merely to roll back metrics code.
 
 ## Machine inventory
 

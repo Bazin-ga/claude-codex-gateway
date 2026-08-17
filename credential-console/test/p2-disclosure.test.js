@@ -60,15 +60,18 @@ test('P2 disclosure is prominent, body-free, and not a premature P6 conversation
 
   assert.match(englishNotice, /Telemetry notice/i);
   assert.match(englishNotice, /records metadata for every proxied Claude gateway\s+request/i);
-  assert.match(englishNotice, /makes those metrics visible to every member who can reach the console/i);
+  assert.match(englishNotice, /four provider-reported token counts/i);
+  assert.match(englishNotice, /makes those metrics visible to every\s+member who can reach the console/i);
   assert.match(englishNotice, /Request and\s+response bodies are not stored by this release/i);
 
   assert.match(chineseNotice, /遥测告知/);
   assert.match(chineseNotice, /记录每个经代理转发的 Claude 网关请求元数据/);
+  assert.match(chineseNotice, /服务商报告的四类 token 数/);
   assert.match(chineseNotice, /这些指标向所有能够访问控制台的成员公开/);
-  assert.match(chineseNotice, /不存储请求正文或回复正文/);
+  assert.match(chineseNotice, /不存储\s*请求正文或回复正文/);
 
   assert.match(consoleNotice, /every proxied Claude gateway request produces a persistent metadata row/i);
+  assert.match(consoleNotice, /four provider-reported token-count fields/i);
   assert.match(consoleNotice, /Member labels are\s+self-entered\s+and unverified/i);
   assert.match(consoleNotice, /must not be used for accountability or billing/i);
 
@@ -199,6 +202,7 @@ test('real server announces body-free metadata disclosure before listening', { t
     const privacy = output.events[privacyIndex];
     assert.equal(privacy.enabled, true);
     assert.match(privacy.detail, /metadata/i);
+    assert.match(privacy.detail, /four provider-reported token counts/i);
     assert.match(privacy.detail, /visible to every console member/i);
     assert.match(privacy.detail, /member labels are self-entered and unverified/i);
     assert.match(privacy.detail, /must not be used for accountability or billing/i);

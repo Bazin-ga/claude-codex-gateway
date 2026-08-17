@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { access, mkdtemp, stat } from 'node:fs/promises';
+import { access, copyFile, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -61,9 +61,75 @@ function rowCount(db) {
   return Number(db.prepare('SELECT COUNT(*) AS count FROM request_metrics').get().count);
 }
 
+async function createV1Database(home, { version = 1, entry = row() } = {}) {
+  const dbPath = join(home, METRICS_FILENAME);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE schema_meta (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      schema_version INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE request_metrics (
+      id INTEGER PRIMARY KEY,
+      started_at_ms INTEGER NOT NULL,
+      hour_bucket_ms INTEGER NOT NULL,
+      method TEXT NOT NULL,
+      path TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      machine_id TEXT,
+      member_label TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      account_alias TEXT NOT NULL,
+      model TEXT,
+      stream INTEGER CHECK (stream IS NULL OR stream IN (0, 1)),
+      status_code INTEGER,
+      outcome TEXT NOT NULL,
+      ttfb_ms INTEGER CHECK (ttfb_ms IS NULL OR ttfb_ms >= 0),
+      duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+      request_bytes INTEGER NOT NULL CHECK (request_bytes >= 0),
+      response_bytes INTEGER NOT NULL CHECK (response_bytes >= 0),
+      upstream_request_id TEXT
+    );
+  `);
+  db.prepare(`
+    INSERT INTO schema_meta (singleton, schema_version, updated_at_ms)
+    VALUES (1, ?, ?)
+  `).run(version, BASE_MS);
+  db.prepare(`
+    INSERT INTO request_metrics (
+      started_at_ms, hour_bucket_ms, method, path, device_id, machine_id,
+      member_label, account_id, account_alias, model, stream, status_code,
+      outcome, ttfb_ms, duration_ms, request_bytes, response_bytes,
+      upstream_request_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    entry.startedAtMs,
+    Math.floor(entry.startedAtMs / HOUR_MS) * HOUR_MS,
+    entry.method,
+    entry.path,
+    entry.deviceId,
+    entry.machineId,
+    entry.memberLabel,
+    entry.accountId,
+    entry.accountAlias,
+    entry.model,
+    entry.stream === null || entry.stream === undefined ? null : (entry.stream ? 1 : 0),
+    entry.statusCode,
+    entry.outcome,
+    entry.ttfbMs,
+    entry.durationMs,
+    entry.requestBytes,
+    entry.responseBytes,
+    entry.upstreamRequestId,
+  );
+  db.close();
+  return dbPath;
+}
+
 test('initializes a private WAL/NORMAL database with schema version and indexes', async (t) => {
   const { store, dbPath } = await newStore(t);
-  assert.equal(METRICS_SCHEMA_VERSION, 1);
+  assert.equal(METRICS_SCHEMA_VERSION, 2);
   assert.equal((await stat(dbPath)).mode & 0o777, 0o600);
 
   const db = readOnly(dbPath);
@@ -90,6 +156,254 @@ test('initializes a private WAL/NORMAL database with schema version and indexes'
     'request_metrics_started_idx',
   ]);
   assert.equal(store.db.isOpen, true);
+});
+
+test('migrates a v1 database in place and keeps old rows readable', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-v1-'));
+  const stateBytes = Buffer.from('{"state":"must remain byte-identical"}\n');
+  await writeFile(join(home, 'state.json'), stateBytes, { mode: 0o600 });
+  const dbPath = await createV1Database(home, {
+    entry: row({ machineId: null, memberLabel: 'legacy-member' }),
+  });
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await store.init();
+  t.after(() => store.close());
+
+  const db = readOnly(dbPath);
+  t.after(() => db.close());
+  assert.equal(
+    db.prepare('SELECT schema_version FROM schema_meta WHERE singleton = 1').get().schema_version,
+    2,
+  );
+  assert.deepEqual(store.queryTotals({ scope: 'all' }), {
+    requestCount: 1,
+    successCount: 1,
+    errorCount: 0,
+    totalRequestBytes: 100,
+    totalResponseBytes: 200,
+    avgTtfbMs: 12,
+    avgDurationMs: 45,
+    totalInputTokens: null,
+    totalInputTokensKnownCount: 0,
+    totalCacheCreationInputTokens: null,
+    totalCacheCreationInputTokensKnownCount: 0,
+    totalCacheReadInputTokens: null,
+    totalCacheReadInputTokensKnownCount: 0,
+    totalOutputTokens: null,
+    totalOutputTokensKnownCount: 0,
+    usageCompleteCount: 0,
+    usagePartialCount: 0,
+    usageUnavailableCount: 1,
+    tokenTotalsOverflow: false,
+  });
+  const columns = db.prepare('PRAGMA table_info(request_metrics)').all().map(({ name }) => name);
+  assert.deepEqual(columns.slice(-5), [
+    'input_tokens',
+    'cache_creation_input_tokens',
+    'cache_read_input_tokens',
+    'output_tokens',
+    'usage_state',
+  ]);
+  assert.deepEqual(await readFile(join(home, 'state.json')), stateBytes);
+});
+
+test('aggregates complete, partial, unavailable, NULL, and explicit zero usage distinctly', async (t) => {
+  const { store } = await newStore(t, { batchSize: 8 });
+  const entries = [
+    row({
+      usageState: 'complete',
+      inputTokens: 10,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: null,
+      outputTokens: 5,
+    }),
+    row({
+      startedAtMs: BASE_MS + 1,
+      usageState: 'partial',
+      inputTokens: 3,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: 2,
+      outputTokens: null,
+    }),
+    row({
+      startedAtMs: BASE_MS + 2,
+      usageState: 'unavailable',
+      inputTokens: null,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+      outputTokens: null,
+    }),
+  ];
+  for (const entry of entries) assert.equal(store.enqueueRequest(entry), true);
+  assert.equal(store.flush().written, entries.length);
+
+  assert.deepEqual(store.queryTotals({ scope: 'all' }), {
+    requestCount: 3,
+    successCount: 3,
+    errorCount: 0,
+    totalRequestBytes: 300,
+    totalResponseBytes: 600,
+    avgTtfbMs: 12,
+    avgDurationMs: 45,
+    totalInputTokens: 13,
+    totalInputTokensKnownCount: 2,
+    totalCacheCreationInputTokens: 0,
+    totalCacheCreationInputTokensKnownCount: 1,
+    totalCacheReadInputTokens: 2,
+    totalCacheReadInputTokensKnownCount: 1,
+    totalOutputTokens: 5,
+    totalOutputTokensKnownCount: 1,
+    usageCompleteCount: 1,
+    usagePartialCount: 1,
+    usageUnavailableCount: 1,
+    tokenTotalsOverflow: false,
+  });
+  const [hour] = store.queryHourly({ scope: 'all' });
+  assert.equal(hour.totalInputTokens, 13);
+  assert.equal(hour.totalCacheCreationInputTokens, 0);
+  assert.equal(hour.totalCacheReadInputTokens, 2);
+  assert.equal(hour.totalOutputTokens, 5);
+  assert.equal(hour.totalInputTokensKnownCount, 2);
+  assert.equal(hour.usagePartialCount, 1);
+});
+
+test('token aggregation reports overflow without making metrics queries fail', async (t) => {
+  const count = 1025;
+  const { store } = await newStore(t, { batchSize: count, maxQueue: count });
+  for (let index = 0; index < count; index += 1) {
+    assert.equal(store.enqueueRequest(row({
+      startedAtMs: BASE_MS + index,
+      usageState: 'complete',
+      inputTokens: Number.MAX_SAFE_INTEGER,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      outputTokens: Number.MAX_SAFE_INTEGER,
+    })), true);
+  }
+  assert.equal(store.flush().written, count);
+  for (const aggregate of [
+    store.queryTotals({ scope: 'consumption' }),
+    store.queryHourly({ scope: 'consumption' })[0],
+    store.queryBreakdown({ by: 'member', scope: 'consumption' })[0],
+  ]) {
+    assert.equal(aggregate.requestCount, count);
+    assert.equal(aggregate.totalInputTokens, null);
+    assert.equal(aggregate.totalOutputTokens, null);
+    assert.equal(aggregate.totalInputTokensKnownCount, count);
+    assert.equal(aggregate.totalOutputTokensKnownCount, count);
+    assert.equal(aggregate.totalCacheCreationInputTokens, 0);
+    assert.equal(aggregate.tokenTotalsOverflow, true);
+  }
+});
+
+test('token aggregates honor existing filters and consumption scope', async (t) => {
+  const { store } = await newStore(t, { batchSize: 8 });
+  const entries = [
+    row({
+      deviceId: 'device-a',
+      machineId: 'machine-a',
+      memberLabel: 'alice',
+      accountId: 'account-a',
+      model: 'model-a',
+      usageState: 'complete',
+      inputTokens: 10,
+      cacheCreationInputTokens: 1,
+      cacheReadInputTokens: 2,
+      outputTokens: 3,
+    }),
+    row({
+      startedAtMs: BASE_MS + 1,
+      path: '/v1/messages/count_tokens',
+      deviceId: 'device-a',
+      machineId: 'machine-a',
+      memberLabel: 'alice',
+      accountId: 'account-a',
+      model: 'model-a',
+      usageState: 'complete',
+      inputTokens: 20,
+      cacheCreationInputTokens: 2,
+      cacheReadInputTokens: 3,
+      outputTokens: 4,
+    }),
+    row({
+      startedAtMs: BASE_MS + 2,
+      deviceId: 'device-b',
+      machineId: null,
+      memberLabel: 'bob',
+      accountId: 'account-b',
+      model: 'model-b',
+      usageState: 'partial',
+      inputTokens: 30,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+      outputTokens: null,
+    }),
+    row({
+      startedAtMs: BASE_MS + 3,
+      path: '/v1/models',
+      deviceId: 'device-c',
+      machineId: 'machine-c',
+      memberLabel: 'carol',
+      accountId: 'account-c',
+      model: 'model-c',
+      usageState: 'complete',
+      inputTokens: 40,
+      cacheCreationInputTokens: 4,
+      cacheReadInputTokens: 5,
+      outputTokens: 6,
+    }),
+  ];
+  for (const entry of entries) assert.equal(store.enqueueRequest(entry), true);
+  assert.equal(store.flush().written, entries.length);
+
+  assert.equal(store.queryTotals({ scope: 'consumption' }).requestCount, 2);
+  assert.equal(store.queryTotals({ scope: 'consumption' }).totalInputTokens, 40);
+  assert.equal(store.queryTotals({ scope: 'all' }).totalInputTokens, 100);
+  assert.equal(
+    store.queryTotals({ scope: 'all', deviceId: 'device-a' }).totalOutputTokens,
+    7,
+  );
+  assert.equal(
+    store.queryTotals({ scope: 'all', machineId: 'machine-a', memberLabel: 'alice' })
+      .totalInputTokens,
+    30,
+  );
+  assert.equal(
+    store.queryTotals({ scope: 'all', unattributedMachine: true }).totalInputTokens,
+    30,
+  );
+  assert.equal(
+    store.queryTotals({ scope: 'all', accountId: 'account-b', model: 'model-b' })
+      .usagePartialCount,
+    1,
+  );
+});
+
+test('reopens v2 data and a checkpointed copy is backup-compatible', async (t) => {
+  const { home, store, dbPath } = await newStore(t, { batchSize: 4 });
+  store.enqueueRequest(row({
+    usageState: 'complete',
+    inputTokens: 7,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 1,
+    outputTokens: 2,
+  }));
+  assert.equal(store.flush().written, 1);
+  assert.equal(store.checkpoint().busy, 0);
+  store.close();
+
+  const reopened = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await reopened.init();
+  assert.equal(reopened.queryTotals().totalInputTokens, 7);
+  reopened.close();
+
+  const backupHome = await mkdtemp(join(tmpdir(), 'credential-console-metrics-backup-'));
+  await copyFile(dbPath, join(backupHome, METRICS_FILENAME));
+  const backup = new MetricsStore({ home: backupHome, flushIntervalMs: 60_000 });
+  await backup.init();
+  t.after(() => backup.close());
+  assert.equal(backup.queryTotals().totalOutputTokens, 2);
+  assert.equal(backup.db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
 });
 
 test('enqueueRequest only queues bounded metadata and does not touch SQLite', async (t) => {
@@ -178,6 +492,18 @@ test('flush commits one batch and query APIs filter and aggregate fixed metadata
     totalResponseBytes: 240,
     avgTtfbMs: 12,
     avgDurationMs: 37.8,
+    totalInputTokens: null,
+    totalInputTokensKnownCount: 0,
+    totalCacheCreationInputTokens: null,
+    totalCacheCreationInputTokensKnownCount: 0,
+    totalCacheReadInputTokens: null,
+    totalCacheReadInputTokensKnownCount: 0,
+    totalOutputTokens: null,
+    totalOutputTokensKnownCount: 0,
+    usageCompleteCount: 0,
+    usagePartialCount: 0,
+    usageUnavailableCount: 5,
+    tokenTotalsOverflow: false,
   });
   assert.deepEqual(store.queryTotals({ scope: 'consumption' }), {
     requestCount: 3,
@@ -187,6 +513,18 @@ test('flush commits one batch and query APIs filter and aggregate fixed metadata
     totalResponseBytes: 230,
     avgTtfbMs: 12,
     avgDurationMs: 33,
+    totalInputTokens: null,
+    totalInputTokensKnownCount: 0,
+    totalCacheCreationInputTokens: null,
+    totalCacheCreationInputTokensKnownCount: 0,
+    totalCacheReadInputTokens: null,
+    totalCacheReadInputTokensKnownCount: 0,
+    totalOutputTokens: null,
+    totalOutputTokensKnownCount: 0,
+    usageCompleteCount: 0,
+    usagePartialCount: 0,
+    usageUnavailableCount: 3,
+    tokenTotalsOverflow: false,
   });
 
   const hourly = store.queryHourly({ scope: 'all' });
@@ -295,7 +633,9 @@ test('row normalization bounds strings, preserves nulls, and ignores body-like f
   const db = readOnly(dbPath);
   t.after(() => db.close());
   const stored = db.prepare(`
-    SELECT member_label, model, stream, machine_id, upstream_request_id
+    SELECT member_label, model, stream, machine_id, upstream_request_id,
+      input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+      output_tokens, usage_state
     FROM request_metrics
   `).get();
   assert.equal(stored.member_label.length, 160);
@@ -303,6 +643,11 @@ test('row normalization bounds strings, preserves nulls, and ignores body-like f
   assert.equal(stored.stream, null);
   assert.equal(stored.machine_id, null);
   assert.equal(stored.upstream_request_id.length, 256);
+  assert.equal(stored.input_tokens, null);
+  assert.equal(stored.cache_creation_input_tokens, null);
+  assert.equal(stored.cache_read_input_tokens, null);
+  assert.equal(stored.output_tokens, null);
+  assert.equal(stored.usage_state, 'unavailable');
   assert.equal(Object.hasOwn(stored, 'body'), false);
   assert.equal(Object.hasOwn(stored, 'oauthToken'), false);
 });
@@ -397,6 +742,104 @@ test('a transient SQLite writer lock requeues the whole batch and succeeds later
   blocker.exec('ROLLBACK');
   assert.deepEqual(store.flush(), { queued: 1, written: 1, dropped: 0, failed: 0 });
   assert.equal(store.queryTotals({ scope: 'all' }).requestCount, 1);
+});
+
+test('invalid usage states and counts are dropped before SQLite is touched', async (t) => {
+  const events = [];
+  const { store } = await newStore(t, {
+    log: (event, detail) => events.push({ event, detail }),
+  });
+  const invalid = [
+    { usageState: 'unknown' },
+    { usageState: null },
+    { usageState: 'unavailable', inputTokens: 1 },
+    { usageState: 'partial' },
+    { usageState: 'complete', inputTokens: null, outputTokens: 1 },
+    { usageState: 'complete', inputTokens: 1, outputTokens: -1 },
+    { usageState: 'partial', inputTokens: 1.5 },
+  ];
+  for (const overrides of invalid) {
+    assert.equal(store.enqueueRequest(row(overrides)), false, JSON.stringify(overrides));
+  }
+  assert.equal(store.queue.length, 0);
+  assert.equal(store.flush().written, 0);
+  assert.equal(store.queryTotals().requestCount, 0);
+  assert.equal(events.filter(({ event }) => event === 'metrics_row_rejected').length, invalid.length);
+});
+
+test('a v1 migration rolls back all DDL when metadata update fails', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-migration-rollback-'));
+  const dbPath = await createV1Database(home);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TRIGGER reject_metrics_upgrade
+    BEFORE UPDATE OF schema_version ON schema_meta
+    BEGIN
+      SELECT RAISE(ABORT, 'migration deliberately blocked');
+    END;
+  `);
+  db.close();
+
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await assert.rejects(store.init(), /migration deliberately blocked/);
+  t.after(() => store.close());
+
+  const verify = new DatabaseSync(dbPath, { readOnly: true });
+  t.after(() => verify.close());
+  assert.equal(
+    verify.prepare('SELECT schema_version FROM schema_meta WHERE singleton = 1').get().schema_version,
+    1,
+  );
+  const columns = verify.prepare('PRAGMA table_info(request_metrics)').all().map(({ name }) => name);
+  assert.equal(columns.includes('input_tokens'), false);
+});
+
+test('an untrusted partially added v1 schema is refused without being promoted', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-partial-schema-'));
+  const dbPath = await createV1Database(home);
+  const partial = new DatabaseSync(dbPath);
+  partial.exec(
+    'ALTER TABLE request_metrics ADD COLUMN input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0)',
+  );
+  partial.close();
+
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await assert.rejects(store.init(), /untrusted partial v2 columns: input_tokens/);
+  t.after(() => store.close());
+
+  const verify = new DatabaseSync(dbPath, { readOnly: true });
+  t.after(() => verify.close());
+  assert.equal(verify.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 1);
+  const columns = verify.prepare('PRAGMA table_info(request_metrics)').all().map(({ name }) => name);
+  assert.equal(columns.includes('input_tokens'), true);
+  assert.equal(columns.includes('output_tokens'), false);
+});
+
+test('corrupt v2 schemas with a missing column or CHECK constraint are refused', async (t) => {
+  const valid = await newStore(t);
+  valid.store.close();
+  const corrupt = new DatabaseSync(valid.dbPath);
+  corrupt.exec('ALTER TABLE request_metrics RENAME COLUMN output_tokens TO output_tokens_removed');
+  corrupt.close();
+  const reopened = new MetricsStore({ home: valid.home, flushIntervalMs: 60_000 });
+  await assert.rejects(reopened.init(), /missing column output_tokens/);
+  t.after(() => reopened.close());
+
+  const uncheckedHome = await mkdtemp(join(tmpdir(), 'credential-console-metrics-unchecked-v2-'));
+  const uncheckedPath = await createV1Database(uncheckedHome);
+  const unchecked = new DatabaseSync(uncheckedPath);
+  unchecked.exec(`
+    ALTER TABLE request_metrics ADD COLUMN input_tokens INTEGER;
+    ALTER TABLE request_metrics ADD COLUMN cache_creation_input_tokens INTEGER;
+    ALTER TABLE request_metrics ADD COLUMN cache_read_input_tokens INTEGER;
+    ALTER TABLE request_metrics ADD COLUMN output_tokens INTEGER;
+    ALTER TABLE request_metrics ADD COLUMN usage_state TEXT NOT NULL DEFAULT 'unavailable';
+    UPDATE schema_meta SET schema_version = 2;
+  `);
+  unchecked.close();
+  const uncheckedStore = new MetricsStore({ home: uncheckedHome, flushIntervalMs: 60_000 });
+  await assert.rejects(uncheckedStore.init(), /missing its non-negative CHECK constraint/);
+  t.after(() => uncheckedStore.close());
 });
 
 test('a future schema version is refused rather than silently rewritten', async (t) => {

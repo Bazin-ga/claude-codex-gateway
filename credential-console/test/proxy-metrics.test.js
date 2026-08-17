@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { brotliCompressSync, gzipSync } from 'node:zlib';
+import { MetricsStore } from '../lib/metrics.js';
 import { handleClaudeProxy } from '../lib/proxy.js';
 
 const DEVICE_TOKEN = 'device-test-token';
@@ -111,6 +116,54 @@ async function fetchMetricResponse(url, body) {
   };
 }
 
+async function rawMetricResponse(url, body, { acceptEncoding = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(new URL(url), {
+      method: 'POST',
+      headers: {
+        ...requestHeaders(),
+        'Content-Length': body.length,
+        ...(acceptEncoding ? { 'Accept-Encoding': acceptEncoding } : {}),
+      },
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.once('end', () => resolve({
+        status: response.statusCode,
+        headers: response.headers,
+        body: Buffer.concat(chunks),
+      }));
+      response.once('error', reject);
+      response.once('aborted', () => reject(new Error('response aborted')));
+    });
+    request.once('error', reject);
+    request.end(body);
+  });
+}
+
+const COMPLETE_SSE = Buffer.from([
+  'event: message_start',
+  'data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":1}}}',
+  '',
+  'event: ping',
+  'data: {"type":"ping"}',
+  '',
+  'event: message_delta',
+  'data: {"type":"message_delta","usage":{"output_tokens":17}}',
+  '',
+  'event: message_stop',
+  'data: {"type":"message_stop"}',
+  '',
+  '',
+].join('\n'));
+
+const PARTIAL_START_SSE = Buffer.from([
+  'event: message_start',
+  'data: {"type":"message_start","message":{"usage":{"input_tokens":13,"cache_creation_input_tokens":0,"cache_read_input_tokens":4,"output_tokens":1}}}',
+  '',
+  '',
+].join('\n'));
+
 test('records successful proxy metadata and forwards the exact request/response bytes', async (t) => {
   const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
   const responseBody = Buffer.from('upstream-response-bytes');
@@ -181,7 +234,181 @@ test('records count_tokens with query under the exact excluded pathname', async 
   assert.equal(row.stream, false);
   assert.equal(row.statusCode, 200);
   assert.equal(row.outcome, 'completed');
+  assert.equal(row.usageState, 'unavailable');
+  assert.equal(row.inputTokens, null);
+  assert.equal(row.outputTokens, null);
   assert.equal(sink.rows.length, 1);
+});
+
+test('extracts cumulative SSE usage without changing response bytes', async (t) => {
+  const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
+  const { proxyUrl } = await startHarness(t, {
+    requestMetrics: sink,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+      res.write(COMPLETE_SSE.subarray(0, 7));
+      res.write(COMPLETE_SSE.subarray(7, 31));
+      res.write(COMPLETE_SSE.subarray(31, 149));
+      res.end(COMPLETE_SSE.subarray(149));
+    },
+  });
+  const response = await fetchMetricResponse(
+    `${proxyUrl}/claude/v1/messages`,
+    Buffer.from('{"model":"usage-sse","stream":true}'),
+  );
+  const row = await waitFor(() => sink.rows[0]);
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, COMPLETE_SSE);
+  assert.equal(row.inputTokens, 11);
+  assert.equal(row.cacheCreationInputTokens, 2);
+  assert.equal(row.cacheReadInputTokens, 3);
+  assert.equal(row.outputTokens, 17, 'message_delta is cumulative, not 1 + 17');
+  assert.equal(row.usageState, 'complete');
+  assert.equal(row.responseBytes, COMPLETE_SSE.length);
+});
+
+test('extracts nullable cache usage from a non-streaming JSON response', async (t) => {
+  const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
+  const responseBody = Buffer.from(JSON.stringify({
+    id: 'message-safe-fixture',
+    type: 'message',
+    content: [{ type: 'text', text: 'hello' }],
+    usage: {
+      input_tokens: 7,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: 0,
+      output_tokens: 9,
+    },
+  }));
+  const { proxyUrl } = await startHarness(t, {
+    requestMetrics: sink,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(responseBody);
+    },
+  });
+  const response = await fetchMetricResponse(
+    `${proxyUrl}/claude/v1/messages`,
+    Buffer.from('{"model":"usage-json","stream":false}'),
+  );
+  const row = await waitFor(() => sink.rows[0]);
+  assert.deepEqual(response.body, responseBody);
+  assert.equal(row.inputTokens, 7);
+  assert.equal(row.cacheCreationInputTokens, null);
+  assert.equal(row.cacheReadInputTokens, 0);
+  assert.equal(row.outputTokens, 9);
+  assert.equal(row.usageState, 'complete');
+});
+
+test('gzip and brotli usage observation preserves compressed client bytes and headers', async (t) => {
+  for (const [encoding, encoded] of [
+    ['gzip', gzipSync(COMPLETE_SSE)],
+    ['br', brotliCompressSync(COMPLETE_SSE)],
+  ]) {
+    const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
+    let upstreamAcceptEncoding = null;
+    const { proxyUrl } = await startHarness(t, {
+      requestMetrics: sink,
+      upstreamHandler: async (req, res) => {
+        upstreamAcceptEncoding = req.headers['accept-encoding'];
+        await readBody(req);
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Content-Encoding': encoding,
+        });
+        res.write(encoded.subarray(0, 5));
+        res.end(encoded.subarray(5));
+      },
+    });
+    const response = await rawMetricResponse(
+      `${proxyUrl}/claude/v1/messages`,
+      Buffer.from('{"model":"usage-compressed","stream":true}'),
+      { acceptEncoding: encoding },
+    );
+    const row = await waitFor(() => sink.rows[0]);
+    assert.equal(upstreamAcceptEncoding, encoding);
+    assert.equal(response.headers['content-encoding'], encoding);
+    assert.deepEqual(response.body, encoded, `${encoding} response bytes changed`);
+    assert.equal(row.responseBytes, encoded.length);
+    assert.equal(row.inputTokens, 11);
+    assert.equal(row.outputTokens, 17);
+    assert.equal(row.usageState, 'complete');
+  }
+});
+
+test('a broken compressed body remains byte-identical and only marks usage unavailable', async (t) => {
+  const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
+  const invalid = Buffer.from('not-a-gzip-stream');
+  const { proxyUrl } = await startHarness(t, {
+    requestMetrics: sink,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Content-Encoding': 'gzip',
+      });
+      res.end(invalid);
+    },
+  });
+  const response = await rawMetricResponse(
+    `${proxyUrl}/claude/v1/messages`,
+    Buffer.from('{"model":"usage-invalid-gzip","stream":true}'),
+    { acceptEncoding: 'gzip' },
+  );
+  const row = await waitFor(() => sink.rows[0]);
+  assert.deepEqual(response.body, invalid);
+  assert.equal(row.outcome, 'completed');
+  assert.equal(row.usageState, 'unavailable');
+  assert.equal(row.inputTokens, null);
+  assert.equal(row.outputTokens, null);
+});
+
+test('compressed SSE usage persists through schema v2 without storing response text', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-p5-integration-'));
+  const metrics = await new MetricsStore({ home, flushIntervalMs: 60_000 }).init();
+  t.after(async () => {
+    metrics.close();
+    await rm(home, { recursive: true, force: true });
+  });
+  const responseMarker = 'response-body-marker-must-not-enter-sqlite';
+  const body = Buffer.from(COMPLETE_SSE.toString('utf8').replace(
+    'event: message_delta',
+    `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"${responseMarker}"}}\n\nevent: message_delta`,
+  ));
+  const encoded = gzipSync(body);
+  const { proxyUrl } = await startHarness(t, {
+    requestMetrics: metrics,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Content-Encoding': 'gzip',
+      });
+      res.end(encoded);
+    },
+  });
+  const response = await rawMetricResponse(
+    `${proxyUrl}/claude/v1/messages`,
+    Buffer.from('{"model":"p5-schema-integration","stream":true}'),
+    { acceptEncoding: 'gzip' },
+  );
+  assert.deepEqual(response.body, encoded);
+  await waitFor(() => metrics.stats.enqueued === 1);
+  assert.equal(metrics.flush().written, 1);
+  const totals = metrics.queryTotals({ scope: 'consumption' });
+  assert.equal(totals.totalInputTokens, 11);
+  assert.equal(totals.totalCacheCreationInputTokens, 2);
+  assert.equal(totals.totalCacheReadInputTokens, 3);
+  assert.equal(totals.totalOutputTokens, 17);
+  assert.equal(totals.usageCompleteCount, 1);
+  assert.equal(totals.usagePartialCount, 0);
+  assert.equal(totals.usageUnavailableCount, 0);
+
+  const database = await readFile(join(home, 'metrics.sqlite'));
+  const wal = await readFile(join(home, 'metrics.sqlite-wal')).catch(() => Buffer.alloc(0));
+  assert.equal(Buffer.concat([database, wal]).includes(Buffer.from(responseMarker)), false);
 });
 
 test('authenticated pre-proxy rejections retain attribution without touching upstream', async (t) => {
@@ -393,12 +620,20 @@ test('upstream disconnect before headers returns 502 and enqueues exactly one ro
 
 test('upstream disconnect after headers records one partial upstream-error row', async (t) => {
   const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
-  const partial = Buffer.from('partial-upstream-body');
+  const partial = Buffer.from([
+    'event: message_start',
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","usage":{"output_tokens":8}}',
+    '',
+    '',
+  ].join('\n'));
   const { proxyUrl } = await startHarness(t, {
     requestMetrics: sink,
     upstreamHandler: async (req, res) => {
       await readBody(req);
-      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
       res.write(partial);
       setTimeout(() => res.destroy(), 20).unref();
     },
@@ -414,6 +649,9 @@ test('upstream disconnect after headers records one partial upstream-error row',
   assert.equal(row.outcome, 'upstream_error_after_headers');
   assert.ok(row.ttfbMs >= 0);
   assert.equal(row.responseBytes, partial.length);
+  assert.equal(row.inputTokens, 5);
+  assert.equal(row.outputTokens, 8);
+  assert.equal(row.usageState, 'partial');
   assert.equal(sink.rows.length, 1);
 });
 
@@ -433,7 +671,8 @@ test('client disconnect records client_aborted, destroys upstream, and enqueues 
     upstreamHandler: async (req, res) => {
       await readBody(req);
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-      const timer = setInterval(() => res.write('data: chunk\n\n'), 5);
+      res.write(PARTIAL_START_SSE);
+      const timer = setInterval(() => res.write(': keepalive\n\n'), 5);
       res.on('close', () => {
         clearInterval(timer);
         t.upstreamClosed?.();
@@ -464,6 +703,11 @@ test('client disconnect records client_aborted, destroys upstream, and enqueues 
   assert.equal(row.statusCode, 200);
   assert.ok(row.ttfbMs >= 0);
   assert.ok(row.responseBytes > 0);
+  assert.equal(row.inputTokens, 13);
+  assert.equal(row.cacheCreationInputTokens, 0);
+  assert.equal(row.cacheReadInputTokens, 4);
+  assert.equal(row.outputTokens, 1);
+  assert.equal(row.usageState, 'partial');
   assert.equal(sink.rows.length, 1);
 });
 
