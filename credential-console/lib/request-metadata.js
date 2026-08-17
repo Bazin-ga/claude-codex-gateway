@@ -1,5 +1,6 @@
 import { Transform } from 'node:stream';
 import { TextDecoder } from 'node:util';
+import { extractPromptCandidate } from './prompt-capture.js';
 
 export const REQUEST_METADATA_PREFIX_BYTES = 64 * 1024;
 
@@ -693,12 +694,15 @@ function normalizedModelLimit(value) {
 export function createRequestMetadataTee({
   prefixLimit = REQUEST_METADATA_PREFIX_BYTES,
   maxModelChars = 256,
+  capturePrompt = false,
 } = {}) {
   const boundedPrefixLimit = normalizedLimit(prefixLimit, REQUEST_METADATA_PREFIX_BYTES);
   const boundedModelLimit = normalizedModelLimit(maxModelChars);
   const parser = new TopLevelJsonScanner({ maxModelChars: boundedModelLimit });
   let requestBytes = 0;
   let capturedPrefixBytes = 0;
+  const promptPrefix = [];
+  let promptCandidate = null;
 
   const stream = new Transform({
     transform(chunk, encoding, callback) {
@@ -709,6 +713,7 @@ export function createRequestMetadataTee({
         if (take > 0) {
           try {
             parser.push(buffer.subarray(0, take));
+            if (capturePrompt) promptPrefix.push(Buffer.from(buffer.subarray(0, take)));
           } catch {
             // Metadata is best effort. Never turn a parser failure into a
             // failure of the byte-for-byte request proxy.
@@ -722,11 +727,18 @@ export function createRequestMetadataTee({
     flush(callback) {
       try {
         parser.finish({ prefixTruncated: requestBytes > capturedPrefixBytes });
+        if (capturePrompt && requestBytes === capturedPrefixBytes) {
+          const metadata = parser.snapshot();
+          promptCandidate = extractPromptCandidate(Buffer.concat(promptPrefix), {
+            parseState: metadata.parseState,
+          });
+        }
       } catch {
         // A malformed prefix must never turn a pass-through body into a
         // failed request during stream finalization.
         parser.fail();
       }
+      promptPrefix.length = 0;
       callback();
     },
   });
@@ -742,6 +754,9 @@ export function createRequestMetadataTee({
         stream: metadata.stream,
         parseState: metadata.parseState,
       };
+    },
+    conversationCandidate() {
+      return promptCandidate;
     },
   };
 }

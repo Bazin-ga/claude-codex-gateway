@@ -46,6 +46,8 @@ import {
   codexConfiguredView,
   codexCredentialView,
   metricsView,
+  conversationsView,
+  conversationDetailView,
 } from './lib/views.js';
 import { requestEnrollment as requestCodexEnrollment } from '../codex-credential/client-agent/enroll.js';
 
@@ -76,6 +78,10 @@ const SESSION_TTL_MS = 12 * 60 * 60_000;
 // heap by the shipped unit; an unbounded map is an OOM plus a restart loop.
 const MAX_SESSIONS = 4_096;
 const DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const BOUNDED_CONVERSATION_SEARCH_ERRORS = new Set([
+  'search_query_too_short',
+  'search_query_requires_indexed_terms',
+]);
 export const SHUTDOWN_DEADLINE_MS = 1_000;
 const CODEX_AGENT_ROOT = fileURLToPath(new URL('../codex-credential/client-agent/', import.meta.url));
 export const CODEX_AGENT_ASSETS = new Map([
@@ -535,6 +541,54 @@ export async function createCredentialConsole(options = {}) {
     }
   }
 
+  function conversationSearchPage(url) {
+    const q = String(url.searchParams.get('q') ?? '');
+    const beforeValue = url.searchParams.get('before_id');
+    const limitValue = Number(url.searchParams.get('limit') ?? 20);
+    const beforeId = beforeValue === null || beforeValue === ''
+      ? null
+      : Number(beforeValue);
+    const limit = Number.isSafeInteger(limitValue) ? limitValue : 20;
+    const empty = {
+      statusCode: 503,
+      result: {
+        items: [],
+        nextBeforeId: null,
+        error: 'conversation_archive_unavailable',
+      },
+      q,
+      beforeId,
+      limit,
+      queueDropped: requestMetrics?.stats?.conversation?.dropped ?? 0,
+    };
+    if (typeof requestMetrics?.searchConversations !== 'function') return empty;
+    try {
+      // Like the metrics dashboard, a read is allowed to flush a bounded batch.
+      // The proxy completion path itself never waits on SQLite.
+      requestMetrics.flush?.();
+      const rawResult = requestMetrics.searchConversations({ q, beforeId, limit });
+      const result = rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+        ? rawResult
+        : { items: [], nextBeforeId: null, error: 'conversation_archive_unavailable' };
+      const statusCode = result?.error
+        ? BOUNDED_CONVERSATION_SEARCH_ERRORS.has(result.error) ? 400 : 503
+        : 200;
+      return {
+        statusCode,
+        result,
+        q,
+        beforeId,
+        limit,
+        queueDropped: requestMetrics.stats?.conversation?.dropped ?? 0,
+      };
+    } catch (error) {
+      log('conversation_search_route_failed', {
+        code: error?.code ?? error?.name ?? 'unknown',
+      });
+      return empty;
+    }
+  }
+
   async function handler(req, res) {
     const url = new URL(req.url, publicBaseUrl);
     const path = url.pathname;
@@ -584,6 +638,58 @@ export async function createCredentialConsole(options = {}) {
       if (!session) return;
       sendHtml(res, 200, metricsView({
         ...metricsPage(url),
+        openMode,
+      }));
+      return;
+    }
+
+    if (path === '/conversations' && req.method !== 'GET') {
+      sendText(res, 405, 'method not allowed\n', 'text/plain; charset=utf-8', { Allow: 'GET' });
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/conversations') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const page = conversationSearchPage(url);
+      sendHtml(res, page.statusCode ?? 200, conversationsView({
+        ...page,
+        openMode,
+      }));
+      return;
+    }
+
+    const conversationParams = routeMatch(path, '/conversations/:id');
+    if (conversationParams && req.method !== 'GET') {
+      sendText(res, 405, 'method not allowed\n', 'text/plain; charset=utf-8', { Allow: 'GET' });
+      return;
+    }
+    if (req.method === 'GET' && conversationParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const conversationId = Number(conversationParams.id);
+      let result = { turn: null, error: null };
+      if (Number.isSafeInteger(conversationId) && conversationId > 0
+        && typeof requestMetrics?.readConversation === 'function') {
+        try {
+          requestMetrics.flush?.();
+          const rawResult = requestMetrics.readConversation(conversationId);
+          result = rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+            ? rawResult
+            : { turn: null, error: 'conversation_unavailable' };
+        } catch (error) {
+          log('conversation_read_route_failed', {
+            code: error?.code ?? error?.name ?? 'unknown',
+          });
+          result = { turn: null, error: 'conversation_unavailable' };
+        }
+      } else if (typeof requestMetrics?.readConversation !== 'function') {
+        result = { turn: null, error: 'conversation_archive_unavailable' };
+      }
+      const statusCode = result?.error ? 503 : (result?.turn ? 200 : 404);
+      sendHtml(res, statusCode, conversationDetailView({
+        result,
+        id: conversationParams.id,
         openMode,
       }));
       return;
@@ -730,7 +836,7 @@ const translations = {
   'metrics-dashboard-link': '查看请求指标',
   'metrics-label': '请求指标',
   'metrics-heading': 'Claude 网关请求指标',
-  'metrics-intro': '本页只展示请求元数据；当前阶段不会存储请求正文或回复正文。',
+  'metrics-intro': '本页只展示请求元数据；本页不展示请求正文或回复正文，符合条件的已捕获对话会在对话归档中单独展示。',
   'metrics-claude-only': 'Token 核算只覆盖 Claude 网关流量。Codex 客户端直接连接服务商，不在此统计范围内。',
   'metrics-attribution-disclaimer': '使用者标签由本人填写，未经验证；只能用于观察用量趋势，不得作为追责或计费依据。',
   'metrics-filter-heading': '筛选请求指标',
@@ -805,6 +911,40 @@ const translations = {
   'metrics-response-bytes': '响应字节数',
   'metrics-avg-ttfb': '平均首字节时间（毫秒）',
   'metrics-avg-duration': '平均总耗时（毫秒）',
+  'conversations-dashboard-link': '查看已捕获对话',
+  'conversations-label': '已捕获对话',
+  'conversations-heading': '对话归档',
+  'conversations-intro': '搜索符合条件且永久保留的 Claude 对话。',
+  'conversation-privacy-heading': '对话隐私告知',
+  'conversation-privacy-notice': '此功能会永久保存每一条已捕获的对话，并把已捕获的对话正文公开给所有能访问本控制台的人。成员标签由本人填写且未经验证。Codex 流量不在采集范围内。',
+  'conversation-open-warning': 'Open 模式：tailnet 中任何能访问本控制台的人都可以读取所有已捕获对话；没有身份识别，也没有阅读审计。成员标签不代表操作人身份。',
+  'conversation-search': '搜索对话',
+  'conversation-search-submit': '搜索',
+  'conversation-search-clear': '清除',
+  'conversation-next-page': '下一页',
+  'conversation-open': '打开对话',
+  'conversation-no-results': '没有符合此搜索条件的已捕获对话。',
+  'conversation-search-error': '对话搜索无法完成。',
+  'conversation-search-query-too-short': '搜索词对当前归档太短。大库中至少输入连续 3 个中文字符或更多可检索文字；请去掉单独特殊标点，并拆开查询。',
+  'conversation-search-requires-indexed-terms': '搜索需要可建立索引的词。大库中请输入至少连续 3 个中文字符，去掉特殊标点，或拆开查询。',
+  'conversation-read-error': '对话无法载入。',
+  'conversation-not-found': '找不到这条对话。',
+  'conversation-detail-heading': '对话',
+  'conversation-back': '返回对话列表',
+  'conversation-unknown-id': '对话',
+  'conversation-captured-at': '捕获时间',
+  'conversation-member-label': '成员标签',
+  'conversation-account': '账号',
+  'conversation-model': '模型',
+  'conversation-prompt': '提示词',
+  'conversation-response': '回复',
+  'conversation-empty-prompt': '未捕获提示词',
+  'conversation-empty-response': '未捕获回复正文',
+  'conversation-queue-dropped': '有对话采集任务被有界队列丢弃。',
+  'conversation-response-complete': '回复完整',
+  'conversation-response-incomplete': '回复不完整',
+  'conversation-response-truncated': '回复已截断',
+  'conversation-response-unavailable': '回复不可用',
   'choose-codex-platform': '选择这台设备的操作系统',
   'one-platform-only': '请只在刚登记的这台设备上选择一种安装器使用，不要把这些脚本复用到其他机器。',
   'view-script': '查看脚本',
@@ -1729,11 +1869,13 @@ async function main() {
     const created = await createCredentialConsole({ tls });
     ({ server } = created);
     const metricsEnabled = Boolean(created.requestMetrics);
+    // Keep the D-013 event name stable for existing log monitors; its detail now
+    // covers the P6 conversation disclosure as well as the P2/P5 metadata rows.
     log('privacy_metadata_recording', {
       enabled: metricsEnabled,
       detail: metricsEnabled
-        ? 'proxied Claude request metadata, including four provider-reported token counts, is stored and visible to every console member; member labels are self-entered and unverified and must not be used for accountability or billing; request and response bodies are not stored'
-        : 'request metadata recording is unavailable, so requests are not currently being stored; request and response bodies are not stored',
+        ? 'proxied Claude request metadata, including four provider-reported token counts, is stored; eligible Claude human prompts and assistant replies are permanently stored and visible to every console member; in open mode anyone on the tailnet who can reach the console can read them with no identity and no reading audit; member labels are self-entered and unverified and must not be used for accountability or billing; Codex traffic is not captured'
+        : 'request metadata and Claude conversation capture are unavailable, so requests and conversation text are not currently being stored',
     });
     server.once('close', () => {
       releaseHomeLock().catch((error) => console.error(error.stack ?? error.message));

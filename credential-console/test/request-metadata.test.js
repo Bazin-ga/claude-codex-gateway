@@ -8,7 +8,7 @@ import {
 } from '../lib/request-metadata.js';
 
 async function runCapture(input, options = {}, { oneByteChunks = false } = {}) {
-  const { stream, snapshot } = createRequestMetadataTee(options);
+  const { stream, snapshot, conversationCandidate } = createRequestMetadataTee(options);
   const output = [];
   stream.on('data', (chunk) => output.push(Buffer.from(chunk)));
   const body = Buffer.isBuffer(input) ? input : Buffer.from(input);
@@ -19,7 +19,11 @@ async function runCapture(input, options = {}, { oneByteChunks = false } = {}) {
     stream.end(body);
   }
   await once(stream, 'end');
-  return { output: Buffer.concat(output), snapshot: snapshot() };
+  return {
+    output: Buffer.concat(output),
+    snapshot: snapshot(),
+    conversationCandidate: conversationCandidate(),
+  };
 }
 
 test('exports the fixed 64 KiB observation limit', () => {
@@ -37,6 +41,51 @@ test('extracts root model and stream and preserves bytes', async () => {
     parseState: 'complete',
   });
   assert.deepEqual(result.output, body);
+  assert.equal(result.conversationCandidate, null);
+});
+
+test('the same bounded tee captures only an eligible final human text message when enabled', async () => {
+  const body = Buffer.from(JSON.stringify({
+    model: 'claude-human',
+    stream: true,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: '  exact first  ' },
+        { type: 'tool_result', tool_use_id: 'tool-1', content: 'never persist this' },
+        { type: 'text', text: '\nsecond\n' },
+      ],
+    }],
+  }));
+  const result = await runCapture(body, { capturePrompt: true }, { oneByteChunks: true });
+  assert.deepEqual(result.output, body);
+  assert.equal(result.snapshot.model, 'claude-human');
+  assert.equal(result.snapshot.stream, true);
+  assert.deepEqual(result.conversationCandidate, {
+    promptText: '  exact first  \n\n\nsecond\n',
+    messageIndex: 0,
+    contentBlockCount: 3,
+    textBlockCount: 2,
+  });
+  assert.equal(result.conversationCandidate.promptText.includes('never persist this'), false);
+});
+
+test('the request tee does not capture tool-only, empty, or truncated bodies', async () => {
+  for (const messages of [
+    [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'tool' }] }],
+    [{ role: 'user', content: [] }],
+  ]) {
+    const result = await runCapture(JSON.stringify({ model: 'skip', messages }), {
+      capturePrompt: true,
+    });
+    assert.equal(result.conversationCandidate, null);
+  }
+  const truncated = await runCapture(JSON.stringify({
+    padding: 'x'.repeat(REQUEST_METADATA_PREFIX_BYTES),
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'too late' }] }],
+  }), { capturePrompt: true });
+  assert.equal(truncated.snapshot.parseState, 'truncated');
+  assert.equal(truncated.conversationCandidate, null);
 });
 
 test('handles every byte as a separate chunk, including escaped strings', async () => {

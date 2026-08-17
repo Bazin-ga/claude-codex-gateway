@@ -5,7 +5,14 @@ import { Transform } from 'node:stream';
 import { sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
 import { createRequestMetadataTee } from './request-metadata.js';
-import { createResponseObservationTee } from './response-observation.js';
+import {
+  createCompositeResponseObserver,
+  createResponseObservationTee,
+} from './response-observation.js';
+import {
+  RESPONSE_CONTENT_MAX_BYTES,
+  createResponseContentAssembler,
+} from './response-content.js';
 import { createResponseUsageParser } from './response-usage.js';
 
 const ALLOWED_PATHS = new Set([
@@ -103,14 +110,48 @@ function safeUsageSnapshot(observation) {
   return usage;
 }
 
+function safeConversationResponse(observation) {
+  let snapshot;
+  try {
+    snapshot = observation?.snapshot?.();
+  } catch {
+    return { responseText: '', responseState: 'unavailable', responseBytes: 0 };
+  }
+  if (!snapshot || typeof snapshot.text !== 'string') {
+    return { responseText: '', responseState: 'unavailable', responseBytes: 0 };
+  }
+  const responseBytes = Buffer.byteLength(snapshot.text, 'utf8');
+  if (responseBytes > RESPONSE_CONTENT_MAX_BYTES) {
+    return { responseText: '', responseState: 'unavailable', responseBytes: 0 };
+  }
+  const unavailableReasons = new Set([
+    'global_budget',
+    'unsupported_encoding',
+    'decode_error',
+    'invalid_utf8',
+    'invalid_text',
+    'protocol_invalid',
+    'observer_write_error',
+    'observer_end_error',
+  ]);
+  const limitReasons = new Set(['raw_limit', 'decoded_limit']);
+  let responseState = 'incomplete';
+  if (snapshot.truncated === true || limitReasons.has(snapshot.reason)) responseState = 'truncated';
+  else if (unavailableReasons.has(snapshot.reason)) responseState = 'unavailable';
+  else if (snapshot.status === 'complete') responseState = 'complete';
+  return { responseText: snapshot.text, responseState, responseBytes };
+}
+
 function log(event, detail = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...detail }));
 }
 
-function enqueueMetricSafely(requestMetrics, row, { accountId, deviceId }) {
-  if (!requestMetrics?.enqueueRequest) return;
+function enqueueMetricSafely(requestMetrics, row, { accountId, deviceId, conversation = null }) {
+  if (!requestMetrics?.enqueueRequest && !requestMetrics?.enqueueCompletion) return;
   try {
-    const result = requestMetrics.enqueueRequest(row);
+    const result = conversation && typeof requestMetrics.enqueueCompletion === 'function'
+      ? requestMetrics.enqueueCompletion({ metrics: row, conversation })
+      : requestMetrics.enqueueRequest?.(row);
     if (result && typeof result.then === 'function') {
       result.catch((error) => log('metrics_enqueue_failed', {
         account_id: accountId,
@@ -197,6 +238,7 @@ export async function handleClaudeProxy(req, res, {
   metadataTeeFactory = createRequestMetadataTee,
   responseObservationFactory = createResponseObservationTee,
   responseUsageParserFactory = createResponseUsageParser,
+  responseContentAssemblerFactory = createResponseContentAssembler,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
   const upstreamPath = requestUrl.pathname.slice('/claude'.length);
@@ -374,7 +416,7 @@ export async function handleClaudeProxy(req, res, {
 
   const startedAtMs = Date.now();
   const startedAtMonotonic = performance.now();
-  const requestMetadata = metadataTeeFactory();
+  const requestMetadata = metadataTeeFactory({ capturePrompt: upstreamPath === '/v1/messages' });
   const requestLimit = passthroughCounter({ maxBytes: MAX_REQUEST_BYTES });
   let responseObservation = null;
   let responseUsageFinished = true;
@@ -408,7 +450,7 @@ export async function handleClaudeProxy(req, res, {
         code: error?.code ?? error?.name ?? 'unknown',
       });
     }
-    enqueueMetricSafely(requestMetrics, {
+    const metricRow = {
       startedAtMs,
       method: req.method ?? 'UNKNOWN',
       path: upstreamPath,
@@ -429,7 +471,32 @@ export async function handleClaudeProxy(req, res, {
       responseBytes: responseObservation?.bytes?.() ?? 0,
       upstreamRequestId,
       ...safeUsageSnapshot(responseObservation),
-    }, { accountId: account.id, deviceId: device.id });
+    };
+    let conversation = null;
+    if (upstreamPath === '/v1/messages'
+      && typeof requestMetrics?.enqueueCompletion === 'function') {
+      try {
+        const prompt = requestMetadata.conversationCandidate?.();
+        if (prompt?.promptText) {
+          conversation = {
+            promptText: prompt.promptText,
+            promptBytes: Buffer.byteLength(prompt.promptText, 'utf8'),
+            ...safeConversationResponse(responseObservation),
+          };
+        }
+      } catch (error) {
+        log('conversation_capture_failed', {
+          account_id: account.id,
+          device_id: device.id,
+          code: error?.code ?? error?.name ?? 'unknown',
+        });
+      }
+    }
+    enqueueMetricSafely(requestMetrics, metricRow, {
+      accountId: account.id,
+      deviceId: device.id,
+      conversation,
+    });
   };
 
   const finalizeCompletedWhenReady = () => {
@@ -457,14 +524,13 @@ export async function handleClaudeProxy(req, res, {
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
       });
-      const usageFormat = requestMetrics?.enqueueRequest
-        && upstreamPath === '/v1/messages' && status >= 200 && status < 400
+      const responseFormat = upstreamPath === '/v1/messages' && status >= 200 && status < 400
         ? responseUsageFormat(upstreamRes.headers['content-type'])
         : null;
-      let observer = null;
-      if (usageFormat) {
+      const observers = [];
+      if (responseFormat && requestMetrics?.enqueueRequest) {
         try {
-          observer = usageObserver(responseUsageParserFactory({ format: usageFormat }));
+          observers.push(usageObserver(responseUsageParserFactory({ format: responseFormat })));
         } catch (error) {
           log('response_usage_parser_init_failed', {
             account_id: account.id,
@@ -473,6 +539,20 @@ export async function handleClaudeProxy(req, res, {
           });
         }
       }
+      if (responseFormat && typeof requestMetrics?.enqueueCompletion === 'function') {
+        try {
+          observers.push(responseContentAssemblerFactory({ format: responseFormat }));
+        } catch (error) {
+          log('response_content_parser_init_failed', {
+            account_id: account.id,
+            device_id: device.id,
+            code: error?.code ?? error?.name ?? 'unknown',
+          });
+        }
+      }
+      const observer = observers.length
+        ? createCompositeResponseObserver(observers)
+        : null;
       responseUsageFinished = false;
       try {
         responseObservation = responseObservationFactory({

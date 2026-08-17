@@ -6,6 +6,7 @@ import test from 'node:test';
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 import {
   createResponseObservationTee,
+  createCompositeResponseObserver,
   MAX_GLOBAL_OBSERVATION_BUDGET_BYTES,
   MAX_OBSERVED_DECODED_BYTES,
   MAX_OBSERVED_RAW_BYTES,
@@ -141,6 +142,29 @@ test('an observer can stop itself while raw delivery continues', async () => {
   assert.deepEqual(observed.aborts, ['observer_stopped']);
 });
 
+test('composite observers isolate a stopped child and merge bounded snapshots', async () => {
+  const firstChunks = [];
+  const secondChunks = [];
+  const first = {
+    aborted: null,
+    write(chunk) { firstChunks.push(Buffer.from(chunk)); return false; },
+    abort(reason) { this.aborted = reason; },
+    snapshot() { return { first: Buffer.concat(firstChunks).toString('utf8') }; },
+  };
+  const second = {
+    ended: false,
+    write(chunk) { secondChunks.push(Buffer.from(chunk)); },
+    end() { this.ended = true; },
+    snapshot() { return { second: Buffer.concat(secondChunks).toString('utf8') }; },
+  };
+  const composite = createCompositeResponseObserver([first, second]);
+  const result = await through([Buffer.from('one'), Buffer.from('two')], { observer: composite });
+  assert.deepEqual(result.received, Buffer.from('onetwo'));
+  assert.equal(first.aborted, 'observer_stopped');
+  assert.equal(second.ended, true);
+  assert.deepEqual(result.tee.snapshot(), { first: 'one', second: 'onetwo' });
+});
+
 test('telemetry is not a second backpressure authority', async () => {
   const observed = observer();
   const tee = createResponseObservationTee({ observer: observed });
@@ -203,6 +227,19 @@ test('compressed observers share a global reservation budget and release it', as
   second.abort('test_cleanup');
   replacement.abort('test_cleanup');
   await Promise.all([second.done, third.done, replacement.done]);
+});
+
+test('the global budget admits eight identity captures and refuses a ninth', async () => {
+  const active = Array.from({ length: 8 }, () => {
+    const observed = observer();
+    return { observed, tee: createResponseObservationTee({ observer: observed }) };
+  });
+  assert.equal(active.every(({ observed }) => observed.aborted.length === 0), true);
+  const ninthObserver = observer();
+  const ninth = createResponseObservationTee({ observer: ninthObserver });
+  assert.deepEqual(ninthObserver.aborted, ['global_budget']);
+  for (const { tee } of active) tee.abort('test_cleanup');
+  await Promise.all([...active.map(({ tee }) => tee.done), ninth.done]);
 });
 
 test('callers cannot raise per-response observation ceilings above the hard cap', async () => {

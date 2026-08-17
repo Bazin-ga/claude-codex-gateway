@@ -2,11 +2,13 @@
 
 Multi-account control plane for subscription-backed Codex and Claude Code access.
 
-> **Telemetry notice:** every proxied Claude gateway request produces a persistent metadata row
-> that is visible to every member who can reach the console. It includes routing, model, status,
-> timing, byte-count, and four provider-reported token-count fields, but never request or response
-> bodies. Member labels are
-> self-entered and unverified, so the metrics must not be used for accountability or billing.
+> **Telemetry and conversation notice:** every proxied Claude gateway request produces a persistent
+> metadata row that is visible to every member who can reach the console. It includes routing, model,
+> status, timing, byte-count, and four provider-reported token-count fields. P6 permanently stores
+> every captured conversation turn from Claude and makes its prompt/reply text visible to everyone who can
+> reach the console; in `open` mode that means anyone on the tailnet, with no identity and no reading
+> audit. Member labels are self-entered and unverified, so metrics must not be used for accountability
+> or billing. Codex traffic is not covered by conversation capture.
 
 It solves two related operational problems:
 
@@ -65,8 +67,8 @@ V1 implements:
   that use the public dispenser and do not fetch files from the private console;
 - a public generic AI onboarding document plus a live private Markdown guide with safe deployment
   metadata, exact read-only version checks, and a copyable dashboard link;
-- persistent, body-free per-request metrics in a separate SQLite database, with server-rendered
-  charts and filters.
+- persistent per-request metrics in a separate SQLite database, with server-rendered charts and
+  filters, plus a permanent archive of eligible captured Claude conversation turns.
 
 V1 deliberately does **not**:
 
@@ -307,16 +309,37 @@ synthetic/lifetime aggregate exceeds JavaScript's exact-integer range,
 the page reports that overflow instead of rounding it or failing the entire metrics query; the
 per-request integer rows remain stored.
 
-The page remains body-free: request and response bodies are not stored or rendered. Metrics are
-visible to every member who can reach the console; in `open` mode that means anyone who can reach
-the private console. Self-entered member labels remain unverified and must not be used for
-accountability or billing.
+The metrics page remains body-free: request and response bodies are not rendered there. P6 separately
+permanently stores eligible captured Claude conversation turns and exposes them through the captured
+conversation archive to every member who can reach the console; in `open` mode that means anyone on
+the tailnet, with no identity and no reading audit. Self-entered member labels remain unverified and
+must not be used for accountability or billing. Codex traffic is not covered by conversation capture.
 
 The first P5 start migrates `metrics.sqlite` from schema 1 to schema 2 in one transaction; old rows
-remain readable with unknown token values. A pre-P5 binary deliberately refuses the newer metrics
-schema. To roll code back, stop the console and restore only `metrics.sqlite` from the pre-upgrade
-checkpointed backup (removing its `-wal`/`-shm` sidecars); do not replace `master.key` or
-`state.json` merely to roll back metrics code.
+remain readable with unknown token values. The first P6 start then migrates schema 2 to schema 3 in
+one transaction, adding the permanent conversation tables and full-text index; existing request rows
+remain readable and simply have no conversation turn. A pre-P5 or pre-P6 binary deliberately refuses
+the newer metrics schema. To roll code back, stop the console and restore only `metrics.sqlite` from
+the matching checkpointed backup (removing its `-wal`/`-shm` sidecars); do not replace `master.key`
+or `state.json` merely to roll back metrics code or conversation UI.
+
+## Captured conversations
+
+P6 permanently retains the prompt and reply text for eligible Claude turns and makes the archive
+available to every member who can reach the console. The list supports full-text search and keyset
+pagination; opening a row shows the complete stored text with its `complete`, `incomplete`,
+`truncated`, or `unavailable` response state. A bounded capture queue can drop a conversation before
+it is stored; the archive reports that condition prominently rather than implying that the turn was
+saved. Codex traffic does not pass through this gateway and is not covered.
+
+This is a deliberate disclosure, not an access-control boundary. In `open` mode, anyone on the
+tailnet who can reach the console can read every captured conversation; there is no identity and no
+reading audit. Member labels are self-entered and unverified and do not identify an actor. Treat the
+conversation archive and its backups as permanent sensitive content.
+
+Search validation is intentionally bounded for large archives: if a query is too short or has no
+indexed terms, enter at least three consecutive Chinese characters, remove standalone punctuation,
+or split the query into simpler terms. Other search failures use a fixed generic error message.
 
 ## Machine inventory
 
@@ -466,8 +489,9 @@ its first device token through the existing console self-service page.
   returns a fixed response; every other path requires a valid device token.
 - The public gateway rate-limits failed authentication by source IP and applies per-device
   request and concurrency budgets after authentication.
-- Prompt and response bodies are streamed and never logged or persisted. Routing, model, status,
-  timing, and byte-count metadata is persisted in `metrics.sqlite` and visible on `/metrics`.
+- Prompt and response bodies are streamed; eligible Claude turns are permanently retained in the
+  conversation archive and visible to every console-reachable member, while routing, model, status,
+  timing, and byte-count metadata remains visible on `/metrics`. Codex traffic is outside capture.
 - TTFB is measured when the upstream response headers arrive (the first HTTP response bytes).
   Request and response byte counts are raw body bytes observed by the gateway; an interrupted row
   therefore contains the partial count observed before the terminal event.

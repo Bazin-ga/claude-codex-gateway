@@ -143,7 +143,7 @@ async function rawMetricResponse(url, body, { acceptEncoding = null } = {}) {
 
 const COMPLETE_SSE = Buffer.from([
   'event: message_start',
-  'data: {"type":"message_start","message":{"usage":{"input_tokens":11,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":1}}}',
+  'data: {"type":"message_start","message":{"role":"assistant","usage":{"input_tokens":11,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":1}}}',
   '',
   'event: ping',
   'data: {"type":"ping"}',
@@ -159,7 +159,49 @@ const COMPLETE_SSE = Buffer.from([
 
 const PARTIAL_START_SSE = Buffer.from([
   'event: message_start',
-  'data: {"type":"message_start","message":{"usage":{"input_tokens":13,"cache_creation_input_tokens":0,"cache_read_input_tokens":4,"output_tokens":1}}}',
+  'data: {"type":"message_start","message":{"role":"assistant","usage":{"input_tokens":13,"cache_creation_input_tokens":0,"cache_read_input_tokens":4,"output_tokens":1}}}',
+  '',
+  '',
+].join('\n'));
+
+const PARTIAL_CONVERSATION_SSE = Buffer.from([
+  PARTIAL_START_SSE.toString('utf8'),
+  'event: content_block_start',
+  'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+  '',
+  'event: content_block_delta',
+  'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}',
+  '',
+  '',
+].join('\n'));
+
+const CONVERSATION_SSE = Buffer.from([
+  'event: message_start',
+  'data: {"type":"message_start","message":{"role":"assistant","usage":{"input_tokens":4,"output_tokens":1}}}',
+  '',
+  'event: content_block_start',
+  'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+  '',
+  'event: content_block_delta',
+  'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"assistant answer"}}',
+  '',
+  'event: content_block_start',
+  'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use"}}',
+  '',
+  'event: content_block_delta',
+  'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"DO_NOT_STORE"}}',
+  '',
+  'event: content_block_stop',
+  'data: {"type":"content_block_stop","index":0}',
+  '',
+  'event: content_block_stop',
+  'data: {"type":"content_block_stop","index":1}',
+  '',
+  'event: message_delta',
+  'data: {"type":"message_delta","usage":{"output_tokens":6}}',
+  '',
+  'event: message_stop',
+  'data: {"type":"message_stop"}',
   '',
   '',
 ].join('\n'));
@@ -411,6 +453,116 @@ test('compressed SSE usage persists through schema v2 without storing response t
   assert.equal(Buffer.concat([database, wal]).includes(Buffer.from(responseMarker)), false);
 });
 
+test('P6 records only final human text prompts and pairs them with text-only replies', async (t) => {
+  const sink = {
+    rows: [],
+    completions: [],
+    enqueueRequest(row) { this.rows.push(row); },
+    enqueueCompletion(value) { this.completions.push(value); },
+  };
+  const { proxyUrl } = await startHarness(t, {
+    requestMetrics: sink,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end(CONVERSATION_SSE);
+    },
+  });
+  const bodies = [
+    {
+      expected: '  human prompt  ',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '  human prompt  ' }] }],
+    },
+    {
+      expected: null,
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'tool output' }] }],
+    },
+    {
+      expected: 'first\n\nsecond',
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: 'first' },
+        { type: 'tool_result', tool_use_id: 'tool-2', content: 'secret tool output' },
+        { type: 'text', text: 'second' },
+      ] }],
+    },
+    { expected: null, messages: [{ role: 'user', content: [] }] },
+  ];
+  for (const [index, fixture] of bodies.entries()) {
+    const response = await fetchMetricResponse(
+      `${proxyUrl}/claude/v1/messages`,
+      Buffer.from(JSON.stringify({ model: `p6-${index}`, stream: true, messages: fixture.messages })),
+    );
+    assert.deepEqual(response.body, CONVERSATION_SSE);
+  }
+  await waitFor(() => sink.rows.length + sink.completions.length === bodies.length);
+  assert.equal(sink.completions.length, 2);
+  assert.equal(sink.rows.length, 2);
+  assert.deepEqual(
+    sink.completions.map(({ conversation }) => conversation.promptText),
+    bodies.filter(({ expected }) => expected !== null).map(({ expected }) => expected),
+  );
+  for (const { metrics, conversation } of sink.completions) {
+    assert.equal(metrics.usageState, 'complete');
+    assert.equal(conversation.responseText, 'assistant answer');
+    assert.equal(conversation.responseState, 'complete');
+    assert.equal(conversation.responseBytes, Buffer.byteLength('assistant answer'));
+    assert.deepEqual(Object.keys(conversation).sort(), [
+      'promptBytes',
+      'promptText',
+      'responseBytes',
+      'responseState',
+      'responseText',
+    ]);
+    assert.equal(JSON.stringify(conversation).includes('DO_NOT_STORE'), false);
+    assert.equal(JSON.stringify(conversation).includes(DEVICE_TOKEN), false);
+    assert.equal(JSON.stringify(conversation).includes(ACCOUNT_CREDENTIAL), false);
+    assert.equal(conversation.promptText.includes('secret tool output'), false);
+  }
+});
+
+test('P6 non-streaming reply capture shares the compressed observation tee', async (t) => {
+  const sink = {
+    completions: [],
+    enqueueRequest() {},
+    enqueueCompletion(value) { this.completions.push(value); },
+  };
+  const body = Buffer.from(JSON.stringify({
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'json answer' },
+      { type: 'tool_use', name: 'never-store', input: { secret: 'DO_NOT_STORE' } },
+    ],
+    usage: { input_tokens: 8, output_tokens: 3 },
+  }));
+  const encoded = gzipSync(body);
+  const { proxyUrl } = await startHarness(t, {
+    requestMetrics: sink,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' });
+      res.end(encoded);
+    },
+  });
+  const response = await rawMetricResponse(
+    `${proxyUrl}/claude/v1/messages`,
+    Buffer.from(JSON.stringify({
+      model: 'p6-json',
+      stream: false,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'json prompt' }] }],
+    })),
+    { acceptEncoding: 'gzip' },
+  );
+  assert.deepEqual(response.body, encoded);
+  await waitFor(() => sink.completions[0]);
+  const { metrics, conversation } = sink.completions[0];
+  assert.equal(metrics.inputTokens, 8);
+  assert.equal(metrics.outputTokens, 3);
+  assert.equal(conversation.promptText, 'json prompt');
+  assert.equal(conversation.responseText, 'json answer');
+  assert.equal(conversation.responseState, 'complete');
+  assert.equal(JSON.stringify(conversation).includes('DO_NOT_STORE'), false);
+});
+
 test('authenticated pre-proxy rejections retain attribution without touching upstream', async (t) => {
   for (const scenario of [
     {
@@ -622,7 +774,7 @@ test('upstream disconnect after headers records one partial upstream-error row',
   const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
   const partial = Buffer.from([
     'event: message_start',
-    'data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}',
+    'data: {"type":"message_start","message":{"role":"assistant","usage":{"input_tokens":5,"output_tokens":1}}}',
     '',
     'event: message_delta',
     'data: {"type":"message_delta","usage":{"output_tokens":8}}',
@@ -656,7 +808,15 @@ test('upstream disconnect after headers records one partial upstream-error row',
 });
 
 test('client disconnect records client_aborted, destroys upstream, and enqueues once', async (t) => {
-  const sink = { rows: [], enqueueRequest(row) { this.rows.push(row); } };
+  const sink = {
+    rows: [],
+    conversations: [],
+    enqueueRequest(row) { this.rows.push(row); },
+    enqueueCompletion({ metrics, conversation }) {
+      this.rows.push(metrics);
+      this.conversations.push(conversation);
+    },
+  };
   const upstreamClosed = new Promise((resolve) => {
     let resolved = false;
     const finish = () => {
@@ -671,7 +831,7 @@ test('client disconnect records client_aborted, destroys upstream, and enqueues 
     upstreamHandler: async (req, res) => {
       await readBody(req);
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-      res.write(PARTIAL_START_SSE);
+      res.write(PARTIAL_CONVERSATION_SSE);
       const timer = setInterval(() => res.write(': keepalive\n\n'), 5);
       res.on('close', () => {
         clearInterval(timer);
@@ -693,7 +853,11 @@ test('client disconnect records client_aborted, destroys upstream, and enqueues 
     });
     request.on('error', () => {});
     request.once('socket', () => {});
-    request.end('{"model":"client-abort","stream":true}');
+    request.end(JSON.stringify({
+      model: 'client-abort',
+      stream: true,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'abort prompt' }] }],
+    }));
     setTimeout(() => reject(new Error('client did not receive a streaming response')), 3_000).unref();
   });
 
@@ -708,6 +872,10 @@ test('client disconnect records client_aborted, destroys upstream, and enqueues 
   assert.equal(row.cacheReadInputTokens, 4);
   assert.equal(row.outputTokens, 1);
   assert.equal(row.usageState, 'partial');
+  assert.equal(sink.conversations.length, 1);
+  assert.equal(sink.conversations[0].promptText, 'abort prompt');
+  assert.equal(sink.conversations[0].responseText, 'partial answer');
+  assert.equal(sink.conversations[0].responseState, 'incomplete');
   assert.equal(sink.rows.length, 1);
 });
 

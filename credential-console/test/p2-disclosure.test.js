@@ -50,7 +50,7 @@ function sectionBetween(text, startMarker, endMarker = null) {
   return text.slice(start, end);
 }
 
-test('P2 disclosure is prominent, body-free, and not a premature P6 conversation notice', async () => {
+test('P6 disclosure is prominent, permanent, and explicit about the open audience', async () => {
   const files = await readRepositoryFiles();
   const englishTop = files.readmeEn.split('\n').slice(0, 14).join('\n');
   const chineseTop = files.readmeZh.split('\n').slice(0, 14).join('\n');
@@ -59,30 +59,35 @@ test('P2 disclosure is prominent, body-free, and not a premature P6 conversation
   const consoleNotice = files.consoleReadme.replace(/^>\s?/gm, '');
 
   assert.match(englishNotice, /Telemetry notice/i);
-  assert.match(englishNotice, /records metadata for every proxied Claude gateway\s+request/i);
+  assert.match(englishNotice, /records metadata for every proxied\s+Claude gateway\s+request/i);
   assert.match(englishNotice, /four provider-reported token counts/i);
-  assert.match(englishNotice, /makes those metrics visible to every\s+member who can reach the console/i);
-  assert.match(englishNotice, /Request and\s+response bodies are not stored by this release/i);
+  assert.match(englishNotice, /makes those metrics\s+visible to every\s+member who can reach the console/i);
+  assert.match(englishNotice, /P6 permanently stores every captured\s+conversation turn from Claude/i);
+  assert.match(englishNotice, /prompt\/reply text visible to everyone who can reach the console/i);
+  assert.match(englishNotice, /open.*anyone on the tailnet.*no identity and no reading audit/is);
+  assert.match(englishNotice, /Codex traffic is not covered by conversation capture/i);
 
   assert.match(chineseNotice, /遥测告知/);
   assert.match(chineseNotice, /记录每个经代理转发的 Claude 网关请求元数据/);
   assert.match(chineseNotice, /服务商报告的四类 token 数/);
   assert.match(chineseNotice, /这些指标向所有能够访问控制台的成员公开/);
-  assert.match(chineseNotice, /不存储\s*请求正文或回复正文/);
+  assert.match(chineseNotice, /P6[\s\S]*永久保存[\s\S]*已捕获[\s\S]*Claude 对话/);
+  assert.match(chineseNotice, /open[\s\S]*tailnet[\s\S]*没有身份识别[\s\S]*阅读审计/i);
+  assert.match(chineseNotice, /Codex 流量不在对话采集范围内/);
 
-  assert.match(consoleNotice, /every proxied Claude gateway request produces a persistent metadata row/i);
+  assert.match(consoleNotice, /every proxied\s+Claude gateway request produces a persistent\s+metadata row/i);
   assert.match(consoleNotice, /four provider-reported token-count fields/i);
   assert.match(consoleNotice, /Member labels are\s+self-entered\s+and unverified/i);
   assert.match(consoleNotice, /must not be used for accountability or billing/i);
 
   for (const english of [files.readmeEn, files.consoleReadme, files.deploy]) {
-    assert.doesNotMatch(
-      english,
-      /(?:record|collect|capture|publish|visible)[^\n]{0,100}(?:all )?conversation (?:content|body|text)/i,
-    );
-    assert.doesNotMatch(english, /公开所有对话内容/i);
+    assert.match(english, /permanently\s+(?:stores|retains)[\s\S]{0,120}captured[\s\S]{0,80}conversation/i);
+    assert.match(english, /open[\s\S]{0,220}(?:anyone|tailnet)[\s\S]{0,180}(?:no identity|no reading audit)/i);
+    assert.match(english, /Codex[\s\S]{0,100}(?:not covered|outside|not captured)/i);
   }
-  assert.doesNotMatch(files.readmeZh, /(?:记录|采集|收集|公开)[^\n。]{0,100}(?:所有)?对话(?:正文|内容|文本)/i);
+  assert.match(files.readmeZh, /永久保存[\s\S]{0,100}已捕获[\s\S]{0,80}Claude 对话/);
+  assert.match(files.readmeZh, /tailnet[\s\S]{0,120}(?:没有身份识别|无身份)[\s\S]{0,80}(?:阅读审计|审计)/i);
+  assert.match(files.readmeZh, /Codex 流量不在对话采集范围内/);
 });
 
 test('console runtime and deployment docs pin Node, warning suppression, and metrics backup recovery', async () => {
@@ -110,6 +115,11 @@ test('console runtime and deployment docs pin Node, warning suppression, and met
   assert.match(restore, /metrics\.sqlite/);
   assert.match(restore, /checkpoint-metrics/);
   assert.match(restore, /metrics\.sqlite-(?:wal|shm)/);
+  assert.match(files.consoleReadme, /schema 2 to schema 3/i);
+  assert.match(files.consoleReadme, /permanent sensitive content/i);
+  assert.match(files.deploy, /schema 2 to schema 3/i);
+  assert.match(files.deploy, /permanently retained conversation text/i);
+  assert.match(files.deploy, /root-only\/encrypted/i);
 });
 
 function collectJsonLines(child, output) {
@@ -145,7 +155,7 @@ async function stopChild(child) {
   }
 }
 
-test('real server announces body-free metadata disclosure before listening', { timeout: 15_000 }, async () => {
+test('real server announces metadata and conversation disclosure before listening', { timeout: 15_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'credential-console-p2-disclosure-'));
   const testToken = 'p2-disclosure-test-token-never-log';
   const testBody = 'p2-disclosure-test-body-never-log';
@@ -206,7 +216,11 @@ test('real server announces body-free metadata disclosure before listening', { t
     assert.match(privacy.detail, /visible to every console member/i);
     assert.match(privacy.detail, /member labels are self-entered and unverified/i);
     assert.match(privacy.detail, /must not be used for accountability or billing/i);
-    assert.match(privacy.detail, /request and response bodies are not stored/i);
+    assert.match(privacy.detail, /eligible Claude human prompts and assistant replies are permanently stored/i);
+    assert.match(privacy.detail, /visible to every console member/i);
+    assert.match(privacy.detail, /open mode anyone (?:on the tailnet )?who can reach the console can read them/i);
+    assert.match(privacy.detail, /no identity and no reading audit/i);
+    assert.match(privacy.detail, /Codex traffic is not captured/i);
     assert.equal(output.nonJson.length, 0, `unexpected non-JSON startup output: ${output.nonJson.join('\n')}`);
     assert.doesNotMatch(output.stderr, /ExperimentalWarning/);
 

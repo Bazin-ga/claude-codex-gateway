@@ -169,6 +169,24 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-attribution-notice p { margin: 0; }
 .account-switch-form { min-width: 190px; }
 .account-selection-details { display: grid; gap: 3px; margin-top: 5px; }
+.conversation-disclosure { margin: 0; }
+.conversation-disclosure h2 { margin-bottom: 8px; }
+.conversation-disclosure p { margin: 6px 0 0; }
+.conversation-list { display: grid; gap: 14px; }
+.conversation-card { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: #fbfcf9; }
+.conversation-card h2 { margin: 0; font-size: 17px; }
+.conversation-card-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+.conversation-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; color: var(--muted); font-size: 12px; }
+.conversation-snippets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.conversation-snippet { min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: white; }
+.conversation-snippet strong { display: block; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
+.conversation-snippet pre, .conversation-text pre { margin: 0; max-height: 260px; font-size: 12px; }
+.conversation-text pre { max-height: none; }
+.conversation-pagination { display: flex; justify-content: flex-end; gap: 10px; align-items: center; }
+.conversation-filters { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: end; }
+.conversation-filters label { margin: 0; }
+.conversation-state { white-space: nowrap; }
+.conversation-queue-dropped { margin: 0; }
 @media (max-width: 800px) {
   .summary, .split { grid-column: span 12; }
   .topbar { align-items: flex-start; }
@@ -177,7 +195,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .identity-chip { white-space: normal; }
   .provider-grid, .member-form, .member-form.codex-form,
   .member-form.with-label, .member-form.codex-form.with-label,
-  .merge-form, .metrics-filters, .metrics-chart-grid, .metrics-token-summary { grid-template-columns: 1fr; }
+  .merge-form, .metrics-filters, .metrics-chart-grid, .metrics-token-summary,
+  .conversation-snippets, .conversation-filters { grid-template-columns: 1fr; }
   .metrics-chart-wide { grid-column: auto; }
 }
 `;
@@ -1113,7 +1132,7 @@ export function metricsView({
         <div>
           <span class="badge stored" data-i18n="metrics-label">Request metrics</span>
           <h1 data-i18n="metrics-heading">Claude gateway request metrics</h1>
-          <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not stored by this phase.</p>
+          <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not rendered here; eligible captured conversations appear in the conversation archive.</p>
           <p class="muted tiny" data-i18n="metrics-claude-only">Token accounting covers Claude gateway traffic only. Codex clients connect directly to their provider and are not included.</p>
         </div>
         <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
@@ -1175,6 +1194,260 @@ export function metricsView({
         <h2 data-i18n="metrics-hourly-table">Hourly details</h2>
         ${metricsTable(rows)}
       </article>
+    </section>
+  `, { openMode });
+}
+
+const CONVERSATION_RESPONSE_STATES = Object.freeze([
+  'complete',
+  'incomplete',
+  'truncated',
+  'unavailable',
+]);
+
+function conversationText(value) {
+  return typeof value === 'string' ? value : '';
+}
+
+function conversationState(item) {
+  const candidate = item?.responseState
+    ?? item?.responseStatus
+    ?? item?.response?.state
+    ?? item?.response?.status;
+  return CONVERSATION_RESPONSE_STATES.includes(candidate) ? candidate : 'unavailable';
+}
+
+function conversationDateText(value) {
+  try {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric >= 0) {
+      const date = new Date(numeric);
+      if (Number.isFinite(date.getTime())) {
+        return date.toISOString().replace('T', ' ').replace('.000Z', 'Z');
+      }
+    }
+    return dateText(value);
+  } catch {
+    return '—';
+  }
+}
+
+function conversationCount(value) {
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric < 0) return 0;
+  return numeric;
+}
+
+function conversationStatusView(state) {
+  const label = state.replaceAll('_', ' ');
+  return `<span class="badge conversation-state" data-i18n="conversation-response-${escapeHtml(state)}">${escapeHtml(label)}</span>`;
+}
+
+function conversationPrivacyView(openMode) {
+  return `<div class="notice error conversation-disclosure" role="alert">
+    <h2 data-i18n="conversation-privacy-heading">Conversation privacy</h2>
+    <p data-i18n="conversation-privacy-notice">This feature permanently stores every captured conversation and makes captured conversation text visible to everyone who can reach this console. Member labels are self-entered and unverified. Codex traffic is not covered.</p>
+    ${openMode ? '<p data-i18n="conversation-open-warning"><strong>Open mode:</strong> anyone on the tailnet who can reach this console can read every captured conversation; there is no identity and no reading audit. A member label is not an actor identity.</p>' : ''}
+  </div>`;
+}
+
+function conversationSearchHref({ q, beforeId, limit }) {
+  const params = [];
+  if (q) params.push(`q=${encodeURIComponent(q)}`);
+  if (beforeId !== null && beforeId !== undefined && String(beforeId) !== '') {
+    params.push(`before_id=${encodeURIComponent(String(beforeId))}`);
+  }
+  params.push(`limit=${encodeURIComponent(String(limit))}`);
+  return `/conversations?${params.join('&')}`;
+}
+
+function conversationSnippetView(labelI18n, label, value, emptyI18n) {
+  const text = conversationText(value);
+  return `<div class="conversation-snippet">
+    <strong data-i18n="${escapeHtml(labelI18n)}">${escapeHtml(label)}</strong>
+    ${text ? `<pre>${escapeHtml(text)}</pre>` : `<div class="empty tiny" data-i18n="${escapeHtml(emptyI18n)}">Not captured</div>`}
+  </div>`;
+}
+
+function conversationItemView(item) {
+  const id = item?.id === null || item?.id === undefined ? '' : String(item.id);
+  const state = conversationState(item);
+  const promptSnippet = item?.promptSnippet ?? item?.promptText;
+  const responseSnippet = item?.responseSnippet ?? item?.responseText;
+  const dropped = item?.conversationCaptureState === 'dropped'
+    || item?.captureState === 'dropped'
+    || item?.queueState === 'dropped';
+  const detailLink = id
+    ? `<a class="button secondary" href="/conversations/${escapeHtml(encodeURIComponent(id))}" data-i18n="conversation-open">Open conversation</a>`
+    : '';
+  return `<article class="conversation-card" data-conversation-id="${escapeHtml(id)}">
+    <div class="conversation-card-head">
+      <div>
+        <h2>${id ? `#${escapeHtml(id)}` : '<span data-i18n="conversation-unknown-id">Conversation</span>'}</h2>
+        <div class="conversation-meta">
+          <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(item?.startedAtMs))}</span>
+          <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(item?.memberLabel ?? '—')}</span>
+          <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(item?.accountAlias ?? item?.accountId ?? '—')}</span>
+          <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(item?.model ?? '—')}</span>
+        </div>
+      </div>
+      ${conversationStatusView(state)}
+    </div>
+    ${dropped ? '<div class="notice error tiny conversation-queue-dropped" role="status" data-i18n="conversation-queue-dropped">Conversation capture was dropped by the bounded queue.</div>' : ''}
+    <div class="conversation-snippets">
+      ${conversationSnippetView('conversation-prompt', 'Prompt', promptSnippet, 'conversation-empty-prompt')}
+      ${conversationSnippetView('conversation-response', 'Response', responseSnippet, 'conversation-empty-response')}
+    </div>
+    <div class="actions">${detailLink}</div>
+  </article>`;
+}
+
+function conversationEnvelope({ result, searchResult, search, items, nextBeforeId, error }) {
+  const source = result ?? searchResult ?? search ?? {};
+  return {
+    items: Array.isArray(items) ? items : (Array.isArray(source.items) ? source.items : []),
+    nextBeforeId: nextBeforeId ?? source.nextBeforeId ?? null,
+    error: error ?? source.error ?? null,
+    dropped: source.droppedConversations ?? source.queueDropped ?? null,
+  };
+}
+
+function conversationSearchErrorView(error) {
+  const code = typeof error === 'string' ? error : error?.code;
+  if (code === 'search_query_too_short') {
+    return '<div class="notice error" role="alert" data-i18n="conversation-search-query-too-short">Search query is too short for this archive. For large archives, enter at least three consecutive Chinese characters or more searchable text; remove standalone punctuation and split the query into simpler terms.</div>';
+  }
+  if (code === 'search_query_requires_indexed_terms') {
+    return '<div class="notice error" role="alert" data-i18n="conversation-search-requires-indexed-terms">Search needs indexed terms. For large archives, enter at least three consecutive Chinese characters, remove special punctuation, or split the query into simpler terms.</div>';
+  }
+  return '<div class="notice error" role="alert" data-i18n="conversation-search-error">Conversation search could not be completed.</div>';
+}
+
+export function conversationsView({
+  result = null,
+  searchResult = null,
+  search = null,
+  items = null,
+  nextBeforeId = null,
+  q = '',
+  beforeId = '',
+  limit = 20,
+  openMode = false,
+  error = null,
+  droppedConversations = null,
+  queueDropped = null,
+  dropped = null,
+  conversationDropped = null,
+  conversationQueueDropped = null,
+} = {}) {
+  const envelope = conversationEnvelope({ result, searchResult, search, items, nextBeforeId, error });
+  const query = typeof q === 'string' ? q : String(q ?? '');
+  const normalizedLimit = Number.isSafeInteger(Number(limit))
+    ? Math.max(1, Math.min(50, Number(limit)))
+    : 20;
+  const droppedCount = conversationCount(
+    envelope.dropped
+      ?? conversationQueueDropped
+      ?? queueDropped
+      ?? conversationDropped
+      ?? droppedConversations
+      ?? dropped,
+  );
+  const itemsView = envelope.items.map(conversationItemView).join('');
+  const nextHref = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
+    ? null
+    : conversationSearchHref({ q: query, beforeId: envelope.nextBeforeId, limit: normalizedLimit });
+  const errorNotice = envelope.error === null || envelope.error === undefined
+    ? ''
+    : conversationSearchErrorView(envelope.error);
+  const droppedNotice = droppedCount > 0
+    ? `<div class="notice error conversation-queue-dropped" role="alert"><span data-i18n="conversation-queue-dropped">Conversation capture was dropped by the bounded queue.</span> <strong>${escapeHtml(String(droppedCount))}</strong></div>`
+    : '';
+  return layout('Captured conversations', `
+    <section class="stack">
+      ${conversationPrivacyView(openMode)}
+      ${errorNotice}
+      ${droppedNotice}
+      <div class="topbar">
+        <div>
+          <span class="badge stored" data-i18n="conversations-label">Captured conversations</span>
+          <h1 data-i18n="conversations-heading">Conversation archive</h1>
+          <p class="muted" data-i18n="conversations-intro">Search permanently retained Claude conversations captured from eligible turns.</p>
+        </div>
+        <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+      </div>
+      <form method="get" action="/conversations" class="card conversation-filters">
+        <label><span data-i18n="conversation-search">Search conversations</span>
+          <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off">
+        </label>
+        <input type="hidden" name="limit" value="${escapeHtml(String(normalizedLimit))}">
+        <button type="submit" data-i18n="conversation-search-submit">Search</button>
+        <a class="button secondary" href="/conversations" data-i18n="conversation-search-clear">Clear</a>
+      </form>
+      <div class="conversation-list">
+        ${itemsView || '<p class="empty" data-i18n="conversation-no-results">No captured conversations match this search.</p>'}
+      </div>
+      ${nextHref ? `<div class="conversation-pagination"><a class="button secondary" href="${escapeHtml(nextHref)}" data-i18n="conversation-next-page">Next page</a></div>` : ''}
+    </section>
+  `, { openMode });
+}
+
+export function conversationDetailView({
+  conversation = null,
+  result = null,
+  turn = null,
+  id = null,
+  error = null,
+  openMode = false,
+} = {}) {
+  const envelope = result ?? {};
+  const supplied = turn
+    ?? (Object.hasOwn(envelope, 'turn') ? envelope.turn : null)
+    ?? (conversation && Object.hasOwn(conversation, 'turn') ? conversation.turn : conversation);
+  const record = supplied;
+  const errorText = error ?? envelope.error ?? conversation?.error ?? null;
+  const errorNotice = errorText
+    ? `<div class="notice error" role="alert"><span data-i18n="conversation-read-error">Conversation could not be loaded.</span><br><span class="tiny">${escapeHtml(String(errorText))}</span></div>`
+    : '';
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return layout('Conversation unavailable', `
+      <section class="stack">
+        ${conversationPrivacyView(openMode)}
+        ${errorNotice || '<div class="notice error" role="alert" data-i18n="conversation-not-found">Conversation not found.</div>'}
+        <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to conversations</a>
+      </section>
+    `, { openMode });
+  }
+  const conversationId = record.id ?? id ?? '—';
+  const state = conversationState(record);
+  const prompt = conversationText(record.promptText ?? record.prompt);
+  const response = conversationText(record.responseText ?? record.response);
+  return layout('Conversation', `
+    <section class="stack">
+      ${conversationPrivacyView(openMode)}
+      ${errorNotice}
+      <div class="topbar">
+        <div>
+          <span class="badge stored" data-i18n="conversations-label">Captured conversations</span>
+          <h1><span data-i18n="conversation-detail-heading">Conversation</span> #${escapeHtml(String(conversationId))}</h1>
+          <div class="conversation-meta">
+            <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(record.startedAtMs))}</span>
+            <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(record.memberLabel ?? '—')}</span>
+            <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(record.accountAlias ?? record.accountId ?? '—')}</span>
+            <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(record.model ?? '—')}</span>
+          </div>
+        </div>
+        ${conversationStatusView(state)}
+      </div>
+      <article class="card conversation-text">
+        <h2 data-i18n="conversation-prompt">Prompt</h2>
+        ${prompt ? `<pre>${escapeHtml(prompt)}</pre>` : '<p class="empty" data-i18n="conversation-empty-prompt">Not captured</p>'}
+      </article>
+      <article class="card conversation-text">
+        <h2 data-i18n="conversation-response">Response</h2>
+        ${response ? `<pre>${escapeHtml(response)}</pre>` : '<p class="empty" data-i18n="conversation-empty-response">Not captured</p>'}
+      </article>
+      <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to conversations</a>
     </section>
   `, { openMode });
 }
@@ -1318,7 +1591,10 @@ export function dashboardView({
           <span class="badge stored" data-i18n="admin-zone">Administrator area</span>
           <h2 data-i18n="admin-heading">Accounts, devices, and exceptional enrollment</h2>
           <p class="muted" data-i18n="admin-intro">Use this area to add provider accounts once, inspect devices, and revoke access. Routine member setup happens above.</p>
-          <a class="button secondary" href="/metrics" data-i18n="metrics-dashboard-link">View request metrics</a>
+          <div class="actions">
+            <a class="button secondary" href="/metrics" data-i18n="metrics-dashboard-link">View request metrics</a>
+            <a class="button secondary" href="/conversations" data-i18n="conversations-dashboard-link">View captured conversations</a>
+          </div>
         </div>
         <section class="grid">
           <article class="card summary"><span class="muted" data-i18n="accounts">Accounts</span><strong>${accounts.length}</strong></article>

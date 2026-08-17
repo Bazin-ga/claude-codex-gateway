@@ -2,9 +2,12 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-> **Telemetry notice:** `credential-console` records metadata for every proxied Claude gateway
-> request, including four provider-reported token counts, and makes those metrics visible to every
-> member who can reach the console. Request and response bodies are not stored by this release.
+> **Telemetry notice / conversation notice:** `credential-console` records metadata for every proxied
+> Claude gateway request, including four provider-reported token counts, and makes those metrics
+> visible to every member who can reach the console. P6 permanently stores every captured
+> conversation turn from Claude and makes its prompt/reply text visible to everyone who can reach the console;
+> in `open` mode that means anyone on the tailnet, with no identity and no reading audit. Member
+> labels are self-entered and unverified. Codex traffic is not covered by conversation capture.
 
 A self-hostable credential distribution centre for **Codex** (ChatGPT subscription) and
 **Claude Code** subscriptions.
@@ -135,9 +138,10 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
   Claude gateway allowlists paths, strips the device authorization header before attaching the
   provider credential, rate-limits failed authentication by source IP, and applies per-device
   request and concurrency budgets.
-- **Body-free request telemetry.** The Claude gateway persists request metadata and separate input,
-  cache-creation input, cache-read input, and output token counts for shared metrics. Request and
-  response bodies are streamed and are neither logged nor stored.
+- **Separated request telemetry and conversations.** The Claude gateway persists request metadata
+  and separate input, cache-creation input, cache-read input, and output token counts for shared
+  metrics. The metrics page remains body-free; P6 separately and permanently stores eligible captured
+  Claude conversation turns for console-wide browsing. Codex traffic is outside that capture boundary.
 - **The centre is a high-value host by design.** A root compromise of the centre can recover
   all active provider credentials. Keep OS access narrow, patch it, and keep an emergency
   service-stop and provider-token revocation procedure.

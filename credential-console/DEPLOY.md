@@ -9,6 +9,11 @@ simply unavailable when the Codex credential home is on a different machine.
 built-in `node:sqlite` module. The shipped service suppresses Node 22's known experimental-module
 warning; it does not suppress application errors.
 
+P6 permanently stores the prompt and reply text for eligible captured conversation turns from Claude in the
+conversation archive. Everyone who can reach the console can read those captured conversations; in
+`open` mode that means anyone on the tailnet, with no identity and no reading audit. Member labels
+are self-entered and unverified, and Codex traffic is not covered by conversation capture.
+
 ## Network
 
 The recommended deployment separates a private control plane from public, token-authenticated
@@ -440,9 +445,10 @@ headers on the way in — with nginx, `proxy_set_header Tailscale-User-Login "";
 
 Treat `master.key` and `state.json` as one recovery unit. A key from one backup combined with
 ciphertext from another decrypts nothing. `usage.json` is a regenerable quota cache and is not
-critical to recovery. `metrics.sqlite` is the non-regenerable request-metadata history. Include
-both optional files in a point-in-time backup when they exist, and checkpoint the metrics WAL
-after stopping the service before copying the database.
+critical to recovery. `metrics.sqlite` is the non-regenerable request-metadata and permanently
+retained conversation history. Treat that database and every backup copy as sensitive conversation
+content. Include both optional files in a point-in-time backup when they exist, and checkpoint the
+metrics WAL after stopping the service before copying the database.
 
 ### Create and transfer a backup
 
@@ -765,13 +771,23 @@ Browser checks:
     confirm the page labels partial totals as a lower bound, renders unknown as `—` rather than
     zero, and leaves unknown hourly SVG points blank;
 18. confirm the token page states that it covers Claude gateway traffic only, excludes Codex, and
-    keeps the existing request/response-body-not-stored and open-mode visibility notices.
+    keeps the metrics-page body-free and open-mode visibility notices.
+19. open the captured-conversations page, search for a known phrase, follow the keyset next-page
+    link, and open a detail row; confirm the permanent-storage/open-mode disclosure is prominent,
+    full text preserves whitespace, all four response states are distinguishable, and a dropped
+    conversation queue count is shown as dropped rather than silently treated as stored. For a
+    bounded search error, enter at least three consecutive Chinese characters, remove standalone
+    punctuation, or split the query; an unknown search failure must remain a fixed generic message.
 
 The first start with token accounting migrates `metrics.sqlite` schema 1 to 2 transactionally.
-Take the normal checkpointed backup immediately before that start. If the code must be rolled back
-to a pre-token-accounting release, stop the console, restore the pre-upgrade `metrics.sqlite` only,
+The first P6 start migrates schema 2 to schema 3 transactionally, adding the permanent conversation
+tables and full-text index; old request rows remain readable and simply have no conversation turn.
+Take the normal checkpointed backup immediately before either upgrade. If the code must be rolled
+back to a pre-P6 release, stop the console, restore the matching pre-upgrade `metrics.sqlite` only,
 remove `metrics.sqlite-wal` and `metrics.sqlite-shm`, then start the old code. Do not roll
-`master.key` or `state.json` back for a metrics-only rollback.
+`master.key` or `state.json` back for a metrics-only or conversation-UI rollback. Because schema 3
+contains permanently retained conversation text, every `metrics.sqlite` snapshot and off-host copy is
+sensitive and must stay root-only/encrypted.
 
 For a real Claude account, have its owner complete the permanent owner-authorization page and
 run a bounded real turn from a newly enrolled client before adding more members. The permanent

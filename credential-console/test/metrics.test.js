@@ -127,14 +127,35 @@ async function createV1Database(home, { version = 1, entry = row() } = {}) {
   return dbPath;
 }
 
+async function createV2Database(home, options = {}) {
+  const dbPath = await createV1Database(home, options);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    ALTER TABLE request_metrics ADD COLUMN input_tokens INTEGER
+      CHECK (input_tokens IS NULL OR input_tokens >= 0);
+    ALTER TABLE request_metrics ADD COLUMN cache_creation_input_tokens INTEGER
+      CHECK (cache_creation_input_tokens IS NULL OR cache_creation_input_tokens >= 0);
+    ALTER TABLE request_metrics ADD COLUMN cache_read_input_tokens INTEGER
+      CHECK (cache_read_input_tokens IS NULL OR cache_read_input_tokens >= 0);
+    ALTER TABLE request_metrics ADD COLUMN output_tokens INTEGER
+      CHECK (output_tokens IS NULL OR output_tokens >= 0);
+    ALTER TABLE request_metrics ADD COLUMN usage_state TEXT NOT NULL DEFAULT 'unavailable'
+      CHECK (usage_state IN ('unavailable', 'partial', 'complete'));
+    UPDATE schema_meta SET schema_version = 2 WHERE singleton = 1;
+  `);
+  db.close();
+  return dbPath;
+}
+
 test('initializes a private WAL/NORMAL database with schema version and indexes', async (t) => {
   const { store, dbPath } = await newStore(t);
-  assert.equal(METRICS_SCHEMA_VERSION, 2);
+  assert.equal(METRICS_SCHEMA_VERSION, 3);
   assert.equal((await stat(dbPath)).mode & 0o777, 0o600);
 
   const db = readOnly(dbPath);
   t.after(() => db.close());
   assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+  assert.equal(store.db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
   // synchronous is connection-local; the read-only verifier has its default
   // while the MetricsStore connection is the one configured to NORMAL.
   assert.equal(store.db.prepare('PRAGMA synchronous').get().synchronous, 1);
@@ -149,6 +170,7 @@ test('initializes a private WAL/NORMAL database with schema version and indexes'
   `).all().map((entry) => entry.name);
   assert.deepEqual(indexes, [
     'request_metrics_account_started_idx',
+    'request_metrics_conversation_capture_idx',
     'request_metrics_device_started_idx',
     'request_metrics_machine_started_idx',
     'request_metrics_member_started_idx',
@@ -173,7 +195,7 @@ test('migrates a v1 database in place and keeps old rows readable', async (t) =>
   t.after(() => db.close());
   assert.equal(
     db.prepare('SELECT schema_version FROM schema_meta WHERE singleton = 1').get().schema_version,
-    2,
+    3,
   );
   assert.deepEqual(store.queryTotals({ scope: 'all' }), {
     requestCount: 1,
@@ -197,14 +219,33 @@ test('migrates a v1 database in place and keeps old rows readable', async (t) =>
     tokenTotalsOverflow: false,
   });
   const columns = db.prepare('PRAGMA table_info(request_metrics)').all().map(({ name }) => name);
-  assert.deepEqual(columns.slice(-5), [
+  for (const name of [
     'input_tokens',
     'cache_creation_input_tokens',
     'cache_read_input_tokens',
     'output_tokens',
     'usage_state',
-  ]);
+    'conversation_capture_state',
+  ]) assert.equal(columns.includes(name), true, name);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM conversation_turns').get().count, 0);
   assert.deepEqual(await readFile(join(home, 'state.json')), stateBytes);
+});
+
+test('migrates a v2 database to v3 with FTS in one transaction', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-v2-'));
+  const dbPath = await createV2Database(home, { entry: row({ memberLabel: 'v2-member' }) });
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await store.init();
+  t.after(() => store.close());
+
+  const db = readOnly(dbPath);
+  t.after(() => db.close());
+  assert.equal(db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 3);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM conversation_turns").get().count, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns_fts'").get().count, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns_trigram_fts'").get().count, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns_trigram_fts_ai'").get().count, 1);
+  assert.equal(store.queryTotals().requestCount, 1);
 });
 
 test('aggregates complete, partial, unavailable, NULL, and explicit zero usage distinctly', async (t) => {
@@ -406,6 +447,530 @@ test('reopens v2 data and a checkpointed copy is backup-compatible', async (t) =
   assert.equal(backup.db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
 });
 
+test('paired completion stores conversation, FTS index, and safe metadata only', async (t) => {
+  const { store, dbPath } = await newStore(t, { batchSize: 4 });
+  const metrics = row({
+    responseBytes: 20,
+    upstreamRequestId: 'header-value-must-not-be-in-conversation',
+  });
+  assert.equal(store.enqueueCompletion({
+    metrics,
+    conversation: {
+      promptText: 'hello search phrase',
+      promptBytes: Buffer.byteLength('hello search phrase'),
+      responseText: 'safe assistant reply',
+      responseState: 'complete',
+      responseBytes: 20,
+      deviceToken: 'ignored-device-token',
+      providerCredential: 'ignored-provider-credential',
+      headers: { authorization: 'ignored-header' },
+    },
+  }), true);
+  assert.equal(store.flush().written, 1);
+
+  const db = readOnly(dbPath);
+  t.after(() => db.close());
+  const stored = db.prepare('SELECT * FROM conversation_turns').get();
+  assert.equal(stored.prompt_text, 'hello search phrase');
+  assert.equal(stored.response_text, 'safe assistant reply');
+  assert.equal(Object.hasOwn(stored, 'device_token'), false);
+  assert.equal(Object.hasOwn(stored, 'provider_credential'), false);
+  assert.equal(Object.hasOwn(stored, 'headers'), false);
+  assert.equal(db.prepare('SELECT conversation_capture_state FROM request_metrics').get().conversation_capture_state, 'stored');
+
+  const search = store.searchConversations({ q: 'search phrase', limit: 1 });
+  assert.equal(search.error, null);
+  assert.equal(search.items.length, 1);
+  assert.match(search.items[0].promptSnippet, /search phrase/);
+  assert.equal(store.searchConversations({ q: '" OR 1=1 --' }).error, null);
+  assert.equal(store.readConversation(stored.id).turn.responseText, 'safe assistant reply');
+  assert.equal(store.readConversation('not-an-id').error, 'conversation_unavailable');
+
+  assert.equal(store.checkpoint().busy, 0);
+  const backupHome = await mkdtemp(join(tmpdir(), 'credential-console-metrics-conversation-backup-'));
+  await copyFile(dbPath, join(backupHome, METRICS_FILENAME));
+  const backup = await new MetricsStore({ home: backupHome, flushIntervalMs: 60_000 }).init();
+  t.after(() => backup.close());
+  assert.equal(backup.searchConversations({ q: 'search phrase' }).items.length, 1);
+  assert.equal(backup.integrityCheck(), true);
+
+  assert.throws(
+    () => store.db.exec(`UPDATE conversation_turns SET response_text = 'changed' WHERE id = ${stored.id}`),
+    /conversation turns are permanent/,
+  );
+  assert.throws(
+    () => store.db.exec(`DELETE FROM conversation_turns WHERE id = ${stored.id}`),
+    /conversation turns are permanent/,
+  );
+});
+
+test('conversation queue enforces item/byte budgets while retaining dropped metrics', async (t) => {
+  const { store } = await newStore(t, {
+    batchSize: 8,
+    maxConversationQueueItems: 1,
+    maxConversationQueueBytes: 8 * 1024,
+  });
+  const conversation = {
+    promptText: 'first prompt',
+    responseText: 'first response',
+    responseState: 'complete',
+    responseBytes: Buffer.byteLength('first response'),
+  };
+  assert.equal(store.enqueueCompletion({ metrics: row(), conversation }), true);
+  assert.equal(store.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS + 1 }),
+    conversation: {
+      promptText: 'second prompt',
+      responseText: 'second response',
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength('second response'),
+    },
+  }), true);
+  assert.equal(store.conversationQueue.length, 1);
+  assert.equal(store.stats.conversation.dropped, 1);
+  assert.equal(store.flush().written, 2);
+  assert.equal(store.queryTotals().requestCount, 2);
+  assert.equal(store.db.prepare(
+    "SELECT COUNT(*) AS count FROM conversation_turns",
+  ).get().count, 1);
+  assert.equal(store.db.prepare(
+    "SELECT COUNT(*) AS count FROM request_metrics WHERE conversation_capture_state = 'dropped'",
+  ).get().count, 1);
+  assert.equal(store.searchConversations({}).droppedConversations, 1);
+  const home = store.home;
+  store.close();
+  const reopened = await new MetricsStore({ home, flushIntervalMs: 60_000 }).init();
+  t.after(() => reopened.close());
+  assert.equal(reopened.searchConversations({}).droppedConversations, 1);
+});
+
+test('conversation flush caps one synchronous batch at four pairs', async (t) => {
+  const { store } = await newStore(t, { batchSize: 64, maxConversationQueueItems: 8 });
+  for (let index = 0; index < 6; index += 1) {
+    assert.equal(store.enqueueCompletion({
+      metrics: row({ startedAtMs: BASE_MS + index }),
+      conversation: {
+        promptText: `batch prompt ${index}`,
+        responseText: `batch response ${index}`,
+        responseState: 'complete',
+        responseBytes: Buffer.byteLength(`batch response ${index}`),
+      },
+    }), true);
+  }
+  assert.equal(store.flush().written, 4);
+  assert.equal(store.conversationQueue.length, 2);
+  assert.equal(store.flush().written, 2);
+  assert.equal(store.conversationQueue.length, 0);
+});
+
+test('conversation text bounds reject prompt overflow and preserve response truncation state', async (t) => {
+  const { store } = await newStore(t, { batchSize: 8 });
+  assert.equal(store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      promptText: 'p'.repeat(32 * 1024 + 1),
+      responseText: '',
+      responseState: 'unavailable',
+      responseBytes: 0,
+    },
+  }), true);
+  assert.equal(store.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS + 1 }),
+    conversation: {
+      promptText: 'valid prompt',
+      responseText: 'truncated prefix',
+      responseState: 'truncated',
+      responseBytes: Buffer.byteLength('truncated prefix'),
+    },
+  }), true);
+  assert.equal(store.flush().written, 2);
+  assert.equal(store.queryTotals().requestCount, 2);
+  assert.equal(store.db.prepare(
+    "SELECT COUNT(*) AS count FROM conversation_turns WHERE response_state = 'truncated'",
+  ).get().count, 1);
+  assert.equal(store.db.prepare(
+    "SELECT COUNT(*) AS count FROM request_metrics WHERE conversation_capture_state = 'dropped'",
+  ).get().count, 1);
+  assert.equal(store.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS + 2 }),
+    conversation: {
+      promptText: 'invalid response state',
+      responseText: '',
+      responseState: null,
+      responseBytes: 0,
+    },
+  }), true);
+  assert.equal(store.flush().written, 1);
+  assert.equal(store.db.prepare(
+    "SELECT COUNT(*) AS count FROM request_metrics WHERE conversation_capture_state = 'dropped'",
+  ).get().count, 2);
+  assert.equal(store.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS + 3 }),
+    conversation: {
+      promptText: 'mismatched response bytes',
+      responseText: 'one',
+      responseState: 'complete',
+      responseBytes: 0,
+    },
+  }), true);
+  assert.equal(store.flush().written, 1);
+  assert.equal(store.db.prepare(
+    "SELECT COUNT(*) AS count FROM request_metrics WHERE conversation_capture_state = 'dropped'",
+  ).get().count, 3);
+  assert.equal(store.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS + 4 }),
+    conversation: {
+      promptText: 'unpaired \ud800',
+      responseText: '',
+      responseState: 'unavailable',
+      responseBytes: 0,
+    },
+  }), true);
+  assert.equal(store.flush().written, 1);
+  assert.equal(store.db.prepare(
+    "SELECT COUNT(*) AS count FROM request_metrics WHERE conversation_capture_state = 'dropped'",
+  ).get().count, 4);
+});
+
+test('conversation queue configuration is hard-clamped and snippets preserve valid UTF-8', async (t) => {
+  const { store } = await newStore(t, {
+    maxConversationQueueItems: Number.MAX_SAFE_INTEGER,
+    maxConversationQueueBytes: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal(store.maxConversationQueueItems, 64);
+  assert.equal(store.maxConversationQueueBytes, 8 * 1024 * 1024);
+  const promptText = `${'a'.repeat(4095)}🌍tail`;
+  assert.equal(store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      promptText,
+      responseText: 'utf8 response',
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength('utf8 response'),
+    },
+  }), true);
+  assert.equal(store.flush().written, 1);
+  const item = store.searchConversations().items[0];
+  assert.ok(Buffer.byteLength(item.promptSnippet, 'utf8') <= 4 * 1024);
+  assert.equal(item.promptSnippet.includes('\uFFFD'), false);
+  assert.equal(store.readConversation(item.id).turn.promptText, promptText);
+});
+
+test('conversation/FTS failure rolls back only the pair and keeps its metric dropped', async (t) => {
+  const { store } = await newStore(t, { batchSize: 4 });
+  store.db.exec('DROP TABLE conversation_turns_fts');
+  assert.equal(store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      promptText: 'fts failure prompt',
+      responseText: 'reply',
+      responseState: 'complete',
+      responseBytes: 5,
+    },
+  }), true);
+  assert.equal(store.flush().written, 1);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM request_metrics').get().count, 1);
+  assert.equal(store.db.prepare(
+    "SELECT conversation_capture_state FROM request_metrics",
+  ).get().conversation_capture_state, 'dropped');
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM conversation_turns').get().count, 0);
+  assert.equal(store.stats.conversation.dropped, 1);
+});
+
+test('conversation lock retry preserves its bounded queue budget', async (t) => {
+  const { store, dbPath } = await newStore(t, { batchSize: 4 });
+  const blocker = new DatabaseSync(dbPath);
+  blocker.exec('BEGIN IMMEDIATE');
+  t.after(() => {
+    if (blocker.isTransaction) blocker.exec('ROLLBACK');
+    blocker.close();
+  });
+  assert.equal(store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      promptText: 'retry prompt',
+      responseText: 'retry response',
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength('retry response'),
+    },
+  }), true);
+  const budgetBefore = store.conversationQueueBytes;
+  assert.equal(store.flush().written, 0);
+  assert.equal(store.conversationQueue.length, 1);
+  assert.equal(store.conversationQueueBytes, budgetBefore);
+  blocker.exec('ROLLBACK');
+  assert.equal(store.flush().written, 1);
+  assert.equal(store.conversationQueueBytes, 0);
+  assert.equal(store.searchConversations({ q: 'retry' }).items.length, 1);
+});
+
+test('conversation retry drops pairs that no longer fit the remaining byte budget', async (t) => {
+  const { store, dbPath } = await newStore(t, {
+    batchSize: 64,
+    maxConversationQueueItems: 8,
+    maxConversationQueueBytes: 64 * 1024,
+  });
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(store.enqueueCompletion({
+      metrics: row({ startedAtMs: BASE_MS + index }),
+      conversation: {
+        promptText: `budget prompt ${index}`,
+        responseText: `budget response ${index}`,
+        responseState: 'complete',
+        responseBytes: Buffer.byteLength(`budget response ${index}`),
+      },
+    }), true);
+  }
+  const remainingBudget = store.conversationQueueBytes - 1;
+  store.maxConversationQueueBytes = remainingBudget;
+  const blocker = new DatabaseSync(dbPath);
+  blocker.exec('BEGIN IMMEDIATE');
+  t.after(() => {
+    if (blocker.isTransaction) blocker.exec('ROLLBACK');
+    blocker.close();
+  });
+  assert.equal(store.flush().written, 0);
+  assert.ok(store.conversationQueueBytes <= remainingBudget);
+  assert.equal(store.conversationQueue.length, 4);
+  assert.equal(store.stats.conversation.dropped, 1);
+});
+
+test('conversation search uses fixed filters, keyset pagination, and bounded errors', async (t) => {
+  const { store } = await newStore(t, { batchSize: 8 });
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal(store.enqueueCompletion({
+      metrics: row({
+        startedAtMs: BASE_MS + index,
+        deviceId: index === 1 ? 'device-b' : 'device-a',
+        machineId: null,
+        memberLabel: index === 1 ? 'bob' : 'alice',
+      }),
+      conversation: {
+        promptText: `pagination phrase ${index}`,
+        responseText: `response ${index}`,
+        responseState: index === 2 ? 'incomplete' : 'complete',
+        responseBytes: Buffer.byteLength(`response ${index}`),
+      },
+    }), true);
+  }
+  assert.equal(store.flush().written, 3);
+  const first = store.searchConversations({ q: 'pagination', limit: 1 });
+  assert.equal(first.error, null);
+  assert.equal(first.items.length, 1);
+  assert.ok(first.nextBeforeId);
+  const second = store.searchConversations({ q: 'pagination', beforeId: first.nextBeforeId, limit: 1 });
+  assert.equal(second.items.length, 1);
+  assert.notEqual(second.items[0].id, first.items[0].id);
+  assert.equal(store.searchConversations({ q: 'pagination', deviceId: 'device-b' }).items.length, 1);
+  assert.equal(store.searchConversations({ q: 'pagination', unattributedMachine: true }).items.length, 3);
+  assert.equal(store.searchConversations({ responseState: 'incomplete' }).items.length, 1);
+  assert.equal(store.searchConversations({ q: '***' }).items.length, 0);
+  assert.equal(store.searchConversations({ q: 'x'.repeat(257) }).error, 'search_unavailable');
+  assert.equal(store.searchConversations({ beforeId: -1 }).error, 'search_unavailable');
+  const result = store.searchConversations({ q: 'pagination', limit: 999 });
+  assert.equal(result.items.length, 3);
+  assert.ok(result.items.every((item) => Buffer.byteLength(item.promptSnippet, 'utf8') <= 4 * 1024));
+});
+
+test('Han queries use safe substring fallback while English remains on FTS', async (t) => {
+  const { store } = await newStore(t, { batchSize: 8 });
+  const hanPrompt = '今天北京天气怎么样';
+  const hanResponse = '北京天气晴朗';
+  assert.equal(store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      promptText: hanPrompt,
+      responseText: hanResponse,
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength(hanResponse),
+    },
+  }), true);
+  const englishResponse = 'weather report';
+  assert.equal(store.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS + 1 }),
+    conversation: {
+      promptText: 'weather report',
+      responseText: englishResponse,
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength(englishResponse),
+    },
+  }), true);
+  assert.equal(store.flush().written, 2);
+  assert.equal(store.searchConversations({ q: hanPrompt }).items.length, 1);
+  for (const term of ['北京', '天气', '晴朗']) {
+    const result = store.searchConversations({ q: term });
+    assert.equal(result.error, null, term);
+    assert.equal(result.items.length, 1, term);
+    assert.match(result.items[0].promptSnippet, /北京|天气|晴朗/);
+  }
+  assert.equal(store.searchConversations({ q: 'weather' }).items.length, 1);
+  const mixed = store.searchConversations({ q: '北京 OR 1=1 --' });
+  assert.equal(mixed.error, null);
+  assert.equal(mixed.items.length, 0);
+  const special = store.searchConversations({ q: '天气" OR 1=1' });
+  assert.equal(special.error, null);
+  assert.equal(special.items.length, 0);
+});
+
+test('short Han fallback has a hard row-count ceiling while trigram remains indexed', async (t) => {
+  const { store } = await newStore(t, { batchSize: 4 });
+  const metricInsert = store.db.prepare(`
+    INSERT INTO request_metrics (
+      started_at_ms, hour_bucket_ms, method, path, device_id, machine_id,
+      member_label, account_id, account_alias, model, stream, status_code,
+      outcome, ttfb_ms, duration_ms, request_bytes, response_bytes,
+      upstream_request_id, input_tokens, cache_creation_input_tokens,
+      cache_read_input_tokens, output_tokens, usage_state, conversation_capture_state
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const conversationInsert = store.db.prepare(`
+    INSERT INTO conversation_turns (
+      request_metrics_id, prompt_text, prompt_bytes, response_text,
+      response_state, response_bytes
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  store.db.exec('BEGIN');
+  const rows = 20_001;
+  for (let index = 1; index <= rows; index += 1) {
+    const promptText = index === rows ? '今天北京天气怎么样' : `synthetic row ${index}`;
+    const responseText = index === rows ? '北京天气晴朗' : 'response';
+    metricInsert.run(
+      BASE_MS + index,
+      Math.floor((BASE_MS + index) / HOUR_MS) * HOUR_MS,
+      'POST', '/v1/messages', `device-${index}`, null, 'member', 'account',
+      'account', 'model', 0, 200, 'completed', 1, 2,
+      Buffer.byteLength(promptText), Buffer.byteLength(responseText), null,
+      null, null, null, null, 'unavailable', 'stored',
+    );
+    const metricId = Number(store.db.prepare('SELECT last_insert_rowid() AS id').get().id);
+    conversationInsert.run(
+      metricId,
+      promptText,
+      Buffer.byteLength(promptText),
+      responseText,
+      'complete',
+      Buffer.byteLength(responseText),
+    );
+  }
+  store.db.exec('COMMIT');
+  assert.equal(store.searchConversations({ q: '北京' }).error, 'search_query_too_short');
+  assert.equal(store.searchConversations({ q: '北京天气' }).items.length, 1);
+});
+
+test('an existing v3 store without the additive trigram index rebuilds it from stored turns', async (t) => {
+  const { home, store, dbPath } = await newStore(t, { batchSize: 4 });
+  const responseText = '北京天气晴朗';
+  store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      promptText: '今天北京天气怎么样',
+      responseText,
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength(responseText),
+    },
+  });
+  store.flush();
+  store.close();
+  const mutate = new DatabaseSync(dbPath);
+  mutate.exec('DROP TRIGGER conversation_turns_trigram_fts_ai; DROP TABLE conversation_turns_trigram_fts;');
+  mutate.close();
+  const reopened = await new MetricsStore({ home, flushIntervalMs: 60_000 }).init();
+  t.after(() => reopened.close());
+  assert.equal(reopened.searchConversations({ q: '北京天气' }).items.length, 1);
+});
+
+test('v1 migration rollback removes both v2 and v3 changes', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-v1-full-rollback-'));
+  const dbPath = await createV1Database(home);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TRIGGER reject_full_upgrade
+    BEFORE UPDATE OF schema_version ON schema_meta
+    BEGIN
+      SELECT RAISE(ABORT, 'full migration deliberately blocked');
+    END;
+  `);
+  db.close();
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await assert.rejects(store.init(), /full migration deliberately blocked/);
+  t.after(() => store.close());
+  const verify = new DatabaseSync(dbPath, { readOnly: true });
+  t.after(() => verify.close());
+  assert.equal(verify.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 1);
+  assert.equal(verify.prepare(
+    "SELECT COUNT(*) AS count FROM sqlite_master WHERE name IN ('conversation_turns', 'conversation_turns_fts', 'conversation_turns_trigram_fts', 'conversation_turns_fts_ai', 'conversation_turns_trigram_fts_ai')",
+  ).get().count, 0);
+  assert.equal(verify.prepare(
+    "SELECT COUNT(*) AS count FROM pragma_table_info('request_metrics') WHERE name = 'conversation_capture_state'",
+  ).get().count, 0);
+});
+
+test('a partial v3 object is refused without promotion', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-v3-partial-'));
+  const dbPath = await createV2Database(home);
+  const db = new DatabaseSync(dbPath);
+  db.exec("ALTER TABLE request_metrics ADD COLUMN conversation_capture_state TEXT NOT NULL DEFAULT 'not_applicable'");
+  db.close();
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await assert.rejects(store.init(), /untrusted partial v3 objects/);
+  t.after(() => store.close());
+  const verify = new DatabaseSync(dbPath, { readOnly: true });
+  t.after(() => verify.close());
+  assert.equal(verify.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 2);
+  assert.equal(verify.prepare(
+    "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns'",
+  ).get().count, 0);
+});
+
+test('a partial trigram table or trigger is refused without promotion', async (t) => {
+  for (const shape of ['table', 'trigger']) {
+    const home = await mkdtemp(join(tmpdir(), `credential-console-metrics-v3-trigram-${shape}-`));
+    const dbPath = await createV2Database(home);
+    const db = new DatabaseSync(dbPath);
+    if (shape === 'table') {
+      db.exec('CREATE TABLE conversation_turns_trigram_fts (prompt_text TEXT, response_text TEXT)');
+    } else {
+      db.exec(`
+        CREATE TRIGGER conversation_turns_trigram_fts_ai
+        AFTER INSERT ON request_metrics
+        BEGIN
+          SELECT 1;
+        END;
+      `);
+    }
+    db.close();
+
+    const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+    await assert.rejects(store.init(), /untrusted partial v3 objects/);
+    t.after(() => store.close());
+    const verify = new DatabaseSync(dbPath, { readOnly: true });
+    t.after(() => verify.close());
+    assert.equal(verify.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 2);
+    assert.equal(verify.prepare(
+      "SELECT COUNT(*) AS count FROM pragma_table_info('request_metrics') WHERE name = 'conversation_capture_state'",
+    ).get().count, 0);
+    assert.equal(verify.prepare(
+      "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns'",
+    ).get().count, 0);
+  }
+});
+
+test('canonical trigger semantics are validated, not just trigger names', async (t) => {
+  const valid = await newStore(t);
+  valid.store.close();
+  const db = new DatabaseSync(valid.dbPath);
+  db.exec(`
+    DROP TRIGGER conversation_turns_no_update;
+    CREATE TRIGGER conversation_turns_no_update
+    BEFORE UPDATE ON conversation_turns
+    BEGIN SELECT 1; END;
+  `);
+  db.close();
+  const reopened = new MetricsStore({ home: valid.home, flushIntervalMs: 60_000 });
+  await assert.rejects(reopened.init(), /incompatible trigger conversation_turns_no_update/);
+  t.after(() => reopened.close());
+});
+
 test('enqueueRequest only queues bounded metadata and does not touch SQLite', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-preinit-'));
   const store = new MetricsStore({
@@ -429,6 +994,25 @@ test('enqueueRequest only queues bounded metadata and does not touch SQLite', as
   const after = readOnly(join(home, METRICS_FILENAME));
   assert.equal(rowCount(after), 2);
   after.close();
+});
+
+test('enqueueCompletion only queues bounded text and does not touch SQLite', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-completion-preinit-'));
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  t.after(() => store.close());
+  assert.equal(store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      promptText: 'queued before init',
+      responseText: 'queued response',
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength('queued response'),
+    },
+  }), true);
+  await assert.rejects(access(join(home, METRICS_FILENAME)), { code: 'ENOENT' });
+  await store.init();
+  assert.equal(store.flush().written, 1);
+  assert.equal(store.searchConversations({ q: 'queued' }).items.length, 1);
 });
 
 test('flush commits one batch and query APIs filter and aggregate fixed metadata', async (t) => {
@@ -688,6 +1272,42 @@ test('integrityCheck accepts exactly one ok result and rejects any other result'
     (error) => Array.isArray(error.result) && error.result.length === 2,
   );
   store.db = realDb;
+});
+
+test('integrityCheck rejects corrupted trigram FTS independently', async (t) => {
+  const { store } = await newStore(t);
+  assert.equal(store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      promptText: 'trigram integrity prompt',
+      responseText: 'trigram integrity response',
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength('trigram integrity response'),
+    },
+  }), true);
+  assert.equal(store.flush().written, 1);
+
+  // Keep SQLite's generic check at "ok" so this assertion exercises the
+  // per-index FTS5 integrity command for the trigram index specifically.
+  store.db.exec('DELETE FROM conversation_turns_trigram_fts_data');
+  const realDb = store.db;
+  store.db = {
+    isOpen: true,
+    prepare(sql, ...args) {
+      if (sql === 'PRAGMA integrity_check') {
+        return { all: () => [{ integrity_check: 'ok' }] };
+      }
+      return realDb.prepare(sql, ...args);
+    },
+  };
+  try {
+    assert.throws(
+      () => store.integrityCheck(),
+      /conversation FTS integrity check failed: conversation_turns_trigram_fts/,
+    );
+  } finally {
+    store.db = realDb;
+  }
 });
 
 test('close flushes and checkpoints once, is idempotent, and stops accepting rows', async (t) => {

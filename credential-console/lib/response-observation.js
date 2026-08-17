@@ -10,9 +10,10 @@ import {
 export const MAX_OBSERVED_RAW_BYTES = 16 * 1024 * 1024;
 export const MAX_OBSERVED_DECODED_BYTES = 16 * 1024 * 1024;
 export const MAX_GLOBAL_OBSERVATION_BUDGET_BYTES = 32 * 1024 * 1024;
-// The JSON parser retains up to 1 MiB as a UTF-16 JavaScript string, so reserve
-// twice its byte ceiling for identity responses rather than counting UTF-8 only.
-const IDENTITY_OBSERVATION_RESERVATION_BYTES = 2 * 1024 * 1024;
+// P6's 2 MiB SSE line / JSON prefix and P5 usage parser both materialize UTF-16
+// strings. Four MiB leaves room for both bounded prefixes while admitting eight
+// normal identity streams within the 32 MiB process budget.
+const IDENTITY_OBSERVATION_RESERVATION_BYTES = 4 * 1024 * 1024;
 let reservedObservationBytes = 0;
 
 function boundedLimit(value, fallback, maximum) {
@@ -35,6 +36,56 @@ function decoderFor(encoding) {
   if (encoding === 'br') return createBrotliDecompress();
   if (encoding === 'deflate') return createInflate();
   return null;
+}
+
+export function createCompositeResponseObserver(observers = []) {
+  const entries = (Array.isArray(observers) ? observers : [])
+    .filter((observer) => observer && typeof observer === 'object')
+    .map((observer) => ({ observer, active: true }));
+
+  function stop(entry, reason) {
+    if (!entry.active) return;
+    entry.active = false;
+    try { entry.observer.abort?.(reason); } catch {}
+  }
+
+  return {
+    write(chunk) {
+      for (const entry of entries) {
+        if (!entry.active) continue;
+        try {
+          if (entry.observer.write?.(chunk) === false) stop(entry, 'observer_stopped');
+        } catch {
+          stop(entry, 'observer_write_error');
+        }
+      }
+      return entries.some((entry) => entry.active);
+    },
+    async end() {
+      for (const entry of entries) {
+        if (!entry.active) continue;
+        entry.active = false;
+        try { await entry.observer.end?.(); } catch {
+          try { entry.observer.abort?.('observer_end_error'); } catch {}
+        }
+      }
+    },
+    abort(reason) {
+      for (const entry of entries) stop(entry, reason);
+    },
+    snapshot() {
+      const result = {};
+      for (const entry of entries) {
+        try {
+          const value = entry.observer.snapshot?.();
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            Object.assign(result, value);
+          }
+        } catch {}
+      }
+      return result;
+    },
+  };
 }
 
 /**
