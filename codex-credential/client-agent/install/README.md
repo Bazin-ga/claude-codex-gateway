@@ -15,22 +15,48 @@ You need three values, all produced on the dispenser host:
 A machine can also mint its own token from the shared enrollment key instead, with
 `node enroll.js` — see [`../README.md`](../README.md).
 
+The preferred input is a mode-600 regular token file. Create it without a
+trailing newline, and keep it outside shared or synchronized folders:
+
+```bash
+umask 077
+printf '%s' '<token-from-add-client>' > "$HOME/.config/codex-credential.token"
+chmod 600 "$HOME/.config/codex-credential.token"
+```
+
 Two things to know before running either installer:
 
-**The token is a command-line argument.** It is therefore readable by any local
-user through `ps` while the installer runs, and the invocation is recorded in
-shell history. On a shared machine, prefer `node enroll.js`, which is never given
-a long-lived token, or remove the history entry afterwards.
+**Do not put the token in a command line.** The new flow reads
+`--token-file <mode-600-file>` or the current process's `CODEX_CRED_TOKEN`
+environment variable. The token file must be a regular non-symlink file with
+exact mode `600`, contain one base64url-safe line, and be non-empty. Invalid
+permissions, symlinks, empty files, whitespace, and newlines are rejected. The
+legacy `--token` / `-Token` option remains for old hand-written installs, but it
+can be exposed through `ps` and shell history and should not be used for new
+generated installers. `node enroll.js` remains preferable when available.
 
-**The installer replaces `~/.codex/auth.json`.** It fetches immediately and
-without a backup. If this machine has a personal `codex login` you want to keep,
-copy that file somewhere safe first, or rehearse against a scratch directory with
-`CODEX_HOME=/tmp/codex-probe node pull.js --force`.
+**Choose legacy or profile mode deliberately.** Without `--profile`, the legacy
+installer still replaces `~/.codex/auth.json` without a backup. With `--profile
+<name>`, it writes an isolated Codex home under
+`~/.local/share/claude-codex-gateway/codex-profiles/`, leaves `~/.codex`
+byte-identical, and installs `codex-gateway` plus `codex-profile-<name>` launchers.
+Profile selection affects only newly started Codex processes; an already-running
+process keeps the `CODEX_HOME` it started with.
 
 ## Linux / macOS
 
 ```bash
-./install.sh --endpoint https://HOST:8443 --token <token> --cert-pin <sha256>
+./install.sh --endpoint https://HOST:8443 \
+  --token-file "$HOME/.config/codex-credential.token" \
+  --profile codex-team \
+  --cert-pin <sha256>
+```
+
+Alternatively, keep the token only in the current process environment:
+
+```bash
+CODEX_CRED_TOKEN='<token>' ./install.sh \
+  --endpoint https://HOST:8443 --cert-pin <sha256>
 ```
 
 Registers a **systemd user timer** on Linux, a **launchd agent** on macOS, or a
@@ -47,10 +73,37 @@ Run from an **already-open PowerShell window** — double-clicking a `.ps1` clos
 the window the instant it finishes, so you would never see the result.
 
 ```powershell
-.\windows\install.ps1 -Endpoint https://HOST:8443 -Token <token> -CertPin <sha256>
+.\windows\install.ps1 -Endpoint https://HOST:8443 `
+  -TokenFile "$env:USERPROFILE\.config\codex-credential.token" `
+  -Profile codex-team `
+  -CertPin <sha256>
 ```
 
+Or set `CODEX_CRED_TOKEN` in the current PowerShell process and omit
+`-TokenFile`. `-Token` is retained only for compatibility with older installs.
+
 Registers a scheduled task (06:00, 18:00, and at logon).
+
+## Switching profiles
+
+Each profile must come from its own independent credential centre: a separate
+`CODEX_CRED_HOME`, refresh process, dispenser, certificate, and device token.
+Never seed a second account into the first account's home.
+
+```bash
+node ~/.local/share/claude-codex-gateway/client-agent/profiles.js list
+node ~/.local/share/claude-codex-gateway/client-agent/profiles.js select codex-team
+codex-gateway                 # selected profile
+codex-profile-codex-team      # fixed profile, independent of selection
+```
+
+`select` first fetches and validates the target credential, including its
+id-token account binding, then atomically updates the selected manifest. A
+failure leaves the previous selection and every existing profile usable. It
+does not retry a request through another account and does not hot-switch a
+running Codex process. The unattended timer refreshes every bound profile, not
+only the selected one; one failed profile does not prevent the others from being
+attempted and selection is never changed by refresh.
 
 ## When something is wrong
 
@@ -105,7 +158,9 @@ closes. Keeping them ASCII removes the failure mode rather than working around i
 **Credentials live in a mode-600 env file**, never inline in a unit or plist. The
 systemd unit reads it via `EnvironmentFile`; launchd and cron have no equivalent,
 so they go through `run.sh`, which **exports** the values — sourcing alone sets
-only shell variables, which a child `node` process never sees.
+only shell variables, which a child `node` process never sees. The installer
+never writes the bearer to stdout/stderr, a scheduled task/unit/plist, or its
+durable log.
 
 **The Windows installer does not use `Start-Transcript`.** Its header records the
 invoking command line, which would put this machine's bearer token in clear text

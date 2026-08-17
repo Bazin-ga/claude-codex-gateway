@@ -15,13 +15,20 @@ const DIAGNOSE_PS1 = new URL('../../codex-credential/client-agent/install/window
 
 const ASSET_NAMES = [
   'pull.js',
+  'profiles.js',
+  'codex-gateway.js',
   'package.json',
   'lib/pinned-request.js',
+  'lib/profile-store.js',
   'install/install.sh',
   'install/systemd/codex-credential.service',
   'install/systemd/codex-credential.timer',
+  'install/systemd/codex-credential-profiles.service',
+  'install/systemd/codex-credential-profiles.timer',
   'install/launchd/com.claude-codex-gateway.codex-credential.plist',
+  'install/launchd/com.claude-codex-gateway.codex-credential-profiles.plist',
   'install/windows/install.ps1',
+  'install/windows/diagnose.ps1',
   'install/start-container-loop.sh',
   'install/diagnose.sh',
 ];
@@ -52,13 +59,13 @@ function generatedUnixInstaller(assets = generatedAssets()) {
     certPin: 'a'.repeat(64),
     assets,
   });
-  const match = html.match(/<pre id="codex-installer-macos">([\s\S]*?)<\/pre>/);
+  const match = html.match(/<pre id="codex-installer-codex-team-macos">([\s\S]*?)<\/pre>/);
   assert.ok(match, 'generated Unix installer should be rendered');
   return htmlDecode(match[1]);
 }
 
 test('one version source stamps Claude profiles and generated Codex outer installers', () => {
-  assert.equal(CLIENT_CONFIG_VERSION, '1');
+  assert.equal(CLIENT_CONFIG_VERSION, '2');
   const claudeHtml = deviceConfiguredView({
     account: { alias: 'claude-version-test' },
     device: { name: 'version-device' },
@@ -66,7 +73,7 @@ test('one version source stamps Claude profiles and generated Codex outer instal
     claudeGatewayUrl: 'https://gateway.example/claude',
   });
   assert.match(claudeHtml, /CREDENTIAL_CONSOLE_CLIENT_CONFIG_VERSION/);
-  assert.match(claudeHtml, /CREDENTIAL_CONSOLE_CLIENT_CONFIG_VERSION[^\n]*1/);
+  assert.match(claudeHtml, /CREDENTIAL_CONSOLE_CLIENT_CONFIG_VERSION[^\n]*2/);
 
   const codexHtml = codexConfiguredView({
     deviceName: 'codex-version-device',
@@ -78,6 +85,11 @@ test('one version source stamps Claude profiles and generated Codex outer instal
   assert.match(codexHtml, /\.config[\\/]claude-codex-gateway[\\/]client-agent/);
   assert.match(codexHtml, /config-version/);
   assert.match(codexHtml, /Join-Path \$env:LOCALAPPDATA/);
+  assert.match(codexHtml, /--token-file/);
+  assert.match(codexHtml, /--profile/);
+  assert.match(codexHtml, /codex-profile-ready/);
+  assert.doesNotMatch(codexHtml, /--token synthetic-codex-token/);
+  assert.doesNotMatch(codexHtml, /-Token synthetic-codex-token/);
   assert.doesNotMatch(codexHtml, /--config-version/);
   assert.doesNotMatch(codexHtml, /-ConfigVersion/);
 });
@@ -120,6 +132,39 @@ test('legacy client-agent installers remain unchanged and Windows outer script o
   const fetchCall = generated.indexOf('$ROOT/install/install.sh');
   const stampWrite = generated.indexOf('config-version');
   assert.ok(fetchCall >= 0 && stampWrite > fetchCall, 'stamp must follow original installer call');
-  assert.match(generated, /printf .*1/);
+  assert.match(generated, /printf .*2/);
   assert.equal(generated.includes('synthetic-device-token'), true, 'installer keeps its existing one-time token path');
+});
+
+test('Windows profile installation validates its origin and restores temporary credential environment', async () => {
+  const windowsInstall = await readFile(INSTALL_PS1, 'utf8');
+  assert.match(windowsInstall, /function Normalize-HttpsOrigin/);
+  assert.match(windowsInstall, /\[Uri\]::TryCreate/);
+  assert.match(windowsInstall, /Scheme -ne 'https'/);
+  assert.match(windowsInstall, /UserInfo/);
+  assert.match(windowsInstall, /AbsolutePath -ne '\/'/);
+  assert.match(windowsInstall, /certificate pin must be a 64-character SHA-256 hex digest/);
+  assert.match(windowsInstall, /pull\.js[^\r\n]+--all-profiles/);
+  assert.doesNotMatch(windowsInstall, /--all-profiles --force/);
+
+  const html = codexConfiguredView({
+    deviceName: 'windows-environment-test',
+    token: 'synthetic-device-token',
+    endpoint: 'https://dispenser.example:8443',
+    certPin: 'a'.repeat(64),
+    assets: generatedAssets(),
+  });
+  const match = html.match(/<pre id="codex-installer-codex-team-windows">([\s\S]*?)<\/pre>/);
+  assert.ok(match, 'generated Windows installer should be rendered');
+  const generated = htmlDecode(match[1]);
+  for (const [variable, previous] of [
+    ['CODEX_CRED_TOKEN', 'PreviousCredentialToken'],
+    ['CODEX_CRED_ENDPOINT', 'PreviousCredentialEndpoint'],
+    ['CODEX_CRED_CERT_PIN', 'PreviousCredentialPin'],
+    ['CODEX_CRED_PROFILE_ROOT', 'PreviousProfileRoot'],
+  ]) {
+    assert.match(generated, new RegExp(`\\$${previous} = \\$env:${variable}`));
+    assert.match(generated, new RegExp(`Remove-Item Env:${variable}`));
+    assert.match(generated, new RegExp(`\\$env:${variable} = \\$${previous}`));
+  }
 });

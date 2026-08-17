@@ -31,6 +31,7 @@ import { createHash } from 'node:crypto';
  * @param {string} options.bearer    secret sent only after the pin matches
  * @param {object} [options.json]    request body, serialised as JSON
  * @param {number} [options.timeoutMs]
+ * @param {number} [options.maxResponseBytes]
  * @returns {Promise<{statusCode: number, body: string}>} resolves for any status
  *          the server actually returned; rejects only on transport or pin failure.
  */
@@ -42,6 +43,7 @@ export function pinnedRequest({
   bearer,
   json = null,
   timeoutMs = 30_000,
+  maxResponseBytes = 1024 * 1024,
 }) {
   return new Promise((resolve, reject) => {
     const url = new URL(path, endpoint);
@@ -62,8 +64,17 @@ export function pinnedRequest({
       },
       (res) => {
         let body = '';
-        res.on('data', (chunk) => (body += chunk));
+        let size = 0;
+        res.on('data', (chunk) => {
+          size += chunk.length;
+          if (size > maxResponseBytes) {
+            res.destroy(new Error('response body exceeded the safe bound'));
+            return;
+          }
+          body += chunk;
+        });
         res.on('end', () => resolve({ statusCode: res.statusCode, body }));
+        res.on('error', reject);
       },
     );
 

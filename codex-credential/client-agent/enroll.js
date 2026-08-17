@@ -29,8 +29,8 @@
 
 import { hostname } from 'node:os';
 import { homedir } from 'node:os';
-import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdir, readFile, rename, chmod, lstat, open, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { pinnedRequest } from './lib/pinned-request.js';
@@ -140,7 +140,9 @@ export async function requestEnrollment({
     );
   }
   if (statusCode !== 200) {
-    throw new Error(`dispenser returned ${statusCode}: ${body.slice(0, 200)}`);
+    // The endpoint is remote and its body is untrusted. It may contain a token
+    // or upstream diagnostic, so never copy it into a local error/log.
+    throw new Error(`dispenser returned ${statusCode} during enrollment`);
   }
 
   let issued;
@@ -149,7 +151,7 @@ export async function requestEnrollment({
   } catch (err) {
     throw new Error(`dispenser returned unparseable body: ${err.message}`);
   }
-  if (typeof issued.token !== 'string' || !issued.token) {
+  if (typeof issued.token !== 'string' || !/^[A-Za-z0-9_-]{8,8192}$/.test(issued.token)) {
     throw new Error('dispenser returned no token');
   }
   return issued;
@@ -160,6 +162,11 @@ export async function requestEnrollment({
  * never clobbers settings an operator added by hand.
  */
 export async function persistEnv(values, envPath = ENV_PATH) {
+  for (const [key, value] of Object.entries(values)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || typeof value !== 'string' || /[\r\n\u0000]/.test(value)) {
+      throw new Error('credential env values must be single-line strings with safe keys');
+    }
+  }
   let existing = '';
   try {
     existing = await readFile(envPath, 'utf8');
@@ -171,9 +178,42 @@ export async function persistEnv(values, envPath = ENV_PATH) {
   const kept = lines.filter((line) => !Object.keys(values).some((k) => line.startsWith(`${k}=`)));
   const merged = [...kept, ...Object.entries(values).map(([k, v]) => `${k}=${v}`)];
 
-  await mkdir(dirname(envPath), { recursive: true, mode: 0o700 });
-  await writeFile(envPath, `${merged.join('\n')}\n`, { mode: 0o600 });
-  await chmod(envPath, 0o600);
+  const parent = dirname(envPath);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  await chmod(parent, 0o700);
+  try {
+    const target = await lstat(envPath);
+    if (target.isSymbolicLink()) throw new Error('credential env file must not be a symbolic link');
+    if (!target.isFile() || target.nlink !== 1) throw new Error('credential env file must be a private regular file');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const tmp = `${envPath}.${randomBytes(6).toString('hex')}.tmp`;
+  let handle;
+  let renamed = false;
+  let writtenStat = null;
+  try {
+    handle = await open(tmp, 'wx', 0o600);
+    await handle.writeFile(`${merged.join('\n')}\n`);
+    await handle.sync();
+    writtenStat = await handle.stat();
+    await handle.close();
+    handle = null;
+    await rename(tmp, envPath);
+    renamed = true;
+    const committed = await lstat(envPath);
+    if (committed.isSymbolicLink() || !committed.isFile() || committed.nlink !== 1
+      || !writtenStat || committed.dev !== writtenStat.dev || committed.ino !== writtenStat.ino) {
+      throw new Error('credential env target changed during atomic commit');
+    }
+    if (process.platform !== 'win32') {
+      const directory = await open(parent, 'r');
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    if (!renamed) await unlink(tmp).catch(() => {});
+  }
   return envPath;
 }
 

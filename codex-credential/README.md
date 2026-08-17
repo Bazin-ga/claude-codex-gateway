@@ -31,6 +31,21 @@ Exactly **one** place holds a working `refresh_token`. Every other machine recei
 
 A client's credential works normally, and any refresh it attempts must fail. No mutual eviction is possible by construction.
 
+## Multiple account profiles
+
+One refresh/dispenser home still owns exactly one provider account. Multi-account
+support composes those homes; it never stores two rotating refresh tokens in one
+home. On each client, `profiles.js` keeps every account in an isolated
+`CODEX_HOME`, pins it to the account claim returned by that account's dispenser,
+and atomically selects only a complete profile. `codex-gateway` starts a new Codex
+process with the selected home, while `codex-profile-<profile>` fixes one explicit home.
+
+This is intentionally not a hot switch for an existing process. A process keeps
+the profile it opened; selection affects the next process. Failed pulls, wrong
+pins and account-binding mismatches leave the previous selection intact and never
+retry a request through a different account. Legacy installations with no profile
+remain byte-compatible and continue writing the default `~/.codex/auth.json`.
+
 ## Self-service enrollment
 
 Minting one token per machine by hand makes whoever holds the server a bottleneck for

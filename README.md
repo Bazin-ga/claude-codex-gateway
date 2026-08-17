@@ -38,6 +38,15 @@ else.
 credential that is *structurally incapable of refreshing* — so no client can ever rotate the
 centre's token away.
 
+For multiple Codex accounts, each account keeps an independent credential home,
+refresh process, dispenser and certificate. Clients install them as isolated
+`CODEX_HOME` profiles; selection affects the next `codex-gateway` process and
+does not overwrite the default `~/.codex` login or hot-switch a running session.
+The profile substrate supports several domains, but one `credential-console`
+process currently has one global Codex dispenser configuration and no Codex
+account picker; a second real account therefore needs a separately configured
+domain until the control plane gains multi-domain routing.
+
 `credential-console` keeps Claude OAuth tokens encrypted at rest and never lets them leave the
 host. Devices authenticate to a gateway with a per-device token; the gateway strips that token
 and attaches the device's currently selected, server-held provider credential upstream. A device

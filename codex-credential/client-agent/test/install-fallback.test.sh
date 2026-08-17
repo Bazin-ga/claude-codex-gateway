@@ -5,6 +5,7 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/codex-client-install-test.XXXXXX")
 HOME_DIR="$TEST_ROOT/home"
 FAKE_BIN="$TEST_ROOT/bin"
+TOKEN_FILE="$TEST_ROOT/token"
 PID_FILE="$HOME_DIR/.cache/claude-codex-gateway/codex-credential-loop.pid"
 
 cleanup() {
@@ -17,6 +18,8 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$HOME_DIR" "$FAKE_BIN"
+printf '%s' 'fallback-token-marker' > "$TOKEN_FILE"
+chmod 600 "$TOKEN_FILE"
 cat > "$FAKE_BIN/node" <<'FAKE_NODE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -38,10 +41,10 @@ FAKE_SYSTEMCTL
 chmod +x "$FAKE_BIN/node" "$FAKE_BIN/codex" "$FAKE_BIN/systemctl"
 
 run_install() {
-  HOME="$HOME_DIR" PATH="$FAKE_BIN:/usr/bin:/bin" \
+  env -u CODEX_CRED_TOKEN HOME="$HOME_DIR" PATH="$FAKE_BIN:/usr/bin:/bin" \
     bash "$ROOT/install/install.sh" \
       --endpoint https://127.0.0.1:8443 \
-      --token test-device-token \
+      --token-file "$TOKEN_FILE" \
       --cert-pin "$(printf 'a%.0s' {1..64})"
 }
 

@@ -246,13 +246,24 @@ For Codex, the member flow is similar:
 4. The console renders macOS, Linux, and Windows self-contained installers together. The member
    chooses exactly one for the enrolled device, copies or downloads it, and runs it locally; it
    does not fetch code from the private console.
-5. The installed client agent immediately writes `~/.codex/auth.json` and registers an
-   unattended refresh timer.
+5. The installed client agent writes an isolated `CODEX_HOME` profile, selects it, installs
+   `codex-gateway` / `codex-profile-<account>` launchers, and registers an unattended profile timer.
+   The member's existing `~/.codex/auth.json` is not modified.
 
 The shared enrollment key never appears in the browser or installer. The downloaded script
 contains only the newly minted device token, dispenser endpoint, and TLS certificate pin. The
 agent still requires the member machine to reach `chatgpt.com/backend-api/`; credentials do not
 replace network egress.
+
+Codex profile selection applies to the next newly started process, not an already-running
+session. Every real Codex account must still have its own independent credential home,
+refresh-center, dispenser endpoint and certificate; a second account must never be seeded into
+the first account's home.
+
+This console process currently accepts only one global Codex dispenser/certificate/enrollment-key
+configuration and does not render a Codex account picker. The generated client profile is therefore
+for that one configured domain. Multi-domain control-plane routing remains separate work even though
+the client-side profile store can safely hold several independently installed domains.
 
 ## AI onboarding and the private live guide
 

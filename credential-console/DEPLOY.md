@@ -148,7 +148,7 @@ actually resolved before exposing it:
 
 ```bash
 curl -fsS http://127.0.0.1:9080/health
-# {"status":"ok","admin_auth":"tailscale","client_config_version":"1","admin_configured":true}
+# {"status":"ok","admin_auth":"tailscale","client_config_version":"2","admin_configured":true}
 ```
 
 Import a Codex credential home read-only. Stop the service before running this mutating command,
@@ -321,6 +321,15 @@ The dispenser remains on its existing public port. The console calls `/enroll` s
 generated self-contained installers call `/credential` over the public internet using the same
 certificate pin. They carry only their per-device token and do not fetch source files from the
 private console.
+
+Generated installers now use profile mode. They write the account into an isolated client
+`CODEX_HOME`, install `codex-gateway` and an account-fixed launcher, and leave the member's default
+`~/.codex` untouched. Selection affects the next new process only. This deployment still has one
+configured Codex dispenser; adding a real second account requires a second independent credential
+home, refresh process, dispenser endpoint, certificate and enrollment-key file. Never seed it into
+the existing home. The console has no Codex account picker or multi-domain routing yet; install the
+second domain separately. Once multiple profiles exist on a client, the profile timer refreshes all
+bound profiles without changing which profile is selected.
 
 ## Tailscale
 

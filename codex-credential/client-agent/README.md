@@ -55,8 +55,41 @@ Platforms: macOS, Windows, Linux — all supported by codex (`darwin-x64`, `darw
 
 1. Wake on a timer. The shipped units run twice daily; `pull.js` then does nothing unless fewer than `CODEX_CRED_RENEW_BELOW_DAYS` (default 4) remain of a ~10-day token. Many chances to succeed before anything breaks.
 2. `GET /credential` from the dispenser with this machine's bearer token.
-3. Write `~/.codex/auth.json` (`%USERPROFILE%\.codex\auth.json` on Windows), mode `0600`.
+3. In legacy mode, write `~/.codex/auth.json`. In profile mode, write only that
+   profile's private `codex-home/auth.json`; the default home remains unchanged.
 4. Exit. Idempotent — safe to run when the credential is still fresh.
+
+## Multiple Codex accounts
+
+Codex traffic goes directly from the client to the provider, so account choice
+cannot use Claude's gateway-level “next request” switch. Each Codex account instead
+gets an independent credential domain and local profile. Add/install and select a
+profile with `profiles.js`, then start new sessions through `codex-gateway`:
+
+```bash
+CODEX_CRED_ENDPOINT=https://HOST:8443 \
+CODEX_CRED_CERT_PIN=<pin> CODEX_CRED_TOKEN=<device bearer> \
+  node profiles.js install --name team-a
+node profiles.js select team-a
+node codex-gateway.js
+```
+
+The profile name is not trusted as identity. The first pinned credential binds it
+to the SHA-256 of the provider account ID; later mismatches fail before any auth or
+selection write. Selection occurs only after the target profile has a complete,
+atomically written auth file. It affects the next new Codex process; an existing
+process keeps the `CODEX_HOME` it started with. No automatic cross-account retry is
+performed.
+
+`profiles.js status` reports only profile name, readiness, selection and access
+expiry. The private, bounded `audit.json` records add/install/select outcomes with
+fixed reason codes; it never stores endpoints, pins, device bearers, provider
+account IDs or account digests.
+
+The profile timer refreshes every installed, account-bound profile, including
+profiles that are not currently selected, so account-fixed launchers do not
+silently expire. A failed account is reported after the remaining profiles have
+still been attempted; refresh never changes the selected profile.
 
 ## The credential shape it writes
 

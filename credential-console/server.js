@@ -99,13 +99,20 @@ export const SHUTDOWN_DEADLINE_MS = 1_000;
 const CODEX_AGENT_ROOT = fileURLToPath(new URL('../codex-credential/client-agent/', import.meta.url));
 export const CODEX_AGENT_ASSETS = new Map([
   ['pull.js', 'pull.js'],
+  ['profiles.js', 'profiles.js'],
+  ['codex-gateway.js', 'codex-gateway.js'],
   ['package.json', 'package.json'],
   ['lib/pinned-request.js', 'lib/pinned-request.js'],
+  ['lib/profile-store.js', 'lib/profile-store.js'],
   ['install/install.sh', 'install/install.sh'],
   ['install/systemd/codex-credential.service', 'install/systemd/codex-credential.service'],
   ['install/systemd/codex-credential.timer', 'install/systemd/codex-credential.timer'],
+  ['install/systemd/codex-credential-profiles.service', 'install/systemd/codex-credential-profiles.service'],
+  ['install/systemd/codex-credential-profiles.timer', 'install/systemd/codex-credential-profiles.timer'],
   ['install/launchd/com.claude-codex-gateway.codex-credential.plist', 'install/launchd/com.claude-codex-gateway.codex-credential.plist'],
+  ['install/launchd/com.claude-codex-gateway.codex-credential-profiles.plist', 'install/launchd/com.claude-codex-gateway.codex-credential-profiles.plist'],
   ['install/windows/install.ps1', 'install/windows/install.ps1'],
+  ['install/windows/diagnose.ps1', 'install/windows/diagnose.ps1'],
   // install.sh execs both of these. Omitting them produced an installer that
   // completed "successfully" and left the machine unable to renew: with no
   // systemd user session it falls back to start-container-loop.sh, which was not
@@ -1468,6 +1475,7 @@ const translations = {
   'conversation-response-truncated': '回复已截断',
   'conversation-response-unavailable': '回复不可用',
   'choose-codex-platform': '选择这台设备的操作系统',
+  'codex-profile-ready': '此安装器会新增一个隔离的 Codex profile，不会修改默认的 ~/.codex 账号。',
   'one-platform-only': '请只在刚登记的这台设备上选择一种安装器使用，不要把这些脚本复用到其他机器。',
   'view-script': '查看脚本',
   'one-time-token': '此单文件脚本包含仅属于当前设备的 token，只显示一次；运行时不需要访问内网控制台。请限制为仅自己可读，并在安装成功后删除。',
@@ -1777,6 +1785,7 @@ document.addEventListener('click', async (event) => {
         // same label", and evicting the wrong one is silent while a surplus row
         // is visible in the inventory and revocable with `add-client.js --revoke`.
         const machineId = randomToken(24);
+        const codexAccount = store.publicAccounts().find((account) => account.provider === 'codex');
         const issued = await codexEnroll({
           endpoint: codexEndpoint,
           enrollmentKey: codexEnrollmentKey,
@@ -1798,6 +1807,7 @@ document.addEventListener('click', async (event) => {
           token: issued.token,
           endpoint: codexEndpoint,
           certPin: codexCertPin,
+          profileName: codexAccount?.alias ?? 'codex-team',
           assets: codexAgentAssets,
           openMode,
         }));

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pulls a short-lived Codex credential from the dispenser and installs it into ~/.codex/auth.json.",
+  "description": "Pulls short-lived Codex credentials into isolated, atomically selectable client profiles.",
   "engines": {
     "node": ">=20"
   },

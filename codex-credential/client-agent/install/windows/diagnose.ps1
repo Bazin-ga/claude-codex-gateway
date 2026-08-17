@@ -1,5 +1,6 @@
 param(
-  [string]$Endpoint = $env:CODEX_CRED_ENDPOINT
+  [string]$Endpoint = $env:CODEX_CRED_ENDPOINT,
+  [string]$Profile
 )
 
 # Diagnose why codex is not using the credential it was given (Windows).
@@ -11,6 +12,9 @@ param(
 # ASCII-only on purpose - see the note in install.ps1.
 
 $ErrorActionPreference = 'Continue'   # every probe must run even if one fails
+if ($Profile -and $Profile -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw 'invalid profile name' }
+$profileHome = if ($Profile) { Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA 'claude-codex-gateway\codex-profiles') $Profile) 'codex-home' } else { Join-Path $env:USERPROFILE '.codex' }
+$taskName = if ($Profile) { 'Codex credential profiles refresh' } else { 'Codex credential refresh' }
 
 Write-Host "===== codex credential diagnosis ====="
 Write-Host ""
@@ -32,7 +36,7 @@ if (-not $found) { Write-Host "  (none - clean)" -ForegroundColor Green }
 Write-Host ""
 
 Write-Host "[2] codex config" -ForegroundColor Cyan
-$cfg = "$env:USERPROFILE\.codex\config.toml"
+$cfg = Join-Path $profileHome 'config.toml'
 if (Test-Path $cfg) {
   $hits = Select-String -Path $cfg -Pattern 'base_url|model_provider|\[model_providers|wire_api|env_key'
   if ($hits) { $hits | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow } }
@@ -43,7 +47,7 @@ if (Test-Path $cfg) {
 Write-Host ""
 
 Write-Host "[3] Which credential is installed" -ForegroundColor Cyan
-$auth = "$env:USERPROFILE\.codex\auth.json"
+$auth = Join-Path $profileHome 'auth.json'
 if (Test-Path $auth) {
   try {
     $j = Get-Content $auth -Raw | ConvertFrom-Json
@@ -114,12 +118,12 @@ Write-Host "[6] Scheduled task" -ForegroundColor Cyan
 # emitting a red error when the script is run somewhere without it.
 $task = $null
 if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
-  $task = Get-ScheduledTask -TaskName 'Codex credential refresh' -ErrorAction SilentlyContinue
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 } else {
   Write-Host "  (scheduled-task cmdlets unavailable on this host)" -ForegroundColor Yellow
 }
 if ($task) {
-  $info = Get-ScheduledTaskInfo -TaskName 'Codex credential refresh' -ErrorAction SilentlyContinue
+  $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
   Write-Host "  state    = $($task.State)"
   Write-Host "  last run = $($info.LastRunTime)  result = $($info.LastTaskResult)"
   Write-Host "  next run = $($info.NextRunTime)"

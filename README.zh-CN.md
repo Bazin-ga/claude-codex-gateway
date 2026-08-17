@@ -33,6 +33,12 @@ distribution centre）。
 `codex-credential` 让可用的 `refresh_token` 有且只有**一个**持有者，对外分发的凭证
 *在结构上就不具备刷新能力*——因此任何客户端都不可能把中心的 token 轮换掉。
 
+多个 Codex 账号分别使用独立的凭证目录、刷新进程、dispenser 与证书。客户端把它们安装成
+隔离的 `CODEX_HOME` profile；选择只影响下一次新启动的 `codex-gateway` 进程，不覆盖默认
+`~/.codex` 登录，也不会热切已经运行的会话。
+profile 底层可以同时保存多个域，但当前一个 `credential-console` 进程只有一套全局 Codex
+dispenser 配置，也没有 Codex 账号选择器；在控制面支持多域路由前，第二个真实账号仍需单独配置域。
+
 `credential-console` 把 Claude OAuth token 加密存放在磁盘上（encrypted at rest），并且不让
 它们离开这台主机。设备用每设备独立的 token 向网关认证；网关剥掉该 token，再向上游附上服务商
 当前为该设备选择、并保存在服务端的凭证。设备可以查看自己的状态，并在管理员已允许的账号之间

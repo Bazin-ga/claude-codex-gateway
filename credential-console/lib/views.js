@@ -2568,7 +2568,7 @@ function base64Asset(assets, name) {
   return Buffer.from(source, 'utf8').toString('base64');
 }
 
-function codexUnixInstaller({ assets, endpoint, certPin, token, clientConfigVersion }) {
+function codexUnixInstaller({ assets, endpoint, certPin, token, profileName, clientConfigVersion }) {
   return `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -2597,19 +2597,31 @@ write_asset() {
 }
 
 write_asset pull.js ${shellSingleQuote(base64Asset(assets, 'pull.js'))}
+write_asset profiles.js ${shellSingleQuote(base64Asset(assets, 'profiles.js'))}
+write_asset codex-gateway.js ${shellSingleQuote(base64Asset(assets, 'codex-gateway.js'))}
 write_asset package.json ${shellSingleQuote(base64Asset(assets, 'package.json'))}
 write_asset lib/pinned-request.js ${shellSingleQuote(base64Asset(assets, 'lib/pinned-request.js'))}
+write_asset lib/profile-store.js ${shellSingleQuote(base64Asset(assets, 'lib/profile-store.js'))}
 write_asset install/install.sh ${shellSingleQuote(base64Asset(assets, 'install/install.sh'))}
 write_asset install/systemd/codex-credential.service ${shellSingleQuote(base64Asset(assets, 'install/systemd/codex-credential.service'))}
 write_asset install/systemd/codex-credential.timer ${shellSingleQuote(base64Asset(assets, 'install/systemd/codex-credential.timer'))}
+write_asset install/systemd/codex-credential-profiles.service ${shellSingleQuote(base64Asset(assets, 'install/systemd/codex-credential-profiles.service'))}
+write_asset install/systemd/codex-credential-profiles.timer ${shellSingleQuote(base64Asset(assets, 'install/systemd/codex-credential-profiles.timer'))}
 write_asset install/launchd/com.claude-codex-gateway.codex-credential.plist ${shellSingleQuote(base64Asset(assets, 'install/launchd/com.claude-codex-gateway.codex-credential.plist'))}
+write_asset install/launchd/com.claude-codex-gateway.codex-credential-profiles.plist ${shellSingleQuote(base64Asset(assets, 'install/launchd/com.claude-codex-gateway.codex-credential-profiles.plist'))}
 write_asset install/start-container-loop.sh ${shellSingleQuote(base64Asset(assets, 'install/start-container-loop.sh'))}
 write_asset install/diagnose.sh ${shellSingleQuote(base64Asset(assets, 'install/diagnose.sh'))}
 chmod 700 "$ROOT/install/install.sh"
 
+TOKEN_FILE="$STAGE/device-token"
+umask 077
+printf '%s' ${shellSingleQuote(token)} > "$TOKEN_FILE"
+chmod 600 "$TOKEN_FILE"
+
 "$ROOT/install/install.sh" \\
   --endpoint ${shellSingleQuote(endpoint)} \\
-  --token ${shellSingleQuote(token)} \\
+  --token-file "$TOKEN_FILE" \\
+  --profile ${shellSingleQuote(profileName)} \\
   --cert-pin ${shellSingleQuote(certPin)}
 
 # The original agent installer owns credential/env writes. Stamp only after it
@@ -2625,16 +2637,24 @@ STAMP_TMP=""
 `;
 }
 
-function codexWindowsInstaller({ assets, endpoint, certPin, token, clientConfigVersion }) {
+function codexWindowsInstaller({ assets, endpoint, certPin, token, profileName, clientConfigVersion }) {
   return `$ErrorActionPreference = 'Stop'
 $Stage = Join-Path $env:TEMP ('codex-gateway-' + [guid]::NewGuid().ToString('N'))
 $Root = Join-Path $Stage 'client-agent'
 $StampTmp = $null
+$PreviousCredentialToken = $env:CODEX_CRED_TOKEN
+$PreviousCredentialEndpoint = $env:CODEX_CRED_ENDPOINT
+$PreviousCredentialPin = $env:CODEX_CRED_CERT_PIN
+$PreviousProfileRoot = $env:CODEX_CRED_PROFILE_ROOT
 $Assets = @{
   'pull.js' = ${powerShellSingleQuote(base64Asset(assets, 'pull.js'))}
+  'profiles.js' = ${powerShellSingleQuote(base64Asset(assets, 'profiles.js'))}
+  'codex-gateway.js' = ${powerShellSingleQuote(base64Asset(assets, 'codex-gateway.js'))}
   'package.json' = ${powerShellSingleQuote(base64Asset(assets, 'package.json'))}
   'lib/pinned-request.js' = ${powerShellSingleQuote(base64Asset(assets, 'lib/pinned-request.js'))}
+  'lib/profile-store.js' = ${powerShellSingleQuote(base64Asset(assets, 'lib/profile-store.js'))}
   'install/windows/install.ps1' = ${powerShellSingleQuote(base64Asset(assets, 'install/windows/install.ps1'))}
+  'install/windows/diagnose.ps1' = ${powerShellSingleQuote(base64Asset(assets, 'install/windows/diagnose.ps1'))}
 }
 
 try {
@@ -2643,7 +2663,8 @@ try {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Target) | Out-Null
     [System.IO.File]::WriteAllBytes($Target, [Convert]::FromBase64String($Assets[$Relative]))
   }
-  & (Join-Path $Root 'install\\windows\\install.ps1') -Endpoint ${powerShellSingleQuote(endpoint)} -Token ${powerShellSingleQuote(token)} -CertPin ${powerShellSingleQuote(certPin)}
+  $env:CODEX_CRED_TOKEN = ${powerShellSingleQuote(token)}
+  & (Join-Path $Root 'install\\windows\\install.ps1') -Endpoint ${powerShellSingleQuote(endpoint)} -Profile ${powerShellSingleQuote(profileName)} -CertPin ${powerShellSingleQuote(certPin)}
   $Stamp = Join-Path $env:LOCALAPPDATA ${powerShellSingleQuote(CODEX_WINDOWS_CLIENT_CONFIG_VERSION_FILE)}
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Stamp) | Out-Null
   $StampTmp = "$Stamp.$PID.tmp"
@@ -2651,6 +2672,10 @@ try {
   Move-Item -Force $StampTmp $Stamp
   $StampTmp = $null
 } finally {
+  if ($null -eq $PreviousCredentialToken) { Remove-Item Env:CODEX_CRED_TOKEN -ErrorAction SilentlyContinue } else { $env:CODEX_CRED_TOKEN = $PreviousCredentialToken }
+  if ($null -eq $PreviousCredentialEndpoint) { Remove-Item Env:CODEX_CRED_ENDPOINT -ErrorAction SilentlyContinue } else { $env:CODEX_CRED_ENDPOINT = $PreviousCredentialEndpoint }
+  if ($null -eq $PreviousCredentialPin) { Remove-Item Env:CODEX_CRED_CERT_PIN -ErrorAction SilentlyContinue } else { $env:CODEX_CRED_CERT_PIN = $PreviousCredentialPin }
+  if ($null -eq $PreviousProfileRoot) { Remove-Item Env:CODEX_CRED_PROFILE_ROOT -ErrorAction SilentlyContinue } else { $env:CODEX_CRED_PROFILE_ROOT = $PreviousProfileRoot }
   if ($StampTmp) { Remove-Item -Force $StampTmp -ErrorAction SilentlyContinue }
   Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 }
@@ -2662,15 +2687,21 @@ export function codexConfiguredView({
   token,
   endpoint,
   certPin,
+  profileName = 'codex-team',
   assets,
   clientConfigVersion = CLIENT_CONFIG_VERSION,
   openMode = false,
 }) {
+  const safeProfile = String(profileName)
+    .replace(/[^A-Za-z0-9._-]/g, '-')
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .slice(0, 64) || 'codex-team';
   const unixScript = codexUnixInstaller({
     assets,
     endpoint,
     certPin,
     token,
+    profileName: safeProfile,
     clientConfigVersion,
   });
   const installers = [
@@ -2684,14 +2715,15 @@ export function codexConfiguredView({
         endpoint,
         certPin,
         token,
+        profileName: safeProfile,
         clientConfigVersion,
       }),
       extension: 'ps1',
     },
   ];
   const installerPanels = installers.map(({ platform, label, script, extension }) => {
-    const filename = `install-codex-${platform}.${extension}`;
-    const targetId = `codex-installer-${platform}`;
+    const filename = `install-codex-${safeProfile}-${platform}.${extension}`;
+    const targetId = `codex-installer-${safeProfile}-${platform}`;
     const runCommand = platform === 'windows'
       ? `$installer = "$HOME\\Downloads\\${filename}"; powershell -ExecutionPolicy Bypass -File $installer; if ($LASTEXITCODE -eq 0) { Remove-Item -Force $installer }`
       : `chmod 600 "$HOME/Downloads/${filename}" && bash "$HOME/Downloads/${filename}" && rm "$HOME/Downloads/${filename}"`;
@@ -2713,6 +2745,7 @@ export function codexConfiguredView({
   return layout('Codex device ready', `
     <section class="card stack">
       <div class="notice success">Codex device <strong>${escapeHtml(deviceName)}</strong> is enrolled.</div>
+      <div class="notice" role="note"><span data-i18n="codex-profile-ready">This installer adds an isolated Codex profile and leaves the default ~/.codex account unchanged.</span> <strong>${escapeHtml(safeProfile)}</strong></div>
       <h1 data-i18n="choose-codex-platform">Choose this device's operating system</h1>
       <p class="muted" data-i18n="one-time-token">This self-contained script has a token scoped to this device and is displayed once. It does not need the private console when it runs. Keep it readable only by you and delete it after installation succeeds.</p>
       <div class="notice" data-i18n="one-platform-only">Use exactly one installer on the device you just enrolled. Do not reuse these scripts on another machine.</div>

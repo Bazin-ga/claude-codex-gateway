@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, X509Certificate } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, stat, symlink, link } from 'node:fs/promises';
 import { createServer } from 'node:https';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -230,8 +230,48 @@ test('a 403 is reported as an operator problem, not a machine one', async () => 
   }
 });
 
+test('a failed enrollment never copies a secret-bearing response body into errors', async () => {
+  const marker = 'fake-refresh-token-must-not-enter-errors';
+  const fixture = await startServer({ status: 500, body: { error: marker } });
+  try {
+    let failure;
+    try {
+      await requestEnrollment({
+        endpoint: fixture.endpoint,
+        enrollmentKey: 'shared-key',
+        pin: fixture.pin,
+        name: 'laptop-01',
+      });
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure);
+    assert.match(failure.message, /returned 500 during enrollment/);
+    assert.equal(failure.message.includes(marker), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test('a success-shaped response with no token is rejected', async () => {
   const fixture = await startServer({ body: { name: 'laptop-01' } });
+  try {
+    await assert.rejects(
+      requestEnrollment({
+        endpoint: fixture.endpoint,
+        enrollmentKey: 'shared-key',
+        pin: fixture.pin,
+        name: 'laptop-01',
+      }),
+      /returned no token/,
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('a success response cannot inject shell syntax into the persisted device bearer', async () => {
+  const fixture = await startServer({ body: { name: 'laptop-01', token: 'abc$(touch-pwned)' } });
   try {
     await assert.rejects(
       requestEnrollment({
@@ -276,4 +316,22 @@ test('persistEnv merges without clobbering unrelated settings', async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('persistEnv rejects line injection, symlink, and hard-link targets without changing a canary', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'codex-enroll-env-safety-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const envPath = path.join(directory, 'credential.env');
+  await assert.rejects(
+    () => persistEnv({ CODEX_CRED_TOKEN: 'safe\nINJECTED=value' }, envPath),
+    /single-line/,
+  );
+  const canary = path.join(directory, 'canary');
+  await writeFile(canary, 'unchanged', { mode: 0o600 });
+  await symlink(canary, envPath);
+  await assert.rejects(() => persistEnv({ CODEX_CRED_TOKEN: 'safe-token' }, envPath), /symbolic link/);
+  await rm(envPath);
+  await link(canary, envPath);
+  await assert.rejects(() => persistEnv({ CODEX_CRED_TOKEN: 'safe-token' }, envPath), /private regular/);
+  assert.equal(await readFile(canary, 'utf8'), 'unchanged');
 });

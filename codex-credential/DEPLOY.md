@@ -218,6 +218,21 @@ node ~/.local/share/claude-codex-gateway/client-agent/pull.js --force
 keeps no backup. If this machine has a personal `codex login` you want to keep, copy that file
 somewhere safe first, or rehearse against a scratch directory with `CODEX_HOME=/tmp/codex-probe`.
 
+For a multi-account client, do not run that legacy write. Give every provider account a separate
+server-side `CODEX_CRED_HOME`/refresh/dispenser/certificate domain, then install each as a client
+profile:
+
+```bash
+./client-agent/install/install.sh --profile codex-team-a \
+  --endpoint https://HOST:8443 --token-file ./device-token --cert-pin <sha256>
+node ~/.local/share/claude-codex-gateway/client-agent/profiles.js select codex-team-a
+codex-gateway
+```
+
+The profile installer leaves `~/.codex` unchanged. `codex-gateway` uses the selected profile for
+a new process; `codex-profile-codex-team-a` always uses that fixed profile. Already-running Codex processes
+keep their original home. Failed selection never falls back to another account.
+
 Do **not** verify with `codex login status` — it reports `Logged in` even for a garbage
 token. Decode the access token's `exp`, or make a real call.
 

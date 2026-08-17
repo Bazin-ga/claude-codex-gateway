@@ -191,7 +191,7 @@ test('tailnet identity mode has no sign-in and binds sessions to the user', asyn
     const health = await fetch(`${app.baseUrl}/health`);
     assert.deepEqual(await health.json(), {
       status: 'ok',
-      client_config_version: '1',
+      client_config_version: '2',
       admin_auth: 'tailscale',
       admin_configured: true,
     });
@@ -227,7 +227,7 @@ test('open mode issues Claude device configs with no login while still enforcing
     const health = await fetch(`${app.baseUrl}/health`);
     assert.deepEqual(await health.json(), {
       status: 'ok',
-      client_config_version: '1',
+      client_config_version: '2',
       admin_auth: 'open',
       admin_configured: false,
     });
@@ -359,8 +359,8 @@ test('open mode self-serves a Codex installer keyed to the self-asserted member 
     });
     assert.equal(enrollment.status, 200);
     const html = await enrollment.text();
-    assert.match(html, /install-codex-macos\.sh/);
-    assert.match(html, /install-codex-windows\.ps1/);
+    assert.match(html, /install-codex-codex-shared-1-macos\.sh/);
+    assert.match(html, /install-codex-codex-shared-1-windows\.ps1/);
     assert.match(html, /codex-open-device-token/);
     assert.match(html, /No authentication: anyone who can reach this console/);
     assert.equal(html.includes('test-enrollment-key-long-enough'), false);
@@ -464,7 +464,7 @@ test('an unset CREDENTIAL_CONSOLE_ADMIN_AUTH defaults to tailscale, not open', a
   const observed = JSON.parse(stdout);
   assert.deepEqual(observed.health, {
     status: 'ok',
-    client_config_version: '1',
+    client_config_version: '2',
     admin_auth: 'tailscale',
     admin_configured: true,
   });
@@ -1444,9 +1444,9 @@ test('tailnet members can self-enroll Codex once and choose any platform install
     });
     assert.equal(enrollment.status, 200);
     const html = await enrollment.text();
-    assert.match(html, /install-codex-macos\.sh/);
-    assert.match(html, /install-codex-linux\.sh/);
-    assert.match(html, /install-codex-windows\.ps1/);
+    assert.match(html, /install-codex-codex-shared-1-macos\.sh/);
+    assert.match(html, /install-codex-codex-shared-1-linux\.sh/);
+    assert.match(html, /install-codex-codex-shared-1-windows\.ps1/);
     assert.equal((html.match(/data-download-target=/g) ?? []).length, 3);
     assert.match(html, /Download installer/);
     assert.match(html, /codex-device-token-shown-once/);
@@ -2159,7 +2159,7 @@ test('installer embeds every asset install.sh execs', async () => {
   );
   // install.sh writes this one itself, as a heredoc, so it is deliberately not
   // shipped. Everything else it names under $DEST has to arrive embedded.
-  const GENERATED_BY_INSTALLER = new Set(['run.sh']);
+  const GENERATED_BY_INSTALLER = new Set(['run.sh', 'run-profiles.sh']);
   const referenced = new Set(
     [...installSh.matchAll(/\$DEST\/([A-Za-z0-9/_.-]+\.(?:sh|js|json|ps1|plist|service|timer))/g)]
       .map((match) => match[1])

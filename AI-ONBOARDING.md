@@ -66,7 +66,10 @@ Use the private console's member page:
 4. Ask the human to review and approve the generated installer locally. After explicit approval,
    the AI may execute it without displaying, copying, or transmitting its contents, and must delete
    it after success. If safe local execution cannot be guaranteed, stop and ask the human to run it.
-5. Verify only through the generated client setup and a real user-approved Codex operation. Do
+5. The installer creates an isolated profile and does not overwrite the person's default
+   `~/.codex`. Start a new process with the generated `codex-gateway` or account-fixed launcher;
+   profile changes do not hot-switch an existing session.
+6. Verify only through the generated client setup and a real user-approved Codex operation. Do
    not run the `codex login` command as part of this onboarding flow.
 
 For background on the installed client, see [`codex-credential/client-agent/README.md`](codex-credential/client-agent/README.md#what-it-does).
