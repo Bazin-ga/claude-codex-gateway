@@ -121,7 +121,7 @@ button.danger { background: var(--red); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; }
 .stack > .card { grid-column: auto; min-width: 0; }
-.notice { border-left: 4px solid var(--amber); background: #fff7e9; padding: 12px 14px; border-radius: 0 10px 10px 0; }
+.notice { min-width: 0; overflow-wrap: anywhere; border-left: 4px solid var(--amber); background: #fff7e9; padding: 12px 14px; border-radius: 0 10px 10px 0; }
 .success { border-left-color: var(--green); background: #eaf6ef; }
 .error { border-left-color: var(--red); background: #faebe9; }
 .open-banner { margin-bottom: 22px; font-weight: 700; }

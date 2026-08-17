@@ -88,6 +88,7 @@ test('one version source stamps Claude profiles and generated Codex outer instal
   assert.match(codexHtml, /--token-file/);
   assert.match(codexHtml, /--profile/);
   assert.match(codexHtml, /codex-profile-ready/);
+  assert.match(codexHtml, /\.notice \{[^}]*overflow-wrap: anywhere/);
   assert.doesNotMatch(codexHtml, /--token synthetic-codex-token/);
   assert.doesNotMatch(codexHtml, /-Token synthetic-codex-token/);
   assert.doesNotMatch(codexHtml, /--config-version/);
