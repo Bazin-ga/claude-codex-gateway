@@ -13,7 +13,7 @@ async function listen(server) {
 }
 
 function conversationMetrics({ unavailable = false, searchError = null } = {}) {
-  const calls = { searches: [], reads: [] };
+  const calls = { searches: [], facets: [], reads: [] };
   return {
     calls,
     stats: { conversation: { dropped: 2 } },
@@ -35,6 +35,20 @@ function conversationMetrics({ unavailable = false, searchError = null } = {}) {
           responseState: 'complete',
         }],
         nextBeforeId: 17,
+        error: null,
+      };
+    },
+    queryConversationFacets(options) {
+      calls.facets.push(options);
+      return {
+        members: [{ value: 'member-safe', count: 2 }],
+        devices: [{ value: 'device-safe', count: 2 }],
+        accounts: [{ value: 'account-safe', count: 2 }],
+        models: [{ value: 'model-safe', count: 2 }],
+        responseStates: [{ value: 'complete', count: 2 }],
+        totalStored: 1,
+        facetTruncated: {},
+        truncated: false,
         error: null,
       };
     },
@@ -94,21 +108,36 @@ function cookieFrom(response) {
   return response.headers.get('set-cookie')?.split(';')[0] ?? '';
 }
 
-test('open conversation routes are reachable without identity, GET-only, and never shadow /claude', async () => {
+test('open conversation routes use a default GET and POST-only filter/search state', async () => {
   const metrics = conversationMetrics();
   const app = await fixture({ requestMetrics: metrics });
   try {
-    const list = await fetch(`${app.baseUrl}/conversations?q=needle&before_id=12&limit=1`);
+    const list = await fetch(`${app.baseUrl}/conversations?q=secret-query&before_id=12&limit=1`);
     assert.equal(list.status, 200);
-    assert.notEqual(cookieFrom(list), '');
+    const cookie = cookieFrom(list);
+    assert.notEqual(cookie, '');
     const listHtml = await list.text();
-    assert.deepEqual(metrics.calls.searches[0], { q: 'needle', beforeId: 12, limit: 1 });
+    assert.deepEqual(metrics.calls.searches[0], { q: '', beforeId: null, limit: 25 });
+    assert.equal(listHtml.includes('secret-query'), false);
     assert.match(listHtml, /data-i18n="conversation-privacy-notice"/);
     assert.match(listHtml, /data-i18n="conversation-open-warning"/);
     assert.match(listHtml, /data-i18n="conversation-queue-dropped"/);
-    assert.match(listHtml, /href="\/conversations\?q=needle&amp;before_id=17&amp;limit=1"/);
+    assert.match(listHtml, /method="post" action="\/conversations"/);
     assert.equal(listHtml.includes('<img src=x'), false);
     assert.equal(listHtml.includes('data-i18n="open-banner"'), true);
+
+    const filtered = await fetch(`${app.baseUrl}/conversations`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ q: 'needle', before_id: '12', limit: '1' }),
+    });
+    assert.equal(filtered.status, 200);
+    const filteredHtml = await filtered.text();
+    assert.deepEqual(metrics.calls.searches[1], { q: 'needle', beforeId: 12, limit: 1 });
+    assert.deepEqual(metrics.calls.facets[1], { q: 'needle' });
+    assert.match(filteredHtml, /data-facet-count="2"/);
+    assert.match(filteredHtml, /name="before_id" value="17"/);
+    assert.match(filteredHtml, /conversation-next-page/);
 
     const translations = await fetch(`${app.baseUrl}/assets/app.js`);
     assert.equal(translations.status, 200);
@@ -131,11 +160,15 @@ test('open conversation routes are reachable without identity, GET-only, and nev
     const malformed = await fetch(`${app.baseUrl}/conversations/not-a-number`);
     assert.equal(malformed.status, 404);
 
-    for (const path of ['/conversations', '/conversations/42']) {
-      const posted = await fetch(`${app.baseUrl}${path}`, { method: 'POST' });
-      assert.equal(posted.status, 405, path);
-      assert.equal(posted.headers.get('allow'), 'GET');
-    }
+    const posted = await fetch(`${app.baseUrl}/conversations`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({}),
+    });
+    assert.equal(posted.status, 200);
+    const detailPosted = await fetch(`${app.baseUrl}/conversations/42`, { method: 'POST' });
+    assert.equal(detailPosted.status, 405);
+    assert.equal(detailPosted.headers.get('allow'), 'GET');
 
     const notArchive = await fetch(`${app.baseUrl}/claude/conversations/42`);
     assert.notEqual(notArchive.status, 200);
@@ -197,7 +230,12 @@ test('bounded search errors return actionable 400 guidance while unknown errors 
   ]) {
     const app = await fixture({ requestMetrics: conversationMetrics({ searchError }) });
     try {
-      const response = await fetch(`${app.baseUrl}/conversations?q=short`);
+      const landing = await fetch(`${app.baseUrl}/conversations`);
+      const response = await fetch(`${app.baseUrl}/conversations`, {
+        method: 'POST',
+        headers: { Cookie: cookieFrom(landing), 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ q: 'short' }),
+      });
       assert.equal(response.status, 400);
       const html = await response.text();
       assert.match(html, new RegExp(`data-i18n="${marker}"`));
@@ -210,12 +248,52 @@ test('bounded search errors return actionable 400 guidance while unknown errors 
 
   const app = await fixture({ requestMetrics: conversationMetrics({ searchError: 'private_search_failure' }) });
   try {
-    const response = await fetch(`${app.baseUrl}/conversations?q=short`);
+    const landing = await fetch(`${app.baseUrl}/conversations`);
+    const response = await fetch(`${app.baseUrl}/conversations`, {
+      method: 'POST',
+      headers: { Cookie: cookieFrom(landing), 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ q: 'short' }),
+    });
     assert.equal(response.status, 503);
     const html = await response.text();
     assert.match(html, /data-i18n="conversation-search-error"/);
     assert.match(html, /Conversation search could not be completed/);
     assert.equal(html.includes('private_search_failure'), false);
+  } finally {
+    await app.close();
+  }
+});
+
+test('conversation filters reject malformed and oversized UTF-8 values before metrics queries', async () => {
+  const metrics = conversationMetrics();
+  const app = await fixture({ requestMetrics: metrics });
+  try {
+    const landing = await fetch(`${app.baseUrl}/conversations`);
+    const cookie = cookieFrom(landing);
+    const baselineSearches = metrics.calls.searches.length;
+    for (const body of [
+      { q: '中'.repeat(100) },
+      { device_id: 'd'.repeat(129) },
+      { before_id: '-2' },
+      { period: 'yesterday' },
+    ]) {
+      const response = await fetch(`${app.baseUrl}/conversations`, {
+        method: 'POST',
+        headers: { Cookie: cookie, 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams(body),
+      });
+      assert.equal(response.status, 400);
+      const html = await response.text();
+      assert.match(html, /data-i18n="conversation-filter-invalid"/);
+      assert.equal(html.includes('中'.repeat(100)), false);
+    }
+    const oversized = await fetch(`${app.baseUrl}/conversations`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ q: 'x'.repeat(8 * 1024) }),
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal(metrics.calls.searches.length, baselineSearches);
   } finally {
     await app.close();
   }

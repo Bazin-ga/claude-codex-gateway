@@ -28,19 +28,31 @@ export function parseCookies(header = '') {
 export async function readBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let rejected = false;
     const decoder = new StringDecoder('utf8');
     let body = '';
     req.on('data', (chunk) => {
+      if (rejected) return;
       size += chunk.length;
       if (size > maxBytes) {
-        req.destroy();
+        // Keep draining the already-flowing request without retaining it. The
+        // route can then return a real 413 instead of resetting the socket.
+        rejected = true;
+        body = '';
         reject(new Error('request body too large'));
         return;
       }
       body += decoder.write(chunk);
     });
-    req.on('end', () => resolve(body + decoder.end()));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (!rejected) resolve(body + decoder.end());
+    });
+    req.on('error', (error) => {
+      if (!rejected) {
+        rejected = true;
+        reject(error);
+      }
+    });
   });
 }
 

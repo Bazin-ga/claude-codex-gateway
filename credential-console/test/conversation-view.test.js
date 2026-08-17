@@ -48,13 +48,14 @@ test('conversation list renders search, escaped snippets, status, queue drop, an
     },
   });
 
-  assert.match(html, /<form method="get" action="\/conversations"/);
+  assert.match(html, /<form method="post" action="\/conversations"/);
   assert.match(html, /name="q" value="&lt;img src=x onerror=alert\(1\)&gt;&amp;&quot;&#39;/);
   assert.match(html, /data-i18n="conversation-response-truncated"/);
   assert.match(html, /data-i18n="conversation-queue-dropped"/);
   assert.match(html, />3<\/strong>/);
   assert.match(html, /href="\/conversations\/42"[^>]*data-i18n="conversation-open"/);
-  assert.match(html, /href="\/conversations\?q=%3Cimg%20src%3Dx%20onerror%3Dalert\(1\)%3E%26%22&#39;%0A&amp;before_id=17&amp;limit=20"/);
+  assert.match(html, /name="before_id" value="17"/);
+  assert.match(html, /name="period" value="all"/);
   assert.match(html, /prompt\n  whitespace/);
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;&amp;&quot;&#39;/);
   assert.equal(html.includes('<img src=x'), false);
@@ -78,6 +79,8 @@ test('conversation detail strictly escapes full text and preserves pre whitespac
         error: null,
       },
     });
+    assert.match(html, /conversation-detail-shell/);
+    assert.match(html, /conversation-detail-meta/);
     assert.match(html, new RegExp(`data-i18n="conversation-response-${responseState}"`));
     assert.match(html, /<pre>  first line\n\tsecond line  <\/pre>/);
     if (responseState === 'unavailable') {
@@ -108,7 +111,65 @@ test('null and read/search errors fail closed without undefined content', () => 
   assert.equal(detail.includes('undefined'), false);
 });
 
+test('conversation filters render bounded facets, selected values, counts, chips, and compact safe rows', () => {
+  const members = Array.from({ length: 150 }, (_, index) => ({ value: `member-${index}`, label: `Member ${index}`, count: index + 1 }));
+  const html = conversationsView({
+    q: '<script>bad</script>',
+    period: '168',
+    memberLabel: 'member-149',
+    deviceId: 'device-1',
+    accountId: 'account-1',
+    model: 'model-1',
+    responseState: 'truncated',
+    limit: 50,
+    result: {
+      totalMatches: 151,
+      facets: {
+        members,
+        devices: [{ value: 'device-1', label: 'Laptop', count: 4 }],
+        accounts: [{ value: 'account-1', label: 'Shared', count: 5 }],
+        models: [{ value: 'model-1', label: 'Opus', count: 6 }],
+        responseStates: [{ value: 'truncated', count: 2 }],
+        truncated: true,
+      },
+      items: [{
+        id: 42,
+        startedAtMs: Date.parse('2026-08-17T12:34:56.000Z'),
+        memberLabel: '<member>',
+        deviceName: 'Laptop',
+        accountAlias: 'Shared',
+        model: 'Opus',
+        promptSnippet: 'p'.repeat(700),
+        responseSnippet: 'r'.repeat(700),
+        responseState: 'truncated',
+      }],
+      nextBeforeId: 17,
+    },
+  });
+  assert.match(html, /method="post" action="\/conversations"/);
+  assert.match(html, /name="member_label"[^>]*list="conversation-member-facets"/);
+  assert.match(html, /name="period"[^>]*value="168"/);
+  assert.match(html, /conversation-filter-query/);
+  assert.match(html, /conversation-filter-state/);
+  assert.match(html, /data-facet-count="4"/);
+  assert.match(html, /data-facet-count="5"/);
+  assert.match(html, /data-facet-count="6"/);
+  assert.match(html, /data-i18n="conversation-facets-truncated"/);
+  assert.match(html, />151<\/strong>/);
+  assert.match(html, /name="before_id" value="17"/);
+  assert.equal((html.match(/<option value="member-/g) ?? []).length, 101, '100 top facets plus selected value');
+  assert.equal(html.includes('<script>bad</script>'), false);
+  assert.equal(html.includes('conversation-result-row'), true);
+  assert.equal((html.match(/<p>p/g) ?? []).length, 1);
+  assert.ok(html.length < 100 * 1024);
+});
+
 test('bounded search errors give actionable guidance while unknown errors stay fixed and opaque', () => {
+  const invalidFilter = conversationsView({
+    result: { items: [], nextBeforeId: null, error: 'conversation_filter_invalid' },
+  });
+  assert.match(invalidFilter, /data-i18n="conversation-filter-invalid"/);
+
   const tooShort = conversationsView({
     result: { items: [], nextBeforeId: null, error: 'search_query_too_short' },
   });
@@ -162,10 +223,12 @@ test('Chinese translations and operator documentation cover permanent conversati
     'conversation-privacy-notice',
     'conversation-open-warning',
     'conversation-search',
+    'conversation-filter-hint',
     'conversation-next-page',
     'conversation-search-error',
     'conversation-search-query-too-short',
     'conversation-search-requires-indexed-terms',
+    'conversation-filter-invalid',
     'conversation-queue-dropped',
     'conversation-response-complete',
     'conversation-response-incomplete',

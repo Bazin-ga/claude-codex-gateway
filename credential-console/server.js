@@ -83,6 +83,18 @@ const BOUNDED_CONVERSATION_SEARCH_ERRORS = new Set([
   'search_query_too_short',
   'search_query_requires_indexed_terms',
 ]);
+const CONVERSATION_PERIODS = new Set(['24', '168', '720', 'all']);
+const CONVERSATION_LIMITS = new Set([25, 50]);
+const CONVERSATION_RESPONSE_STATES = new Set([
+  'complete',
+  'incomplete',
+  'truncated',
+  'unavailable',
+]);
+const CONVERSATION_QUERY_MAX_BYTES = 256;
+const CONVERSATION_MEMBER_MAX_BYTES = 160;
+const CONVERSATION_IDENTIFIER_MAX_BYTES = 128;
+const CONVERSATION_MODEL_MAX_BYTES = 256;
 export const SHUTDOWN_DEADLINE_MS = 1_000;
 const CODEX_AGENT_ROOT = fileURLToPath(new URL('../codex-credential/client-agent/', import.meta.url));
 export const CODEX_AGENT_ASSETS = new Map([
@@ -797,21 +809,122 @@ export async function createCredentialConsole(options = {}) {
   function conversationSearchPage(url) {
     const q = String(url.searchParams.get('q') ?? '');
     const beforeValue = url.searchParams.get('before_id');
-    const limitValue = Number(url.searchParams.get('limit') ?? 20);
+    const limitValue = Number(url.searchParams.get('limit') ?? 25);
     const beforeId = beforeValue === null || beforeValue === ''
       ? null
       : Number(beforeValue);
-    const limit = Number.isSafeInteger(limitValue) ? limitValue : 20;
+    // Keep the old one-row route fixture usable while the public UI offers the
+    // bounded 25/50 choices. MetricsStore clamps again at its own boundary.
+    const limit = limitValue === 1 || CONVERSATION_LIMITS.has(limitValue) ? limitValue : 25;
+    const requestedPeriod = String(url.searchParams.get('period') ?? 'all');
+    const period = CONVERSATION_PERIODS.has(requestedPeriod) ? requestedPeriod : 'all';
+    let invalidFilterLength = Buffer.byteLength(q, 'utf8') > CONVERSATION_QUERY_MAX_BYTES;
+    const boundedParam = (name, maxBytes) => {
+      const value = url.searchParams.get(name);
+      if (value === null || value === '') return null;
+      const text = String(value);
+      if (Buffer.byteLength(text, 'utf8') > maxBytes) invalidFilterLength = true;
+      return text;
+    };
+    const memberLabel = boundedParam('member_label', CONVERSATION_MEMBER_MAX_BYTES);
+    const deviceId = boundedParam('device_id', CONVERSATION_IDENTIFIER_MAX_BYTES);
+    const accountId = boundedParam('account_id', CONVERSATION_IDENTIFIER_MAX_BYTES);
+    const model = boundedParam('model', CONVERSATION_MODEL_MAX_BYTES);
+    const requestedResponseState = boundedParam('response_state', CONVERSATION_QUERY_MAX_BYTES);
+    const responseState = CONVERSATION_RESPONSE_STATES.has(requestedResponseState)
+      ? requestedResponseState
+      : null;
+    const invalidCursor = beforeValue !== null && beforeValue !== ''
+      && (!Number.isSafeInteger(beforeId) || beforeId < 1);
+    const invalidPeriod = requestedPeriod !== 'all' && !CONVERSATION_PERIODS.has(requestedPeriod);
+    const invalidLimit = !Number.isSafeInteger(limitValue)
+      || (limitValue !== 1 && !CONVERSATION_LIMITS.has(limitValue));
+    const invalidResponseState = requestedResponseState !== null
+      && requestedResponseState !== ''
+      && !CONVERSATION_RESPONSE_STATES.has(requestedResponseState);
+    const hasExtendedFilters = url.searchParams.has('period')
+      || memberLabel !== null
+      || deviceId !== null
+      || accountId !== null
+      || model !== null
+      || responseState !== null;
+    const now = Date.now();
+    const fromMs = period === 'all' ? null : now - Number(period) * 60 * 60 * 1000;
+    const fallbackDevices = store.publicDevices().map((device) => ({
+      value: device.id,
+      label: device.name || device.id,
+    }));
+    const fallbackMembers = [...new Map(store.publicDevices()
+      .filter((device) => device.member_label)
+      .map((device) => [device.member_label, { value: device.member_label, label: device.member_label }]))
+      .values()];
+    const fallbackAccounts = store.publicAccounts().map((account) => ({
+      value: account.id,
+      label: account.alias,
+    }));
+    const fallbackFacets = {
+      members: fallbackMembers,
+      devices: fallbackDevices,
+      accounts: fallbackAccounts,
+      models: [],
+      responseStates: [...CONVERSATION_RESPONSE_STATES].map((value) => ({ value, label: value })),
+    };
+    if (invalidCursor || invalidPeriod || invalidLimit || invalidResponseState || invalidFilterLength) {
+      return {
+        statusCode: 400,
+        result: {
+          items: [],
+          nextBeforeId: null,
+          error: 'conversation_filter_invalid',
+          totalMatches: null,
+          facets: fallbackFacets,
+        },
+        q: '',
+        beforeId: null,
+        limit: 25,
+        period: 'all',
+        memberLabel: null,
+        deviceId: null,
+        accountId: null,
+        model: null,
+        responseState: null,
+        queueDropped: requestMetrics?.stats?.conversation?.dropped ?? 0,
+      };
+    }
+    const enrichItems = (items) => {
+      const devices = new Map(store.publicDevices().map((device) => [device.id, device]));
+      const accounts = new Map(store.publicAccounts().map((account) => [account.id, account.alias]));
+      return (Array.isArray(items) ? items : []).map((item) => {
+        const device = devices.get(item?.deviceId);
+        return {
+          ...item,
+          accountAlias: typeof item?.accountAlias === 'string' && item.accountAlias
+            ? item.accountAlias
+            : (accounts.get(item?.accountId) ?? null),
+          deviceName: typeof item?.deviceName === 'string'
+            ? item.deviceName
+            : (typeof device?.name === 'string' ? device.name : null),
+        };
+      });
+    };
     const empty = {
       statusCode: 503,
       result: {
         items: [],
         nextBeforeId: null,
         error: 'conversation_archive_unavailable',
+        totalMatches: null,
+        facets: fallbackFacets,
       },
       q,
       beforeId,
       limit,
+      period,
+      memberLabel,
+      deviceId,
+      accountId,
+      model,
+      responseState,
       queueDropped: requestMetrics?.stats?.conversation?.dropped ?? 0,
     };
     if (typeof requestMetrics?.searchConversations !== 'function') return empty;
@@ -819,10 +932,76 @@ export async function createCredentialConsole(options = {}) {
       // Like the metrics dashboard, a read is allowed to flush a bounded batch.
       // The proxy completion path itself never waits on SQLite.
       requestMetrics.flush?.();
-      const rawResult = requestMetrics.searchConversations({ q, beforeId, limit });
-      const result = rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+      const searchOptions = { q, beforeId, limit };
+      if (hasExtendedFilters) {
+        if (fromMs !== null) {
+          searchOptions.fromMs = fromMs;
+          searchOptions.toMs = now;
+        }
+        if (memberLabel !== null) searchOptions.memberLabel = memberLabel;
+        if (deviceId !== null) searchOptions.deviceId = deviceId;
+        if (accountId !== null) searchOptions.accountId = accountId;
+        if (model !== null) searchOptions.model = model;
+        if (responseState !== null) searchOptions.responseState = responseState;
+      }
+      const rawResult = requestMetrics.searchConversations(searchOptions);
+      const source = rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
         ? rawResult
         : { items: [], nextBeforeId: null, error: 'conversation_archive_unavailable' };
+      let facetSource = null;
+      if (typeof requestMetrics.queryConversationFacets === 'function') {
+        const facetOptions = { q };
+        if (fromMs !== null) {
+          facetOptions.fromMs = fromMs;
+          facetOptions.toMs = now;
+        }
+        if (memberLabel !== null) facetOptions.memberLabel = memberLabel;
+        if (deviceId !== null) facetOptions.deviceId = deviceId;
+        if (accountId !== null) facetOptions.accountId = accountId;
+        if (model !== null) facetOptions.model = model;
+        if (responseState !== null) facetOptions.responseState = responseState;
+        try {
+          const queried = requestMetrics.queryConversationFacets(facetOptions);
+          if (queried && typeof queried === 'object' && !Array.isArray(queried)) facetSource = queried;
+        } catch {
+          // Facets are an enhancement. A search result remains useful when a
+          // metrics implementation has not deployed the facet query yet.
+        }
+      }
+      const devicesById = new Map(fallbackDevices.map((device) => [device.value, device.label]));
+      const accountsById = new Map(fallbackAccounts.map((account) => [account.value, account.label]));
+      const facetEntries = (name, labels = new Map()) => (Array.isArray(facetSource?.[name])
+        ? facetSource[name].map((entry) => {
+          const value = entry?.value === null || entry?.value === undefined
+            ? ''
+            : String(entry.value);
+          if (!value) return null;
+          return {
+            value,
+            label: labels.get(value) ?? value,
+            count: Number.isSafeInteger(entry?.count) ? entry.count : null,
+          };
+        }).filter(Boolean)
+        : null);
+      const mappedFacets = facetSource ? {
+        members: facetEntries('members'),
+        devices: facetEntries('devices', devicesById),
+        accounts: facetEntries('accounts', accountsById),
+        models: facetEntries('models'),
+        responseStates: facetEntries('responseStates'),
+        facetTruncated: facetSource.facetTruncated ?? {},
+        truncated: facetSource.truncated === true,
+      } : fallbackFacets;
+      const result = {
+        items: enrichItems(source.items),
+        nextBeforeId: source.nextBeforeId ?? null,
+        error: source.error ?? null,
+        droppedConversations: source.droppedConversations ?? null,
+        totalMatches: Number.isSafeInteger(source.totalMatches)
+          ? source.totalMatches
+          : (Number.isSafeInteger(facetSource?.totalStored) ? facetSource.totalStored : null),
+        facets: mappedFacets,
+      };
       const statusCode = result?.error
         ? BOUNDED_CONVERSATION_SEARCH_ERRORS.has(result.error) ? 400 : 503
         : 200;
@@ -832,6 +1011,12 @@ export async function createCredentialConsole(options = {}) {
         q,
         beforeId,
         limit,
+        period,
+        memberLabel,
+        deviceId,
+        accountId,
+        model,
+        responseState,
         queueDropped: requestMetrics.stats?.conversation?.dropped ?? 0,
       };
     } catch (error) {
@@ -896,15 +1081,39 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
-    if (path === '/conversations' && req.method !== 'GET') {
-      sendText(res, 405, 'method not allowed\n', 'text/plain; charset=utf-8', { Allow: 'GET' });
+    if (path === '/conversations' && !['GET', 'POST'].includes(req.method)) {
+      sendText(res, 405, 'method not allowed\n', 'text/plain; charset=utf-8', { Allow: 'GET, POST' });
       return;
     }
 
     if (req.method === 'GET' && path === '/conversations') {
       const session = requireSession(req, res);
       if (!session) return;
-      const page = conversationSearchPage(url);
+      // Search state stays out of URLs: GET is the default landing page, while
+      // the read-only filter form submits a bounded POST below.
+      const page = conversationSearchPage(new URL('/conversations', url));
+      sendHtml(res, page.statusCode ?? 200, conversationsView({
+        ...page,
+        openMode,
+      }));
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/conversations') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      let form;
+      try {
+        form = await readForm(req, 8 * 1024);
+      } catch {
+        sendText(res, 413, 'conversation filter form too large\n');
+        return;
+      }
+      const formUrl = new URL('/conversations', url);
+      for (const [key, value] of Object.entries(form)) {
+        if (typeof value === 'string') formUrl.searchParams.set(key, value);
+      }
+      const page = conversationSearchPage(formUrl, { fromForm: true });
       sendHtml(res, page.statusCode ?? 200, conversationsView({
         ...page,
         openMode,
@@ -1189,6 +1398,11 @@ const translations = {
   'metrics-device-comparison-hours-truncated': '每小时比较有界；部分小时已省略。',
   'metrics-device-comparison-unavailable-devices': '部分设备无法用于比较。',
   'metrics-device-comparison-table-caption': '四类原始 token 值与覆盖情况备用表',
+  'metrics-device-comparison-table-toggle': '显示原始比较表',
+  'metrics-device-comparison-table-truncated': '原始表只显示最新 200 行；更早的行已省略。',
+  'metrics-hourly-table-caption': '每小时请求与 token 明细',
+  'metrics-hourly-table-toggle': '显示每小时明细',
+  'metrics-hourly-table-truncated': '每小时表只显示最新 200 行；更早的行已省略。',
   'conversations-dashboard-link': '查看已捕获对话',
   'conversations-label': '已捕获对话',
   'conversations-heading': '对话归档',
@@ -1200,11 +1414,41 @@ const translations = {
   'conversation-search-submit': '搜索',
   'conversation-search-clear': '清除',
   'conversation-next-page': '下一页',
+  'conversation-filters-heading': '筛选条件',
+  'conversation-filter-hint': '输入文字可搜索成员建议；留空表示全部成员。',
+  'conversation-filter-period-label': '时间范围',
+  'conversation-filter-member-label': '成员',
+  'conversation-filter-device-label': '设备',
+  'conversation-filter-account-label': '账号',
+  'conversation-filter-model-label': '模型',
+  'conversation-filter-state-label': '回复状态',
+  'conversation-filter-limit-label': '每页行数',
+  'conversation-period-all': '全部时间',
+  'conversation-period-24': '最近 24 小时',
+  'conversation-period-168': '最近 7 天',
+  'conversation-period-720': '最近 30 天',
+  'conversation-all-members': '全部成员',
+  'conversation-all-devices': '全部设备',
+  'conversation-all-accounts': '全部账号',
+  'conversation-all-models': '全部模型',
+  'conversation-all-states': '全部回复状态',
+  'conversation-total-matches': '条匹配结果',
+  'conversation-pagination-hint': '结果按最新时间优先排列。',
+  'conversation-facets-truncated': '部分筛选值未列出；当前选中的值仍然可用。',
+  'conversation-filter-query': '查询',
+  'conversation-filter-period': '时间',
+  'conversation-filter-member': '成员',
+  'conversation-filter-device': '设备',
+  'conversation-filter-account': '账号',
+  'conversation-filter-model': '模型',
+  'conversation-filter-state': '状态',
+  'conversation-device': '设备',
   'conversation-open': '打开对话',
   'conversation-no-results': '没有符合此搜索条件的已捕获对话。',
   'conversation-search-error': '对话搜索无法完成。',
   'conversation-search-query-too-short': '搜索词对当前归档太短。大库中至少输入连续 3 个中文字符或更多可检索文字；请去掉单独特殊标点，并拆开查询。',
   'conversation-search-requires-indexed-terms': '搜索需要可建立索引的词。大库中请输入至少连续 3 个中文字符，去掉特殊标点，或拆开查询。',
+  'conversation-filter-invalid': '一个或多个对话筛选值无效或过长。请清除筛选条件后重试。',
   'conversation-read-error': '对话无法载入。',
   'conversation-not-found': '找不到这条对话。',
   'conversation-detail-heading': '对话',
@@ -1338,6 +1582,21 @@ function applyLanguage(language) {
 }
 
 applyLanguage(localStorage.getItem('credential_console_language') ?? 'en');
+
+// Keep the result list near the top on narrow screens while preserving an
+// expanded, no-JavaScript fallback and the always-open desktop filter rail.
+// Reconcile breakpoint changes as well, so rotating a phone cannot leave a
+// closed details element behind a hidden desktop summary.
+const conversationFilterMedia = window.matchMedia?.('(max-width: 800px)');
+const syncConversationFilters = (media) => {
+  document.querySelectorAll('.conversation-filter-details').forEach((details) => {
+    details.open = !media.matches;
+  });
+};
+if (conversationFilterMedia) {
+  syncConversationFilters(conversationFilterMedia);
+  conversationFilterMedia.addEventListener?.('change', syncConversationFilters);
+}
 
 async function copyText(text) {
   if (navigator.clipboard?.writeText) {

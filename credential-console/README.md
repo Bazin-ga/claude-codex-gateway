@@ -328,11 +328,14 @@ or `state.json` merely to roll back metrics code or conversation UI.
 ## Captured conversations
 
 P6 permanently retains the prompt and reply text for eligible Claude turns and makes the archive
-available to every member who can reach the console. The list supports full-text search and keyset
-pagination; opening a row shows the complete stored text with its `complete`, `incomplete`,
-`truncated`, or `unavailable` response state. A bounded capture queue can drop a conversation before
-it is stored; the archive reports that condition prominently rather than implying that the turn was
-saved. Codex traffic does not pass through this gateway and is not covered.
+available to every member who can reach the console. The list supports full-text search,
+period/member/device/account/model/state filters, facet counts, and keyset pagination. Filter and
+pagination forms use bounded read-only POST bodies so prompt text and labels do not enter URLs; a
+plain GET is only the default landing page. Opening a row shows the complete stored text with its
+`complete`, `incomplete`, `truncated`, or `unavailable` response state. Result previews are capped
+server-side at 600 characters and two visual lines. A bounded capture queue can drop a conversation
+before it is stored; the archive reports that condition prominently rather than implying that the
+turn was saved. Codex traffic does not pass through this gateway and is not covered.
 
 This is a deliberate disclosure, not an access-control boundary. In `open` mode, anyone on the
 tailnet who can reach the console can read every captured conversation; there is no identity and no

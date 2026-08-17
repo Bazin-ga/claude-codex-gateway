@@ -790,12 +790,14 @@ Browser checks:
     and ignores only the single-device selector while retaining the other filters;
 18. confirm the token page states that it covers Claude gateway traffic only, excludes Codex, and
     keeps the metrics-page body-free and open-mode visibility notices.
-19. open the captured-conversations page, search for a known phrase, follow the keyset next-page
-    link, and open a detail row; confirm the permanent-storage/open-mode disclosure is prominent,
-    full text preserves whitespace, all four response states are distinguishable, and a dropped
-    conversation queue count is shown as dropped rather than silently treated as stored. For a
-    bounded search error, enter at least three consecutive Chinese characters, remove standalone
-    punctuation, or split the query; an unknown search failure must remain a fixed generic message.
+19. open the captured-conversations page, submit its POST filter form with a known phrase, follow
+    the POST keyset next-page form, and open a detail row; confirm prompt text does not enter the
+    URL, the permanent-storage/open-mode disclosure is prominent, full text preserves whitespace,
+    all four response states are distinguishable, and a dropped conversation queue count is shown
+    as dropped rather than silently treated as stored. Verify period/member/device/account/model
+    facets show bounded counts and that a mobile filter rail can collapse. For a bounded search
+    error, enter at least three consecutive Chinese characters, remove standalone punctuation, or
+    split the query; an unknown search failure must remain a fixed generic message.
 
 The first start with token accounting migrates `metrics.sqlite` schema 1 to 2 transactionally.
 The first P6 start migrates schema 2 to schema 3 transactionally, adding the permanent conversation

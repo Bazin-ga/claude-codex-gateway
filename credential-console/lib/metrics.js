@@ -36,6 +36,7 @@ const MAX_RESPONSE_BYTES = 1024 * 1024;
 const MAX_SEARCH_QUERY_BYTES = 256;
 const MAX_SEARCH_LIMIT = 50;
 const MAX_SEARCH_SNIPPET_BYTES = 4 * 1024;
+const MAX_CONVERSATION_FACETS = 100;
 const MAX_READ_CONVERSATION_BYTES = 1024 * 1024;
 const CONVERSATION_QUEUE_OVERHEAD_BYTES = 4 * 1024;
 const MAX_SHORT_HAN_SEARCH_ROWS = 20_000;
@@ -1131,6 +1132,134 @@ function normalizeConversationSearch({
   };
 }
 
+function conversationSearchPlan(filters) {
+  const useTrigram = Boolean(filters.trigramQuery);
+  const useFts = Boolean(filters.ftsQuery) && !filters.containsHan && !useTrigram;
+  const useSubstring = filters.substringTerms.length > 0;
+  const searchTable = useTrigram
+    ? 'conversation_turns_trigram_fts'
+    : 'conversation_turns_fts';
+  const substringPredicate = useSubstring
+    ? filters.substringTerms
+      .map(() => '(instr(t.prompt_text, ?) > 0 OR instr(t.response_text, ?) > 0)')
+      .join(' AND ')
+    : null;
+  return {
+    useFts,
+    useTrigram,
+    useSubstring,
+    hasText: useFts || useTrigram || useSubstring,
+    searchTable,
+    textPredicate: useFts || useTrigram
+      ? `${searchTable} MATCH ?`
+      : useSubstring
+        ? substringPredicate
+        : '? IS NULL',
+    textParams: useFts
+      ? [filters.ftsQuery]
+      : useTrigram
+        ? [filters.trigramQuery]
+        : useSubstring
+          ? filters.substringTerms.flatMap((term) => [term, term])
+          : [null],
+  };
+}
+
+function conversationSearchFilterSql(plan, { includeBefore = false } = {}) {
+  return `
+    WHERE (${plan.textPredicate})
+      AND (? IS NULL OR m.started_at_ms >= ?)
+      AND (? IS NULL OR m.started_at_ms < ?)
+      AND (? IS NULL OR m.device_id = ?)
+      AND (? IS NULL OR m.machine_id = ?)
+      AND (? = 0 OR m.machine_id IS NULL)
+      AND (? IS NULL OR m.member_label = ?)
+      AND (? IS NULL OR m.account_id = ?)
+      AND (? IS NULL OR m.model = ?)
+      AND (? IS NULL OR t.response_state = ?)
+      ${includeBefore ? 'AND (? IS NULL OR t.id < ?)' : ''}
+  `;
+}
+
+function conversationSearchFilterParams(filters, plan, { includeBefore = false } = {}) {
+  return [
+    ...plan.textParams,
+    filters.fromMs, filters.fromMs,
+    filters.toMs, filters.toMs,
+    filters.deviceId, filters.deviceId,
+    filters.machineId, filters.machineId,
+    filters.unattributedMachine,
+    filters.memberLabel, filters.memberLabel,
+    filters.accountId, filters.accountId,
+    filters.model, filters.model,
+    filters.responseState, filters.responseState,
+    ...(includeBefore ? [filters.beforeId, filters.beforeId] : []),
+  ];
+}
+
+function normalizeConversationFacetFilters(filters = {}) {
+  if (!filters || typeof filters !== 'object' || Array.isArray(filters)) {
+    throw new TypeError('conversation facet filters must be an object');
+  }
+  if (filters.beforeId !== undefined && filters.beforeId !== null) {
+    throw new TypeError('conversation facets do not accept a pagination cursor');
+  }
+  if (filters.limit !== undefined && filters.limit !== 20) {
+    throw new TypeError('conversation facets do not accept a result limit');
+  }
+  return normalizeConversationSearch({ ...filters, beforeId: null, limit: 20 });
+}
+
+function conversationFacetFilterSql(plan = null) {
+  return `
+    WHERE ${plan?.hasText ? `(${plan.textPredicate}) AND` : ''}
+      (? IS NULL OR m.started_at_ms >= ?)
+      AND (? IS NULL OR m.started_at_ms < ?)
+      AND (? IS NULL OR m.device_id = ?)
+      AND (? IS NULL OR m.machine_id = ?)
+      AND (? = 0 OR m.machine_id IS NULL)
+      AND (? IS NULL OR m.member_label = ?)
+      AND (? IS NULL OR m.account_id = ?)
+      AND (? IS NULL OR m.model = ?)
+      AND (? IS NULL OR t.response_state = ?)
+  `;
+}
+
+function conversationFacetFilterParams(filters, plan = null) {
+  return [
+    ...(plan?.hasText ? plan.textParams : []),
+    filters.fromMs, filters.fromMs,
+    filters.toMs, filters.toMs,
+    filters.deviceId, filters.deviceId,
+    filters.machineId, filters.machineId,
+    filters.unattributedMachine,
+    filters.memberLabel, filters.memberLabel,
+    filters.accountId, filters.accountId,
+    filters.model, filters.model,
+    filters.responseState, filters.responseState,
+  ];
+}
+
+function conversationFacetBaseFilterSql(plan = null) {
+  return `
+    WHERE ${plan?.hasText ? `(${plan.textPredicate}) AND` : ''}
+      (? IS NULL OR m.started_at_ms >= ?)
+      AND (? IS NULL OR m.started_at_ms < ?)
+      AND (? IS NULL OR m.machine_id = ?)
+      AND (? = 0 OR m.machine_id IS NULL)
+  `;
+}
+
+function conversationFacetBaseFilterParams(filters, plan = null) {
+  return [
+    ...(plan?.hasText ? plan.textParams : []),
+    filters.fromMs, filters.fromMs,
+    filters.toMs, filters.toMs,
+    filters.machineId, filters.machineId,
+    filters.unattributedMachine,
+  ];
+}
+
 function clipConversationText(value, maxBytes) {
   const text = String(value ?? '');
   if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
@@ -1510,6 +1639,20 @@ export class MetricsStore {
     `).get();
   }
 
+  #conversationMatchCount(filters, plan) {
+    const textJoin = plan.useFts || plan.useTrigram
+      ? `JOIN ${plan.searchTable} ON ${plan.searchTable}.rowid = t.id`
+      : '';
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS total_matches
+      FROM conversation_turns t
+      JOIN request_metrics m ON m.id = t.request_metrics_id
+      ${textJoin}
+      ${conversationSearchFilterSql(plan)}
+    `).get(...conversationSearchFilterParams(filters, plan));
+    return Number(row?.total_matches ?? 0);
+  }
+
   #insertConversationPair(pair) {
     this.db.exec('SAVEPOINT conversation_pair');
     try {
@@ -1731,6 +1874,216 @@ export class MetricsStore {
     }));
   }
 
+  queryConversationFacets(filters = {}) {
+    try {
+      return this.#queryConversationFacets(filters);
+    } catch (error) {
+      this.#safeLog('conversation_facets_failed', { code: error.code ?? error.name ?? 'unknown' });
+      return this.#emptyConversationFacets('search_unavailable');
+    }
+  }
+
+  #queryConversationFacets(filters = {}) {
+    const normalized = normalizeConversationFacetFilters(filters);
+    const plan = conversationSearchPlan(normalized);
+    if (normalized.emptyLiteralQuery) {
+      return {
+        members: [],
+        devices: [],
+        accounts: [],
+        models: [],
+        responseStates: [],
+        totalStored: 0,
+        earliestStartedAtMs: null,
+        latestStartedAtMs: null,
+        facetTruncated: {
+          members: false,
+          devices: false,
+          accounts: false,
+          models: false,
+          responseStates: false,
+        },
+        truncated: false,
+        error: null,
+      };
+    }
+    const workload = plan.useSubstring ? this.#conversationSearchWorkload() : null;
+    if (workload && Number(workload.count) > MAX_SHORT_HAN_SEARCH_ROWS) {
+      return this.#emptyConversationFacets(
+        normalized.shortHanQuery ? 'search_query_too_short' : 'search_query_requires_indexed_terms',
+      );
+    }
+    if (workload && Number(workload.bytes) > MAX_SHORT_HAN_SEARCH_BYTES) {
+      return this.#emptyConversationFacets('search_query_requires_indexed_terms');
+    }
+    const params = conversationFacetFilterParams(normalized, plan);
+    const textJoin = plan.useFts || plan.useTrigram
+      ? `JOIN ${plan.searchTable} ON ${plan.searchTable}.rowid = t.id`
+      : '';
+    const stats = this.#queryRows(`
+      SELECT
+        COUNT(*) AS total_stored,
+        MIN(m.started_at_ms) AS earliest_started_at_ms,
+        MAX(m.started_at_ms) AS latest_started_at_ms
+      FROM conversation_turns t
+      JOIN request_metrics m ON m.id = t.request_metrics_id
+      ${textJoin}
+      ${conversationFacetFilterSql(plan)}
+    `, params)[0];
+    // Facets are disjunctive: each list applies every active constraint except
+    // its own dimension. This keeps, for example, member B available while
+    // member A is selected, without changing the exact filtered total above.
+    const facetRows = this.#queryRows(`
+      WITH criteria(
+        member_filter,
+        device_filter,
+        account_filter,
+        model_filter,
+        response_filter
+      ) AS (VALUES (?, ?, ?, ?, ?)),
+      base AS (
+        SELECT
+          m.member_label,
+          m.device_id,
+          m.account_id,
+          m.model,
+          t.response_state
+        FROM conversation_turns t
+        JOIN request_metrics m ON m.id = t.request_metrics_id
+        ${textJoin}
+        ${conversationFacetBaseFilterSql(plan)}
+      ),
+      facet_values AS (
+        SELECT 'members' AS facet, member_label AS value, COUNT(*) AS facet_count
+        FROM base, criteria
+        WHERE member_label IS NOT NULL AND member_label <> ''
+          AND (device_filter IS NULL OR device_id = device_filter)
+          AND (account_filter IS NULL OR account_id = account_filter)
+          AND (model_filter IS NULL OR model = model_filter)
+          AND (response_filter IS NULL OR response_state = response_filter)
+        GROUP BY member_label
+        UNION ALL
+        SELECT 'devices' AS facet, device_id AS value, COUNT(*) AS facet_count
+        FROM base, criteria
+        WHERE device_id IS NOT NULL AND device_id <> ''
+          AND (member_filter IS NULL OR member_label = member_filter)
+          AND (account_filter IS NULL OR account_id = account_filter)
+          AND (model_filter IS NULL OR model = model_filter)
+          AND (response_filter IS NULL OR response_state = response_filter)
+        GROUP BY device_id
+        UNION ALL
+        SELECT 'accounts' AS facet, account_id AS value, COUNT(*) AS facet_count
+        FROM base, criteria
+        WHERE account_id IS NOT NULL AND account_id <> ''
+          AND (member_filter IS NULL OR member_label = member_filter)
+          AND (device_filter IS NULL OR device_id = device_filter)
+          AND (model_filter IS NULL OR model = model_filter)
+          AND (response_filter IS NULL OR response_state = response_filter)
+        GROUP BY account_id
+        UNION ALL
+        SELECT 'models' AS facet, model AS value, COUNT(*) AS facet_count
+        FROM base, criteria
+        WHERE model IS NOT NULL AND model <> ''
+          AND (member_filter IS NULL OR member_label = member_filter)
+          AND (device_filter IS NULL OR device_id = device_filter)
+          AND (account_filter IS NULL OR account_id = account_filter)
+          AND (response_filter IS NULL OR response_state = response_filter)
+        GROUP BY model
+        UNION ALL
+        SELECT 'responseStates' AS facet, response_state AS value, COUNT(*) AS facet_count
+        FROM base, criteria
+        WHERE response_state IS NOT NULL AND response_state <> ''
+          AND (member_filter IS NULL OR member_label = member_filter)
+          AND (device_filter IS NULL OR device_id = device_filter)
+          AND (account_filter IS NULL OR account_id = account_filter)
+          AND (model_filter IS NULL OR model = model_filter)
+        GROUP BY response_state
+      ),
+      ranked AS (
+        SELECT
+          facet,
+          value,
+          facet_count,
+          COUNT(*) OVER (PARTITION BY facet) AS facet_value_count,
+          ROW_NUMBER() OVER (
+            PARTITION BY facet
+            ORDER BY facet_count DESC, value IS NULL ASC, value ASC
+          ) AS facet_rank
+        FROM facet_values
+      )
+      SELECT facet, value, facet_count, facet_value_count
+      FROM ranked
+      WHERE facet_rank <= ${MAX_CONVERSATION_FACETS}
+      ORDER BY facet, facet_rank
+    `, [
+      normalized.memberLabel,
+      normalized.deviceId,
+      normalized.accountId,
+      normalized.model,
+      normalized.responseState,
+      ...conversationFacetBaseFilterParams(normalized, plan),
+    ]);
+    const result = {
+      members: [],
+      devices: [],
+      accounts: [],
+      models: [],
+      responseStates: [],
+      totalStored: Number(stats?.total_stored ?? 0),
+      earliestStartedAtMs: stats?.earliest_started_at_ms === null
+        || stats?.earliest_started_at_ms === undefined
+        ? null
+        : Number(stats.earliest_started_at_ms),
+      latestStartedAtMs: stats?.latest_started_at_ms === null
+        || stats?.latest_started_at_ms === undefined
+        ? null
+        : Number(stats.latest_started_at_ms),
+      facetTruncated: {
+        members: false,
+        devices: false,
+        accounts: false,
+        models: false,
+        responseStates: false,
+      },
+      truncated: false,
+      error: null,
+    };
+    for (const row of facetRows) {
+      if (!Object.hasOwn(result, row.facet) || !Array.isArray(result[row.facet])) continue;
+      if (Number(row.facet_value_count) > MAX_CONVERSATION_FACETS) {
+        result.facetTruncated[row.facet] = true;
+        result.truncated = true;
+      }
+      result[row.facet].push({
+        value: row.value ?? null,
+        count: Number(row.facet_count),
+      });
+    }
+    return result;
+  }
+
+  #emptyConversationFacets(error) {
+    return {
+      members: [],
+      devices: [],
+      accounts: [],
+      models: [],
+      responseStates: [],
+      totalStored: null,
+      earliestStartedAtMs: null,
+      latestStartedAtMs: null,
+      facetTruncated: {
+        members: false,
+        devices: false,
+        accounts: false,
+        models: false,
+        responseStates: false,
+      },
+      truncated: false,
+      error,
+    };
+  }
+
   searchConversations(options = {}) {
     try {
       this.#assertOpen();
@@ -1739,18 +2092,18 @@ export class MetricsStore {
         return {
           items: [],
           nextBeforeId: null,
+          totalMatches: 0,
           droppedConversations: this.#persistentConversationDroppedCount(),
           error: null,
         };
       }
-      const useTrigram = Boolean(filters.trigramQuery);
-      const useFts = Boolean(filters.ftsQuery) && !filters.containsHan && !useTrigram;
-      const useSubstring = filters.substringTerms.length > 0;
-      const workload = useSubstring ? this.#conversationSearchWorkload() : null;
+      const plan = conversationSearchPlan(filters);
+      const workload = plan.useSubstring ? this.#conversationSearchWorkload() : null;
       if (workload && Number(workload.count) > MAX_SHORT_HAN_SEARCH_ROWS) {
         return {
           items: [],
           nextBeforeId: null,
+          totalMatches: null,
           droppedConversations: this.#persistentConversationDroppedCount(),
           error: filters.shortHanQuery ? 'search_query_too_short' : 'search_query_requires_indexed_terms',
         };
@@ -1759,22 +2112,16 @@ export class MetricsStore {
         return {
           items: [],
           nextBeforeId: null,
+          totalMatches: null,
           droppedConversations: this.#persistentConversationDroppedCount(),
           error: 'search_query_requires_indexed_terms',
         };
       }
-      const searchTable = useTrigram
-        ? 'conversation_turns_trigram_fts'
-        : 'conversation_turns_fts';
-      const substringPredicate = useSubstring
-        ? filters.substringTerms
-          .map(() => '(instr(t.prompt_text, ?) > 0 OR instr(t.response_text, ?) > 0)')
-          .join(' AND ')
-        : null;
-      const textSelect = useFts || useTrigram
+      const totalMatches = this.#conversationMatchCount(filters, plan);
+      const textSelect = plan.useFts || plan.useTrigram
         ? `
-            snippet(${searchTable}, 0, '', '', '…', 32) AS prompt_snippet,
-            snippet(${searchTable}, 1, '', '', '…', 32) AS response_snippet
+            snippet(${plan.searchTable}, 0, '', '', '…', 32) AS prompt_snippet,
+            snippet(${plan.searchTable}, 1, '', '', '…', 32) AS response_snippet
           `
         : `
             substr(t.prompt_text, 1, 4096) AS prompt_snippet,
@@ -1798,43 +2145,15 @@ export class MetricsStore {
           ${textSelect}
         FROM conversation_turns t
         JOIN request_metrics m ON m.id = t.request_metrics_id
-        ${useFts || useTrigram ? `JOIN ${searchTable} ON ${searchTable}.rowid = t.id` : ''}
-        WHERE (${useFts || useTrigram
-          ? `${searchTable} MATCH ?`
-          : useSubstring
-            ? substringPredicate
-            : '? IS NULL'})
-          AND (? IS NULL OR m.started_at_ms >= ?)
-          AND (? IS NULL OR m.started_at_ms < ?)
-          AND (? IS NULL OR m.device_id = ?)
-          AND (? IS NULL OR m.machine_id = ?)
-          AND (? = 0 OR m.machine_id IS NULL)
-          AND (? IS NULL OR m.member_label = ?)
-          AND (? IS NULL OR m.account_id = ?)
-          AND (? IS NULL OR m.model = ?)
-          AND (? IS NULL OR t.response_state = ?)
-          AND (? IS NULL OR t.id < ?)
+        ${plan.useFts || plan.useTrigram
+          ? `JOIN ${plan.searchTable} ON ${plan.searchTable}.rowid = t.id`
+          : ''}
+        ${conversationSearchFilterSql(plan, { includeBefore: true })}
         ORDER BY t.id DESC
         LIMIT ?
       `;
       const params = [
-        ...(useFts
-          ? [filters.ftsQuery]
-          : useTrigram
-            ? [filters.trigramQuery]
-          : useSubstring
-            ? filters.substringTerms.flatMap((term) => [term, term])
-            : [null]),
-        filters.fromMs, filters.fromMs,
-        filters.toMs, filters.toMs,
-        filters.deviceId, filters.deviceId,
-        filters.machineId, filters.machineId,
-        filters.unattributedMachine,
-        filters.memberLabel, filters.memberLabel,
-        filters.accountId, filters.accountId,
-        filters.model, filters.model,
-        filters.responseState, filters.responseState,
-        filters.beforeId, filters.beforeId,
+        ...conversationSearchFilterParams(filters, plan, { includeBefore: true }),
         filters.limit,
       ];
       const rows = this.db.prepare(sql).all(...params);
@@ -1858,6 +2177,7 @@ export class MetricsStore {
       return {
         items,
         nextBeforeId: items.length === filters.limit ? items.at(-1).id : null,
+        totalMatches,
         droppedConversations: this.#persistentConversationDroppedCount(),
         error: null,
       };
@@ -1866,6 +2186,7 @@ export class MetricsStore {
       return {
         items: [],
         nextBeforeId: null,
+        totalMatches: null,
         droppedConversations: this.#persistentConversationDroppedCount(),
         error: 'search_unavailable',
       };

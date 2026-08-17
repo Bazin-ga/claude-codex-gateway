@@ -757,19 +757,140 @@ test('conversation search uses fixed filters, keyset pagination, and bounded err
   const first = store.searchConversations({ q: 'pagination', limit: 1 });
   assert.equal(first.error, null);
   assert.equal(first.items.length, 1);
+  assert.equal(first.totalMatches, 3);
   assert.ok(first.nextBeforeId);
   const second = store.searchConversations({ q: 'pagination', beforeId: first.nextBeforeId, limit: 1 });
   assert.equal(second.items.length, 1);
+  assert.equal(second.totalMatches, 3);
   assert.notEqual(second.items[0].id, first.items[0].id);
-  assert.equal(store.searchConversations({ q: 'pagination', deviceId: 'device-b' }).items.length, 1);
-  assert.equal(store.searchConversations({ q: 'pagination', unattributedMachine: true }).items.length, 3);
-  assert.equal(store.searchConversations({ responseState: 'incomplete' }).items.length, 1);
-  assert.equal(store.searchConversations({ q: '***' }).items.length, 0);
-  assert.equal(store.searchConversations({ q: 'x'.repeat(257) }).error, 'search_unavailable');
+  assert.equal(store.searchConversations({ q: 'pagination', deviceId: 'device-b' }).totalMatches, 1);
+  assert.equal(store.searchConversations({ q: 'pagination', unattributedMachine: true }).totalMatches, 3);
+  assert.equal(store.searchConversations({ responseState: 'incomplete' }).totalMatches, 1);
+  assert.equal(store.searchConversations({ q: '***' }).totalMatches, 0);
+  assert.equal(store.searchConversations({ q: 'x'.repeat(257) }).totalMatches, null);
   assert.equal(store.searchConversations({ beforeId: -1 }).error, 'search_unavailable');
   const result = store.searchConversations({ q: 'pagination', limit: 999 });
   assert.equal(result.items.length, 3);
   assert.ok(result.items.every((item) => Buffer.byteLength(item.promptSnippet, 'utf8') <= 4 * 1024));
+});
+
+test('conversation facets and exact search counts stay bounded and filter-compatible', async (t) => {
+  const { store } = await newStore(t, { batchSize: 256, maxQueue: 256 });
+  const metricInsert = store.db.prepare(`
+    INSERT INTO request_metrics (
+      started_at_ms, hour_bucket_ms, method, path, device_id, machine_id,
+      member_label, account_id, account_alias, model, stream, status_code,
+      outcome, ttfb_ms, duration_ms, request_bytes, response_bytes,
+      upstream_request_id, input_tokens, cache_creation_input_tokens,
+      cache_read_input_tokens, output_tokens, usage_state, conversation_capture_state
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const conversationInsert = store.db.prepare(`
+    INSERT INTO conversation_turns (
+      request_metrics_id, prompt_text, prompt_bytes, response_text,
+      response_state, response_bytes
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const xssMember = '<script>alert(1)</script>';
+  const rows = 150;
+  store.db.exec('BEGIN');
+  for (let index = 0; index < rows; index += 1) {
+    const promptText = `facet prompt ${index}`;
+    const responseText = `facet response ${index}`;
+    const responseState = ['complete', 'incomplete', 'truncated', 'unavailable'][index % 4];
+    const startedAtMs = BASE_MS + index;
+    metricInsert.run(
+      startedAtMs,
+      Math.floor(startedAtMs / HOUR_MS) * HOUR_MS,
+      'POST', '/v1/messages', `facet-device-${index % 3}`, null,
+      `member-${String(index).padStart(3, '0')}`, `facet-account-${index % 4}`,
+      `facet-account-${index % 4}`, `facet-model-${index % 5}`, 0, 200,
+      'completed', 1, 2, Buffer.byteLength(promptText), Buffer.byteLength(responseText),
+      null, null, null, null, null, 'unavailable', 'stored',
+    );
+    const metricId = Number(store.db.prepare('SELECT last_insert_rowid() AS id').get().id);
+    conversationInsert.run(
+      metricId,
+      promptText,
+      Buffer.byteLength(promptText),
+      responseText,
+      responseState,
+      Buffer.byteLength(responseText),
+    );
+  }
+  const specialPrompt = '今天北京天气怎么样';
+  const specialResponse = '北京天气晴朗';
+  const specialStartedAtMs = BASE_MS + rows + 1;
+  metricInsert.run(
+    specialStartedAtMs,
+    Math.floor(specialStartedAtMs / HOUR_MS) * HOUR_MS,
+    'POST', '/v1/messages', 'facet-special-device', null,
+    xssMember, 'facet-special-account', 'facet-special-account', 'facet-special-model',
+    0, 200, 'completed', 1, 2,
+    Buffer.byteLength(specialPrompt), Buffer.byteLength(specialResponse),
+    null, null, null, null, null, 'unavailable', 'stored',
+  );
+  const specialMetricId = Number(store.db.prepare('SELECT last_insert_rowid() AS id').get().id);
+  conversationInsert.run(
+    specialMetricId,
+    specialPrompt,
+    Buffer.byteLength(specialPrompt),
+    specialResponse,
+    'complete',
+    Buffer.byteLength(specialResponse),
+  );
+  store.db.exec('COMMIT');
+
+  const facets = store.queryConversationFacets();
+  assert.equal(facets.totalStored, 151);
+  assert.equal(facets.earliestStartedAtMs, BASE_MS);
+  assert.equal(facets.latestStartedAtMs, specialStartedAtMs);
+  assert.equal(facets.members.length, 100);
+  assert.equal(facets.facetTruncated.members, true);
+  assert.equal(facets.truncated, true);
+  assert.equal(facets.members.every((entry) => entry.count === 1), true);
+  assert.equal(facets.members.some((entry) => entry.value === xssMember), true);
+  assert.equal(facets.devices.length, 4);
+  assert.equal(facets.accounts.length, 5);
+  assert.equal(facets.models.length, 6);
+  assert.equal(facets.responseStates.length, 4);
+  assert.equal(facets.facetTruncated.devices, false);
+
+  const filtered = store.queryConversationFacets({
+    fromMs: specialStartedAtMs,
+    toMs: specialStartedAtMs + 1,
+    memberLabel: xssMember,
+    deviceId: 'facet-special-device',
+    accountId: 'facet-special-account',
+    model: 'facet-special-model',
+    responseState: 'complete',
+  });
+  assert.equal(filtered.totalStored, 1);
+  assert.deepEqual(filtered.members, [{ value: xssMember, count: 1 }]);
+  assert.deepEqual(filtered.devices, [{ value: 'facet-special-device', count: 1 }]);
+  assert.deepEqual(filtered.responseStates, [{ value: 'complete', count: 1 }]);
+
+  const disjunctive = store.queryConversationFacets({
+    memberLabel: 'member-000',
+    responseState: 'complete',
+  });
+  assert.equal(disjunctive.totalStored, 1);
+  assert.ok(disjunctive.members.length > 1, 'member facet should exclude its own active filter');
+  assert.equal(disjunctive.members.some((entry) => entry.value === 'member-004'), true);
+  assert.deepEqual(disjunctive.responseStates, [{ value: 'complete', count: 1 }]);
+
+  const cjk = store.queryConversationFacets({ q: '北京天气' });
+  assert.equal(cjk.totalStored, 1);
+  assert.deepEqual(cjk.members, [{ value: xssMember, count: 1 }]);
+  assert.equal(store.searchConversations({ q: '北京天气' }).totalMatches, 1);
+  const shortCjk = store.queryConversationFacets({ q: '北京' });
+  assert.equal(shortCjk.totalStored, 1);
+  assert.deepEqual(shortCjk.members, [{ value: xssMember, count: 1 }]);
+  assert.equal(shortCjk.error, null);
+  assert.equal(
+    store.queryConversationFacets({ beforeId: 1 }).error,
+    'search_unavailable',
+  );
 });
 
 test('Han queries use safe substring fallback while English remains on FTS', async (t) => {
@@ -855,6 +976,7 @@ test('short Han fallback has a hard row-count ceiling while trigram remains inde
   store.db.exec('COMMIT');
   assert.equal(store.searchConversations({ q: '北京' }).error, 'search_query_too_short');
   assert.equal(store.searchConversations({ q: '北京天气' }).items.length, 1);
+  assert.equal(store.queryConversationFacets({ q: '北京' }).error, 'search_query_too_short');
 });
 
 test('an existing v3 store without the additive trigram index rebuilds it from stored turns', async (t) => {

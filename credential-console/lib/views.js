@@ -22,10 +22,21 @@ const styles = `
   --blue: #285e8e;
   --member: #0f5138;
   --member-soft: #e7f6ee;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 22px;
+  --space-6: 28px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --shadow-soft: 0 10px 26px rgba(22,33,29,.06);
+  --focus: #d78226;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--paper); color: var(--ink); }
+body { margin: 0; background: var(--paper); color: var(--ink); line-height: 1.45; }
 a { color: var(--green); }
 .shell { max-width: 1180px; margin: 0 auto; padding: 28px 22px 64px; }
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 28px; }
@@ -40,7 +51,7 @@ h2 { font-size: 20px; margin: 0 0 18px; }
 p { line-height: 1.55; }
 .muted { color: var(--muted); }
 .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 18px; }
-.card { min-width: 0; grid-column: span 12; background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 22px; box-shadow: 0 14px 34px rgba(22,33,29,.055); }
+.card { min-width: 0; grid-column: span 12; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: var(--space-5); box-shadow: var(--shadow-soft); }
 .summary { grid-column: span 4; }
 .summary strong { display: block; font-size: 30px; margin-top: 8px; }
 .split { grid-column: span 6; }
@@ -99,8 +110,8 @@ tr:last-child td { border-bottom: 0; }
 .merge-form { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line); }
 .merge-form label { margin-bottom: 0; }
 form { margin: 0; }
-label { display: block; font-weight: 700; font-size: 13px; margin-bottom: 12px; }
-input, select, textarea { width: 100%; margin-top: 6px; border: 1px solid #c7d0c7; background: white; border-radius: 10px; padding: 10px 12px; color: var(--ink); font: inherit; }
+label { display: block; min-width: 0; font-weight: 700; font-size: 13px; margin-bottom: 12px; }
+input, select, textarea { width: 100%; min-width: 0; max-width: 100%; margin-top: 6px; border: 1px solid #c7d0c7; background: white; border-radius: 10px; padding: 10px 12px; color: var(--ink); font: inherit; }
 textarea { min-height: 112px; resize: vertical; }
 button, .button { appearance: none; border: 0; border-radius: 10px; padding: 10px 14px; background: var(--green); color: white; font-weight: 750; cursor: pointer; text-decoration: none; display: inline-block; }
 button:hover, .button:hover { background: var(--green-dark); }
@@ -166,6 +177,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-filters .filter-actions { display: flex; gap: 8px; align-items: center; }
 .metrics-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .metrics-summary .summary { grid-column: auto; }
+.metrics-summary .summary strong { font-size: clamp(22px, 6vw, 30px); overflow-wrap: anywhere; }
 .metrics-token-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .metrics-token-summary .summary { grid-column: auto; }
 .metrics-token-summary .summary strong { word-break: break-word; }
@@ -175,7 +187,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-chart-wide { grid-column: 1 / -1; }
 .metrics-chart h3 { margin: 0 0 10px; font-size: 16px; }
 .metrics-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
-.metrics-chart .metrics-grid-line { stroke: var(--line); stroke-width: 1; }
+.metrics-chart .metrics-grid-line { stroke: var(--line); stroke-width: 1; opacity: .9; }
 .metrics-chart .metrics-axis { fill: var(--muted); font-size: 11px; }
 .metrics-chart .metrics-line { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
 .metrics-chart .metrics-line.total, .metrics-chart .metrics-swatch.total { stroke: var(--green); background: var(--green); }
@@ -212,6 +224,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-chart .metrics-point.device-5 { fill: #7b4ea3; }
 .metrics-chart .metrics-point.device-6 { fill: #008b8b; }
 .metrics-chart .metrics-point.device-7 { fill: #c26d2d; }
+.metrics-chart .metrics-point { stroke: white; stroke-width: 1.5; vector-effect: non-scaling-stroke; cursor: help; }
+.metrics-chart .metrics-point:hover, .metrics-chart .metrics-point:focus { stroke: var(--ink); stroke-width: 2.5; }
 .metrics-chart .metrics-swatch.device-0, .metrics-chart .metrics-swatch.device-1,
 .metrics-chart .metrics-swatch.device-2, .metrics-chart .metrics-swatch.device-3,
 .metrics-chart .metrics-swatch.device-4, .metrics-chart .metrics-swatch.device-5,
@@ -233,12 +247,15 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-chart .metrics-swatch.device-5 { border-top-color: #7b4ea3; }
 .metrics-chart .metrics-swatch.device-6 { border-top-color: #008b8b; }
 .metrics-chart .metrics-swatch.device-7 { border-top-color: #c26d2d; }
-.metrics-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
-.metrics-legend-item { display: inline-flex; gap: 6px; align-items: center; }
+.metrics-legend { display: flex; min-width: 0; gap: 12px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
+.metrics-legend-item { display: inline-flex; min-width: 0; max-width: 100%; gap: 6px; align-items: center; flex-wrap: wrap; overflow-wrap: anywhere; }
+.metrics-legend-item > span { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .metrics-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 .metrics-empty { color: var(--muted); padding: 10px 0 0; }
 .metrics-table th, .metrics-table td { font-size: 12px; padding: 9px 8px; }
 .metrics-table-wrap { overflow-x: auto; }
+.metrics-hourly-details > summary, .metrics-comparison-raw > summary { cursor: pointer; color: var(--green); font-weight: 800; padding: 8px 0; }
+.metrics-hourly-details[open] > summary, .metrics-comparison-raw[open] > summary { margin-bottom: 8px; }
 .metrics-attribution-notice { margin: 0; }
 .metrics-attribution-notice p { margin: 0; }
 .account-switch-form { min-width: 190px; }
@@ -253,10 +270,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .accounts-table th:last-child, .accounts-table td:last-child { min-width: 240px; }
 .accounts-table td:last-child input { min-width: 140px; }
 .accounts-table td:last-child .button { white-space: normal; }
-.page-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin: -8px 0 24px; padding: 6px; border: 1px solid var(--line); border-radius: 12px; background: white; }
+.page-tabs { position: sticky; top: 10px; z-index: 3; display: flex; gap: var(--space-2); flex-wrap: wrap; margin: -8px 0 24px; padding: 6px; border: 1px solid var(--line); border-radius: var(--radius-md); background: rgba(255,255,255,.94); box-shadow: 0 6px 18px rgba(22,33,29,.06); backdrop-filter: blur(8px); }
 .page-tabs a { padding: 8px 12px; border-radius: 8px; color: var(--muted); font-size: 13px; font-weight: 750; text-decoration: none; }
 .page-tabs a:hover, .page-tabs a[aria-current="page"] { background: var(--ink); color: white; }
-.page-tabs a:focus-visible { outline: 3px solid var(--amber); outline-offset: 2px; }
+.page-tabs a:focus-visible, button:focus-visible, a.button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 .metrics-comparison { min-width: 0; }
 .metrics-comparison svg { width: 100%; height: auto; display: block; }
 .metrics-comparison-table-wrap { overflow-x: auto; }
@@ -267,21 +284,49 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-disclosure { margin: 0; }
 .conversation-disclosure h2 { margin-bottom: 8px; }
 .conversation-disclosure p { margin: 6px 0 0; }
-.conversation-list { display: grid; gap: 14px; }
-.conversation-card { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: #fbfcf9; }
-.conversation-card h2 { margin: 0; font-size: 17px; }
-.conversation-card-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
-.conversation-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; color: var(--muted); font-size: 12px; }
-.conversation-snippets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
-.conversation-snippet { min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: white; }
-.conversation-snippet strong { display: block; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
+.conversation-layout { display: grid; grid-template-columns: minmax(220px, 260px) minmax(0, 1fr); gap: 22px; align-items: start; }
+.conversation-filter-details { position: sticky; top: 72px; min-width: 0; }
+.conversation-filter-details > summary { display: none; }
+.conversation-rail { display: grid; gap: 14px; min-width: 0; }
+.conversation-rail h2 { margin: 0; font-size: 17px; }
+.conversation-filter-hint { margin: 0; }
+.conversation-rail label { margin: 0; }
+.conversation-rail .filter-actions { display: grid; grid-template-columns: 1fr; gap: 8px; }
+.conversation-rail .filter-actions > * { width: 100%; text-align: center; }
+.conversation-results { display: grid; gap: 14px; min-width: 0; }
+.conversation-results-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.conversation-results-head h1 { margin: 0; }
+.conversation-result-summary { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+.conversation-chip-list { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.conversation-filter-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; background: #eef3ee; color: var(--ink); font-size: 12px; overflow-wrap: anywhere; }
+.conversation-filter-chip a { color: inherit; font-weight: 800; text-decoration: none; }
+.conversation-list { display: grid; gap: 10px; }
+.conversation-card, .conversation-result-row { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: #fbfcf9; }
+.conversation-result-row { min-width: 0; box-shadow: 0 7px 18px rgba(22,33,29,.035); }
+.conversation-card h2, .conversation-result-row h2 { margin: 0; font-size: 17px; }
+.conversation-card-head, .conversation-result-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+.conversation-result-head { align-items: center; }
+.conversation-result-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.conversation-meta, .conversation-result-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; color: var(--muted); font-size: 12px; }
+.conversation-result-meta { margin-top: 4px; white-space: normal; }
+.conversation-result-meta span { overflow-wrap: anywhere; }
+.conversation-snippets, .conversation-result-snippets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.conversation-snippet, .conversation-result-snippet { min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: white; }
+.conversation-snippet strong, .conversation-result-snippet strong { display: block; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
+.conversation-result-snippet p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin: 0; min-height: 2.7em; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.35; font-size: 13px; }
 .conversation-snippet pre, .conversation-text pre { margin: 0; max-height: 260px; font-size: 12px; }
-.conversation-text pre { max-height: none; }
-.conversation-pagination { display: flex; justify-content: flex-end; gap: 10px; align-items: center; }
-.conversation-filters { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: end; }
+.conversation-text pre { max-height: none; white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversation-pagination { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; }
+.conversation-pagination form { margin: 0; }
+.conversation-filters { display: grid; gap: 12px; align-items: end; }
 .conversation-filters label { margin: 0; }
-.conversation-state { white-space: nowrap; }
+.conversation-state { flex: 0 0 auto; white-space: nowrap; }
 .conversation-queue-dropped { margin: 0; }
+.conversation-detail-shell { width: min(100%, 900px); margin: 0 auto; }
+.conversation-detail-meta { display: flex; gap: 8px 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+.conversation-detail-meta span { min-width: 0; overflow-wrap: anywhere; }
+.conversation-detail-shell .topbar > * { min-width: 0; }
+.conversation-detail-shell .conversation-text { max-width: 900px; }
 @media (max-width: 800px) {
   .summary, .split { grid-column: span 12; }
   .topbar { align-items: flex-start; flex-wrap: wrap; }
@@ -293,7 +338,14 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .provider-grid, .member-form, .member-form.codex-form,
   .member-form.with-label, .member-form.codex-form.with-label,
   .merge-form, .metrics-filters, .metrics-chart-grid, .metrics-token-summary,
-  .conversation-snippets, .conversation-filters { grid-template-columns: 1fr; }
+  .conversation-snippets, .conversation-result-snippets { grid-template-columns: 1fr; }
+  .conversation-filters { grid-template-columns: 1fr; }
+  .conversation-layout { grid-template-columns: 1fr; }
+  .conversation-filter-details > summary { display: block; cursor: pointer; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius-md); background: white; color: var(--green); font-weight: 800; }
+  .conversation-filter-details[open] > summary { margin-bottom: 10px; }
+  .conversation-filter-details { position: static; }
+  .conversation-results-head { display: grid; }
+  .conversation-result-actions { justify-content: flex-start; }
   .metrics-chart-wide { grid-column: auto; }
 }
 `;
@@ -830,6 +882,7 @@ const METRICS_HOUR_OPTIONS = Object.freeze([
   { value: 168, label: 'Last 7 days', i18n: 'metrics-hours-168' },
   { value: 720, label: 'Last 30 days', i18n: 'metrics-hours-720' },
 ]);
+const MAX_METRIC_MARKERS = 16;
 const UNATTRIBUTED_MACHINE_VALUE = '__unattributed__';
 
 function finiteMetricNumber(value, { min = 0, max = Number.MAX_SAFE_INTEGER, fallback = 0 } = {}) {
@@ -1060,16 +1113,31 @@ function metricPolyline(rows, getter, maxValue, plot) {
   }).filter(Boolean).join(' ');
 }
 
-function metricPoints(rows, getter, maxValue, plot, className) {
+function metricPoints(rows, getter, maxValue, plot, className, { label = className, formatValue = metricDisplayNumber } = {}) {
   if (!rows.length) return '';
   const denominator = Math.max(rows.length - 1, 1);
-  return rows.map((row, index) => {
+  // Sample known values, not raw row positions. Otherwise a sparse singleton
+  // between two sampled positions has only an SVG moveto and becomes invisible.
+  const knownIndexes = rows
+    .map((row, index) => {
+      const value = getter(row);
+      return value === null || value === undefined || value === '' ? null : index;
+    })
+    .filter((index) => index !== null);
+  const indexes = knownIndexes.length <= MAX_METRIC_MARKERS
+    ? knownIndexes
+    : [...new Set(Array.from({ length: MAX_METRIC_MARKERS }, (_, marker) => (
+      knownIndexes[Math.round((marker * (knownIndexes.length - 1)) / (MAX_METRIC_MARKERS - 1))]
+    )))];
+  return indexes.map((index) => {
+    const row = rows[index];
     const rawValue = getter(row);
     if (rawValue === null || rawValue === undefined || rawValue === '') return '';
     const value = finiteMetricNumber(rawValue, { max: maxValue });
     const x = plot.left + (plot.width * index) / denominator;
     const y = plot.top + plot.height - (plot.height * value) / Math.max(maxValue, 1);
-    return `<circle class="metrics-point ${escapeHtml(className)}" cx="${metricSvgNumber(x)}" cy="${metricSvgNumber(y)}" r="3" aria-hidden="true"></circle>`;
+    const pointLabel = `${label} · ${metricHourLabel(row.hourBucketMs)} · ${formatValue(value)}`;
+    return `<circle class="metrics-point ${escapeHtml(className)}" cx="${metricSvgNumber(x)}" cy="${metricSvgNumber(y)}" r="3" aria-hidden="true"><title>${escapeHtml(pointLabel)}</title></circle>`;
   }).filter(Boolean).join('');
 }
 
@@ -1124,7 +1192,14 @@ function metricSvgChart({
     : `<text class="metrics-axis" x="${plot.left}" y="${height - 12}" text-anchor="start">${escapeHtml(firstLabel)}</text>
       <text class="metrics-axis" x="${plot.left + plot.width}" y="${height - 12}" text-anchor="end">${escapeHtml(lastLabel)}</text>`;
   const paths = series.map((entry) => `<path class="metrics-line ${escapeHtml(entry.className)}"${entry.dashArray ? ` stroke-dasharray="${escapeHtml(entry.dashArray)}"` : ''} d="${escapeHtml(metricPolyline(safeRows, entry.getter, scale, plot))}"></path>`).join('');
-  const points = series.map((entry) => metricPoints(safeRows, entry.getter, scale, plot, entry.className)).join('');
+  const points = series.map((entry) => metricPoints(
+    safeRows,
+    entry.getter,
+    scale,
+    plot,
+    entry.className,
+    { label: entry.label, formatValue },
+  )).join('');
   return `${commonStart}
     ${grid}
     <line class="metrics-grid-line" x1="${plot.left}" x2="${plot.left}" y1="${plot.top}" y2="${plot.top + plot.height}"></line>
@@ -1214,8 +1289,11 @@ function metricUsageCoverage(row) {
 }
 
 function metricsTable(rows) {
-  const body = rows.length
-    ? rows.map((row) => `<tr>
+  const sourceRows = Array.isArray(rows) ? rows : [];
+  const tableRows = sourceRows.slice(-200);
+  const truncated = sourceRows.length > tableRows.length;
+  const body = tableRows.length
+    ? tableRows.map((row) => `<tr>
         <td>${escapeHtml(metricHourLabel(row.hourBucketMs))}</td>
         <td>${escapeHtml(metricDisplayNumber(row.requestCount))}</td>
         <td>${escapeHtml(metricDisplayNumber(row.successCount))}</td>
@@ -1231,26 +1309,31 @@ function metricsTable(rows) {
         <td>${metricUsageCoverage(row)}</td>
       </tr>`).join('')
     : '<tr><td colspan="13" class="empty" data-i18n="metrics-no-data">No matching request data for this period.</td></tr>';
-  return `<div class="metrics-table-wrap">
-    <table class="metrics-table">
-      <thead><tr>
-        <th data-i18n="metrics-hour">Hour (UTC)</th>
-        <th data-i18n="metrics-request-count">Requests</th>
-        <th data-i18n="metrics-success-count">Successes</th>
-        <th data-i18n="metrics-error-count">Errors</th>
-        <th data-i18n="metrics-request-bytes">Request bytes</th>
-        <th data-i18n="metrics-response-bytes">Response bytes</th>
-        <th data-i18n="metrics-avg-ttfb">Avg TTFB (ms)</th>
-        <th data-i18n="metrics-avg-duration">Avg duration (ms)</th>
-        <th data-i18n="metrics-total-input-tokens">Input tokens</th>
-        <th data-i18n="metrics-total-cache-creation-input-tokens">Cache creation input tokens</th>
-        <th data-i18n="metrics-total-cache-read-input-tokens">Cache read input tokens</th>
-        <th data-i18n="metrics-total-output-tokens">Output tokens</th>
-        <th data-i18n="metrics-usage-coverage">Usage coverage</th>
-      </tr></thead>
-      <tbody>${body}</tbody>
-    </table>
-  </div>`;
+  return `<details class="metrics-hourly-details"${truncated ? '' : ' open'}>
+    <summary data-i18n="metrics-hourly-table-toggle">Show hourly details</summary>
+    ${truncated ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-hourly-table-truncated">The hourly table shows the latest 200 rows; older rows are omitted.</p>' : ''}
+    <div class="metrics-table-wrap">
+      <table class="metrics-table">
+        <caption class="muted tiny" data-i18n="metrics-hourly-table-caption">Hourly request and token details</caption>
+        <thead><tr>
+        <th scope="col" data-i18n="metrics-hour">Hour (UTC)</th>
+        <th scope="col" data-i18n="metrics-request-count">Requests</th>
+        <th scope="col" data-i18n="metrics-success-count">Successes</th>
+        <th scope="col" data-i18n="metrics-error-count">Errors</th>
+        <th scope="col" data-i18n="metrics-request-bytes">Request bytes</th>
+        <th scope="col" data-i18n="metrics-response-bytes">Response bytes</th>
+        <th scope="col" data-i18n="metrics-avg-ttfb">Avg TTFB (ms)</th>
+        <th scope="col" data-i18n="metrics-avg-duration">Avg duration (ms)</th>
+        <th scope="col" data-i18n="metrics-total-input-tokens">Input tokens</th>
+        <th scope="col" data-i18n="metrics-total-cache-creation-input-tokens">Cache creation input tokens</th>
+        <th scope="col" data-i18n="metrics-total-cache-read-input-tokens">Cache read input tokens</th>
+        <th scope="col" data-i18n="metrics-total-output-tokens">Output tokens</th>
+        <th scope="col" data-i18n="metrics-usage-coverage">Usage coverage</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  </details>`;
 }
 
 const DEVICE_COMPARISON_INPUT_FIELDS = Object.freeze([
@@ -1391,6 +1474,10 @@ function deviceComparisonCoverageView(coverage) {
 
 function deviceComparisonView(input) {
   const comparison = normalizeDeviceComparison(input);
+  const comparisonTableSource = [...comparison.sourceRows]
+    .sort((left, right) => Number(right.hourBucketMs ?? right.hour_bucket_ms) - Number(left.hourBucketMs ?? left.hour_bucket_ms))
+    .slice(0, 200);
+  const comparisonTableBounded = comparison.sourceRows.length > comparisonTableSource.length;
   const sourceRowsByDevice = new Map(comparison.devices.map((device) => [device.value, []]));
   for (const row of comparison.sourceRows) {
     const deviceId = String(row?.deviceId ?? row?.device_id ?? row?.device ?? '');
@@ -1436,7 +1523,7 @@ function deviceComparisonView(input) {
     </div>`;
   }).join('');
   const tableRows = comparison.devices.flatMap((device) => (
-    (sourceRowsByDevice.get(device.value) ?? []).map((row) => `<tr>
+    comparisonTableSource.filter((row) => String(row?.deviceId ?? row?.device_id ?? row?.device ?? '') === device.value).map((row) => `<tr>
       <td>${escapeHtml(metricHourLabel(row.hourBucketMs ?? row.hour_bucket_ms))}</td>
       <td>${escapeHtml(device.label)}</td>
       <td>${escapeHtml(metricTokenText(row.inputTokens ?? row.totalInputTokens))}</td>
@@ -1452,6 +1539,9 @@ function deviceComparisonView(input) {
       : '',
     comparison.hoursTruncated
       ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-device-comparison-hours-truncated">The hourly comparison is bounded; some hours are omitted.</p>'
+      : '',
+    comparisonTableBounded
+      ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-device-comparison-table-truncated">The raw table shows the latest 200 rows; older rows are omitted.</p>'
       : '',
     comparison.unavailableDeviceCount > 0
       ? `<p class="notice metrics-comparison-note" role="note"><span data-i18n="metrics-device-comparison-unavailable-devices">Some devices were unavailable for comparison.</span> <strong>${escapeHtml(String(comparison.unavailableDeviceCount))}</strong></p>`
@@ -1470,11 +1560,14 @@ function deviceComparisonView(input) {
     <h3 data-i18n="metrics-device-output-comparison-heading">Hourly output tokens by device</h3>
     ${outputChart}
     <div class="metrics-legend">${legend || '<span class="metrics-empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</span>'}</div>
-    <div class="metrics-comparison-table-wrap"><table class="metrics-table metrics-comparison-table">
-      <caption class="muted tiny" data-i18n="metrics-device-comparison-table-caption">Raw four-category values and coverage fallback</caption>
-      <thead><tr><th scope="col" data-i18n="metrics-hour">Hour (UTC)</th><th scope="col" data-i18n="metrics-device-comparison-device">Device</th><th scope="col" data-i18n="metrics-total-input-tokens">Input tokens</th><th scope="col" data-i18n="metrics-total-cache-creation-input-tokens">Cache creation input tokens</th><th scope="col" data-i18n="metrics-total-cache-read-input-tokens">Cache read input tokens</th><th scope="col" data-i18n="metrics-total-output-tokens">Output tokens</th><th scope="col" data-i18n="metrics-device-comparison-coverage">Coverage</th></tr></thead>
-      <tbody>${tableRows || '<tr><td colspan="7" class="empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</td></tr>'}</tbody>
-    </table></div>
+    <details class="metrics-comparison-raw">
+      <summary data-i18n="metrics-device-comparison-table-toggle">Show raw comparison table</summary>
+      <div class="metrics-comparison-table-wrap"><table class="metrics-table metrics-comparison-table">
+        <caption class="muted tiny" data-i18n="metrics-device-comparison-table-caption">Raw four-category values and coverage fallback</caption>
+        <thead><tr><th scope="col" data-i18n="metrics-hour">Hour (UTC)</th><th scope="col" data-i18n="metrics-device-comparison-device">Device</th><th scope="col" data-i18n="metrics-total-input-tokens">Input tokens</th><th scope="col" data-i18n="metrics-total-cache-creation-input-tokens">Cache creation input tokens</th><th scope="col" data-i18n="metrics-total-cache-read-input-tokens">Cache read input tokens</th><th scope="col" data-i18n="metrics-total-output-tokens">Output tokens</th><th scope="col" data-i18n="metrics-device-comparison-coverage">Coverage</th></tr></thead>
+        <tbody>${tableRows || '<tr><td colspan="7" class="empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</td></tr>'}</tbody>
+      </table></div>
+    </details>
   </article>`;
 }
 
@@ -1659,6 +1752,15 @@ const CONVERSATION_RESPONSE_STATES = Object.freeze([
   'truncated',
   'unavailable',
 ]);
+const CONVERSATION_PERIOD_OPTIONS = Object.freeze([
+  { value: 'all', label: 'All time', i18n: 'conversation-period-all' },
+  { value: '24', label: 'Last 24 hours', i18n: 'conversation-period-24' },
+  { value: '168', label: 'Last 7 days', i18n: 'conversation-period-168' },
+  { value: '720', label: 'Last 30 days', i18n: 'conversation-period-720' },
+]);
+const CONVERSATION_LIMIT_OPTIONS = Object.freeze([25, 50]);
+const MAX_CONVERSATION_FACETS = 100;
+const MAX_CONVERSATION_SNIPPET_CHARS = 600;
 
 function conversationText(value) {
   return typeof value === 'string' ? value : '';
@@ -1699,28 +1801,98 @@ function conversationStatusView(state) {
 }
 
 function conversationPrivacyView(openMode) {
-  return `<div class="notice error conversation-disclosure" role="alert">
+  return `<div class="notice error conversation-disclosure" role="note">
     <h2 data-i18n="conversation-privacy-heading">Conversation privacy</h2>
     <p data-i18n="conversation-privacy-notice">This feature permanently stores every captured conversation and makes captured conversation text visible to everyone who can reach this console. Member labels are self-entered and unverified. Codex traffic is not covered.</p>
     ${openMode ? '<p data-i18n="conversation-open-warning"><strong>Open mode:</strong> anyone on the tailnet who can reach this console can read every captured conversation; there is no identity and no reading audit. A member label is not an actor identity.</p>' : ''}
   </div>`;
 }
 
-function conversationSearchHref({ q, beforeId, limit }) {
-  const params = [];
-  if (q) params.push(`q=${encodeURIComponent(q)}`);
-  if (beforeId !== null && beforeId !== undefined && String(beforeId) !== '') {
-    params.push(`before_id=${encodeURIComponent(String(beforeId))}`);
+function conversationFormField(name, value) {
+  return `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value ?? '')}">`;
+}
+
+function conversationFormFields({ q, period, memberLabel, deviceId, accountId, model, responseState, limit, beforeId = null }) {
+  return [
+    conversationFormField('q', q),
+    conversationFormField('period', period),
+    conversationFormField('member_label', memberLabel),
+    conversationFormField('device_id', deviceId),
+    conversationFormField('account_id', accountId),
+    conversationFormField('model', model),
+    conversationFormField('response_state', responseState),
+    conversationFormField('limit', limit),
+    beforeId === null || beforeId === undefined ? '' : conversationFormField('before_id', beforeId),
+  ].join('');
+}
+
+function conversationSnippetText(value) {
+  const text = conversationText(value);
+  if (text.length <= MAX_CONVERSATION_SNIPPET_CHARS) return text;
+  return `${Array.from(text).slice(0, MAX_CONVERSATION_SNIPPET_CHARS).join('')}…`;
+}
+
+function conversationFacetOptions(values, selected, allLabel, allI18n) {
+  const options = Array.isArray(values) ? values : [];
+  const seen = new Set();
+  const selectedValue = String(selected ?? '');
+  const rendered = [`<option value=""${selectedValue ? '' : ' selected'} data-i18n="${escapeHtml(allI18n)}">${escapeHtml(allLabel)}</option>`];
+  for (const entry of options.slice(0, MAX_CONVERSATION_FACETS)) {
+    const value = String(entry?.value ?? '');
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    const label = String(entry?.label ?? value);
+    const count = Number.isSafeInteger(entry?.count) ? ` (${entry.count})` : '';
+    const countAttribute = Number.isSafeInteger(entry?.count) ? ` data-facet-count="${entry.count}"` : '';
+    rendered.push(`<option value="${escapeHtml(value)}"${value === selectedValue ? ' selected' : ''}${countAttribute}>${escapeHtml(`${label}${count}`)}</option>`);
   }
-  params.push(`limit=${encodeURIComponent(String(limit))}`);
-  return `/conversations?${params.join('&')}`;
+  if (selectedValue && !seen.has(selectedValue)) {
+    rendered.push(`<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`);
+  }
+  return rendered.join('');
+}
+
+function conversationFacetDatalist(values, selected) {
+  const options = Array.isArray(values) ? values : [];
+  const seen = new Set();
+  const selectedValue = String(selected ?? '');
+  const rendered = [];
+  for (const entry of options.slice(0, MAX_CONVERSATION_FACETS)) {
+    const value = String(entry?.value ?? '');
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    const label = String(entry?.label ?? value);
+    const count = Number.isSafeInteger(entry?.count) ? ` (${entry.count})` : '';
+    const countAttribute = Number.isSafeInteger(entry?.count) ? ` data-facet-count="${entry.count}"` : '';
+    rendered.push(`<option value="${escapeHtml(value)}" label="${escapeHtml(`${label}${count}`)}"${countAttribute}></option>`);
+  }
+  if (selectedValue && !seen.has(selectedValue)) {
+    rendered.push(`<option value="${escapeHtml(selectedValue)}" label="${escapeHtml(selectedValue)}"></option>`);
+  }
+  return rendered.join('');
+}
+
+function conversationActiveChips({ q, period, memberLabel, deviceId, accountId, model, responseState }) {
+  const entries = [
+    q ? ['conversation-filter-query', 'Query', q] : null,
+    period && period !== 'all' ? ['conversation-filter-period', 'Period', period] : null,
+    memberLabel ? ['conversation-filter-member', 'Member', memberLabel] : null,
+    deviceId ? ['conversation-filter-device', 'Device', deviceId] : null,
+    accountId ? ['conversation-filter-account', 'Account', accountId] : null,
+    model ? ['conversation-filter-model', 'Model', model] : null,
+    responseState ? ['conversation-filter-state', 'State', responseState] : null,
+  ].filter(Boolean);
+  if (!entries.length) return '';
+  return `<div class="conversation-chip-list" aria-label="Active filters">
+    ${entries.map(([i18n, label, value]) => `<span class="conversation-filter-chip"><span data-i18n="${i18n}">${label}</span>: ${escapeHtml(value)}</span>`).join('')}
+  </div>`;
 }
 
 function conversationSnippetView(labelI18n, label, value, emptyI18n) {
-  const text = conversationText(value);
-  return `<div class="conversation-snippet">
+  const text = conversationSnippetText(value);
+  return `<div class="conversation-result-snippet">
     <strong data-i18n="${escapeHtml(labelI18n)}">${escapeHtml(label)}</strong>
-    ${text ? `<pre>${escapeHtml(text)}</pre>` : `<div class="empty tiny" data-i18n="${escapeHtml(emptyI18n)}">Not captured</div>`}
+    ${text ? `<p>${escapeHtml(text)}</p>` : `<div class="empty tiny" data-i18n="${escapeHtml(emptyI18n)}">Not captured</div>`}
   </div>`;
 }
 
@@ -1735,25 +1907,26 @@ function conversationItemView(item) {
   const detailLink = id
     ? `<a class="button secondary" href="/conversations/${escapeHtml(encodeURIComponent(id))}" data-i18n="conversation-open">Open conversation</a>`
     : '';
-  return `<article class="conversation-card" data-conversation-id="${escapeHtml(id)}">
-    <div class="conversation-card-head">
+  const device = item?.deviceName ?? item?.deviceId ?? '—';
+  return `<article class="conversation-result-row" data-conversation-id="${escapeHtml(id)}">
+    <div class="conversation-result-head">
       <div>
         <h2>${id ? `#${escapeHtml(id)}` : '<span data-i18n="conversation-unknown-id">Conversation</span>'}</h2>
-        <div class="conversation-meta">
+        <div class="conversation-result-meta">
           <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(item?.startedAtMs))}</span>
           <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(item?.memberLabel ?? '—')}</span>
-          <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(item?.accountAlias ?? item?.accountId ?? '—')}</span>
+          <span><span data-i18n="conversation-device">Device</span>: ${escapeHtml(device)}</span>
+          <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(item?.accountAlias ?? '—')}</span>
           <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(item?.model ?? '—')}</span>
         </div>
       </div>
-      ${conversationStatusView(state)}
+      <div class="conversation-result-actions">${conversationStatusView(state)}${detailLink}</div>
     </div>
     ${dropped ? '<div class="notice error tiny conversation-queue-dropped" role="status" data-i18n="conversation-queue-dropped">Conversation capture was dropped by the bounded queue.</div>' : ''}
-    <div class="conversation-snippets">
+    <div class="conversation-result-snippets">
       ${conversationSnippetView('conversation-prompt', 'Prompt', promptSnippet, 'conversation-empty-prompt')}
       ${conversationSnippetView('conversation-response', 'Response', responseSnippet, 'conversation-empty-response')}
     </div>
-    <div class="actions">${detailLink}</div>
   </article>`;
 }
 
@@ -1764,11 +1937,18 @@ function conversationEnvelope({ result, searchResult, search, items, nextBeforeI
     nextBeforeId: nextBeforeId ?? source.nextBeforeId ?? null,
     error: error ?? source.error ?? null,
     dropped: source.droppedConversations ?? source.queueDropped ?? null,
+    facets: source.facets && typeof source.facets === 'object' && !Array.isArray(source.facets)
+      ? source.facets
+      : {},
+    totalMatches: Number.isSafeInteger(source.totalMatches) ? source.totalMatches : null,
   };
 }
 
 function conversationSearchErrorView(error) {
   const code = typeof error === 'string' ? error : error?.code;
+  if (code === 'conversation_filter_invalid') {
+    return '<div class="notice error" role="alert" data-i18n="conversation-filter-invalid">One or more conversation filters are invalid or too long. Clear the filters and try again.</div>';
+  }
   if (code === 'search_query_too_short') {
     return '<div class="notice error" role="alert" data-i18n="conversation-search-query-too-short">Search query is too short for this archive. For large archives, enter at least three consecutive Chinese characters or more searchable text; remove standalone punctuation and split the query into simpler terms.</div>';
   }
@@ -1786,7 +1966,13 @@ export function conversationsView({
   nextBeforeId = null,
   q = '',
   beforeId = '',
-  limit = 20,
+  period = 'all',
+  memberLabel = '',
+  deviceId = '',
+  accountId = '',
+  model = '',
+  responseState = '',
+  limit = 25,
   openMode = false,
   error = null,
   droppedConversations = null,
@@ -1797,9 +1983,20 @@ export function conversationsView({
 } = {}) {
   const envelope = conversationEnvelope({ result, searchResult, search, items, nextBeforeId, error });
   const query = typeof q === 'string' ? q : String(q ?? '');
-  const normalizedLimit = Number.isSafeInteger(Number(limit))
-    ? Math.max(1, Math.min(50, Number(limit)))
-    : 20;
+  const normalizedLimit = Number(limit) === 1
+    ? 1
+    : CONVERSATION_LIMIT_OPTIONS.includes(Number(limit)) ? Number(limit) : 25;
+  const normalizedPeriod = CONVERSATION_PERIOD_OPTIONS.some((option) => option.value === String(period))
+    ? String(period)
+    : 'all';
+  const normalizedMember = String(memberLabel ?? '');
+  const normalizedDevice = String(deviceId ?? '');
+  const normalizedAccount = String(accountId ?? '');
+  const normalizedModel = String(model ?? '');
+  const normalizedState = CONVERSATION_RESPONSE_STATES.includes(String(responseState))
+    ? String(responseState)
+    : '';
+  const facets = envelope.facets ?? {};
   const droppedCount = conversationCount(
     envelope.dropped
       ?? conversationQueueDropped
@@ -1809,40 +2006,90 @@ export function conversationsView({
       ?? dropped,
   );
   const itemsView = envelope.items.map(conversationItemView).join('');
-  const nextHref = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
-    ? null
-    : conversationSearchHref({ q: query, beforeId: envelope.nextBeforeId, limit: normalizedLimit });
   const errorNotice = envelope.error === null || envelope.error === undefined
     ? ''
     : conversationSearchErrorView(envelope.error);
   const droppedNotice = droppedCount > 0
     ? `<div class="notice error conversation-queue-dropped" role="alert"><span data-i18n="conversation-queue-dropped">Conversation capture was dropped by the bounded queue.</span> <strong>${escapeHtml(String(droppedCount))}</strong></div>`
     : '';
+  const facetNotice = facets.truncated === true
+    ? '<div class="notice" role="note" data-i18n="conversation-facets-truncated">Some filter values are omitted from the list; a selected value remains available.</div>'
+    : '';
+  const totalMatches = envelope.totalMatches === null || envelope.totalMatches === undefined
+    ? envelope.items.length
+    : envelope.totalMatches;
+  const periodOptions = CONVERSATION_PERIOD_OPTIONS.map((option) => (
+    `<option value="${escapeHtml(option.value)}"${normalizedPeriod === option.value ? ' selected' : ''} data-i18n="${escapeHtml(option.i18n)}">${escapeHtml(option.label)}</option>`
+  )).join('');
+  const stateOptions = [
+    '<option value="" data-i18n="conversation-all-states">All response states</option>',
+    ...CONVERSATION_RESPONSE_STATES.map((state) => `<option value="${escapeHtml(state)}"${normalizedState === state ? ' selected' : ''} data-i18n="conversation-response-${escapeHtml(state)}">${escapeHtml(state)}</option>`),
+  ].join('');
+  const nextForm = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
+    ? ''
+    : `<form method="post" action="/conversations" class="conversation-pagination-form">
+        ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
+        <button type="submit" data-i18n="conversation-next-page">Next page</button>
+      </form>`;
   return layout('Captured conversations', `
     <section class="stack">
       ${conversationPrivacyView(openMode)}
-      ${errorNotice}
-      ${droppedNotice}
-      <div class="topbar">
-        <div>
-          <span class="badge stored" data-i18n="conversations-label">Captured conversations</span>
-          <h1 data-i18n="conversations-heading">Conversation archive</h1>
-          <p class="muted" data-i18n="conversations-intro">Search permanently retained Claude conversations captured from eligible turns.</p>
-        </div>
-        <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+      <div class="conversation-layout">
+        <details class="conversation-filter-details" open>
+          <summary data-i18n="conversation-filters-heading">Filters</summary>
+          <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters">
+          <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
+          <p class="muted tiny conversation-filter-hint" data-i18n="conversation-filter-hint">Type to search member suggestions; leave the field blank for everyone.</p>
+          <label><span data-i18n="conversation-search">Search conversations</span>
+            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Prompt or response" data-placeholder-en="Prompt or response" data-placeholder-zh="提示词或回复">
+          </label>
+          <label><span data-i18n="conversation-filter-period-label">Period</span>
+            <select name="period">${periodOptions}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-member-label">Member</span>
+            <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
+            <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>
+          </label>
+          <label><span data-i18n="conversation-filter-device-label">Device</span>
+            <select name="device_id">${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-account-label">Account</span>
+            <select name="account_id">${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-model-label">Model</span>
+            <select name="model">${conversationFacetOptions(facets.models, normalizedModel, 'All models', 'conversation-all-models')}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-state-label">Response state</span>
+            <select name="response_state">${stateOptions}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-limit-label">Rows per page</span>
+            <select name="limit">${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select>
+          </label>
+          <div class="filter-actions">
+            <button type="submit" data-i18n="conversation-search-submit">Search</button>
+            <a class="button secondary" href="/conversations" data-i18n="conversation-search-clear">Clear</a>
+          </div>
+          </form>
+        </details>
+        <section class="conversation-results" aria-labelledby="conversation-results-heading">
+          <div class="conversation-results-head">
+            <div>
+              <span class="badge stored" data-i18n="conversations-label">Captured conversations</span>
+              <h1 id="conversation-results-heading" data-i18n="conversations-heading">Conversation archive</h1>
+              <p class="muted" data-i18n="conversations-intro">Search permanently retained Claude conversations captured from eligible turns.</p>
+              ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
+            </div>
+            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
+          </div>
+          ${errorNotice}
+          ${droppedNotice}
+          ${facetNotice}
+          <div class="conversation-list" aria-live="polite">
+            ${itemsView || '<p class="empty" data-i18n="conversation-no-results">No captured conversations match this search.</p>'}
+          </div>
+          ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-pagination-hint">Results are ordered newest first.</span>${nextForm}</div>` : ''}
+        </section>
       </div>
-      <form method="get" action="/conversations" class="card conversation-filters">
-        <label><span data-i18n="conversation-search">Search conversations</span>
-          <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off">
-        </label>
-        <input type="hidden" name="limit" value="${escapeHtml(String(normalizedLimit))}">
-        <button type="submit" data-i18n="conversation-search-submit">Search</button>
-        <a class="button secondary" href="/conversations" data-i18n="conversation-search-clear">Clear</a>
-      </form>
-      <div class="conversation-list">
-        ${itemsView || '<p class="empty" data-i18n="conversation-no-results">No captured conversations match this search.</p>'}
-      </div>
-      ${nextHref ? `<div class="conversation-pagination"><a class="button secondary" href="${escapeHtml(nextHref)}" data-i18n="conversation-next-page">Next page</a></div>` : ''}
     </section>
   `, { openMode, activeTab: 'conversations' });
 }
@@ -1866,7 +2113,7 @@ export function conversationDetailView({
     : '';
   if (!record || typeof record !== 'object' || Array.isArray(record)) {
     return layout('Conversation unavailable', `
-      <section class="stack">
+      <section class="stack conversation-detail-shell">
         ${conversationPrivacyView(openMode)}
         ${errorNotice || '<div class="notice error" role="alert" data-i18n="conversation-not-found">Conversation not found.</div>'}
         <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to conversations</a>
@@ -1878,17 +2125,17 @@ export function conversationDetailView({
   const prompt = conversationText(record.promptText ?? record.prompt);
   const response = conversationText(record.responseText ?? record.response);
   return layout('Conversation', `
-    <section class="stack">
+    <section class="stack conversation-detail-shell">
       ${conversationPrivacyView(openMode)}
       ${errorNotice}
       <div class="topbar">
         <div>
           <span class="badge stored" data-i18n="conversations-label">Captured conversations</span>
           <h1><span data-i18n="conversation-detail-heading">Conversation</span> #${escapeHtml(String(conversationId))}</h1>
-          <div class="conversation-meta">
+          <div class="conversation-detail-meta">
             <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(record.startedAtMs))}</span>
             <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(record.memberLabel ?? '—')}</span>
-            <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(record.accountAlias ?? record.accountId ?? '—')}</span>
+            <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(record.accountAlias ?? '—')}</span>
             <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(record.model ?? '—')}</span>
           </div>
         </div>

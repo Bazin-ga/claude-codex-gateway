@@ -456,6 +456,28 @@ test('single known points remain visible as markers while unknown points have no
   assert.doesNotMatch(outputChart, /class="metrics-point device-1"/);
 });
 
+test('a sparse singleton remains visible when a long chart samples markers', () => {
+  const singletonIndex = 347;
+  const tokenHourly = Array.from({ length: 720 }, (_, index) => ({
+    hourBucketMs: HOURLY[0].hourBucketMs + index * 3600000,
+    totalInputTokens: index === singletonIndex ? 17 : null,
+    totalInputTokensKnownCount: index === singletonIndex ? 1 : 0,
+    totalCacheCreationInputTokens: null,
+    totalCacheCreationInputTokensKnownCount: 0,
+    totalCacheReadInputTokens: null,
+    totalCacheReadInputTokensKnownCount: 0,
+    totalOutputTokens: null,
+    totalOutputTokensKnownCount: 0,
+    usageCompleteCount: 0,
+    usagePartialCount: index === singletonIndex ? 1 : 0,
+    usageUnavailableCount: index === singletonIndex ? 0 : 1,
+  }));
+  const html = render({ hourly: [], tokenHourly });
+  const tokenChart = html.match(/aria-labelledby="metrics-tokens-chart-title metrics-tokens-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  assert.match(tokenChart, /class="metrics-point input"/);
+  assert.match(tokenChart, />Input tokens · [^<]+ · 17<\/title>/);
+});
+
 test('known counts prevent a lower-bound hour from becoming a complete chart point', () => {
   const html = render({
     deviceTokenComparison: {
@@ -484,6 +506,47 @@ test('known counts prevent a lower-bound hour from becoming a complete chart poi
   assert.match(html, /data-i18n="metrics-device-comparison-partial"/);
   assert.match(html, /<td>10<\/td>/);
   assert.match(html, /<td>4<\/td>/);
+});
+
+test('long chart series cap marker titles and bound raw hourly tables', () => {
+  const longRows = Array.from({ length: 720 }, (_, index) => ({
+    hourBucketMs: HOURLY[0].hourBucketMs + index * 3600000,
+    requestCount: index + 1,
+    successCount: index,
+    errorCount: 1,
+    avgTtfbMs: index + 1,
+    avgDurationMs: index + 2,
+    inputTokens: index + 3,
+    cacheCreationInputTokens: index + 4,
+    cacheReadInputTokens: index + 5,
+    outputTokens: index + 6,
+    inputTokensKnownCount: 1,
+    cacheCreationInputTokensKnownCount: 1,
+    cacheReadInputTokensKnownCount: 1,
+    outputTokensKnownCount: 1,
+  }));
+  const comparison = {
+    devices: Array.from({ length: 8 }, (_, index) => ({ deviceId: `device-${index}`, label: `Device ${index}` })),
+    rows: Array.from({ length: 720 * 8 }, (_, index) => ({
+      hourBucketMs: HOURLY[0].hourBucketMs + Math.floor(index / 8) * 3600000,
+      deviceId: `device-${index % 8}`,
+      inputTokens: index + 1,
+      cacheCreationInputTokens: index + 2,
+      cacheReadInputTokens: index + 3,
+      outputTokens: index + 4,
+      inputTokensKnownCount: 1,
+      cacheCreationInputTokensKnownCount: 1,
+      cacheReadInputTokensKnownCount: 1,
+      outputTokensKnownCount: 1,
+    })),
+  };
+  const html = render({ hourly: longRows, tokenHourly: longRows, deviceTokenComparison: comparison });
+  assert.ok(Buffer.byteLength(html, 'utf8') < 512000, `long metrics page should stay below 512KiB (${Buffer.byteLength(html, 'utf8')} bytes)`);
+  assert.match(html, /metrics-hourly-table-truncated/);
+  assert.match(html, /metrics-hourly-details/);
+  assert.match(html, /metrics-comparison-raw/);
+  const pointTitles = html.match(/<circle class="metrics-point[\s\S]*?<title>/g) ?? [];
+  assert.ok(pointTitles.length <= 16 * 25, `marker title count should be bounded (${pointTitles.length})`);
 });
 
 test('P5 metrics labels have Chinese translation entries', async () => {
