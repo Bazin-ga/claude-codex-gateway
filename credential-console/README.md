@@ -58,6 +58,8 @@ V1 implements:
 - macOS/Linux and Windows profile instructions shown once at enrollment;
 - read-only import and expiry/health display for one or more existing
   `codex-credential` homes;
+- a first-screen credential-health summary that classifies safe public metadata
+  without rendering access tokens, account identifiers, paths, or failure text;
 - a permanent authorization page for each Codex account that runs the ChatGPT subscription
   PKCE flow on the server and either seeds a `codex-credential` home directly or shows the
   resulting `auth.json` once for the operator to copy;
@@ -593,6 +595,26 @@ files out of that home, both read-only: `public/current.json` for the credential
 boundary, so no bearer digest reaches a rendered page. It never writes either, and has no
 access to `secret/` unless `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` names that home — see
 [Codex account authorization](#codex-account-authorization).
+
+### Credential health and alert semantics
+
+The dashboard reads `public/current.json` and (when present) `public/health.json` as untrusted,
+read-only metadata. A Codex current snapshot is valid only when it contains nonempty
+`access_token` and `account_id` fields plus a parseable `expires_at`; the token and account id are
+used only for validation and never leave the server. A missing/unreadable current file is shown as
+unavailable, malformed metadata as invalid, and an expired timestamp as expired. The current
+snapshot is authoritative for expiry even when a health snapshot is older.
+
+Health snapshots must use version `1`. Optional timestamps, cycle outcomes, failure classes,
+quarantine state, and access booleans are sanitized into a fixed vocabulary. Missing, malformed,
+or stale health is a safe observability warning; refresh failures, quarantine, persistence or
+publish failures, unreadable state, and an active cycle stuck beyond 15 minutes are critical.
+Snapshot staleness is `expected_interval_seconds × 2.5`, clamped to 15 minutes–7 days, with a
+36-hour fallback. Codex expiry warns at 3 days and is critical at 24 hours or once expired;
+Claude warns at 7 days and is critical at 24 hours or once expired. Accounts awaiting login or
+authorization remain neutral. The first-screen summary shows at most three critical/warning
+items; the account table includes relative expiry, last successful credential check, and last
+rotation using safe timestamps only.
 
 List public account metadata:
 

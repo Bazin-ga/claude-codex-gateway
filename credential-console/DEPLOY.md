@@ -168,6 +168,21 @@ The server holds a single-writer lock on the credential home for its lifetime. T
 `import-codex` commands acquire the same lock and fail fast while the service is running. Stop the
 service before running either of them. `list` is read-only and does not acquire the lock.
 
+The dashboard reads the imported home's `public/current.json` and, when available,
+`public/health.json` as untrusted read-only metadata. A current snapshot is valid only with
+nonempty `access_token` and `account_id` fields plus a parseable `expires_at`; those values are
+used for validation only and are never rendered. Missing/unreadable current metadata is classified
+as unavailable, malformed metadata as invalid, and an expired timestamp as expired. A valid
+current expiry is authoritative over a stale health expiry. Version-1 health fields are
+sanitized to fixed timestamps/outcomes/classes and booleans: raw failures, paths, tokens, and
+account ids never reach HTML. Missing, malformed, or stale health is a warning; refresh failure,
+quarantine, persist/publish/unreadable outcomes, and cycles stuck beyond 15 minutes are critical.
+Staleness is `expected_interval_seconds × 2.5`, clamped to 15 minutes–7 days, with a 36-hour
+fallback. Codex warns at 3 days and is critical at 24 hours/expired; Claude warns at 7 days and
+is critical at 24 hours/expired. Login-required and pending rows remain neutral. The first-screen
+summary shows at most three alerts, while account rows show relative expiry, the last successful
+credential check, and last rotation.
+
 ## Codex account authorization
 
 The console can run the ChatGPT subscription login itself, so no `codex login` on a separate

@@ -1,4 +1,5 @@
 import { escapeHtml } from './http.js';
+import { classifyCredentialAlerts } from './credential-alerts.js';
 import {
   CLAUDE_CLIENT_CONFIG_VERSION_KEY,
   CLIENT_CONFIG_VERSION,
@@ -57,7 +58,31 @@ tr:last-child td { border-bottom: 0; }
 .badge.credential-active { background: #dff2e8; color: var(--green); }
 .badge.credential-revoked { background: #e8eee9; color: var(--muted); }
 .badge.legacy { background: #faecd7; color: var(--amber); }
+.badge.alert-critical { background: #f8e4e1; color: var(--red); }
+.badge.alert-warning { background: #faecd7; color: var(--amber); }
+.badge.alert-neutral { background: #e5edf4; color: var(--blue); }
+.badge.alert-ok { background: #dff2e8; color: var(--green); }
 .badge > span { margin-left: 4px; }
+.credential-alert-summary { border-top: 5px solid var(--green); }
+.credential-alert-summary.has-critical { border-top-color: var(--red); }
+.credential-alert-summary.has-warning { border-top-color: var(--amber); }
+.credential-alert-heading { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.credential-alert-heading h2 { margin-bottom: 5px; }
+.credential-alert-counts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.credential-alert-list { list-style: none; padding: 0; margin: 12px 0 0; display: grid; gap: 8px; }
+.credential-alert-item { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px; background: #fbfcf9; }
+.credential-alert-item > div { min-width: 0; }
+.credential-alert-item strong { overflow-wrap: anywhere; }
+.credential-alert-label { margin-top: 3px; color: var(--muted); font-size: 13px; }
+.credential-alert-more { margin: 10px 0 0; }
+.account-status-stack { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.account-history { display: grid; gap: 3px; min-width: 170px; }
+.account-history > div { line-height: 1.4; }
+.relative-expiry { white-space: nowrap; }
+.relative-expiry strong { font-weight: 750; }
+.relative-expiry.expired strong { color: var(--red); }
+.credential-table-wrap { overflow-x: auto; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .machine-list { display: grid; gap: 14px; }
 .machine { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: #fbfcf9; }
 .machine-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 12px; }
@@ -305,6 +330,113 @@ function dateText(value) {
   if (!value) return '—';
   const time = Date.parse(value);
   return Number.isFinite(time) ? new Date(time).toLocaleString('en-GB', { hour12: false }) : value;
+}
+
+function compactDuration(milliseconds) {
+  const totalMinutes = Math.max(1, Math.round(Math.abs(milliseconds) / 60_000));
+  if (totalMinutes >= 24 * 60) {
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    return hours ? `${days}d ${hours}h` : `${days}d`;
+  }
+  if (totalMinutes >= 60) {
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  return `${totalMinutes}m`;
+}
+
+const CREDENTIAL_ALERT_LABEL_KEYS = Object.freeze({
+  current_invalid: 'credential-alert-current-invalid',
+  current_unavailable: 'credential-alert-current-unavailable',
+  access_expired: 'credential-alert-access-expired',
+  access_expires_24h: 'credential-alert-access-expires-24h',
+  access_expires_3d: 'credential-alert-access-expires-3d',
+  access_expires_7d: 'credential-alert-access-expires-7d',
+  credential_unavailable: 'credential-alert-credential-unavailable',
+  health_missing: 'credential-alert-health-missing',
+  health_invalid: 'credential-alert-health-invalid',
+  health_unavailable: 'credential-alert-health-unavailable',
+  health_stale: 'credential-alert-health-stale',
+  refresh_failed: 'credential-alert-refresh-failed',
+  refresh_quarantined: 'credential-alert-refresh-quarantined',
+  refresh_stuck: 'credential-alert-refresh-stuck',
+  refreshing: 'credential-alert-refreshing',
+  persist: 'credential-alert-persist',
+  persist_failed: 'credential-alert-persist-failed',
+  publish: 'credential-alert-publish',
+  publish_failed: 'credential-alert-publish-failed',
+  read_failed: 'credential-alert-read-failed',
+  unreadable: 'credential-alert-unreadable',
+  unhandled: 'credential-alert-unhandled',
+  operation_blocked: 'credential-alert-operation-blocked',
+  configuration_invalid: 'credential-alert-configuration-invalid',
+  quarantine: 'credential-alert-quarantine',
+  provider_rejected: 'credential-alert-provider-rejected',
+  timeout: 'credential-alert-timeout',
+  pre_mint_rejected: 'credential-alert-pre-mint-rejected',
+  account_unhealthy: 'credential-alert-account-unhealthy',
+  login_required: 'credential-alert-login-required',
+  pending: 'credential-alert-pending',
+});
+
+function credentialAlertLabelKey(code) {
+  return CREDENTIAL_ALERT_LABEL_KEYS[code] ?? 'credential-alert-refresh-failed';
+}
+
+function credentialAlertBadge(alert) {
+  const severity = ['critical', 'warning', 'neutral', 'ok'].includes(alert?.severity)
+    ? alert.severity
+    : 'neutral';
+  return `<span class="badge alert-${severity}" data-i18n="credential-severity-${severity}">${escapeHtml(severity[0].toUpperCase() + severity.slice(1))}</span>`;
+}
+
+function expiryView(alert) {
+  if (!alert || alert.expiresInMs === null || alert.expiresInMs === undefined) {
+    return '<span class="muted" data-i18n="expires-unknown">Not available</span>';
+  }
+  const expired = alert.expiresInMs <= 0;
+  const duration = compactDuration(alert.expiresInMs);
+  return `<div class="relative-expiry${expired ? ' expired' : ''}">
+    <span data-i18n="${expired ? 'expires-ago' : 'expires-in'}">${expired ? 'Expired' : 'Expires in'}</span>
+    <strong>${escapeHtml(duration)}</strong>
+  </div><div class="muted tiny">${escapeHtml(dateText(alert.expiresAt))}</div>`;
+}
+
+function credentialCheckText(value, i18nKey) {
+  return `<div><span data-i18n="${i18nKey}">${i18nKey === 'last-successful-check' ? 'Last successful credential check' : 'Last rotation'}</span>: <span>${escapeHtml(value ? dateText(value) : '—')}</span></div>`;
+}
+
+function credentialAlertSummaryView(accounts, alerts) {
+  if (!accounts.length || (!alerts?.criticalCount && !alerts?.warningCount)) return '';
+  const summary = alerts?.summary ?? [];
+  const stateClass = alerts?.criticalCount ? ' has-critical' : alerts?.warningCount ? ' has-warning' : '';
+  const liveRole = alerts?.criticalCount ? 'alert' : 'status';
+  const liveMode = alerts?.criticalCount ? 'assertive' : 'polite';
+  const items = summary.map((alert) => {
+    const provider = alert.provider === 'codex' ? 'Codex' : 'Claude Code';
+    return `<li class="credential-alert-item">
+      <div><strong>${escapeHtml(alert.alias || provider)}</strong><div class="muted tiny">${escapeHtml(provider)}</div>
+        <div class="credential-alert-label" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>
+      </div>${credentialAlertBadge(alert)}
+    </li>`;
+  }).join('');
+  let body;
+  if (items) {
+    body = `<ul class="credential-alert-list">${items}</ul>${alerts.summaryTruncated
+      ? '<p class="muted tiny credential-alert-more" data-i18n="credential-alert-more">More credential alerts are listed in the account table.</p>'
+      : ''}`;
+  }
+  return `<section class="card credential-alert-summary${stateClass}" role="${liveRole}" aria-live="${liveMode}" aria-labelledby="credential-alert-heading">
+    <div class="credential-alert-heading"><div><h2 id="credential-alert-heading" data-i18n="credential-health-heading">Credential health</h2>
+      <p class="muted tiny" data-i18n="credential-health-intro">Live credential status from safe public metadata.</p></div>
+      <div class="credential-alert-counts" aria-label="Credential alert counts">
+        ${alerts.criticalCount ? `<span class="badge alert-critical"><strong>${alerts.criticalCount}</strong> <span data-i18n="credential-critical-label">critical</span></span>` : ''}
+        ${alerts.warningCount ? `<span class="badge alert-warning"><strong>${alerts.warningCount}</strong> <span data-i18n="credential-warning-label">warning</span></span>` : ''}
+      </div>
+    </div>${body}
+  </section>`;
 }
 
 function quotaWindowView(usage, kind, label, i18n) {
@@ -1773,9 +1905,15 @@ export function dashboardView({
   codexSelfServiceReady = false,
   onboardingUrl = null,
   error = null,
+  credentialAlerts = null,
+  now = Date.now(),
 }) {
+  const alerts = credentialAlerts ?? classifyCredentialAlerts(accounts, { now });
+  const alertsById = new Map(alerts.accounts
+    .filter((entry) => entry.accountId)
+    .map((entry) => [entry.accountId, entry]));
   const activeDevices = devices.filter((device) => !device.revoked_at);
-  const healthy = accounts.filter((account) => account.status === 'healthy').length;
+  const healthy = alerts.accounts.filter((account) => account.severity === 'ok').length;
   const selfServiceAccounts = accounts.filter((account) => (
     account.provider === 'claude'
     && ['stored', 'healthy'].includes(account.status)
@@ -1791,13 +1929,18 @@ export function dashboardView({
   })).join('');
   const accountRows = accounts.map((account) => {
     const available = ['stored', 'healthy'].includes(account.status);
+    const alert = alertsById.get(account.id)
+      ?? alerts.accounts.find((entry) => entry.alias === account.alias)
+      ?? null;
     return `
     <tr>
       <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(account.email_label || 'No email label')}</div></td>
       <td>${escapeHtml(account.provider === 'claude' ? 'Claude Code' : 'Codex')}</td>
-      <td>${statusBadge(account.status)}</td>
+      <td><div class="account-status-stack">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}</div>
+        ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}</td>
       <td>${escapeHtml(account.active_devices ?? '—')}</td>
-      <td>${escapeHtml(dateText(account.expires_at))}</td>
+      <td>${expiryView(alert)}</td>
+      <td class="account-history">${credentialCheckText(alert?.lastSuccessAt, 'last-successful-check')}${credentialCheckText(alert?.lastRotationAt, 'last-rotation')}</td>
       <td>${accountUsageView(account)}</td>
       <td>
         ${account.provider === 'claude' ? `<div class="stack">
@@ -1845,6 +1988,7 @@ export function dashboardView({
   return layout('Dashboard', `
     <div class="stack">
       ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+      ${credentialAlertSummaryView(accounts, alerts)}
       ${openMode || adminIdentity ? `<section class="member-zone">
         <div class="zone-heading">
           <div>
@@ -1919,8 +2063,9 @@ export function dashboardView({
             <div class="topbar"><div><h2 data-i18n="accounts">Accounts</h2><div class="muted tiny" data-i18n="upstream-secret-note">Provider tokens are encrypted and never displayed after submission. Exceptional one-time enrollment remains available per account.</div></div></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th data-i18n="account">Account</th><th data-i18n="provider">Provider</th><th data-i18n="status">Status</th><th data-i18n="devices">Devices</th><th data-i18n="expires">Expires</th><th data-i18n="usage-quota">Usage quota</th><th data-i18n="action">Action</th></tr></thead>
-                <tbody>${accountRows || '<tr><td colspan="7" class="empty" data-i18n="no-accounts">No accounts yet.</td></tr>'}</tbody>
+                <caption class="visually-hidden" data-i18n="accounts-table-caption">Credential accounts and safe health metadata</caption>
+                <thead><tr><th scope="col" data-i18n="account">Account</th><th scope="col" data-i18n="provider">Provider</th><th scope="col" data-i18n="status">Status</th><th scope="col" data-i18n="devices">Devices</th><th scope="col" data-i18n="expires">Expires</th><th scope="col" data-i18n="last-successful-check">Last successful check</th><th scope="col" data-i18n="last-rotation">Last rotation</th><th scope="col" data-i18n="usage-quota">Usage quota</th><th scope="col" data-i18n="action">Action</th></tr></thead>
+                <tbody>${accountRows || '<tr><td colspan="9" class="empty" data-i18n="no-accounts">No accounts yet.</td></tr>'}</tbody>
               </table>
             </div>
           </article>

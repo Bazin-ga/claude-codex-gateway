@@ -22,6 +22,7 @@ import { MetricsStore } from './lib/metrics.js';
 import { CLIENT_CONFIG_VERSION } from './lib/client-config-version.js';
 import { buildOnboardingGuideUrl, buildOnboardingMarkdown } from './lib/onboarding.js';
 import { UsageMonitor } from './lib/usage.js';
+import { safeTimestamp } from './lib/credential-alerts.js';
 import {
   createClaudeAuthorizationRequest,
   exchangeClaudeAuthorization,
@@ -127,32 +128,223 @@ function routeMatch(path, pattern) {
   return params;
 }
 
-async function externalAccountStatus(account) {
-  if (account.external?.kind !== 'codex-credential') return {};
-  try {
-    const current = JSON.parse(
-      await readFile(`${account.external.home}/public/current.json`, 'utf8'),
-    );
-    let clients = { clients: [] };
-    let clientCount = null;
-    try {
-      clients = JSON.parse(
-        await readFile(`${account.external.home}/clients/clients.json`, 'utf8'),
-      );
-      clientCount = (clients.clients ?? []).filter((client) => !client.revoked).length;
-    } catch {
-      // The console has no access to the Codex client-token registry once the
-      // recommended systemd hardening is applied; the count is then unavailable.
-    }
-    const expiresAt = Date.parse(current.expires_at);
-    return {
-      status: Number.isFinite(expiresAt) && expiresAt > Date.now() ? 'healthy' : 'expired',
-      expires_at: current.expires_at ?? null,
-      active_devices: clientCount,
-    };
-  } catch (error) {
-    return { status: 'unhealthy', last_failure: error.message };
+const SAFE_HEALTH_OUTCOMES = new Set([
+  'fresh', 'refreshed', 'recovered', 'refreshing', 'quarantined',
+  'pre_mint_rejected', 'timeout', 'persist_failed', 'publish_failed',
+  'unreadable', 'unhandled', 'operation_blocked',
+]);
+const SAFE_HEALTH_FAILURE_CLASSES = new Set([
+  'quarantine',
+  'provider_rejected',
+  'persist_failed',
+  'publish_failed',
+  'unreadable',
+  'unhandled',
+  'operation_blocked',
+  'configuration_invalid',
+  'timeout',
+]);
+
+function metadataObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+}
+
+function nonEmptyMetadata(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function optionalHealthTimestamp(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return safeTimestamp(value);
+}
+
+function optionalHealthNumber(value, { integer = false, nonNegative = false } = {}) {
+  if (value === undefined || value === null || value === '') return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  if (integer && !Number.isInteger(number)) return null;
+  if (nonNegative && number < 0) return null;
+  return number;
+}
+
+function sanitizeHealthSnapshot(raw) {
+  const source = metadataObject(raw);
+  if (!source || source.version !== 1) return null;
+  const timestampFields = [
+    'updated_at',
+    'last_cycle_started_at',
+    'last_cycle_finished_at',
+    'last_success_at',
+    'last_refresh_at',
+    'last_failure_at',
+  ];
+  const timestamps = Object.fromEntries(timestampFields.map((field) => [
+    field,
+    optionalHealthTimestamp(source[field]),
+  ]));
+  // A present malformed timestamp is a malformed health snapshot. Missing
+  // optional canaries remain null and are intentionally harmless.
+  if (timestampFields.some((field) => (
+    source[field] !== undefined
+      && source[field] !== null
+      && source[field] !== ''
+      && timestamps[field] === null
+  ))) return null;
+
+  const expected = optionalHealthNumber(source.expected_interval_seconds, {
+    integer: true,
+    nonNegative: true,
+  });
+  if (source.expected_interval_seconds !== undefined
+    && source.expected_interval_seconds !== null
+    && source.expected_interval_seconds !== ''
+    && (expected === null || expected <= 0 || expected > 30 * 24 * 60 * 60)) return null;
+  const consecutive = optionalHealthNumber(source.consecutive_failures, {
+    integer: true,
+    nonNegative: true,
+  });
+  if (source.consecutive_failures !== undefined
+    && source.consecutive_failures !== null
+    && source.consecutive_failures !== ''
+    && consecutive === null) return null;
+
+  let lastOutcome = null;
+  if (source.last_outcome !== undefined && source.last_outcome !== null && source.last_outcome !== '') {
+    if (typeof source.last_outcome !== 'string') return null;
+    lastOutcome = source.last_outcome.toLowerCase();
+    if (!SAFE_HEALTH_OUTCOMES.has(lastOutcome)) return null;
   }
+  let failureClass = null;
+  if (source.failure_class !== undefined && source.failure_class !== null && source.failure_class !== '') {
+    if (typeof source.failure_class !== 'string') return null;
+    failureClass = source.failure_class.toLowerCase();
+    if (!SAFE_HEALTH_FAILURE_CLASSES.has(failureClass)) return null;
+  }
+
+  const quarantineSource = source.quarantine;
+  let quarantine = { present: false, since: null };
+  if (quarantineSource !== undefined && quarantineSource !== null) {
+    const value = metadataObject(quarantineSource);
+    if (!value || typeof value.present !== 'boolean') return null;
+    const since = optionalHealthTimestamp(value.since);
+    if (value.since !== undefined && value.since !== null && value.since !== '' && since === null) return null;
+    quarantine = { present: value.present, since: value.present ? since : null };
+  }
+
+  let access = null;
+  if (source.access !== undefined && source.access !== null) {
+    const value = metadataObject(source.access);
+    if (!value || typeof value.present !== 'boolean' || typeof value.valid !== 'boolean') return null;
+    const expiresAt = optionalHealthTimestamp(value.expires_at);
+    if (value.expires_at !== undefined && value.expires_at !== null && value.expires_at !== '' && expiresAt === null) return null;
+    const remaining = optionalHealthNumber(value.remaining_seconds, {
+      integer: true,
+      nonNegative: true,
+    });
+    if (value.remaining_seconds !== undefined && value.remaining_seconds !== null && value.remaining_seconds !== '' && remaining === null) return null;
+    access = {
+      present: value.present,
+      valid: value.valid,
+      expires_at: expiresAt,
+      remaining_seconds: remaining,
+    };
+  }
+
+  return {
+    version: 1,
+    ...timestamps,
+    expected_interval_seconds: expected,
+    last_outcome: lastOutcome,
+    failure_class: failureClass,
+    consecutive_failures: consecutive,
+    quarantine,
+    access,
+  };
+}
+
+async function readPublicJson(path) {
+  let body;
+  try {
+    body = await readFile(path, 'utf8');
+  } catch (error) {
+    // Keep filesystem details (including paths and permission messages) inside
+    // the server log boundary. The dashboard only needs a stable category.
+    return { status: error?.code === 'ENOENT' ? 'missing' : 'unavailable', value: null };
+  }
+  try {
+    return { status: 'ok', value: JSON.parse(body) };
+  } catch {
+    return { status: 'invalid', value: null };
+  }
+}
+
+/**
+ * Read the two public Codex metadata files without ever returning their
+ * credential values. current.json is authoritative for expiry; health.json is
+ * an observability snapshot and is sanitized field-by-field before it reaches
+ * the classifier or a view.
+ */
+export async function externalAccountStatus(account, { now = Date.now() } = {}) {
+  if (account?.external?.kind !== 'codex-credential') return {};
+  const parsedNow = typeof now === 'number' && Number.isFinite(now)
+    ? now
+    : Date.parse(String(now ?? ''));
+  const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+  const home = account.external.home;
+  const currentRead = await readPublicJson(`${home}/public/current.json`);
+  const healthRead = await readPublicJson(`${home}/public/health.json`);
+  const health = healthRead.status === 'ok' ? sanitizeHealthSnapshot(healthRead.value) : null;
+  const healthStatus = healthRead.status === 'ok'
+    ? (health ? 'ok' : 'invalid')
+    : healthRead.status;
+
+  let currentStatus;
+  let expiresAt = null;
+  if (currentRead.status !== 'ok') {
+    currentStatus = currentRead.status === 'missing' ? 'unavailable' : currentRead.status;
+  } else {
+    const current = metadataObject(currentRead.value);
+    const currentExpiresAt = safeTimestamp(current?.expires_at);
+    const valid = current
+      && nonEmptyMetadata(current.access_token)
+      && nonEmptyMetadata(current.account_id)
+      && currentExpiresAt !== null;
+    if (!valid) currentStatus = 'invalid';
+    else {
+      expiresAt = currentExpiresAt;
+      currentStatus = Date.parse(currentExpiresAt) <= nowMs ? 'expired' : 'healthy';
+    }
+  }
+
+  let clientCount = null;
+  const clientsRead = await readPublicJson(`${home}/clients/clients.json`);
+  if (clientsRead.status === 'ok') {
+    const clients = metadataObject(clientsRead.value)?.clients;
+    if (Array.isArray(clients)) {
+      clientCount = clients.filter((client) => metadataObject(client) && !client.revoked).length;
+    }
+  }
+
+  return {
+    status: currentStatus,
+    current_status: currentStatus,
+    external_status: currentStatus,
+    current_read_status: currentRead.status,
+    health_read_status: healthStatus,
+    refresh_health: health,
+    health_status: healthStatus,
+    expires_at: expiresAt,
+    active_devices: clientCount,
+    refresh_health_status: healthStatus,
+    health_read_status: healthStatus,
+    // Only timestamps and fixed enums leave this function. In particular there
+    // is no access token, account id, exception text, or filesystem path here.
+    ...(health ? {
+      last_success_at: health.last_success_at,
+      last_refresh_at: health.last_refresh_at,
+      last_failure_at: health.last_failure_at,
+    } : {}),
+  };
 }
 
 /**
@@ -377,8 +569,24 @@ export async function createCredentialConsole(options = {}) {
   async function accountsWithExternalStatus() {
     return Promise.all(store.publicAccounts().map(async (account) => {
       const internal = store.accountById(account.id);
+      // publicAccounts intentionally contains a legacy last_failure string for
+      // API compatibility. Do not pass it to a page or to the alert classifier:
+      // it may contain an exception, URL, or filesystem path.
+      const safeAccount = {
+        id: account.id,
+        provider: account.provider,
+        alias: account.alias,
+        email_label: account.email_label,
+        status: account.status,
+        created_at: safeTimestamp(account.created_at),
+        expires_at: safeTimestamp(account.expires_at),
+        last_success_at: safeTimestamp(account.last_success_at),
+        last_failure_at: safeTimestamp(account.last_failure_at),
+        external: account.external ? { kind: account.external.kind } : null,
+        active_devices: account.active_devices,
+      };
       return {
-        ...account,
+        ...safeAccount,
         ...await externalAccountStatus(internal),
         usage: usageMonitor.snapshotForAccount(account.id),
       };
@@ -1043,8 +1251,60 @@ const translations = {
   'status-healthy': '健康',
   'status-unhealthy': '异常',
   'status-expired': '已过期',
+  'status-invalid': '无效',
+  'status-unavailable': '不可用',
   'status-stored': '已保存',
-  'status-login-required': '需要登录'
+  'status-login-required': '需要登录',
+  'status-pending': '等待中',
+  'credential-health-heading': '凭据健康度',
+  'credential-health-intro': '来自安全公开元数据的实时凭据状态。',
+  'credential-critical-label': '个严重问题',
+  'credential-warning-label': '个警告',
+  'credential-all-clear-badge': '一切正常',
+  'credential-all-clear': '没有活跃的凭据警报。',
+  'credential-no-accounts': '尚未登记提供商账号。',
+  'credential-alert-more': '更多凭据警报见下方账号表。',
+  'credential-severity-critical': '严重',
+  'credential-severity-warning': '警告',
+  'credential-severity-neutral': '处理中',
+  'credential-severity-ok': '正常',
+  'credential-alert-current-invalid': '当前 Codex 凭据元数据无效。',
+  'credential-alert-current-unavailable': '当前 Codex 凭据无法读取。',
+  'credential-alert-access-expired': '凭据已过期。',
+  'credential-alert-access-expires-24h': '凭据将在 24 小时内过期。',
+  'credential-alert-access-expires-3d': '凭据将在 3 天内过期。',
+  'credential-alert-access-expires-7d': '凭据将在 7 天内过期。',
+  'credential-alert-credential-unavailable': '凭据当前不可用。',
+  'credential-alert-health-missing': '刷新健康快照缺失。',
+  'credential-alert-health-invalid': '刷新健康快照无效。',
+  'credential-alert-health-unavailable': '刷新健康快照暂时无法读取。',
+  'credential-alert-health-stale': '刷新健康快照已过时。',
+  'credential-alert-refresh-failed': '最近一次凭据刷新失败。',
+  'credential-alert-refresh-quarantined': '凭据刷新已进入隔离状态。',
+  'credential-alert-refresh-stuck': '凭据刷新周期运行时间过长。',
+  'credential-alert-refreshing': '凭据刷新正在进行中。',
+  'credential-alert-persist': '凭据刷新持久化失败。',
+  'credential-alert-persist-failed': '凭据刷新持久化失败。',
+  'credential-alert-publish': '凭据发布失败。',
+  'credential-alert-publish-failed': '凭据发布失败。',
+  'credential-alert-read-failed': '凭据状态读取失败。',
+  'credential-alert-unreadable': '凭据状态不可读。',
+  'credential-alert-unhandled': '凭据刷新发生未处理故障。',
+  'credential-alert-operation-blocked': '凭据刷新操作被阻止。',
+  'credential-alert-configuration-invalid': '凭据刷新配置无效。',
+  'credential-alert-quarantine': '凭据刷新已隔离。',
+  'credential-alert-provider-rejected': '提供商拒绝了凭据刷新。',
+  'credential-alert-timeout': '凭据刷新超时。',
+  'credential-alert-pre-mint-rejected': '凭据刷新在签发前被拒绝。',
+  'credential-alert-account-unhealthy': '账号当前不健康。',
+  'credential-alert-login-required': '需要完成账号登录。',
+  'credential-alert-pending': '账号仍在等待授权。',
+  'expires-unknown': '不可用',
+  'expires-in': '将在',
+  'expires-ago': '已过期',
+  'last-successful-check': '最近成功凭据检查',
+  'last-rotation': '最近轮换',
+  'accounts-table-caption': '账号及安全健康元数据'
 };
 
 function applyLanguage(language) {

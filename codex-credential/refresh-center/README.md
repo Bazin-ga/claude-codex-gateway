@@ -50,9 +50,19 @@ node refresh.js                     # per run; install/ has a systemd timer
 |---|---|---|
 | `CODEX_CRED_HOME` | `/var/lib/codex-credential` | Data directory |
 | `CODEX_CRED_REFRESH_THRESHOLD_DAYS` | `3` | Refresh once fewer than this many days remain |
+| `CODEX_CRED_REFRESH_EXPECTED_INTERVAL_SECONDS` | `86400` | Expected cycle interval recorded in the public health snapshot (positive safe integer, max 30 days) |
 | `CODEX_CRED_ALERT_WEBHOOK` | — | POST target for alerts; stderr is always used |
 
 Zero dependencies — Node ≥ 20 built-ins only.
+
+Each refresh cycle also publishes `public/health.json` atomically with mode
+`0640`. It contains versioned, non-secret cycle timestamps, the last outcome,
+failure count, quarantine state, and access-token presence/expiry metadata. The
+file never contains a token, fingerprint, account ID, provider error, or path.
+Health publication is best effort and cannot change the credential refresh
+result. The health snapshot uses `fresh`, `refreshed`, `recovered`,
+`quarantined`, `pre_mint_rejected`, `timeout`, `persist_failed`,
+`publish_failed`, `unreadable`, `unhandled`, and `operation_blocked` outcomes.
 
 ## Status
 

@@ -37,6 +37,7 @@ export class CredentialStore {
     this.refreshAttemptPath = join(this.secretDir, 'refresh-in-flight.json');
     this.operationLockPath = join(this.secretDir, 'operation.lock');
     this.publicPath = join(this.publicDir, 'current.json');
+    this.healthPath = join(this.publicDir, 'health.json');
   }
 
   async init() {

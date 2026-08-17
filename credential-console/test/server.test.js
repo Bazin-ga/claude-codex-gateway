@@ -2581,7 +2581,11 @@ test('a Codex home nothing has enrolled against yet is not reported as unreadabl
   await mkdir(join(seededHome, 'public'), { recursive: true, mode: 0o750 });
   await writeFile(
     join(seededHome, 'public', 'current.json'),
-    JSON.stringify({ access_token: 'a', expires_at: new Date(Date.now() + 600_000).toISOString() }),
+    JSON.stringify({
+      access_token: 'a',
+      account_id: 'fixture-account',
+      expires_at: new Date(Date.now() + 600_000).toISOString(),
+    }),
   );
   const app = await fixture({ adminAuth: 'open' });
   try {
