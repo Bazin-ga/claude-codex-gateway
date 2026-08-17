@@ -15,15 +15,26 @@
  *
  * Idempotent by consequence rather than by check: re-enrolling mints a fresh
  * token and revokes this machine's previous one, so re-running the installer is
- * safe and a token that leaked from this machine dies on the next run.
+ * safe and a token that leaked from this machine dies on the next run. "This
+ * machine" is decided by two things, neither of them the name — a name alone
+ * cannot distinguish a reinstall from a second machine that chose the same name,
+ * and treating those two cases alike silently evicted the other machine:
+ *
+ *   - the opaque handle in lib/machine-id.js, which survives reinstalls;
+ *   - the digest of the token this machine currently holds, which survives the
+ *     handle. A rebuilt container or a restored backup arrives with a fresh
+ *     handle on a machine that is not new, and without the digest its previous
+ *     row would stay active with nobody able to retire it.
  */
 
 import { hostname } from 'node:os';
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { pinnedRequest } from './lib/pinned-request.js';
+import { MACHINE_ID_PATTERN, ensureMachineId, machineIdPathFor } from './lib/machine-id.js';
 
 const ENDPOINT = process.env.CODEX_CRED_ENDPOINT;
 const ENROLLMENT_KEY = process.env.CODEX_CRED_ENROLLMENT_KEY;
@@ -32,6 +43,9 @@ const PIN = process.env.CODEX_CRED_CERT_PIN;
 /** The env file the systemd unit / launchd job reads. Mode 600, never inline in a unit. */
 const ENV_PATH = process.env.CODEX_CRED_ENV_FILE
   ?? join(homedir(), '.config', 'codex-credential.env');
+
+/** This machine's opaque handle, kept beside the env file. */
+const MACHINE_ID_PATH = process.env.CODEX_CRED_MACHINE_ID_FILE ?? machineIdPathFor(ENV_PATH);
 
 function log(event, detail = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, host: hostname(), ...detail }));
@@ -47,20 +61,75 @@ export function machineName(raw = process.env.CODEX_CRED_NAME ?? hostname()) {
   return (cleaned || 'machine').slice(0, 64);
 }
 
-/** @returns {Promise<{name: string, token: string}>} */
+/**
+ * The token this machine currently holds, if it has one.
+ *
+ * Read from the env file rather than the environment, because that is where the
+ * previous enrollment put it and an operator re-running this by hand will not
+ * have sourced it. Any failure is "no previous token" — this is an optimisation
+ * on revocation, never a precondition for enrolling.
+ */
+export async function currentToken(envPath = ENV_PATH) {
+  const fromEnv = process.env.CODEX_CRED_TOKEN;
+  if (fromEnv) return fromEnv;
+  try {
+    const line = (await readFile(envPath, 'utf8'))
+      .split('\n')
+      .find((entry) => entry.startsWith('CODEX_CRED_TOKEN='));
+    const value = line?.slice('CODEX_CRED_TOKEN='.length).trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `machineId` is an explicit argument with no default, and that is deliberate:
+ * the credential console imports this function to mint tokens *on behalf of*
+ * other people's machines, and a default that read this host's handle would
+ * stamp the console's own identity onto every machine it enrolled. Only a
+ * process running on the machine being enrolled should pass one.
+ *
+ * `previousTokenSha256` is the same idea from the other direction: the digest of
+ * the token this machine already holds, which is the only way the server can
+ * retire that exact row once the handle beside it has been lost. A digest and
+ * never the token — the server stores precisely this value already, so it learns
+ * nothing new, and it cannot be replayed as a bearer.
+ *
+ * @returns {Promise<{name: string, token: string}>}
+ */
 export async function requestEnrollment({
   endpoint = ENDPOINT,
   enrollmentKey = ENROLLMENT_KEY,
   pin = PIN,
   name = machineName(),
+  machineId = null,
+  previousTokenSha256 = null,
 } = {}) {
+  // A handle we cannot vouch for is dropped rather than sent: the server would
+  // refuse the whole request over it, and an unusable local file must never be
+  // the reason a machine cannot get a credential. Without it the server falls
+  // back to what it did before fingerprints existed.
+  const usableMachineId = typeof machineId === 'string' && MACHINE_ID_PATTERN.test(machineId)
+    ? machineId
+    : null;
+  // Same rule for the proof: a malformed digest would cost the whole request a
+  // 400, and enrolling matters more than tidying up an old row.
+  const usableDigest = typeof previousTokenSha256 === 'string' && /^[a-f0-9]{64}$/.test(previousTokenSha256)
+    ? previousTokenSha256
+    : null;
+
   const { statusCode, body } = await pinnedRequest({
     endpoint,
     path: '/enroll',
     method: 'POST',
     pin,
     bearer: enrollmentKey,
-    json: { name },
+    json: {
+      name,
+      ...(usableMachineId ? { machine_id: usableMachineId } : {}),
+      ...(usableDigest ? { previous_token_sha256: usableDigest } : {}),
+    },
   });
 
   if (statusCode === 403) {
@@ -118,11 +187,40 @@ async function main() {
   }
 
   const name = machineName();
-  log('enrolling', { name, endpoint: ENDPOINT });
+  // Never fatal: ensureMachineId() reports a degraded outcome instead of throwing,
+  // because an enrollment that fails over a missing handle is strictly worse than
+  // one the server records as a new machine.
+  const machine = await ensureMachineId(MACHINE_ID_PATH);
+  // The row this machine already owns. Presenting its digest is what retires that
+  // row when the handle no longer matches — a rebuilt container, a restored
+  // backup, an unwritable ~/.config — instead of leaving a live token behind on
+  // every reinstall.
+  const previous = await currentToken(ENV_PATH);
+  const previousTokenSha256 = previous
+    ? createHash('sha256').update(previous).digest('hex')
+    : null;
+  log('enrolling', {
+    name,
+    endpoint: ENDPOINT,
+    // Whether a previous token was found, never the token and never its digest.
+    replacing_previous_token: Boolean(previousTokenSha256),
+    // The handle is opaque and identifies nothing but itself, so it is safe to
+    // log — unlike the token, which never appears here.
+    machine_id: machine.id,
+    machine_id_source: machine.created ? 'generated' : 'existing',
+    ...(machine.persisted
+      ? {}
+      : {
+        machine_id_persisted: false,
+        machine_id_error: machine.error,
+        impact: `could not write ${MACHINE_ID_PATH}; this machine reports a new handle at every enrollment`
+          + `${previousTokenSha256 ? ', and relies on its current token to retire the previous row' : ''}`,
+      }),
+  });
 
   let issued;
   try {
-    issued = await requestEnrollment({ name });
+    issued = await requestEnrollment({ name, machineId: machine.id, previousTokenSha256 });
   } catch (err) {
     log('enroll_failed', { error: err.message });
     process.exitCode = 1;

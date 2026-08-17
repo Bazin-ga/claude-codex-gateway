@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { machineName, persistEnv, requestEnrollment } from '../enroll.js';
+import { currentToken, machineName, persistEnv, requestEnrollment } from '../enroll.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -88,6 +88,128 @@ test('enrollment posts the machine name and returns the minted token', async () 
     assert.deepEqual(JSON.parse(sent.body), { name: 'laptop-01' });
   } finally {
     await fixture.close();
+  }
+});
+
+test('enrollment reports the machine handle when the caller has one', async () => {
+  const fixture = await startServer();
+  try {
+    await requestEnrollment({
+      endpoint: fixture.endpoint,
+      enrollmentKey: 'shared-key',
+      pin: fixture.pin,
+      name: 'laptop-01',
+      machineId: 'machine-handle-aaaaaaaaaaaaaaaa',
+    });
+
+    assert.deepEqual(JSON.parse(fixture.requests[0].body), {
+      name: 'laptop-01',
+      machine_id: 'machine-handle-aaaaaaaaaaaaaaaa',
+    });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('an unusable handle is dropped rather than blocking the enrollment', async () => {
+  const fixture = await startServer();
+  try {
+    // The console mints for other people's machines and passes none, and a local
+    // handle file can be corrupt. Neither may cost this machine its credential:
+    // the request goes out without a fingerprint and the server falls back to
+    // what it did before fingerprints existed.
+    for (const machineId of [null, undefined, '', 'too-short', 'has spaces in it', 42]) {
+      const issued = await requestEnrollment({
+        endpoint: fixture.endpoint,
+        enrollmentKey: 'shared-key',
+        pin: fixture.pin,
+        name: 'laptop-01',
+        machineId,
+      });
+      assert.equal(issued.token, 'minted-machine-token');
+      assert.deepEqual(JSON.parse(fixture.requests.at(-1).body), { name: 'laptop-01' });
+    }
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('enrollment offers the digest of the token it already holds, never the token', async () => {
+  const fixture = await startServer();
+  const directory = await mkdtemp(path.join(tmpdir(), 'codex-enroll-env-'));
+  const envPath = path.join(directory, 'codex-credential.env');
+  const held = 'the-token-this-machine-currently-holds';
+  try {
+    await persistEnv({ CODEX_CRED_ENDPOINT: 'https://example', CODEX_CRED_TOKEN: held }, envPath);
+    delete process.env.CODEX_CRED_TOKEN;
+    const previousTokenSha256 = createHash('sha256').update(await currentToken(envPath)).digest('hex');
+
+    await requestEnrollment({
+      endpoint: fixture.endpoint,
+      enrollmentKey: 'shared-key',
+      pin: fixture.pin,
+      name: 'laptop-01',
+      machineId: 'machine-handle-aaaaaaaaaaaaaaaa',
+      previousTokenSha256,
+    });
+
+    const sent = JSON.parse(fixture.requests.at(-1).body);
+    assert.deepEqual(sent, {
+      name: 'laptop-01',
+      machine_id: 'machine-handle-aaaaaaaaaaaaaaaa',
+      previous_token_sha256: createHash('sha256').update(held).digest('hex'),
+    });
+    // The digest is proof of the token, never a second copy of it.
+    assert.equal(fixture.requests.at(-1).body.includes(held), false);
+
+    // Same rule as the handle: an unusable value is dropped rather than allowed
+    // to cost a 400. Tidying an old row matters less than getting a credential.
+    for (const bad of [null, undefined, '', 'nope', 'A'.repeat(64), 42]) {
+      await requestEnrollment({
+        endpoint: fixture.endpoint,
+        enrollmentKey: 'shared-key',
+        pin: fixture.pin,
+        name: 'laptop-01',
+        previousTokenSha256: bad,
+      });
+      assert.deepEqual(JSON.parse(fixture.requests.at(-1).body), { name: 'laptop-01' });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    await fixture.close();
+  }
+});
+
+test('the token this machine already holds is read back out of its env file', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'codex-enroll-env-'));
+  const envPath = path.join(directory, 'codex-credential.env');
+  const saved = process.env.CODEX_CRED_TOKEN;
+  try {
+    delete process.env.CODEX_CRED_TOKEN;
+    // A machine enrolling for the first time has nothing to prove and must not
+    // be blocked by that: no file, no token, no error.
+    assert.equal(await currentToken(envPath), null);
+
+    await persistEnv({
+      CODEX_CRED_ENDPOINT: 'https://example',
+      CODEX_CRED_CERT_PIN: 'abc',
+      CODEX_CRED_TOKEN: 'previously-minted-token',
+    }, envPath);
+    assert.equal(await currentToken(envPath), 'previously-minted-token');
+
+    // An env file an operator hand-edited into something unusable is "no token",
+    // exactly like a missing one.
+    await writeFile(envPath, 'CODEX_CRED_ENDPOINT=https://example\nCODEX_CRED_TOKEN=\n');
+    assert.equal(await currentToken(envPath), null);
+
+    // A sourced environment wins, because that is the token the process would
+    // actually be using.
+    process.env.CODEX_CRED_TOKEN = 'token-from-the-environment';
+    assert.equal(await currentToken(envPath), 'token-from-the-environment');
+  } finally {
+    if (saved === undefined) delete process.env.CODEX_CRED_TOKEN;
+    else process.env.CODEX_CRED_TOKEN = saved;
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

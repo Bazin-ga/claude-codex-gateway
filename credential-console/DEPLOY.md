@@ -30,9 +30,19 @@ sudo install -d -o root -g root -m 0755 /var/www/letsencrypt
 ```
 
 If importing a Codex credential home on the same host, grant read-only access to its public
-credential metadata through the systemd unit's `SupplementaryGroups=codex-credential`. Do not grant
-access to its client-token registry or `/var/lib/codex-credential/secret` — unless you deliberately
-enable console-side seeding, which requires exactly that and is described in
+credential metadata **and to `clients/`** through the systemd unit's
+`SupplementaryGroups=codex-credential`. The shipped unit lists both under `ReadOnlyPaths=`.
+
+`clients/clients.json` is the dispenser's machine registry, and it is the only record that a Codex
+machine exists — those machines enrol against the dispenser and never contact the console. Without
+read access the dashboard's machine inventory permanently shows
+`Codex machines could not be read…` and lists no Codex machine at all. The dispenser still owns
+every write to that file; the console reads it and drops `token_sha256` at the read boundary, so no
+bearer digest reaches a rendered page. A `clients/` directory that does not exist yet is not an
+error — it means no machine has enrolled — and produces no warning.
+
+Do not grant access to `/var/lib/codex-credential/secret` unless you deliberately enable
+console-side seeding, which requires exactly that and is described in
 [Codex account authorization](#codex-account-authorization).
 
 Initialize the encryption key before any other console command on a genuine first deployment:
@@ -178,8 +188,9 @@ produce a refusal.
    [Service]
    # Both lists are additive; the empty assignment resets the shipped value first.
    InaccessiblePaths=
-   InaccessiblePaths=/var/lib/codex-credential/clients
    ReadOnlyPaths=
+   # Keep clients/ readable, or the dashboard loses every Codex machine.
+   ReadOnlyPaths=/var/lib/codex-credential/clients
    ReadWritePaths=/var/lib/codex-credential/secret /var/lib/codex-credential/public
    ```
 

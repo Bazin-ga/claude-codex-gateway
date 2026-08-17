@@ -38,6 +38,10 @@ V1 implements:
 - one-time, 30-minute device enrollment links;
 - tailnet-member self-service issuance for Claude Code devices, with no console sign-in step;
 - distinct, revocable device tokens;
+- an optional opaque machine handle on a device record, and a dashboard that reads the device
+  list as a machine inventory: one row per machine, its Claude and Codex credentials nested
+  underneath, revoked ones collapsed, and rows without a handle flagged and one click from
+  being filed under a machine — see [Machine inventory](#machine-inventory);
 - a public-capable streaming Claude gateway limited to `/v1/messages`,
   `/v1/messages/count_tokens`, and `/v1/models`, with failed-authentication, per-device rate,
   and per-device concurrency limits;
@@ -235,6 +239,72 @@ contains only the newly minted device token, dispenser endpoint, and TLS certifi
 agent still requires the member machine to reach `chatgpt.com/backend-api/`; credentials do not
 replace network egress.
 
+## Machine inventory
+
+A device row records one credential *issuance*, not a machine. It is identified by a
+self-asserted member label plus a name somebody typed; revoking it only marks the row; and
+`account_id` is fixed at issuance, so moving a machine to another account appends a second
+row. The flat list therefore only ever grew, and could not answer "what machines are there".
+
+The dashboard groups it by the opaque handle a machine's own agent reports
+([`../codex-credential/client-agent/lib/machine-id.js`](../codex-credential/client-agent/lib/machine-id.js)).
+Each machine is one row with every credential it holds underneath, from both paths:
+
+- **Claude** credentials come from this console's own `state.json`.
+- **Codex** machines never contact this console — they enrol against the dispenser and pull
+  from it directly — so their rows are read out of that home's `clients/clients.json`,
+  read-only, the same way an imported account's expiry is. A home the console cannot read
+  costs its own machines from the list and nothing else; the page says so and still renders
+  everything it knows. A home with no `clients/` yet is not a failure — it means nothing has
+  enrolled — and produces no warning. The shipped systemd unit must keep `clients/` under
+  `ReadOnlyPaths=`; see [DEPLOY.md](DEPLOY.md).
+
+Codex credentials this console mints on a member's behalf ("Set up a Codex machine") carry a
+handle the **console** generated for that issuance, not one the machine reported: the
+generated installer runs `pull.js`, never `enroll.js`, so such a machine never reaches
+`/enroll` and has nothing of its own to report. Without one, the dispenser fell back to its
+pre-handle rule and revoked every credential sharing that row's name — and since the name is
+`<device>-<sha256(member label)[0:10]>` over a self-asserted label, two people who both typed
+`alex` and `shared` silently evicted each other. The cost of fixing it is stated where it
+falls: a member who re-requests a config for the same device gets a new handle, so their
+previous console-minted credential stays active rather than being revoked. Retire it with
+`add-client.js --revoke` on the dispenser host. Rows minted before this carry no handle at all
+and stay unattributed permanently; the note on the row says so.
+
+Two things it deliberately does not do:
+
+- **It never merges rows on a matching name or member label.** Both are typed by a person and
+  neither is verified, so folding them together would put two people's laptops in one row and
+  call it inventory. A row with no handle is its own entry, labelled as unattributed.
+- **It does not describe a handle as identifying a person.** This deployment authenticates
+  nobody and the member label beside it is self-asserted, which makes the handle the only
+  identifier here that a user cannot trivially forge — and it still says nothing about who is
+  using the machine. It is random bytes generated once, by the agent on that machine or by the
+  console for that one issuance: not a hostname, a username, a MAC address, or a serial
+  number.
+
+Revoked credentials are the majority of rows over time, so they are collapsed rather than
+dropped: each machine folds its own revoked credentials away, and a machine holding nothing
+live folds into "machines with no active credential". Everything remains one click away.
+
+Account status and credential status are two columns, in two vocabularies. A healthy account
+holding a revoked credential is the normal end state of a retired laptop, and previously read
+as a fault.
+
+### Merging a legacy row
+
+The Claude path has no client agent — the member's browser cannot report a handle — so every
+Claude credential starts unattributed. An operator who knows that a given credential and a
+given machine are the same box can file it there with one control, restricted to machines the
+page is already showing.
+
+`POST /devices/:id/machine` is CSRF-protected like revoke and delete, and is the narrowest
+write in the store: it adds `machine_id` to one device row. No account is read or touched, no
+credential is re-encrypted, and no other row moves. A row that already carries the requested
+handle is already where it is being asked to go, so a repeated submission writes nothing and
+records nothing; a row carrying a *different* handle is refused outright rather than
+reassigned. There is no un-merge — revoke the credential instead.
+
 ## Security boundaries
 
 - `master.key`, `state.json`, and the data directory are mode 600/700.
@@ -361,9 +431,11 @@ node cli.js import-codex \
 sudo systemctl start credential-console
 ```
 
-The import stores only the external home path. At dashboard render time the service reads
-`public/current.json`. It has no production access to the client-token registry, and none to
-`secret/` unless `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` names that home — see
+The import stores only the external home path. At dashboard render time the service reads two
+files out of that home, both read-only: `public/current.json` for the credential's expiry, and
+`clients/clients.json` for the machine inventory — `token_sha256` is dropped at the read
+boundary, so no bearer digest reaches a rendered page. It never writes either, and has no
+access to `secret/` unless `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` names that home — see
 [Codex account authorization](#codex-account-authorization).
 
 List public account metadata:
@@ -402,6 +474,14 @@ The suite proves that:
 - a Tailscale identity can self-issue a device credential without an enrollment link;
 - a Tailscale identity can self-enroll a Codex device once and choose any platform installer;
 - device tokens are independently revocable;
+- a `state.json` written before machine handles existed still opens, still decrypts its stored
+  credential under the same key and authenticated data, and is not rewritten by opening it;
+- the dashboard groups credentials into machines and reads Codex machines out of a dispenser
+  home, rows without a handle stay separate and labelled, and a home it cannot read degrades
+  the list instead of failing the page;
+- merging a legacy row adds one field and is idempotent, CSRF-protected, refused for an
+  unknown machine, and refused outright for a row already attributed elsewhere;
+- a revoked credential does not change how its account renders;
 - CSRF bypasses are rejected;
 - unsupported gateway paths are rejected;
 - repeated public gateway authentication failures are rate-limited;

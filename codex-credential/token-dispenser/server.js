@@ -48,6 +48,36 @@ const MAX_ENROLL_BODY = 4096;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /**
+ * The optional machine fingerprint an agent reports at enrollment: an opaque
+ * random handle the client generated once and kept (client-agent/lib/machine-id.js).
+ *
+ * Validated like the name — bounded, character-restricted, rejected outright if
+ * malformed — because it arrives on the same public endpoint and ends up stored
+ * verbatim. It identifies a machine and nothing else: it is not derived from
+ * anything about the host or the person using it, and it proves nothing about
+ * who is calling.
+ */
+const MACHINE_ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
+
+/**
+ * The digest of the token the caller currently holds, offered as proof that the
+ * row it is replacing is its own.
+ *
+ * A handle answers "same machine?" only while the machine still has it. A
+ * container rebuild, a restored backup, a new OS user or an unwritable
+ * `~/.config` all produce a fresh handle on a machine that is emphatically not
+ * new — and without this, the row it already owns would stay active forever with
+ * nobody able to retire it. The digest is proof rather than inference: only the
+ * holder of that token can produce it, so honouring it cannot reopen the
+ * name-collision hole the handle exists to close.
+ *
+ * A digest, never the token: the server already stores exactly this value, so
+ * sending it discloses nothing it does not have, and it cannot be replayed as a
+ * bearer.
+ */
+const TOKEN_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+
+/**
  * Enrollment mutates clients.json read-modify-write. Two concurrent enrollments
  * would otherwise race and one would silently lose its token — the machine would
  * hold a bearer the server has no record of, and fail with 401 days later.
@@ -172,9 +202,40 @@ function readBody(req) {
  *      and rotating the key (set-enrollment-key.js) does not disturb machines
  *      already enrolled.
  *
- * Re-enrolling an existing name is allowed and revokes that name's previous
- * token. Re-running the installer is therefore safe, and a token that leaked
- * from a machine dies the next time that machine enrolls.
+ * Re-enrolling is allowed and revokes the caller's previous token, so re-running
+ * the installer is safe and a token that leaked from a machine dies the next
+ * time that machine enrolls. Identifying "the caller's previous token" is the
+ * whole difficulty, and it is decided by exactly two rules:
+ *
+ *   1. PROOF. If the caller presents `previous_token_sha256` and an active row
+ *      carries that digest, that row is revoked, whatever its name or handle.
+ *      Only the holder of a token can produce its digest, so this is evidence
+ *      rather than a guess — and it is the only thing that retires a row whose
+ *      handle the machine has since lost.
+ *   2. CLAIM, among the active rows of the same name. A row is claimable when it
+ *      carries no handle, or carries the caller's. Which gives, symmetrically:
+ *
+ *        - two fingerprinted machines never touch each other. Two people who
+ *          independently named their machine `laptop` used to evict each other
+ *          on every install, silently, with the victim finding out days later as
+ *          a 401 mid-turn. Now they coexist, and the overlap is logged as
+ *          `enroll_name_shared`;
+ *        - a handle-less row is claimed by anyone enrolling under that name,
+ *          because that is precisely what the pre-handle rule did with it. This
+ *          is what retires the caller's OWN pre-upgrade row on the first run
+ *          after an upgrade, and it is why the rollout does not strand a live
+ *          token per machine in the fleet. Counted as `reclaimed_legacy`;
+ *        - a handle-less caller therefore claims handle-less rows and nothing
+ *          else. It no longer evicts fingerprinted machines wholesale, which
+ *          during the rollout would have made an un-upgraded agent strictly more
+ *          destructive than before.
+ *
+ * What is left unbounded, honestly: a machine that loses BOTH its handle and its
+ * token — a wiped `~/.config`, a container with no persistent home — can prove
+ * nothing and claim nothing, so its previous row stays active until it expires
+ * with the credential or an operator runs `add-client.js --revoke`. There is no
+ * signal here that distinguishes it from a second machine, and inventing one
+ * would disconnect machines nobody asked about.
  */
 export async function handleEnroll(req, res, { clientsPath, enrollmentPath, ip }) {
   let enrollment;
@@ -197,8 +258,14 @@ export async function handleEnroll(req, res, { clientsPath, enrollmentPath, ip }
   }
 
   let name;
+  let reportedMachineId;
+  let reportedPreviousDigest;
   try {
-    ({ name } = JSON.parse(await readBody(req)) ?? {});
+    ({
+      name,
+      machine_id: reportedMachineId,
+      previous_token_sha256: reportedPreviousDigest,
+    } = JSON.parse(await readBody(req)) ?? {});
   } catch (err) {
     return send(res, 400, { error: `unreadable body: ${err.message}` });
   }
@@ -207,6 +274,26 @@ export async function handleEnroll(req, res, { clientsPath, enrollmentPath, ip }
       error: 'name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}',
     });
   }
+  // Absent is a supported shape, not an error: agents installed before this
+  // existed keep enrolling. Present-but-malformed is an error, because storing
+  // an unvalidated identifier is how one becomes something else later.
+  const omitted = reportedMachineId === undefined || reportedMachineId === null;
+  if (!omitted && (typeof reportedMachineId !== 'string' || !MACHINE_ID_PATTERN.test(reportedMachineId))) {
+    return send(res, 400, {
+      error: 'machine_id must match [A-Za-z0-9_-]{16,64}',
+    });
+  }
+  const machineId = omitted ? null : reportedMachineId;
+  // Same shape rule as the handle: absent is normal, malformed is refused rather
+  // than compared against stored digests as whatever it happens to be.
+  const digestOmitted = reportedPreviousDigest === undefined || reportedPreviousDigest === null;
+  if (!digestOmitted
+    && (typeof reportedPreviousDigest !== 'string' || !TOKEN_DIGEST_PATTERN.test(reportedPreviousDigest))) {
+    return send(res, 400, {
+      error: 'previous_token_sha256 must be a sha256 hex digest',
+    });
+  }
+  const previousDigest = digestOmitted ? null : reportedPreviousDigest;
 
   const token = await serialized(async () => {
     let db;
@@ -219,18 +306,47 @@ export async function handleEnroll(req, res, { clientsPath, enrollmentPath, ip }
     db.clients ??= [];
 
     let replaced = 0;
+    let keptSameName = 0;
+    let reclaimedLegacy = 0;
+    let reclaimedByToken = 0;
+    const revoke = (client, reason) => {
+      client.revoked = true;
+      client.revoked_at = new Date().toISOString();
+      client.revoked_reason = reason;
+    };
     for (const client of db.clients) {
-      if (client.name === name && !client.revoked) {
-        client.revoked = true;
-        client.revoked_at = new Date().toISOString();
-        client.revoked_reason = 're-enrolled';
+      if (client.revoked) continue;
+      // Rule 1: proof. Matched before the name is even looked at — a machine that
+      // renamed itself is still the machine that holds this token.
+      if (previousDigest !== null && client.token_sha256 === previousDigest) {
+        revoke(client, 're-enrolled');
+        reclaimedByToken += 1;
         replaced += 1;
+        continue;
       }
+      if (client.name !== name) continue;
+      // Rule 2: claim. A stored handle that is not the caller's belongs to another
+      // machine and is left alone in both directions — a caller reporting no
+      // handle has no more right to it than one reporting a different handle.
+      const stored = typeof client.machine_id === 'string' ? client.machine_id : null;
+      if (stored !== null && stored !== machineId) {
+        keptSameName += 1;
+        continue;
+      }
+      // A handle-less row is exactly the row the pre-handle rule would have
+      // revoked for this same request, so revoking it keeps the old guarantee
+      // without weakening the new one.
+      if (stored === null && machineId !== null) reclaimedLegacy += 1;
+      revoke(client, 're-enrolled');
+      replaced += 1;
     }
 
     const minted = randomBytes(32).toString('base64url');
     db.clients.push({
       name,
+      // Absent means "enrolled by an agent that reports no fingerprint". Nothing
+      // rewrites existing rows to add it.
+      ...(machineId ? { machine_id: machineId } : {}),
       token_sha256: createHash('sha256').update(minted).digest('hex'),
       added_at: new Date().toISOString(),
       enrolled: true,
@@ -238,7 +354,24 @@ export async function handleEnroll(req, res, { clientsPath, enrollmentPath, ip }
 
     await mkdir(dirname(clientsPath), { recursive: true, mode: 0o700 });
     await writeFileAtomic(clientsPath, `${JSON.stringify(db, null, 2)}\n`);
-    log('enrolled', { name, ip, replaced_previous: replaced });
+    log('enrolled', {
+      name,
+      ip,
+      machine_id: machineId,
+      replaced_previous: replaced,
+      // Split apart because they mean different things to an operator reading
+      // the log: one row this machine proved, one row it inherited from before
+      // handles existed, and N rows belonging to somebody else left alone.
+      reclaimed_by_token: reclaimedByToken,
+      reclaimed_legacy: reclaimedLegacy,
+      kept_same_name: keptSameName,
+    });
+    if (keptSameName) {
+      // The case the fingerprint exists to make visible: more than one machine
+      // is answering to this name. Nothing is broken — say so plainly, since the
+      // previous behaviour was to disconnect one of them without a word.
+      log('enroll_name_shared', { name, ip, machine_id: machineId, other_active: keptSameName });
+    }
     return minted;
   });
 

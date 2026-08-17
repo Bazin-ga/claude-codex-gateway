@@ -46,6 +46,25 @@ tr:last-child td { border-bottom: 0; }
 .badge.unhealthy, .badge.expired { background: #f8e4e1; color: var(--red); }
 .badge.stored { background: #e5edf4; color: var(--blue); }
 .badge.login_required { background: #faecd7; color: var(--amber); }
+/* A revoked credential is an ordinary end of life, not a fault, so it is
+   deliberately not given the red of an unhealthy account. */
+.badge.credential-active { background: #dff2e8; color: var(--green); }
+.badge.credential-revoked { background: #e8eee9; color: var(--muted); }
+.badge.legacy { background: #faecd7; color: var(--amber); }
+.badge > span { margin-left: 4px; }
+.machine-list { display: grid; gap: 14px; }
+.machine { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: #fbfcf9; }
+.machine-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 12px; }
+.machine-title { font-size: 15px; font-weight: 750; word-break: break-all; }
+.machine-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.machine details, .machine-group { margin-top: 18px; }
+.machine summary, .machine-group > summary { cursor: pointer; color: var(--green); font-weight: 750; font-size: 13px; }
+.machine-group > summary { font-size: 14px; }
+.machine-group > h3 { margin: 0 0 4px; font-size: 15px; }
+.machine-group > p { margin: 0 0 12px; }
+.machine-group[open] > summary { margin-bottom: 12px; }
+.merge-form { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line); }
+.merge-form label { margin-bottom: 0; }
 form { margin: 0; }
 label { display: block; font-weight: 700; font-size: 13px; margin-bottom: 12px; }
 input, select, textarea { width: 100%; margin-top: 6px; border: 1px solid #c7d0c7; background: white; border-radius: 10px; padding: 10px 12px; color: var(--ink); font: inherit; }
@@ -113,7 +132,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .zone-heading { display: grid; }
   .identity-chip { white-space: normal; }
   .provider-grid, .member-form, .member-form.codex-form,
-  .member-form.with-label, .member-form.codex-form.with-label { grid-template-columns: 1fr; }
+  .member-form.with-label, .member-form.codex-form.with-label,
+  .merge-form { grid-template-columns: 1fr; }
 }
 `;
 
@@ -204,9 +224,222 @@ function accountUsageView(account, { showAccount = false } = {}) {
   </div>`;
 }
 
+/**
+ * A credential's own state, kept in a vocabulary of its own.
+ *
+ * Not `healthy`/`expired`: those are account words, and reusing them made a
+ * revoked credential on a working account read as an account in trouble. A
+ * revocation is a thing somebody did on purpose.
+ */
+function credentialBadge(state) {
+  return `<span class="badge credential-${state}" data-i18n="credential-${state}">${state === 'revoked' ? 'Revoked' : 'Active'}</span>`;
+}
+
+/**
+ * The account a credential belongs to, with the account's OWN status.
+ *
+ * The two facts live in two columns from here on. A healthy account holding a
+ * revoked credential is the normal end state of a retired laptop, and the list
+ * has to be able to say that without looking like an outage.
+ */
+function accountCell(account) {
+  if (!account) {
+    return '<td data-account-status="unknown"><span class="muted" data-i18n="unknown-account">Unknown account</span></td>';
+  }
+  return `<td data-account-status="${escapeHtml(account.status)}"><strong>${escapeHtml(account.alias)}</strong><div class="tiny">${statusBadge(account.status)}</div></td>`;
+}
+
+function claudeCredentialRow(device, account, csrf) {
+  const state = device.revoked_at ? 'revoked' : 'active';
+  return `<tr data-credential-state="${state}">
+    <td><strong>${escapeHtml(device.name)}</strong><div class="muted tiny">${escapeHtml(device.member_label || '—')}</div></td>
+    <td>Claude Code</td>
+    ${accountCell(account)}
+    <td>${credentialBadge(state)}</td>
+    <td>${escapeHtml(dateText(device.last_seen_at))}</td>
+    <td>${device.revoked_at
+      ? `<span class="muted tiny">${escapeHtml(dateText(device.revoked_at))}</span>`
+      : `<form method="post" action="/devices/${encodeURIComponent(device.id)}/revoke">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <button class="danger" type="submit" data-i18n="revoke">Revoke</button>
+      </form>`}</td>
+  </tr>`;
+}
+
+/**
+ * A Codex machine's row, read out of the dispenser's registry.
+ *
+ * Nothing here is actionable from this console: a Codex machine pulls its
+ * credential from the dispenser and never contacts this process, so the
+ * dispenser is where it is revoked and where its last contact is recorded. The
+ * console shows what it can see and does not pretend to more.
+ */
+function codexCredentialRow(client, account) {
+  const state = client.revoked ? 'revoked' : 'active';
+  return `<tr data-credential-state="${state}">
+    <td><strong>${escapeHtml(client.name || '—')}</strong><div class="muted tiny"><span data-i18n="enrolled-at">Enrolled</span> ${escapeHtml(dateText(client.added_at))}</div></td>
+    <td>Codex</td>
+    ${accountCell(account)}
+    <td>${credentialBadge(state)}</td>
+    <td><span class="muted tiny" data-i18n="not-reported-here">Not reported to this console</span></td>
+    <td>${client.revoked
+      ? `<span class="muted tiny">${escapeHtml(dateText(client.revoked_at))}</span>${client.revoked_reason
+        ? `<div class="muted tiny">${escapeHtml(client.revoked_reason)}</div>`
+        : ''}`
+      : '<span class="muted tiny" data-i18n="dispenser-managed">Managed by the dispenser</span>'}</td>
+  </tr>`;
+}
+
+/**
+ * The credential list read as a machine inventory: one row per machine, its
+ * credentials nested underneath.
+ *
+ * A device row is one credential issuance, not a machine, and the two Claude and
+ * Codex paths record issuances in two different places. What ties them together
+ * is the handle the machine reports, so that is the key, and the two sources are
+ * merged on it here — the store cannot do it, because the Codex side lives in
+ * another process's file.
+ *
+ * What is deliberately NOT done: rows without a handle are never folded together
+ * on a matching name or member label. Both are typed by a person, neither is
+ * verified, and guessing would put two people's laptops in one row and call it
+ * an inventory. Each such row is its own `legacy` entry instead — visibly
+ * unattributed, and for the console's own rows, one click from being filed
+ * properly.
+ */
+function machineInventory({ machines, codexClients }) {
+  const entries = new Map();
+  const entryFor = (key, machineId) => {
+    let entry = entries.get(key);
+    if (!entry) {
+      entry = {
+        key,
+        machine_id: machineId ?? null,
+        legacy: !machineId,
+        devices: [],
+        codex: [],
+        active: 0,
+        revoked: 0,
+        names: [],
+        member_labels: [],
+      };
+      entries.set(key, entry);
+    }
+    return entry;
+  };
+  const remember = (entry, field, value) => {
+    if (value && !entry[field].includes(value)) entry[field].push(value);
+  };
+
+  for (const machine of machines) {
+    const key = machine.machine_id
+      ? `machine:${machine.machine_id}`
+      : `issuance:${machine.devices[0]?.id ?? entries.size}`;
+    const entry = entryFor(key, machine.machine_id);
+    entry.devices.push(...machine.devices);
+    entry.active += machine.active_devices;
+    entry.revoked += machine.revoked_devices;
+    for (const device of machine.devices) {
+      remember(entry, 'names', device.name);
+      remember(entry, 'member_labels', device.member_label);
+    }
+  }
+
+  codexClients.forEach((client, index) => {
+    const key = client.machine_id
+      ? `machine:${client.machine_id}`
+      : `codex:${client.account_id}:${index}`;
+    const entry = entryFor(key, client.machine_id);
+    entry.codex.push(client);
+    if (client.revoked) entry.revoked += 1;
+    else entry.active += 1;
+    remember(entry, 'names', client.name);
+  });
+
+  return [...entries.values()].map((entry) => ({
+    ...entry,
+    // Only the console's own rows can be filed under a machine: `clients.json`
+    // belongs to the dispenser and this process reads it, never writes it.
+    mergeable: entry.legacy && entry.devices.length === 1 && entry.codex.length === 0,
+  }));
+}
+
+function machineEntryView(entry, { accounts, csrf, machineOptions }) {
+  const accountFor = (id) => accounts.find((account) => account.id === id) ?? null;
+  const rows = [
+    ...entry.devices.map((device) => ({
+      revoked: Boolean(device.revoked_at),
+      html: claudeCredentialRow(device, accountFor(device.account_id), csrf),
+    })),
+    ...entry.codex.map((client) => ({
+      revoked: client.revoked,
+      html: codexCredentialRow(client, accountFor(client.account_id)),
+    })),
+  ];
+  const activeRows = rows.filter((row) => !row.revoked).map((row) => row.html).join('');
+  const revokedRows = rows.filter((row) => row.revoked).map((row) => row.html).join('');
+  const revokedCount = rows.filter((row) => row.revoked).length;
+  const head = `<thead><tr>
+    <th data-i18n="credential">Credential</th>
+    <th data-i18n="credential-type">Type</th>
+    <th data-i18n="account">Account</th>
+    <th data-i18n="credential-status">Credential status</th>
+    <th data-i18n="last-seen">Last seen</th>
+    <th data-i18n="action">Action</th>
+  </tr></thead>`;
+  const mergeControl = entry.mergeable
+    ? (machineOptions
+      ? `<form method="post" action="/devices/${encodeURIComponent(entry.devices[0].id)}/machine" class="merge-form">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <label><span data-i18n="merge-into-machine">File this credential under a machine</span>
+            <select name="machine_id" required>${machineOptions}</select>
+          </label>
+          <div><button type="submit" class="secondary" data-i18n="merge-credential">Merge</button></div>
+        </form>`
+      : '<p class="muted tiny" data-i18n="no-merge-targets">No machine has reported a handle yet, so there is nothing to file this under.</p>')
+    : '';
+  // Two different histories produce a handle-less Codex row and the registry does
+  // not record which one this is, so the note names both rather than asserting
+  // the flattering one. Saying "it reports a handle at its next enrollment" was
+  // false for every row the console minted itself: the generated installer ships
+  // pull.js, never enroll.js, so such a machine never reaches /enroll at all and
+  // would have waited forever for a resolution that cannot arrive.
+  const codexLegacyNote = entry.legacy && !entry.mergeable
+    ? '<p class="muted tiny" data-i18n="codex-legacy-note">This Codex credential carries no machine handle: it was either enrolled before handles existed, in which case the agent on that machine reports one at its next enrollment, or minted by this console on a machine\'s behalf, in which case it never will — the generated installer runs pull.js, not enroll.js. The console reads the dispenser\'s registry and cannot write a handle into it either way.</p>'
+    : '';
+
+  return `<article class="machine" data-machine-key="${escapeHtml(entry.key)}" data-machine-legacy="${entry.legacy}">
+    <div class="machine-head">
+      <div>
+        <div class="machine-title">${entry.machine_id
+          ? `<code>${escapeHtml(entry.machine_id)}</code>`
+          : '<span data-i18n="unattributed-credential">Unattributed credential</span>'}</div>
+        <div class="muted tiny">${escapeHtml(entry.names.join(', ') || '—')}</div>
+        ${entry.member_labels.length ? `<div class="muted tiny">${escapeHtml(entry.member_labels.join(', '))}</div>` : ''}
+      </div>
+      <div class="machine-tags">
+        ${entry.legacy ? '<span class="badge legacy" data-i18n="legacy-no-handle">No machine handle</span>' : ''}
+        <span class="badge credential-active">${entry.active} <span data-i18n="count-active">active</span></span>
+        ${entry.revoked ? `<span class="badge credential-revoked">${entry.revoked} <span data-i18n="count-revoked">revoked</span></span>` : ''}
+      </div>
+    </div>
+    <div class="table-wrap"><table>${head}<tbody>${activeRows
+      || '<tr><td colspan="6" class="empty" data-i18n="no-active-credentials">No active credential.</td></tr>'}</tbody></table></div>
+    ${revokedCount ? `<details data-revoked-credentials="${revokedCount}">
+      <summary><span data-i18n="revoked-credentials">Revoked credentials</span> (${revokedCount})</summary>
+      <div class="table-wrap"><table>${head}<tbody>${revokedRows}</tbody></table></div>
+    </details>` : ''}
+    ${mergeControl}
+    ${codexLegacyNote}
+  </article>`;
+}
+
 export function dashboardView({
   accounts,
   devices,
+  machines = [],
+  codexClients = [],
+  codexUnavailable = [],
   csrf,
   adminIdentity = null,
   openMode = false,
@@ -264,19 +497,22 @@ export function dashboardView({
                 <input name="member_label" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="alex" maxlength="64">
               </label>` : '';
   const memberFormClass = openMode ? ' with-label' : '';
-  const deviceRows = devices.map((device) => {
-    const account = accounts.find((entry) => entry.id === device.account_id);
-    return `<tr>
-      <td><strong>${escapeHtml(device.name)}</strong><div class="muted tiny">${escapeHtml(device.member_label)}</div></td>
-      <td>${escapeHtml(account?.alias ?? 'unknown')}</td>
-      <td>${device.revoked_at ? statusBadge('expired') : statusBadge('healthy')}</td>
-      <td>${escapeHtml(dateText(device.last_seen_at))}</td>
-      <td>${device.revoked_at ? escapeHtml(dateText(device.revoked_at)) : `<form method="post" action="/devices/${encodeURIComponent(device.id)}/revoke">
-        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-        <button class="danger" type="submit" data-i18n="revoke">Revoke</button>
-      </form>`}</td>
-    </tr>`;
-  }).join('');
+  const inventory = machineInventory({ machines, codexClients });
+  // A machine can only be merged INTO one that already reported a handle, so the
+  // options are exactly the non-legacy entries. Rendered once and shared by every
+  // merge form on the page.
+  const machineOptions = inventory.filter((entry) => entry.machine_id).map((entry) => (
+    `<option value="${escapeHtml(entry.machine_id)}">${escapeHtml(entry.names.join(', ') || entry.machine_id)} · ${escapeHtml(entry.machine_id)}</option>`
+  )).join('');
+  const entryView = (entry) => machineEntryView(entry, { accounts, csrf, machineOptions });
+  const liveMachines = inventory.filter((entry) => entry.active > 0 && !entry.legacy);
+  // Kept in a group of their own rather than mixed in among machines: an issuance
+  // nobody can attribute is not an inventory entry, and listing it as one would be
+  // the quiet guess this whole view exists to avoid.
+  const unattributed = inventory.filter((entry) => entry.active > 0 && entry.legacy);
+  // Everything a machine ever held is kept, but one holding nothing live is history
+  // rather than inventory, so it starts folded away.
+  const retiredMachines = inventory.filter((entry) => entry.active === 0);
 
   return layout('Dashboard', `
     <div class="stack">
@@ -340,7 +576,7 @@ export function dashboardView({
         <section class="grid">
           <article class="card summary"><span class="muted" data-i18n="accounts">Accounts</span><strong>${accounts.length}</strong></article>
           <article class="card summary"><span class="muted" data-i18n="healthy">Healthy</span><strong>${healthy}</strong></article>
-          <article class="card summary"><span class="muted" data-i18n="active-devices">Active devices</span><strong>${activeDevices.length}</strong></article>
+          <article class="card summary"><span class="muted" data-i18n="active-claude-credentials">Active Claude credentials</span><strong>${activeDevices.length}</strong></article>
           <article class="card">
             <div class="topbar"><div><h2 data-i18n="accounts">Accounts</h2><div class="muted tiny" data-i18n="upstream-secret-note">Provider tokens are encrypted and never displayed after submission. Exceptional one-time enrollment remains available per account.</div></div></div>
             <div class="table-wrap">
@@ -391,13 +627,22 @@ export function dashboardView({
             <div class="notice success" data-i18n="same-self-service">Administrators and members see the same self-service area. No manual credential delivery is required.</div>
           </article>
           <article class="card">
-            <h2 data-i18n="devices">Devices</h2>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th data-i18n="device-name">Device</th><th data-i18n="account">Account</th><th data-i18n="status">Status</th><th data-i18n="last-seen">Last seen</th><th data-i18n="action">Action</th></tr></thead>
-                <tbody>${deviceRows || '<tr><td colspan="5" class="empty" data-i18n="no-devices">No devices enrolled yet.</td></tr>'}</tbody>
-              </table>
-            </div>
+            <div class="topbar"><div>
+              <h2><span data-i18n="machines">Machines</span> (${liveMachines.length})</h2>
+              <div class="muted tiny" data-i18n="machines-intro">One row per machine, with every credential it holds underneath. A machine is identified by an opaque random handle — reported by its own agent, or minted here for one issuance when the machine has no agent to report one. It says nothing about who is using it, and the member label beside it is self-asserted and unverified.</div>
+            </div></div>
+            ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
+            <div class="machine-list">${liveMachines.map(entryView).join('')
+              || '<p class="empty" data-i18n="no-machines">No machine holds a credential yet.</p>'}</div>
+            ${unattributed.length ? `<section class="machine-group" data-unattributed-credentials="${unattributed.length}">
+              <h3><span data-i18n="unattributed-credentials">Credentials not attributed to a machine</span> (${unattributed.length})</h3>
+              <p class="muted tiny" data-i18n="unattributed-intro">Issued before machine handles existed, or through a path that reports none — a browser is not an agent and has none to give. Nothing is inferred from a matching name or member label; file one under a machine to have it counted there.</p>
+              <div class="machine-list">${unattributed.map(entryView).join('')}</div>
+            </section>` : ''}
+            ${retiredMachines.length ? `<details class="machine-group" data-retired-machines="${retiredMachines.length}">
+              <summary><span data-i18n="retired-machines">Machines with no active credential</span> (${retiredMachines.length})</summary>
+              <div class="machine-list">${retiredMachines.map(entryView).join('')}</div>
+            </details>` : ''}
           </article>
         </section>
       </section>

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -356,6 +356,60 @@ test('open mode self-serves a Codex installer keyed to the self-asserted member 
     assert.equal(enrollmentRequests.length, 1);
     const suffix = createHash('sha256').update('dana').digest('hex').slice(0, 10);
     assert.equal(enrollmentRequests[0].name, `open-laptop-${suffix}`);
+  } finally {
+    await app.close();
+  }
+});
+
+test('two members who assert the same label and device name do not evict each other', async () => {
+  // The console's Codex path is the one place a member takes a credential without
+  // ever running the agent, so nothing on their machine can report a handle. It
+  // therefore used to send none, and the dispenser fell back to its pre-handle
+  // rule: revoke every active row of that name. The name is
+  // `<device>-<sha256(member label)[0:10]>` over a label that is self-asserted and
+  // unverified, so two people who both typed `alex` and `shared` silently kicked
+  // each other offline — exactly the defect the handle exists to fix.
+  const enrollmentRequests = [];
+  const app = await fixture({
+    adminAuth: 'open',
+    codex: {
+      codexEndpoint: 'https://203.0.113.10:8443',
+      codexCertPin: 'a'.repeat(64),
+      codexEnrollmentKey: 'test-enrollment-key-long-enough',
+      codexEnroll: async (request) => {
+        enrollmentRequests.push(request);
+        return { name: request.name, token: `codex-token-${enrollmentRequests.length}` };
+      },
+    },
+  });
+  try {
+    const page = await fetch(`${app.baseUrl}/`);
+    const cookie = cookieFrom(page);
+    const csrf = csrfFrom(await page.text());
+    const claim = () => fetch(`${app.baseUrl}/codex/self-service`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf, device_name: 'shared', member_label: 'alex' }),
+    });
+
+    assert.equal((await claim()).status, 200);
+    assert.equal((await claim()).status, 200);
+
+    // Same dispenser name, as before — the collision in the name is a property of
+    // an unverified label and is not what this fixes.
+    assert.equal(enrollmentRequests[0].name, enrollmentRequests[1].name);
+    // Different handles, which is what stops the dispenser revoking the first
+    // person's row when the second person asks.
+    for (const request of enrollmentRequests) {
+      assert.match(request.machineId, /^[A-Za-z0-9_-]{16,64}$/);
+    }
+    assert.notEqual(enrollmentRequests[0].machineId, enrollmentRequests[1].machineId);
+    // Nothing that authenticates is used as the handle, and no secret rides along.
+    for (const request of enrollmentRequests) {
+      assert.equal(request.machineId.includes('alex'), false);
+      assert.equal(request.machineId.includes('shared'), false);
+      assert.equal(request.machineId, request.machineId.trim());
+    }
   } finally {
     await app.close();
   }
@@ -1758,6 +1812,421 @@ test('installer embeds every asset install.sh execs', async () => {
     [],
     `server.js loads these but the generated installer never writes them: ${notEmitted.join(', ')}`,
   );
+});
+
+// A Codex machine never contacts this console: it enrols against the dispenser and
+// pulls from it. The dispenser's registry is therefore the only place its existence
+// is written down, and this is the shape the console has to read it in.
+async function codexClientsHome(clients) {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-dispenser-'));
+  await mkdir(join(home, 'clients'), { recursive: true });
+  await writeFile(
+    join(home, 'clients', 'clients.json'),
+    `${JSON.stringify({ clients }, null, 2)}\n`,
+  );
+  return home;
+}
+
+function machineArticle(html, key) {
+  const anchor = html.indexOf(`data-machine-key="${key}"`);
+  assert.notEqual(anchor, -1, `machine ${key} should be rendered`);
+  return html.slice(html.lastIndexOf('<article', anchor), html.indexOf('</article>', anchor));
+}
+
+function credentialRows(fragment, state) {
+  const pattern = new RegExp(`<tr data-credential-state="${state}">([\\s\\S]*?)</tr>`, 'g');
+  return [...fragment.matchAll(pattern)].map((match) => match[1]);
+}
+
+const MACHINE_HANDLE = 'kZ3nQx7Rw9TmVb2LpYs4Jc6H';
+
+test('the device list renders as a machine inventory, Codex machines included', async () => {
+  const digests = {
+    codexActive: 'a1'.repeat(32),
+    codexRevoked: 'b2'.repeat(32),
+    codexLegacy: 'c3'.repeat(32),
+  };
+  const codexHome = await codexClientsHome([
+    {
+      name: 'work-laptop',
+      machine_id: MACHINE_HANDLE,
+      token_sha256: digests.codexActive,
+      added_at: '2026-03-01T00:00:00.000Z',
+      enrolled: true,
+    },
+    {
+      name: 'work-laptop',
+      machine_id: MACHINE_HANDLE,
+      token_sha256: digests.codexRevoked,
+      added_at: '2026-01-01T00:00:00.000Z',
+      revoked: true,
+      revoked_at: '2026-03-01T00:00:00.000Z',
+      revoked_reason: 're-enrolled',
+    },
+    // Enrolled before handles existed. The console reads the dispenser's registry
+    // and never writes it, so this one cannot be merged from here.
+    { name: 'ancient-box', token_sha256: digests.codexLegacy, added_at: '2025-12-01T00:00:00.000Z' },
+    // Written by another process across a trust boundary, so a value that is not a
+    // handle must not be read as one. Coerced into a grouping key, `42` and `{}`
+    // would collapse unrelated machines into one fabricated row (`machine:42`,
+    // `machine:[object Object]`) and offer it as a merge target the store then
+    // refuses — a machine on the page that exists nowhere else.
+    { name: 'malformed-number', machine_id: 42, token_sha256: 'd4'.repeat(32) },
+    { name: 'malformed-object', machine_id: {}, token_sha256: 'd5'.repeat(32) },
+    { name: 'malformed-short', machine_id: 'short', token_sha256: 'd6'.repeat(32) },
+    { name: 'malformed-empty', machine_id: '', token_sha256: 'd7'.repeat(32) },
+    { name: 'malformed-charset', machine_id: 'has spaces in it and is long', token_sha256: 'd8'.repeat(32) },
+  ]);
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const masterToken = 'sk-ant-oat01-master-token-that-must-never-render';
+    const claude = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'claude-max-1',
+      emailLabel: 'owner@example.com',
+      credential: { oauth_token: masterToken },
+    });
+    const codexAccount = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-shared-1',
+      external: { kind: 'codex-credential', home: codexHome },
+    });
+    const live = await app.store.issueDeviceCredential({
+      accountId: claude.id,
+      memberLabel: 'alex',
+      deviceName: 'work-laptop',
+      machineId: MACHINE_HANDLE,
+    });
+    const retired = await app.store.issueDeviceCredential({
+      accountId: claude.id,
+      memberLabel: 'alex',
+      deviceName: 'work-laptop-old',
+      machineId: MACHINE_HANDLE,
+    });
+    await app.store.revokeDevice(retired.device.id);
+    const unattributed = await app.store.issueDeviceCredential({
+      accountId: claude.id,
+      memberLabel: 'sam',
+      deviceName: 'old-desktop',
+    });
+
+    const html = await (await fetch(`${app.baseUrl}/`)).text();
+
+    // One machine, four credentials: the Claude issuance and the Codex enrollment
+    // are the same box, and only the reported handle can say so.
+    const machine = machineArticle(html, `machine:${MACHINE_HANDLE}`);
+    assert.match(machine, /data-machine-legacy="false"/);
+    assert.equal(credentialRows(machine, 'active').length, 2);
+    assert.equal(credentialRows(machine, 'revoked').length, 2);
+    assert.match(credentialRows(machine, 'active')[0], /work-laptop/);
+    assert.match(credentialRows(machine, 'active')[1], /Codex/);
+
+    // Revoked credentials are the majority of rows over time. They stay in the
+    // page — and out of the way.
+    const collapsed = machine.indexOf('<details data-revoked-credentials="2"');
+    assert.notEqual(collapsed, -1);
+    assert.equal(machine.includes('<details data-revoked-credentials="2" open'), false);
+    assert.equal(
+      machine.slice(0, collapsed).includes('data-credential-state="revoked"'),
+      false,
+      'a revoked credential belongs inside the collapsed section, not above it',
+    );
+    assert.match(machine.slice(collapsed), /<strong>work-laptop-old<\/strong>/);
+
+    // Two rows nothing can attribute to a machine: one this console issued, one
+    // the dispenser did. Neither is quietly folded into the machine above on the
+    // strength of a matching name, and they are kept in a group of their own
+    // rather than listed as if they were machines.
+    // Seven, not two: the five malformed handles are each their own unattributed
+    // row rather than a `machine:42` / `machine:[object Object]` group.
+    const legacyGroup = html.indexOf('data-unattributed-credentials="7"');
+    assert.notEqual(legacyGroup, -1);
+    assert.ok(html.indexOf(`data-machine-key="machine:${MACHINE_HANDLE}"`) < legacyGroup);
+    assert.ok(html.indexOf(`data-machine-key="issuance:${unattributed.device.id}"`) > legacyGroup);
+    const legacy = machineArticle(html, `issuance:${unattributed.device.id}`);
+    assert.match(legacy, /data-machine-legacy="true"/);
+    assert.match(legacy, /data-i18n="legacy-no-handle"/);
+    assert.match(legacy, new RegExp(`action="/devices/${unattributed.device.id}/machine"`));
+    assert.match(legacy, new RegExp(`<option value="${MACHINE_HANDLE}"`));
+
+    // Keyed by its position in the dispenser's registry, because there is nothing
+    // else about it that is known to be unique.
+    const codexLegacy = machineArticle(html, `codex:${codexAccount.id}:2`);
+    assert.match(codexLegacy, /ancient-box/);
+    assert.match(codexLegacy, /data-i18n="legacy-no-handle"/);
+    assert.match(codexLegacy, /data-i18n="codex-legacy-note"/);
+    assert.equal(codexLegacy.includes('/machine"'), false, 'the console cannot write the dispenser registry');
+
+    // A value that is not a handle is read as no handle, never coerced into one.
+    // Each malformed row keeps its own key, so nothing is grouped by `42`, and no
+    // fabricated machine is offered as a merge target.
+    for (const [index, name] of [
+      [3, 'malformed-number'], [4, 'malformed-object'], [5, 'malformed-short'],
+      [6, 'malformed-empty'], [7, 'malformed-charset'],
+    ]) {
+      const row = machineArticle(html, `codex:${codexAccount.id}:${index}`);
+      assert.match(row, new RegExp(name), `${name} should keep a key of its own`);
+      assert.match(row, /data-machine-legacy="true"/);
+      assert.match(row, /data-i18n="legacy-no-handle"/);
+    }
+    assert.equal(html.includes('machine:42'), false);
+    assert.equal(html.includes('[object Object]'), false);
+    assert.equal(html.includes('machine:short'), false);
+    // And the only handle the merge control offers is the one real one.
+    assert.equal((legacy.match(/<option value="/g) ?? []).length, 1);
+
+    // Nothing that authenticates anything reaches the page: not the provider
+    // credential, not a device token, not even the digest of a dispenser bearer.
+    for (const secret of [masterToken, live.token, retired.token, ...Object.values(digests)]) {
+      assert.equal(html.includes(secret), false, 'the dashboard must render no credential material');
+    }
+  } finally {
+    await app.close();
+  }
+});
+
+test('a legacy row merges into a machine once, however many times it is submitted', async () => {
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'claude-max-1',
+      credential: { oauth_token: 'sk-ant-oat01-must-survive-a-merge' },
+    });
+    await app.store.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'alex',
+      deviceName: 'work-laptop',
+      machineId: MACHINE_HANDLE,
+    });
+    const legacy = await app.store.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'alex',
+      deviceName: 'work-desktop',
+    });
+    const before = { ...app.store.publicDevices().find((row) => row.id === legacy.device.id) };
+
+    const page = await fetch(`${app.baseUrl}/`);
+    const cookie = cookieFrom(page);
+    const csrf = csrfFrom(await page.text());
+    const merge = (body) => fetch(`${app.baseUrl}/devices/${legacy.device.id}/machine`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(body),
+    });
+
+    // Guarded exactly like revoke and delete.
+    const noCsrf = await merge({ machine_id: MACHINE_HANDLE });
+    assert.equal(noCsrf.status, 403);
+    assert.equal(app.store.publicDevices().find((row) => row.id === legacy.device.id).machine_id, undefined);
+
+    // A handle nobody has reported would file the credential under a machine that
+    // does not exist, which is worse than refusing.
+    const unknown = await merge({ csrf, machine_id: 'unreported-machine-handle-zz' });
+    assert.equal(unknown.status, 303);
+    assert.match(unknown.headers.get('location'), /error=.*no%20such%20machine/);
+    assert.equal(app.store.publicDevices().find((row) => row.id === legacy.device.id).machine_id, undefined);
+
+    for (const attempt of [1, 2]) {
+      const response = await merge({ csrf, machine_id: MACHINE_HANDLE });
+      assert.equal(response.status, 303, `merge attempt ${attempt}`);
+      assert.equal(response.headers.get('location'), '/');
+    }
+
+    // Additive: the handle appears, nothing else about the row moved, and the
+    // account's credential is neither touched nor re-encrypted.
+    const after = app.store.publicDevices().find((row) => row.id === legacy.device.id);
+    assert.deepEqual(after, { ...before, machine_id: MACHINE_HANDLE });
+    assert.deepEqual(app.store.accountCredential(account.id), {
+      oauth_token: 'sk-ant-oat01-must-survive-a-merge',
+    });
+    assert.equal(
+      app.store.state.audit.filter((event) => event.event === 'device_machine_merged').length,
+      1,
+      'a repeated merge must not be recorded as a second change',
+    );
+
+    // Both credentials now read as one machine, and it is no longer offered a merge.
+    const html = await (await fetch(`${app.baseUrl}/`, { headers: { Cookie: cookie } })).text();
+    const machine = machineArticle(html, `machine:${MACHINE_HANDLE}`);
+    assert.equal(credentialRows(machine, 'active').length, 2);
+    assert.equal(html.includes(`/devices/${legacy.device.id}/machine`), false);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a legacy row files under a machine only the dispenser knows about', async () => {
+  // The headline use case. A Claude credential is issued from a browser, which has
+  // no handle to report, while the same box enrolled with the Codex agent and does
+  // — in the dispenser's registry, which this console reads and never writes. If
+  // the allowlist were built from Claude devices alone the documented workflow
+  // would fail closed with "no such machine is currently listed" and there would
+  // be nothing else to merge into.
+  const codexOnlyHandle = 'dispenser-only-handle-77777777';
+  const codexHome = await codexClientsHome([
+    { name: 'codex-box', machine_id: codexOnlyHandle, token_sha256: 'e1'.repeat(32), added_at: '2026-02-01T00:00:00.000Z' },
+  ]);
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'claude-max-1',
+      credential: { oauth_token: 'sk-ant-oat01-must-survive-a-merge' },
+    });
+    await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-shared-1',
+      external: { kind: 'codex-credential', home: codexHome },
+    });
+    const legacy = await app.store.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'alex',
+      deviceName: 'work-laptop',
+    });
+    // No Claude device carries this handle, so it can only have come from
+    // clients.json.
+    assert.deepEqual(app.store.publicDevices().map((row) => row.machine_id), [undefined]);
+
+    const page = await fetch(`${app.baseUrl}/`);
+    const cookie = cookieFrom(page);
+    const rendered = await page.text();
+    const csrf = csrfFrom(rendered);
+    assert.match(
+      machineArticle(rendered, `issuance:${legacy.device.id}`),
+      new RegExp(`<option value="${codexOnlyHandle}"`),
+    );
+
+    const merged = await fetch(`${app.baseUrl}/devices/${legacy.device.id}/machine`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf, machine_id: codexOnlyHandle }),
+    });
+    assert.equal(merged.status, 303);
+    assert.equal(merged.headers.get('location'), '/');
+    assert.equal(
+      app.store.publicDevices().find((row) => row.id === legacy.device.id).machine_id,
+      codexOnlyHandle,
+    );
+
+    // And the two credentials now read as one machine.
+    const html = await (await fetch(`${app.baseUrl}/`, { headers: { Cookie: cookie } })).text();
+    assert.equal(credentialRows(machineArticle(html, `machine:${codexOnlyHandle}`), 'active').length, 2);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a revoked credential does not make its account read as a problem', async () => {
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'claude-max-1',
+      credential: { oauth_token: 'sk-ant-oat01-healthy' },
+    });
+    await app.store.updateAccountHealth(account.id, { success: true });
+    const device = await app.store.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'alex',
+      deviceName: 'lost-laptop',
+      machineId: MACHINE_HANDLE,
+    });
+    await app.store.revokeDevice(device.device.id);
+
+    const html = await (await fetch(`${app.baseUrl}/`)).text();
+    const machine = machineArticle(html, `machine:${MACHINE_HANDLE}`);
+    const [revoked] = credentialRows(machine, 'revoked');
+
+    // Two facts, two columns: the credential is gone, the account behind it is not.
+    assert.match(revoked, /data-account-status="healthy"/);
+    assert.match(revoked, /data-i18n="status-healthy"/);
+    assert.match(revoked, /data-i18n="credential-revoked"/);
+    // And the account's own vocabulary is no longer borrowed to describe a device,
+    // which is what made a retired laptop read as an outage.
+    assert.equal(revoked.includes('badge expired'), false);
+    assert.equal(app.store.publicAccounts()[0].status, 'healthy');
+  } finally {
+    await app.close();
+  }
+});
+
+test('a Codex credential home the console cannot read costs its machines, not the page', async () => {
+  // A registry that exists and cannot be parsed. This is the case the banner is
+  // for: something is there, and the console genuinely does not know what.
+  const unreadableHome = await codexClientsHome([]);
+  await writeFile(join(unreadableHome, 'clients', 'clients.json'), 'not json at all\n');
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const claude = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'claude-max-1',
+      credential: { oauth_token: 'sk-ant-oat01-master' },
+    });
+    await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-shared-1',
+      external: { kind: 'codex-credential', home: unreadableHome },
+    });
+    await app.store.issueDeviceCredential({
+      accountId: claude.id,
+      memberLabel: 'alex',
+      deviceName: 'work-laptop',
+      machineId: MACHINE_HANDLE,
+    });
+
+    const response = await fetch(`${app.baseUrl}/`);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, /data-i18n="codex-inventory-unavailable"/);
+    assert.match(html, /codex-shared-1/);
+    // Degraded, not blank: everything the console knows on its own still renders.
+    assert.match(machineArticle(html, `machine:${MACHINE_HANDLE}`), /work-laptop/);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a Codex home nothing has enrolled against yet is not reported as unreadable', async () => {
+  // Exactly what `seedCodexCredentialHome` leaves behind: CodexCredentialStore.init()
+  // creates secret/ and public/, and clients/ does not exist until the first
+  // /enroll or add-client.js. Reporting that as a home the console could not read
+  // put a permanent degradation banner on every freshly authorized Codex account,
+  // which is how an operator learns to ignore the banner that means something.
+  const seededHome = await mkdtemp(join(tmpdir(), 'credential-console-seeded-'));
+  await mkdir(join(seededHome, 'secret'), { recursive: true, mode: 0o700 });
+  await mkdir(join(seededHome, 'public'), { recursive: true, mode: 0o750 });
+  await writeFile(
+    join(seededHome, 'public', 'current.json'),
+    JSON.stringify({ access_token: 'a', expires_at: new Date(Date.now() + 600_000).toISOString() }),
+  );
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const codexAccount = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-shared-1',
+      external: { kind: 'codex-credential', home: seededHome },
+    });
+
+    const html = await (await fetch(`${app.baseUrl}/`)).text();
+
+    assert.equal(
+      html.includes('data-i18n="codex-inventory-unavailable"'),
+      false,
+      'no machine has enrolled yet — that is not a home the console failed to read',
+    );
+    // And the account itself reads as what it is, rather than degraded — the two
+    // readers of that same file used to disagree about this one home, one of them
+    // silently and one of them in a banner.
+    assert.match(html, /codex-shared-1/);
+    assert.match(html, /data-i18n="status-healthy"/);
+    assert.equal(html.includes('data-i18n="status-unhealthy"'), false);
+    assert.equal(codexAccount.external.home, seededHome);
+  } finally {
+    await app.close();
+  }
 });
 
 test('an unauthorized account row can be deleted from the console, a credentialed one cannot', async () => {

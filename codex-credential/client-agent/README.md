@@ -23,6 +23,29 @@ shared key can only *mint* — it cannot read a credential. Re-running mints a f
 revokes this machine's previous one, so installers are safe to re-run and a token that leaked
 from this machine dies at its next enrollment.
 
+**This machine** is decided by a handle, not by the name. `enroll.js` generates 24 random
+bytes the first time it runs and keeps them in `~/.config/codex-credential.machine-id`
+(mode 600, beside the env file rather than in it, because `install.sh` rewrites that file
+wholesale). It reports the handle at `/enroll`, and the dispenser uses it to tell a reinstall
+from a second machine that picked the same name — without it, two people who both called
+their laptop `laptop` revoke each other's token on every install. The handle is random: it is
+not the hostname, the username, a MAC address or a serial number, and it identifies the
+machine and nothing else. A location that cannot be written degrades to a fresh handle every
+run rather than failing the enrollment. `CODEX_CRED_MACHINE_ID_FILE` overrides the path.
+
+A handle only works while the machine still has it, and a rebuilt container, a restored backup
+or a new OS user arrives without one. So `enroll.js` also sends `previous_token_sha256` — the
+digest of the `CODEX_CRED_TOKEN` already in the env file. That is proof rather than inference,
+so the server revokes exactly that row whatever handle or name it carries, and honouring it
+cannot re-open the name-collision hole. The digest is never logged, and the server already
+stores that exact value, so sending it discloses nothing.
+
+Deleting the handle file alone is therefore harmless: the machine looks new in the registry,
+but its previous row is still retired through the digest. Losing **both** the handle and the
+env file leaves the previous row active until it expires with the credential or an operator
+runs `add-client.js --revoke` — nothing about that request distinguishes it from a genuinely
+new machine, and guessing would disconnect one.
+
 Machines provisioned by hand with `add-client.js` skip this step and set
 `CODEX_CRED_TOKEN` directly.
 
@@ -134,3 +157,9 @@ success-shaped response with no token is rejected; machine names are sanitised t
 the server accepts; the env file is merged without clobbering unrelated settings; and on
 Windows the ACL hardening applies a protected single-identity rule via a non-interactive
 encoded command.
+
+`test/machine-id.test.js` covers the handle: it is generated once and reused on every later
+run, it carries nothing about the host or its user, an unusable stored value is replaced
+rather than trusted, and a location that cannot be written degrades to "looks like a new
+machine" instead of throwing. `test/enroll.test.js` adds that a valid handle is posted at
+`/enroll` and an unusable one is dropped rather than allowed to block the enrollment.

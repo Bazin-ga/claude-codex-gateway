@@ -14,7 +14,7 @@ import {
   sendJson,
   sendText,
 } from './lib/http.js';
-import { CredentialStore } from './lib/store.js';
+import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { UsageMonitor } from './lib/usage.js';
@@ -141,6 +141,60 @@ async function externalAccountStatus(account) {
     };
   } catch (error) {
     return { status: 'unhealthy', last_failure: error.message };
+  }
+}
+
+/**
+ * The Codex machines a dispenser knows about, read out of the credential home
+ * this console imported.
+ *
+ * A Codex machine never talks to the console: it enrols against the dispenser and
+ * pulls from it directly, so `clients.json` is the only place its existence is
+ * recorded and this read is the only way the inventory can show it. Read-only and
+ * best-effort, exactly like the expiry read beside it — the recommended systemd
+ * hardening puts `clients/` out of the console's reach, and an inventory that
+ * 500s because of that would be worse than one that says so.
+ *
+ * `token_sha256` is dropped here rather than at the view. It is a digest of a
+ * live bearer token; nothing downstream needs it, and the surest way to keep it
+ * out of a rendered page is for the page never to be handed it.
+ *
+ * A missing file is "no machine has enrolled yet", not a home this console could
+ * not read. `clients/` is created by the first `/enroll` or `add-client.js`, and
+ * a home the console seeded itself has only `secret/` and `public/` until then —
+ * so reporting ENOENT as degradation put a permanent warning on every freshly
+ * authorized Codex account and taught operators to ignore the banner that flags
+ * a genuinely unreadable one. The sibling read in `externalAccountStatus` has
+ * always treated it this way.
+ *
+ * @returns {Promise<{clients: object[], error: string|null}>}
+ */
+async function codexClientsFor(account) {
+  try {
+    const parsed = JSON.parse(
+      await readFile(`${account.external.home}/clients/clients.json`, 'utf8'),
+    );
+    const clients = Array.isArray(parsed.clients) ? parsed.clients : [];
+    return {
+      error: null,
+      clients: clients.map((client) => ({
+        account_id: account.id,
+        name: typeof client.name === 'string' ? client.name : '',
+        // Validated on the way in, like every other handle: this file is written
+        // by another process and a malformed value must not be rendered as if it
+        // identified something.
+        machine_id: typeof client.machine_id === 'string' && MACHINE_ID_PATTERN.test(client.machine_id)
+          ? client.machine_id
+          : null,
+        revoked: Boolean(client.revoked),
+        added_at: typeof client.added_at === 'string' ? client.added_at : null,
+        revoked_at: typeof client.revoked_at === 'string' ? client.revoked_at : null,
+        revoked_reason: typeof client.revoked_reason === 'string' ? client.revoked_reason : null,
+      })),
+    };
+  } catch (error) {
+    if (error.code === 'ENOENT') return { clients: [], error: null };
+    return { clients: [], error: error.message };
   }
 }
 
@@ -301,6 +355,42 @@ export async function createCredentialConsole(options = {}) {
     }));
   }
 
+  /**
+   * Every Codex machine row this console can currently see, plus the homes it
+   * could not read. A home that refuses the read costs its own machines from the
+   * list and nothing else; the page still renders everything else it knows.
+   */
+  async function codexMachineReport() {
+    const clients = [];
+    const unavailable = [];
+    for (const account of store.state.accounts) {
+      if (account.external?.kind !== 'codex-credential') continue;
+      const read = await codexClientsFor(account);
+      if (read.error) unavailable.push({ alias: account.alias, reason: read.error });
+      else clients.push(...read.clients);
+    }
+    return { clients, unavailable };
+  }
+
+  /**
+   * The handles a merge is allowed to name.
+   *
+   * Restricted to machines that already exist, so a stale form or a mistyped
+   * handle cannot invent a machine nobody can see and file a credential under
+   * it. A device row that already carries the handle keeps it in this set, which
+   * is what makes re-submitting the same merge a no-op rather than an error.
+   */
+  function knownMachineIds(codexClients) {
+    const known = new Set();
+    for (const device of store.publicDevices()) {
+      if (device.machine_id) known.add(device.machine_id);
+    }
+    for (const client of codexClients) {
+      if (client.machine_id) known.add(client.machine_id);
+    }
+    return known;
+  }
+
   async function handler(req, res) {
     const url = new URL(req.url, publicBaseUrl);
     const path = url.pathname;
@@ -341,7 +431,7 @@ const translations = {
   'admin-intro': '这里用于一次性录入上游账号、查看设备和撤销访问。普通成员的日常领取发生在上方自助区。',
   'accounts': '账号',
   'healthy': '健康',
-  'active-devices': '活跃设备',
+  'active-claude-credentials': '有效的 Claude 凭据',
   'account': '账号',
   'provider': '提供商',
   'status': '状态',
@@ -413,7 +503,32 @@ const translations = {
   'member-step-3': '复制或下载只显示一次的本机安装脚本并运行。',
   'member-step-4': '设备丢失或停用时，只撤销该设备。',
   'same-self-service': '管理员和成员看到的是同一个自助区，不再需要人工分发授权凭证。',
-  'no-devices': '尚无已登记设备。',
+  'machines': '机器',
+  'machines-intro': '每台机器一行，其持有的全部凭据折叠在下方。机器由一个不透明的随机句柄标识——由机器上的代理上报，或者在机器没有代理可上报时，由本控制台为该次签发生成。这个句柄不说明使用者是谁，旁边的成员标签是自己填写的、不做校验。',
+  'no-machines': '还没有任何机器持有凭据。',
+  'unattributed-credential': '无法归属的凭据',
+  'unattributed-credentials': '未归属到机器的凭据',
+  'unattributed-intro': '这些凭据签发于机器句柄出现之前，或者来自不会上报句柄的路径——浏览器不是代理，没有句柄可报。这里不会根据设备名或成员标签相同就自动合并；把某条凭据归入一台机器后，它才会计入那台机器。',
+  'legacy-no-handle': '没有机器句柄',
+  'count-active': '个有效',
+  'count-revoked': '个已撤销',
+  'credential': '凭据',
+  'credential-type': '类型',
+  'credential-status': '凭据状态',
+  'credential-active': '有效',
+  'credential-revoked': '已撤销',
+  'unknown-account': '未知账号',
+  'enrolled-at': '登记于',
+  'not-reported-here': '不会上报到本控制台',
+  'dispenser-managed': '由 dispenser 管理',
+  'no-active-credentials': '没有有效凭据。',
+  'revoked-credentials': '已撤销的凭据',
+  'retired-machines': '没有有效凭据的机器',
+  'merge-into-machine': '把这条凭据归入某台机器',
+  'merge-credential': '归并',
+  'no-merge-targets': '还没有任何机器上报过句柄，因此没有可归入的对象。',
+  'codex-legacy-note': '这条 Codex 凭据没有机器句柄：要么它登记于机器句柄出现之前——那台机器上的代理会在下次登记时上报句柄；要么它是本控制台代为签发的——那种凭据永远不会上报，因为生成的安装脚本运行的是 pull.js，不含 enroll.js。无论哪种情况，控制台只读取 dispenser 的注册表，无法把句柄写进去。',
+  'codex-inventory-unavailable': '至少有一个凭据目录的 Codex 机器列表读不到，因此只有 dispenser 知道的机器不会出现在这个列表里。',
   'choose-codex-platform': '选择这台设备的操作系统',
   'one-platform-only': '请只在刚登记的这台设备上选择一种安装器使用，不要把这些脚本复用到其他机器。',
   'view-script': '查看脚本',
@@ -549,9 +664,17 @@ document.addEventListener('click', async (event) => {
     if (req.method === 'GET' && path === '/') {
       const session = requireSession(req, res);
       if (!session) return;
+      const codex = await codexMachineReport();
       sendHtml(res, 200, dashboardView({
         accounts: await accountsWithExternalStatus(),
         devices: store.publicDevices(),
+        // Revoked rows are carried into the page and collapsed there, rather than
+        // filtered out here: they are the majority of rows over time, they are
+        // why the flat list stopped being readable, and they are still the record
+        // of what a machine used to hold.
+        machines: store.publicMachines({ includeRevoked: true }),
+        codexClients: codex.clients,
+        codexUnavailable: codex.unavailable,
         csrf: session.csrf,
         adminIdentity: session.admin_identity,
         openMode,
@@ -590,17 +713,41 @@ document.addEventListener('click', async (event) => {
           .digest('hex')
           .slice(0, 10);
         const machineName = `${deviceName.slice(0, 53)}-${memberSuffix}`;
+        // A handle per issuance, minted here because the machine cannot mint one
+        // for itself: the generated installer carries pull.js, not enroll.js, so
+        // a console-configured machine never reaches /enroll and never reports
+        // anything of its own.
+        //
+        // Without it every console row went to the dispenser with no handle, and
+        // the dispenser then applied its pre-handle rule: revoke every active row
+        // of that name. The name is `<device>-<sha256(member label)[0:10]>` and
+        // the label is self-asserted and unverified (D-010), so two people who
+        // both typed `alex` and `shared` produced the same name and silently
+        // evicted each other — exactly the defect the handle exists to fix, still
+        // fully live on the one member-facing Codex path.
+        //
+        // The cost, stated plainly: a member re-requesting a config for the same
+        // device gets a new handle too, so their previous console-minted token
+        // stays active instead of being revoked. That is deliberate. The console
+        // cannot tell "the same person again" from "a second person asserting the
+        // same label", and evicting the wrong one is silent while a surplus row
+        // is visible in the inventory and revocable with `add-client.js --revoke`.
+        const machineId = randomToken(24);
         const issued = await codexEnroll({
           endpoint: codexEndpoint,
           enrollmentKey: codexEnrollmentKey,
           pin: codexCertPin,
           name: machineName,
+          machineId,
         });
         log('codex_device_self_enrolled', {
           identity,
           member_label: memberLabel,
           device_name: deviceName,
           dispenser_name: issued.name,
+          // Opaque and safe to log: it identifies this issuance's machine and
+          // nothing else. The minted token never appears here.
+          machine_id: machineId,
         });
         sendHtml(res, 200, codexConfiguredView({
           deviceName,
@@ -1036,6 +1183,46 @@ document.addEventListener('click', async (event) => {
       }
       try {
         await store.deleteAccount(deleteAccountParams.id);
+        redirect(res, '/');
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+
+    // Filing a legacy issuance under a machine. CSRF-protected like revoke and
+    // delete, and refusing rather than half-doing it: the store writes one absent
+    // field or nothing at all, and this route will not name a machine that does
+    // not already exist.
+    const mergeMachineParams = routeMatch(path, '/devices/:id/machine');
+    if (req.method === 'POST' && mergeMachineParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        const machineId = String(form.machine_id ?? '').trim();
+        const codex = await codexMachineReport();
+        if (!knownMachineIds(codex.clients).has(machineId)) {
+          // Including the case where the handle is real but lives only in a
+          // dispenser home that has become unreadable since the page rendered.
+          // Refusing is recoverable; writing an unverifiable handle is not.
+          throw new Error('no such machine is currently listed; reload the dashboard and choose one of the machines it shows');
+        }
+        const { changed } = await store.mergeDeviceIntoMachine({
+          deviceId: mergeMachineParams.id,
+          machineId,
+        });
+        log('device_machine_merged', {
+          device_id: mergeMachineParams.id,
+          machine_id: machineId,
+          identity: session.admin_identity ?? 'anonymous',
+          // A repeat submission is success with nothing written; say which it was.
+          changed,
+        });
         redirect(res, '/');
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);

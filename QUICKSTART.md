@@ -105,7 +105,7 @@ The tools create the rest of the layout themselves:
 | `secret/credential.json` | refresh-center | the real credential, **including the refresh token** |
 | `secret/credential.*.bak.json` | refresh-center | the last 5 generations |
 | `public/current.json` | refresh-center | access token, id token, account id, expiry — no refresh token |
-| `clients/clients.json` | dispenser, `add-client.js` | per-machine token **digests** |
+| `clients/clients.json` | dispenser, `add-client.js` | per-machine token **digests** and machine handles |
 | `clients/enrollment.json` | `set-enrollment-key.js` | the enrollment key **digest** |
 | `tls/server.{crt,key}` | `gen-cert.sh` | the dispenser's certificate |
 
@@ -253,14 +253,26 @@ node ~/.local/share/claude-codex-gateway/client-agent/enroll.js
 The prompted read is deliberate: `export CODEX_CRED_ENROLLMENT_KEY=<key>` typed at a prompt
 lands verbatim in `~/.bash_history`, which outlives the session.
 
-It logs `enrolled` and writes `~/.config/codex-credential.env` at mode 600 containing
-`CODEX_CRED_ENDPOINT`, `CODEX_CRED_CERT_PIN` and the minted `CODEX_CRED_TOKEN`. The token
-itself is never logged. `CODEX_CRED_NAME` overrides the machine name, which otherwise comes
-from the hostname; `CODEX_CRED_ENV_FILE` overrides where the env file is written.
+It logs `enrolled` and writes **two** mode-600 files. `~/.config/codex-credential.env` holds
+`CODEX_CRED_ENDPOINT`, `CODEX_CRED_CERT_PIN` and the minted `CODEX_CRED_TOKEN`; the token
+itself is never logged. `~/.config/codex-credential.machine-id` holds this machine's opaque
+handle — 24 random bytes generated on the first run, kept beside the env file rather than in
+it because `install.sh` rewrites that file wholesale. The handle is not the hostname, the
+username, a MAC address or a serial number, and the `enrolling` log line reports it along with
+`machine_id_source`.
+
+`CODEX_CRED_NAME` overrides the machine name, which otherwise comes from the hostname;
+`CODEX_CRED_ENV_FILE` overrides where the env file is written; `CODEX_CRED_MACHINE_ID_FILE`
+overrides where the handle is kept. If you relocate or wipe `~/.config`, move both.
 
 Re-running `enroll.js` mints a fresh token and revokes this machine's previous one, so
 re-running an installer is safe and a token that leaked from this machine dies at its next
-enrollment.
+enrollment. "This machine" is decided by the handle, and — when the handle is gone but the env
+file is not — by the digest of the token the machine currently holds, which `enroll.js` sends
+as `previous_token_sha256`. Deleting the handle file alone is therefore harmless: the machine
+looks new in the registry, but its previous row is still retired. Losing **both** files (a
+wiped home, a container with no persistent `~/.config`) leaves the old row active until it
+expires with the credential or an operator runs `add-client.js --revoke`.
 
 A hand-minted machine skips enrollment entirely and sets `CODEX_CRED_TOKEN` from
 `add-client.js` directly.

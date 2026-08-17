@@ -20,6 +20,20 @@ import {
 const STATE_VERSION = 1;
 const MAX_AUDIT_EVENTS = 2_000;
 
+/**
+ * The opaque handle a client reports for the machine it runs on.
+ *
+ * Same rule as the token dispenser's copy (token-dispenser/server.js), duplicated
+ * rather than shared because the two are separate processes with separate trust
+ * boundaries and neither should be able to widen the other's validation.
+ *
+ * It identifies a machine and nothing more. This deployment authenticates nobody
+ * and the member label beside it is self-asserted, so the handle is the only
+ * identifier here a user cannot trivially forge — which still says nothing about
+ * who that user is.
+ */
+export const MACHINE_ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -38,10 +52,25 @@ function newState() {
   };
 }
 
-function buildDevice({ account, memberLabel, deviceName }) {
+/**
+ * Nothing, or a validated handle. An absent handle is the normal shape for every
+ * row written before machines existed here and for every caller that has none to
+ * offer, so it is not an error; a malformed one is, because it would be stored
+ * verbatim and read later as if it meant something.
+ */
+function normalizedMachineId(machineId) {
+  if (machineId === null || machineId === undefined || machineId === '') return null;
+  if (typeof machineId !== 'string' || !MACHINE_ID_PATTERN.test(machineId)) {
+    throw new Error('machine id must match [A-Za-z0-9_-]{16,64}');
+  }
+  return machineId;
+}
+
+function buildDevice({ account, memberLabel, deviceName, machineId = null }) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(deviceName)) {
     throw new Error('device name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}');
   }
+  const machine = normalizedMachineId(machineId);
   const token = `sk-ant-api03-${randomToken(32)}`;
   return {
     token,
@@ -50,6 +79,11 @@ function buildDevice({ account, memberLabel, deviceName }) {
       account_id: account.id,
       member_label: String(memberLabel ?? '').slice(0, 160),
       name: deviceName,
+      // Optional and written only when the caller has one. A row without it is
+      // legacy: one credential issuance that cannot be attributed to a machine.
+      // Absence is read as "unknown" at every point of use; no row is ever
+      // rewritten to acquire one.
+      ...(machine ? { machine_id: machine } : {}),
       token_sha256: sha256(token),
       created_at: nowIso(),
       last_seen_at: null,
@@ -590,7 +624,7 @@ export class CredentialStore {
     return this.state.enrollments.find((record) => record.code_sha256 === digest) ?? null;
   }
 
-  async redeemEnrollment({ code, deviceName }) {
+  async redeemEnrollment({ code, deviceName, machineId = null }) {
     return this.serialized(async () => {
       const enrollment = this.enrollmentByCode(code);
       if (!enrollment) throw new Error('enrollment code not found');
@@ -603,6 +637,7 @@ export class CredentialStore {
         account,
         memberLabel: enrollment.member_label,
         deviceName,
+        machineId,
       });
       enrollment.used_at = nowIso();
       enrollment.device_id = device.id;
@@ -612,13 +647,14 @@ export class CredentialStore {
         account_id: account.id,
         member_label: device.member_label,
         name: device.name,
+        ...(device.machine_id ? { machine_id: device.machine_id } : {}),
       });
       await this.persist();
       return { account, device, token };
     });
   }
 
-  async issueDeviceCredential({ accountId, memberLabel, deviceName }) {
+  async issueDeviceCredential({ accountId, memberLabel, deviceName, machineId = null }) {
     return this.serialized(async () => {
       const account = this.accountById(accountId);
       if (!account) throw new Error('account not found');
@@ -641,6 +677,7 @@ export class CredentialStore {
         account,
         memberLabel: normalizedMember,
         deviceName,
+        machineId,
       });
       this.state.devices.push(device);
       this.audit('device_self_enrolled', {
@@ -648,6 +685,7 @@ export class CredentialStore {
         account_id: account.id,
         member_label: device.member_label,
         name: device.name,
+        ...(device.machine_id ? { machine_id: device.machine_id } : {}),
       });
       await this.persist();
       return { account, device, token };
@@ -673,6 +711,127 @@ export class CredentialStore {
 
   publicDevices() {
     return this.state.devices.map(({ token_sha256: _secret, ...device }) => ({ ...device }));
+  }
+
+  /**
+   * The device list read as a machine inventory.
+   *
+   * A device row is one credential issuance, not a machine: it is identified by a
+   * self-asserted member label plus a name somebody typed, revocation only marks
+   * the row, and moving a machine between accounts appends another row. So the
+   * flat list only grows and cannot answer "what machines are there". Grouping by
+   * the reported handle can.
+   *
+   * Two rules keep this honest about what it does not know:
+   *
+   *   - a row with no `machine_id` predates the handle (or came from a caller
+   *     without one) and is reported as its own `legacy: true` entry with
+   *     `machine_id: null`. Merging such rows on name or member label would be a
+   *     guess, and the whole point of the handle is to stop guessing;
+   *   - `active_devices` / `revoked_devices` count every row of that machine;
+   *     everything else — `devices`, the distinct lists, the timestamps —
+   *     describes only the rows `includeRevoked` admits. An inventory should show
+   *     what is live now without losing the fact that the machine has
+   *     accumulated dead rows.
+   *
+   * Machines appear in the order they first issued a credential. By default a
+   * machine whose rows are all revoked is omitted entirely — it is history, not
+   * inventory — and `includeRevoked: true` brings it and its rows back.
+   */
+  publicMachines({ includeRevoked = false } = {}) {
+    const machines = new Map();
+
+    for (const device of this.publicDevices()) {
+      const key = device.machine_id ? `machine:${device.machine_id}` : `device:${device.id}`;
+      let machine = machines.get(key);
+      if (!machine) {
+        machine = {
+          machine_id: device.machine_id ?? null,
+          legacy: !device.machine_id,
+          devices: [],
+          account_ids: [],
+          member_labels: [],
+          names: [],
+          active_devices: 0,
+          revoked_devices: 0,
+          first_created_at: null,
+          last_seen_at: null,
+        };
+        machines.set(key, machine);
+      }
+
+      if (device.revoked_at) machine.revoked_devices += 1;
+      else machine.active_devices += 1;
+      if (!includeRevoked && device.revoked_at) continue;
+
+      machine.devices.push(device);
+      for (const [field, value] of [
+        ['account_ids', device.account_id],
+        ['member_labels', device.member_label],
+        ['names', device.name],
+      ]) {
+        if (value !== null && value !== undefined && !machine[field].includes(value)) {
+          machine[field].push(value);
+        }
+      }
+      if (device.created_at
+        && (machine.first_created_at === null || device.created_at < machine.first_created_at)) {
+        machine.first_created_at = device.created_at;
+      }
+      if (device.last_seen_at
+        && (machine.last_seen_at === null || device.last_seen_at > machine.last_seen_at)) {
+        machine.last_seen_at = device.last_seen_at;
+      }
+    }
+
+    return [...machines.values()].filter((machine) => machine.devices.length > 0);
+  }
+
+  /**
+   * File a legacy issuance under a machine, by writing the handle it never had.
+   *
+   * This is the only way a row written before handles existed can join the
+   * inventory: the Claude path has no client agent, so nothing on the member's
+   * machine can report a handle at issuance time, and the operator is the only
+   * one who knows that `alex`'s `work-laptop` row and that Codex machine are the
+   * same box.
+   *
+   * Deliberately the narrowest possible write:
+   *
+   *   - it adds one absent field to one device row. No account is read or
+   *     touched, no credential is re-encrypted, no other row moves;
+   *   - a row that already carries the requested handle is already where it is
+   *     being asked to go, so that is success with nothing written. Two clicks,
+   *     a double submit, or a replayed form therefore cost one row change in
+   *     total;
+   *   - a row carrying a DIFFERENT handle is refused outright. Reassigning it
+   *     would be rewriting a recorded fact on the strength of a form post, and
+   *     the wrong answer silently merges two machines that are not one. An
+   *     operator who really did mis-merge can revoke the credential; there is no
+   *     un-merge, on purpose.
+   *
+   * @returns {Promise<{device: object, changed: boolean}>}
+   */
+  async mergeDeviceIntoMachine({ deviceId, machineId }) {
+    return this.serialized(async () => {
+      const machine = normalizedMachineId(machineId);
+      if (!machine) throw new Error('a machine handle is required');
+      const device = this.state.devices.find((entry) => entry.id === deviceId);
+      if (!device) throw new Error('device not found');
+      if (device.machine_id === machine) return { device, changed: false };
+      if (device.machine_id) {
+        throw new Error('device is already attributed to a different machine');
+      }
+      device.machine_id = machine;
+      this.audit('device_machine_merged', {
+        device_id: device.id,
+        account_id: device.account_id,
+        name: device.name,
+        machine_id: machine,
+      });
+      await this.persist();
+      return { device, changed: true };
+    });
   }
 
   async revokeDevice(deviceId) {

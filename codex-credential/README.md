@@ -47,8 +47,14 @@ configuration value is rather than the way a credential is:
   IP. A leak is bounded and visible.
 - rotating it leaves already-enrolled machines untouched — it only stops *new* enrollments
   with the old key.
-- re-enrolling a name revokes that name's previous token, so re-running an installer is safe
-  and a token that leaked from a machine dies at its next enrollment.
+- re-enrolling revokes **the caller's** previous token, so re-running an installer is safe and
+  a token that leaked from a machine dies at its next enrollment. `POST /enroll` takes an
+  optional `machine_id` — an opaque handle the agent generated once and kept, not derived from
+  the hostname, the user, a MAC address or a serial number — plus an optional
+  `previous_token_sha256`, the digest of the token it currently holds. The handle stops two
+  people who both named their machine `laptop` from evicting each other; the digest is proof
+  of ownership, and is what retires a row when the machine has lost its handle. A request with
+  neither keeps the old rule for handle-less rows, and leaves other machines' rows alone.
 
 Enrollment is **off until configured**, and an unconfigured server answers exactly like a
 wrong key (`403`), so probing cannot distinguish the two.
@@ -123,8 +129,10 @@ the only live copy of the credential is the one under `$CODEX_CRED_HOME/secret/`
 a backup has to cover.
 
 Self-service enrollment is covered by tests in `token-dispenser/test/` — that a minted token
-authenticates, that re-enrolling revokes the previous one, that concurrent enrollments do not
-lose each other, and that the enrollment path cannot return a credential.
+authenticates, that re-enrolling revokes the caller's previous one (matched by reported machine
+handle, by presented token digest, or by the pre-handle rule for rows that carry no handle),
+that a second machine sharing a name is left working, that concurrent enrollments do not lose
+each other, and that the enrollment path cannot return a credential.
 
 Not verifiable from here: whether many machines sharing one subscription draws vendor
 attention. Concurrent calls on one access token succeeded in testing, but from a single host
