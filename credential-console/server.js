@@ -1304,6 +1304,7 @@ const translations = {
   'expires-ago': '已过期',
   'last-successful-check': '最近成功凭据检查',
   'last-rotation': '最近轮换',
+  'credential-history': '凭证历史',
   'accounts-table-caption': '账号及安全健康元数据'
 };
 

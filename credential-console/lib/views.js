@@ -40,11 +40,12 @@ h2 { font-size: 20px; margin: 0 0 18px; }
 p { line-height: 1.55; }
 .muted { color: var(--muted); }
 .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 18px; }
-.card { grid-column: span 12; background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 22px; box-shadow: 0 14px 34px rgba(22,33,29,.055); }
+.card { min-width: 0; grid-column: span 12; background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 22px; box-shadow: 0 14px 34px rgba(22,33,29,.055); }
 .summary { grid-column: span 4; }
 .summary strong { display: block; font-size: 30px; margin-top: 8px; }
 .split { grid-column: span 6; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table-wrap { width: 100%; min-width: 0; max-width: 100%; overflow-x: auto; }
 th, td { text-align: left; padding: 13px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
 tr:last-child td { border-bottom: 0; }
@@ -242,7 +243,13 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-attribution-notice p { margin: 0; }
 .account-switch-form { min-width: 190px; }
 .account-selection-details { display: grid; gap: 3px; margin-top: 5px; }
-.accounts-table { min-width: 1100px; }
+.accounts-table { width: 100%; min-width: 1000px; table-layout: fixed; }
+.accounts-table th:nth-child(1) { width: 16%; }
+.accounts-table th:nth-child(2) { width: 13%; }
+.accounts-table th:nth-child(3) { width: 13%; }
+.accounts-table th:nth-child(4) { width: 18%; }
+.accounts-table th:nth-child(5) { width: 20%; }
+.accounts-table th:nth-child(6) { width: 20%; }
 .accounts-table th:last-child, .accounts-table td:last-child { min-width: 240px; }
 .accounts-table td:last-child input { min-width: 140px; }
 .accounts-table td:last-child .button { white-space: normal; }
@@ -1941,11 +1948,10 @@ export function dashboardView({
       ?? null;
     return `
     <tr>
-      <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(account.email_label || 'No email label')}</div></td>
-      <td>${escapeHtml(account.provider === 'claude' ? 'Claude Code' : 'Codex')}</td>
+      <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(account.provider === 'claude' ? 'Claude Code' : 'Codex')} · ${escapeHtml(account.email_label || 'No email label')}</div></td>
       <td><div class="account-status-stack">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}</div>
-        ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}</td>
-      <td>${escapeHtml(account.active_devices ?? '—')}</td>
+        ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}
+        <div class="muted tiny"><span data-i18n="devices">Devices</span>: ${escapeHtml(account.active_devices ?? '—')}</div></td>
       <td>${expiryView(alert)}</td>
       <td class="account-history">${credentialCheckText(alert?.lastSuccessAt, 'last-successful-check')}${credentialCheckText(alert?.lastRotationAt, 'last-rotation')}</td>
       <td>${accountUsageView(account)}</td>
@@ -2071,8 +2077,8 @@ export function dashboardView({
             <div class="table-wrap">
               <table class="accounts-table">
                 <caption class="visually-hidden" data-i18n="accounts-table-caption">Credential accounts and safe health metadata</caption>
-                <thead><tr><th scope="col" data-i18n="account">Account</th><th scope="col" data-i18n="provider">Provider</th><th scope="col" data-i18n="status">Status</th><th scope="col" data-i18n="devices">Devices</th><th scope="col" data-i18n="expires">Expires</th><th scope="col" data-i18n="last-successful-check">Last successful check</th><th scope="col" data-i18n="last-rotation">Last rotation</th><th scope="col" data-i18n="usage-quota">Usage quota</th><th scope="col" data-i18n="action">Action</th></tr></thead>
-                <tbody>${accountRows || '<tr><td colspan="9" class="empty" data-i18n="no-accounts">No accounts yet.</td></tr>'}</tbody>
+                <thead><tr><th scope="col" data-i18n="account">Account</th><th scope="col" data-i18n="status">Status</th><th scope="col" data-i18n="expires">Expires</th><th scope="col" data-i18n="credential-history">Credential history</th><th scope="col" data-i18n="usage-quota">Usage quota</th><th scope="col" data-i18n="action">Action</th></tr></thead>
+                <tbody>${accountRows || '<tr><td colspan="6" class="empty" data-i18n="no-accounts">No accounts yet.</td></tr>'}</tbody>
               </table>
             </div>
           </article>

@@ -99,3 +99,13 @@ test('warning-only summary uses polite status semantics and action text stays tr
   }
   assert.match(viewSource, /max-width: 800px/);
 });
+
+test('account table keeps six aligned responsive columns', () => {
+  const html = render([codex('aligned')]);
+  const table = html.match(/<table class="accounts-table">[\s\S]*?<\/table>/)?.[0] ?? '';
+  assert.equal((table.match(/<th\b/g) ?? []).length, 6);
+  assert.equal((table.match(/<td\b/g) ?? []).length, 6);
+  assert.match(table, /data-i18n="credential-history"/);
+  assert.match(html, /\.card \{ min-width: 0;/);
+  assert.match(html, /\.table-wrap \{ width: 100%; min-width: 0; max-width: 100%; overflow-x: auto; \}/);
+});
