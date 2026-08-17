@@ -242,6 +242,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-attribution-notice p { margin: 0; }
 .account-switch-form { min-width: 190px; }
 .account-selection-details { display: grid; gap: 3px; margin-top: 5px; }
+.accounts-table { min-width: 1100px; }
+.accounts-table th:last-child, .accounts-table td:last-child { min-width: 240px; }
+.accounts-table td:last-child input { min-width: 140px; }
+.accounts-table td:last-child .button { white-space: normal; }
 .page-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin: -8px 0 24px; padding: 6px; border: 1px solid var(--line); border-radius: 12px; background: white; }
 .page-tabs a { padding: 8px 12px; border-radius: 8px; color: var(--muted); font-size: 13px; font-weight: 750; text-decoration: none; }
 .page-tabs a:hover, .page-tabs a[aria-current="page"] { background: var(--ink); color: white; }
@@ -2065,7 +2069,7 @@ export function dashboardView({
           <article class="card">
             <div class="topbar"><div><h2 data-i18n="accounts">Accounts</h2><div class="muted tiny" data-i18n="upstream-secret-note">Provider tokens are encrypted and never displayed after submission. Exceptional one-time enrollment remains available per account.</div></div></div>
             <div class="table-wrap">
-              <table>
+              <table class="accounts-table">
                 <caption class="visually-hidden" data-i18n="accounts-table-caption">Credential accounts and safe health metadata</caption>
                 <thead><tr><th scope="col" data-i18n="account">Account</th><th scope="col" data-i18n="provider">Provider</th><th scope="col" data-i18n="status">Status</th><th scope="col" data-i18n="devices">Devices</th><th scope="col" data-i18n="expires">Expires</th><th scope="col" data-i18n="last-successful-check">Last successful check</th><th scope="col" data-i18n="last-rotation">Last rotation</th><th scope="col" data-i18n="usage-quota">Usage quota</th><th scope="col" data-i18n="action">Action</th></tr></thead>
                 <tbody>${accountRows || '<tr><td colspan="9" class="empty" data-i18n="no-accounts">No accounts yet.</td></tr>'}</tbody>

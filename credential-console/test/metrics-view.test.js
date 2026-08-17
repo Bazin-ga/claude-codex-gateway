@@ -348,6 +348,8 @@ test('layout pins stack cards to one responsive column and marks the active usag
   assert.match(html, /\.machine \{ min-width: 0;/);
   assert.match(html, /\.topbar \{ align-items: flex-start; flex-wrap: wrap; \}/);
   assert.match(html, /button, \.button, input, select \{ min-height: 44px; \}/);
+  assert.match(html, /accounts-table \{ min-width: 1100px; \}/);
+  assert.match(html, /accounts-table td:last-child input \{ min-width: 140px; \}/);
   assert.doesNotMatch(messageView('Error', 'safe message'), /class="page-tabs"/);
 });
 
