@@ -168,6 +168,23 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-chart .metrics-line.device-5, .metrics-chart .metrics-swatch.device-5 { stroke: #7b4ea3; background: #7b4ea3; }
 .metrics-chart .metrics-line.device-6, .metrics-chart .metrics-swatch.device-6 { stroke: #008b8b; background: #008b8b; }
 .metrics-chart .metrics-line.device-7, .metrics-chart .metrics-swatch.device-7 { stroke: #c26d2d; background: #c26d2d; }
+.metrics-chart .metrics-point.total { fill: var(--green); }
+.metrics-chart .metrics-point.success { fill: var(--blue); }
+.metrics-chart .metrics-point.error { fill: var(--red); }
+.metrics-chart .metrics-point.ttfb { fill: var(--amber); }
+.metrics-chart .metrics-point.duration { fill: var(--ink); }
+.metrics-chart .metrics-point.input { fill: var(--blue); }
+.metrics-chart .metrics-point.cache-create { fill: var(--amber); }
+.metrics-chart .metrics-point.cache-read { fill: var(--green); }
+.metrics-chart .metrics-point.output { fill: var(--red); }
+.metrics-chart .metrics-point.device-0 { fill: var(--green); }
+.metrics-chart .metrics-point.device-1 { fill: var(--blue); }
+.metrics-chart .metrics-point.device-2 { fill: var(--amber); }
+.metrics-chart .metrics-point.device-3 { fill: var(--red); }
+.metrics-chart .metrics-point.device-4 { fill: var(--ink); }
+.metrics-chart .metrics-point.device-5 { fill: #7b4ea3; }
+.metrics-chart .metrics-point.device-6 { fill: #008b8b; }
+.metrics-chart .metrics-point.device-7 { fill: #c26d2d; }
 .metrics-chart .metrics-swatch.device-0, .metrics-chart .metrics-swatch.device-1,
 .metrics-chart .metrics-swatch.device-2, .metrics-chart .metrics-swatch.device-3,
 .metrics-chart .metrics-swatch.device-4, .metrics-chart .metrics-swatch.device-5,
@@ -897,6 +914,19 @@ function metricPolyline(rows, getter, maxValue, plot) {
   }).filter(Boolean).join(' ');
 }
 
+function metricPoints(rows, getter, maxValue, plot, className) {
+  if (!rows.length) return '';
+  const denominator = Math.max(rows.length - 1, 1);
+  return rows.map((row, index) => {
+    const rawValue = getter(row);
+    if (rawValue === null || rawValue === undefined || rawValue === '') return '';
+    const value = finiteMetricNumber(rawValue, { max: maxValue });
+    const x = plot.left + (plot.width * index) / denominator;
+    const y = plot.top + plot.height - (plot.height * value) / Math.max(maxValue, 1);
+    return `<circle class="metrics-point ${escapeHtml(className)}" cx="${metricSvgNumber(x)}" cy="${metricSvgNumber(y)}" r="3" aria-hidden="true"></circle>`;
+  }).filter(Boolean).join('');
+}
+
 function metricSvgChart({
   id,
   title,
@@ -948,11 +978,13 @@ function metricSvgChart({
     : `<text class="metrics-axis" x="${plot.left}" y="${height - 12}" text-anchor="start">${escapeHtml(firstLabel)}</text>
       <text class="metrics-axis" x="${plot.left + plot.width}" y="${height - 12}" text-anchor="end">${escapeHtml(lastLabel)}</text>`;
   const paths = series.map((entry) => `<path class="metrics-line ${escapeHtml(entry.className)}"${entry.dashArray ? ` stroke-dasharray="${escapeHtml(entry.dashArray)}"` : ''} d="${escapeHtml(metricPolyline(safeRows, entry.getter, scale, plot))}"></path>`).join('');
+  const points = series.map((entry) => metricPoints(safeRows, entry.getter, scale, plot, entry.className)).join('');
   return `${commonStart}
     ${grid}
     <line class="metrics-grid-line" x1="${plot.left}" x2="${plot.left}" y1="${plot.top}" y2="${plot.top + plot.height}"></line>
     <line class="metrics-grid-line" x1="${plot.left}" x2="${plot.left + plot.width}" y1="${plot.top + plot.height}" y2="${plot.top + plot.height}"></line>
     ${paths}
+    ${points}
     ${xLabels}
   </svg>`;
 }

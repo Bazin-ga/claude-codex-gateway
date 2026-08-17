@@ -396,9 +396,58 @@ test('cross-device comparison is capped at eight, escapes labels, preserves unkn
   const outputChart = html.match(/aria-labelledby="metrics-device-output-comparison-chart-title metrics-device-output-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
   assert.match(inputChart, /class="metrics-line device-1"[^>]*d=""/);
   assert.match(outputChart, /class="metrics-line device-2"[^>]*d=""/);
+  assert.match(inputChart, /class="metrics-point device-0"/);
+  assert.match(outputChart, /class="metrics-point device-0"/);
+  assert.doesNotMatch(inputChart, /class="metrics-point device-1"/);
+  assert.doesNotMatch(outputChart, /class="metrics-point device-2"/);
   assert.equal(html.includes('<img src=x onerror=alert(1)>'), false);
   assert.equal(html.includes('NaN'), false);
   assert.equal(html.includes('Infinity'), false);
+});
+
+test('single known points remain visible as markers while unknown points have none', () => {
+  const html = render({
+    deviceTokenComparison: {
+      devices: [
+        { deviceId: 'known-device', label: 'Known device' },
+        { deviceId: 'unknown-device', label: 'Unknown device' },
+      ],
+      rows: [
+        {
+          hourBucketMs: HOURLY[0].hourBucketMs,
+          deviceId: 'known-device',
+          requestCount: 1,
+          inputTokens: 1,
+          inputTokensKnownCount: 1,
+          cacheCreationInputTokens: 2,
+          cacheCreationInputTokensKnownCount: 1,
+          cacheReadInputTokens: 3,
+          cacheReadInputTokensKnownCount: 1,
+          outputTokens: 4,
+          outputTokensKnownCount: 1,
+        },
+        {
+          hourBucketMs: HOURLY[0].hourBucketMs,
+          deviceId: 'unknown-device',
+          requestCount: 1,
+          inputTokens: null,
+          inputTokensKnownCount: 0,
+          cacheCreationInputTokens: null,
+          cacheCreationInputTokensKnownCount: 0,
+          cacheReadInputTokens: null,
+          cacheReadInputTokensKnownCount: 0,
+          outputTokens: null,
+          outputTokensKnownCount: 0,
+        },
+      ],
+    },
+  });
+  const inputChart = html.match(/aria-labelledby="metrics-device-input-comparison-chart-title metrics-device-input-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  const outputChart = html.match(/aria-labelledby="metrics-device-output-comparison-chart-title metrics-device-output-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  assert.match(inputChart, /class="metrics-point device-0"[^>]*aria-hidden="true"/);
+  assert.match(outputChart, /class="metrics-point device-0"[^>]*aria-hidden="true"/);
+  assert.doesNotMatch(inputChart, /class="metrics-point device-1"/);
+  assert.doesNotMatch(outputChart, /class="metrics-point device-1"/);
 });
 
 test('known counts prevent a lower-bound hour from becoming a complete chart point', () => {
