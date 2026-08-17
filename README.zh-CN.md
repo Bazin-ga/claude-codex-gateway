@@ -99,10 +99,12 @@ distribution centre）。
 
 ## 从这里开始
 
-1. 先读 [`QUICKSTART.md`](QUICKSTART.md)，这是从零到一个可用客户端的最短路径。
-2. 然后读 [`codex-credential/DEPLOY.md`](codex-credential/DEPLOY.md)——服务端、一次性的
+1. 如果由 AI 协助配置成员机器，先读公开的
+   [`AI 接入指引`](AI-ONBOARDING.md)。它要求先加入 tailnet 再打开私有控制台，且不包含部署密钥。
+2. 再读 [`QUICKSTART.md`](QUICKSTART.md)，这是从零到一个可用客户端的最短路径。
+3. 然后读 [`codex-credential/DEPLOY.md`](codex-credential/DEPLOY.md)——服务端、一次性的
    人工登录，以及每台机器上的 agent。
-3. 如果还想要 Claude 账号和 UI，再读
+4. 如果还想要 Claude 账号和 UI，再读
    [`credential-console/DEPLOY.md`](credential-console/DEPLOY.md)——网络拓扑、管理员认证、
    成员自助，以及备份/恢复/回滚流程。
 

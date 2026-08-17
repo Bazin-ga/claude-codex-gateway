@@ -105,11 +105,14 @@ The two families are independent. Deploying `codex-credential` alone is a comple
 
 ## Start here
 
-1. Read [`QUICKSTART.md`](QUICKSTART.md) for the shortest path from nothing to a working
+1. If an AI is helping configure a member machine, read the public
+   [`AI onboarding guide`](AI-ONBOARDING.md) first. It requires joining the tailnet before
+   opening the private console and never contains deployment secrets.
+2. Read [`QUICKSTART.md`](QUICKSTART.md) for the shortest path from nothing to a working
    client.
-2. Then [`codex-credential/DEPLOY.md`](codex-credential/DEPLOY.md) — the server, the one-time
+3. Then [`codex-credential/DEPLOY.md`](codex-credential/DEPLOY.md) — the server, the one-time
    human login, and the per-machine agent.
-3. Then, if you want Claude accounts and a UI,
+4. Then, if you want Claude accounts and a UI,
    [`credential-console/DEPLOY.md`](credential-console/DEPLOY.md) — network topology,
    administrator auth, member self-service, and the backup/restore/rollback procedure.
 

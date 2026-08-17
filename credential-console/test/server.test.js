@@ -183,6 +183,7 @@ test('tailnet identity mode has no sign-in and binds sessions to the user', asyn
     const health = await fetch(`${app.baseUrl}/health`);
     assert.deepEqual(await health.json(), {
       status: 'ok',
+      client_config_version: '1',
       admin_auth: 'tailscale',
       admin_configured: true,
     });
@@ -218,6 +219,7 @@ test('open mode issues Claude device configs with no login while still enforcing
     const health = await fetch(`${app.baseUrl}/health`);
     assert.deepEqual(await health.json(), {
       status: 'ok',
+      client_config_version: '1',
       admin_auth: 'open',
       admin_configured: false,
     });
@@ -454,6 +456,7 @@ test('an unset CREDENTIAL_CONSOLE_ADMIN_AUTH defaults to tailscale, not open', a
   const observed = JSON.parse(stdout);
   assert.deepEqual(observed.health, {
     status: 'ok',
+    client_config_version: '1',
     admin_auth: 'tailscale',
     admin_configured: true,
   });

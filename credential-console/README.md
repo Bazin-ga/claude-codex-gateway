@@ -62,6 +62,8 @@ V1 implements:
   and weekly windows whenever the provider reports them;
 - tailnet-member Codex self-enrollment with self-contained macOS, Linux, and Windows installers
   that use the public dispenser and do not fetch files from the private console;
+- a public generic AI onboarding document plus a live private Markdown guide with safe deployment
+  metadata, exact read-only version checks, and a copyable dashboard link;
 - persistent, body-free per-request metrics in a separate SQLite database, with server-rendered
   charts and filters.
 
@@ -246,6 +248,38 @@ The shared enrollment key never appears in the browser or installer. The downloa
 contains only the newly minted device token, dispenser endpoint, and TLS certificate pin. The
 agent still requires the member machine to reach `chatgpt.com/backend-api/`; credentials do not
 replace network egress.
+
+## AI onboarding and the private live guide
+
+The repository's [`AI-ONBOARDING.md`](../AI-ONBOARDING.md) is the public, generic edition. It is
+static documentation for a machine that has not joined the tailnet yet; it contains no deployment
+address, account list, provider credential, device token, or control-plane command. It tells an AI
+to join the approved tailnet first and then wait for a human to provide the private guide link.
+
+After a member reaches the dashboard, the Administrator area shows a copyable link ending in
+`/onboarding.md`. The **Copy guide link** button copies that exact link and **Open guide** fetches
+the current Markdown. The route follows the same reachability/identity and session logic as the
+console: Tailscale mode requires a tailnet identity, while an open-mode GET may create an anonymous
+session. It returns Markdown/plain text, is not part of the public `/claude` gateway mount, and is
+generated on every request from the current safe deployment metadata: configured console/gateway
+addresses, account aliases, IDs and statuses, administrator mode, and client configuration version.
+It never includes provider credentials, device tokens, token digests, audit history, or external
+credential-home contents.
+
+In `open` mode, reachability is the authorization boundary: anyone who can reach the console can
+read this live guide and its endpoint/account metadata, as well as issue credentials and switch
+active devices. Keep `open` behind the private overlay network. The member label remains
+self-entered and unverified; it is not an actor identity. Tailscale mode still treats the guide as
+tailnet-internal rather than public internet content.
+
+Every generated Claude profile and Codex installer carries the server's client configuration
+version. Compare stamps by exact equality. If the stamp is missing, stop and report that it is
+absent; on a mismatch, stop and report both the installed and expected values. Never automatically
+replace or downgrade the profile. After an operator explicitly approves it, generate a fresh
+profile/installer; never repair a profile by copying a secret into it. An AI may execute a generated
+secret-bearing installer locally only after the human explicitly authorizes that execution. It must
+not print, upload, or paste the installer, its secret, or secret-bearing output back into the
+conversation.
 
 ## Machine inventory
 
@@ -440,6 +474,9 @@ systemd unit keeps the Node service on `127.0.0.1:9080`, so the direct TLS varia
 In `tailscale` administrator-auth mode,
 every user-owned device allowed to reach the Serve endpoint receives administrator access. In
 `open` mode every client that can reach the listener does, with no identity at all.
+The dashboard's `/onboarding.md` guide is served only through that session-bearing control-plane
+surface; it is not a Funnel route. It is safe to copy the link from the dashboard, but never move
+it to the public gateway mount.
 Funnel traffic has no Tailscale identity and can reach only the device-token-authenticated data
 plane. Tagged devices do not receive Tailscale user identity headers and are refused by the
 control plane.

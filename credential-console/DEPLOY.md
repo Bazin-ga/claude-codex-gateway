@@ -126,13 +126,24 @@ CSRF tokens still apply, so a visitor's browser cannot be driven by another site
 carries a banner stating that the console is unauthenticated, and `/health` reports
 `admin_configured: false` for as long as the mode is set — alert on it if you did not intend it.
 
+The dashboard also shows a **Copy guide link** button for the tailnet-internal live AI guide. The
+link ends in `/onboarding.md`; it follows the same reachability/identity and session logic as the
+console and returns Markdown, not HTML. Tailscale mode requires a tailnet identity; an open-mode GET
+may create an anonymous session. In `open` mode, anyone who can reach this private console can read
+the guide's current deployment and account metadata, so the same private-network restriction
+applies to this guide.
+The public repository's `AI-ONBOARDING.md` is only the generic, address-free edition and is not a
+replacement for this live link. A human must explicitly authorize any local execution of a
+secret-bearing generated installer; after authorization an AI may run it locally, but must never
+paste the installer or its output into the conversation.
+
 There is no third mode and nothing to bootstrap: the console has no administrator credential, so
 neither deployment needs a password file or a setup command. Confirm the mode a running service
 actually resolved before exposing it:
 
 ```bash
 curl -fsS http://127.0.0.1:9080/health
-# {"status":"ok","admin_auth":"tailscale","admin_configured":true}
+# {"status":"ok","admin_auth":"tailscale","client_config_version":"1","admin_configured":true}
 ```
 
 Import a Codex credential home read-only. Stop the service before running this mutating command,
@@ -738,6 +749,15 @@ Browser checks:
 12. confirm Codex quota data appears after the first refresh; if an account is marked as
     needing reauthorization, complete its permanent owner-authorization page once and confirm
     the five-hour and weekly windows appear without re-enrolling any member device.
+13. from the dashboard's Administrator area, copy the `/onboarding.md` link, open it through the
+    same private console session, and confirm the response is Markdown with current account
+    metadata but no provider credential, device token, digest, or audit data;
+14. confirm the live guide reports the client configuration version and compares stamps by exact
+    equality; a missing stamp reports absent, while a mismatch reports both values, and neither
+    automatically replaces or downgrades the profile; after operator approval, generate a fresh
+    installer;
+15. in a deliberately private `open` test deployment, confirm the dashboard visibly warns that
+    anyone reachable can read the live guide and its deployment/account metadata.
 
 For a real Claude account, have its owner complete the permanent owner-authorization page and
 run a bounded real turn from a newly enrolled client before adding more members. The permanent

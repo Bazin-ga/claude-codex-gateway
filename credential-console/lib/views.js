@@ -1,4 +1,10 @@
 import { escapeHtml } from './http.js';
+import {
+  CLAUDE_CLIENT_CONFIG_VERSION_KEY,
+  CLIENT_CONFIG_VERSION,
+  CODEX_UNIX_CLIENT_CONFIG_VERSION_FILE,
+  CODEX_WINDOWS_CLIENT_CONFIG_VERSION_FILE,
+} from './client-config-version.js';
 
 const styles = `
 :root {
@@ -938,6 +944,7 @@ export function dashboardView({
   adminIdentity = null,
   openMode = false,
   codexSelfServiceReady = false,
+  onboardingUrl = null,
   error = null,
 }) {
   const activeDevices = devices.filter((device) => !device.revoked_at);
@@ -1072,6 +1079,16 @@ export function dashboardView({
           <article class="card summary"><span class="muted" data-i18n="accounts">Accounts</span><strong>${accounts.length}</strong></article>
           <article class="card summary"><span class="muted" data-i18n="healthy">Healthy</span><strong>${healthy}</strong></article>
           <article class="card summary"><span class="muted" data-i18n="active-claude-credentials">Active Claude credentials</span><strong>${activeDevices.length}</strong></article>
+          ${onboardingUrl ? `<article class="card">
+            <h2 data-i18n="ai-onboarding-guide">AI onboarding guide</h2>
+            <p class="muted" data-i18n="ai-onboarding-intro">This tailnet-internal Markdown is generated from current deployment state. It contains endpoints, account status, and the client config version, but never a token.</p>
+            ${openMode ? '<div class="notice error tiny" role="alert" data-i18n="open-onboarding-warning">Open mode: anyone who can reach this console can read this live guide and its deployment/account metadata. Keep this console private; member labels are unverified and do not identify the actor.</div>' : ''}
+            <pre id="onboarding-guide-link">${escapeHtml(onboardingUrl)}</pre>
+            <div class="setup-actions">
+              <button type="button" class="secondary" data-copy-target="onboarding-guide-link" data-i18n="copy-onboarding-link">Copy guide link</button>
+              <a class="button secondary" href="${escapeHtml(onboardingUrl)}" target="_blank" rel="noopener noreferrer" data-i18n="open-onboarding-guide">Open guide</a>
+            </div>
+          </article>` : ''}
           <article class="card">
             <div class="topbar"><div><h2 data-i18n="accounts">Accounts</h2><div class="muted tiny" data-i18n="upstream-secret-note">Provider tokens are encrypted and never displayed after submission. Exceptional one-time enrollment remains available per account.</div></div></div>
             <div class="table-wrap">
@@ -1320,13 +1337,17 @@ function base64Asset(assets, name) {
   return Buffer.from(source, 'utf8').toString('base64');
 }
 
-function codexUnixInstaller({ assets, endpoint, certPin, token }) {
+function codexUnixInstaller({ assets, endpoint, certPin, token, clientConfigVersion }) {
   return `#!/usr/bin/env bash
 set -euo pipefail
 
 STAGE="$(mktemp -d "\${TMPDIR:-/tmp}/codex-gateway.XXXXXX")"
 ROOT="$STAGE/client-agent"
-cleanup() { rm -rf "$STAGE"; }
+STAMP_TMP=""
+cleanup() {
+  [ -z "$STAMP_TMP" ] || rm -f -- "$STAMP_TMP"
+  rm -rf "$STAGE"
+}
 trap cleanup EXIT
 
 write_asset() {
@@ -1359,13 +1380,25 @@ chmod 700 "$ROOT/install/install.sh"
   --endpoint ${shellSingleQuote(endpoint)} \\
   --token ${shellSingleQuote(token)} \\
   --cert-pin ${shellSingleQuote(certPin)}
+
+# The original agent installer owns credential/env writes. Stamp only after it
+# returns successfully, so a failed pull never claims the new client version.
+STAMP_FILE="$HOME/${CODEX_UNIX_CLIENT_CONFIG_VERSION_FILE}"
+install -d -m 700 "$(dirname "$STAMP_FILE")"
+chmod 700 "$(dirname "$STAMP_FILE")"
+STAMP_TMP="$(mktemp "$STAMP_FILE.tmp.XXXXXX")"
+printf '%s\\n' ${shellSingleQuote(clientConfigVersion)} > "$STAMP_TMP"
+chmod 600 "$STAMP_TMP"
+mv -f -- "$STAMP_TMP" "$STAMP_FILE"
+STAMP_TMP=""
 `;
 }
 
-function codexWindowsInstaller({ assets, endpoint, certPin, token }) {
+function codexWindowsInstaller({ assets, endpoint, certPin, token, clientConfigVersion }) {
   return `$ErrorActionPreference = 'Stop'
 $Stage = Join-Path $env:TEMP ('codex-gateway-' + [guid]::NewGuid().ToString('N'))
 $Root = Join-Path $Stage 'client-agent'
+$StampTmp = $null
 $Assets = @{
   'pull.js' = ${powerShellSingleQuote(base64Asset(assets, 'pull.js'))}
   'package.json' = ${powerShellSingleQuote(base64Asset(assets, 'package.json'))}
@@ -1380,7 +1413,14 @@ try {
     [System.IO.File]::WriteAllBytes($Target, [Convert]::FromBase64String($Assets[$Relative]))
   }
   & (Join-Path $Root 'install\\windows\\install.ps1') -Endpoint ${powerShellSingleQuote(endpoint)} -Token ${powerShellSingleQuote(token)} -CertPin ${powerShellSingleQuote(certPin)}
+  $Stamp = Join-Path $env:LOCALAPPDATA ${powerShellSingleQuote(CODEX_WINDOWS_CLIENT_CONFIG_VERSION_FILE)}
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Stamp) | Out-Null
+  $StampTmp = "$Stamp.$PID.tmp"
+  [IO.File]::WriteAllText($StampTmp, ${powerShellSingleQuote(clientConfigVersion)} + "\`r\`n", [Text.UTF8Encoding]::new($false))
+  Move-Item -Force $StampTmp $Stamp
+  $StampTmp = $null
 } finally {
+  if ($StampTmp) { Remove-Item -Force $StampTmp -ErrorAction SilentlyContinue }
   Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 }
 `;
@@ -1392,16 +1432,29 @@ export function codexConfiguredView({
   endpoint,
   certPin,
   assets,
+  clientConfigVersion = CLIENT_CONFIG_VERSION,
   openMode = false,
 }) {
-  const unixScript = codexUnixInstaller({ assets, endpoint, certPin, token });
+  const unixScript = codexUnixInstaller({
+    assets,
+    endpoint,
+    certPin,
+    token,
+    clientConfigVersion,
+  });
   const installers = [
     { platform: 'macos', label: 'macOS', script: unixScript, extension: 'sh' },
     { platform: 'linux', label: 'Linux', script: unixScript, extension: 'sh' },
     {
       platform: 'windows',
       label: 'Windows PowerShell',
-      script: codexWindowsInstaller({ assets, endpoint, certPin, token }),
+      script: codexWindowsInstaller({
+        assets,
+        endpoint,
+        certPin,
+        token,
+        clientConfigVersion,
+      }),
       extension: 'ps1',
     },
   ];
@@ -1467,6 +1520,7 @@ ln -sfn "$HELPER_FILE" "$DEFAULT_HELPER"
 printf '{}\n' > "$SETTINGS_FILE"
 cat > "$PROFILE_FILE" <<'PROFILE'
 export ANTHROPIC_BASE_URL=${shellSingleQuote(gateway)}
+export ${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${shellSingleQuote(CLIENT_CONFIG_VERSION)}
 export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5'
 export CLAUDE_CODE_API_KEY_HELPER_TTL_MS=300000
 export CLAUDE_CODE_USE_GATEWAY=1
@@ -1502,6 +1556,7 @@ Copy-Item -Force $helper $defaultHelper
 @'
 $tokenFile = [IO.Path]::Combine($HOME, '.config', 'claude-codex-gateway', 'claude-${profile}.token')
 $env:ANTHROPIC_BASE_URL=${powerShellSingleQuote(gateway)}
+$env:${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${powerShellSingleQuote(CLIENT_CONFIG_VERSION)}
 $env:ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5'
 $env:CLAUDE_CODE_USE_GATEWAY='1'
 $env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB='1'

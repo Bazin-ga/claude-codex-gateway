@@ -19,6 +19,8 @@ import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
+import { CLIENT_CONFIG_VERSION } from './lib/client-config-version.js';
+import { buildOnboardingGuideUrl, buildOnboardingMarkdown } from './lib/onboarding.js';
 import { UsageMonitor } from './lib/usage.js';
 import {
   createClaudeAuthorizationRequest,
@@ -230,6 +232,7 @@ export async function createCredentialConsole(options = {}) {
   }).init();
   const sessions = new Map();
   const publicBaseUrl = options.publicBaseUrl ?? PUBLIC_BASE_URL;
+  const onboardingUrl = buildOnboardingGuideUrl(publicBaseUrl);
   const claudeGatewayUrl = options.claudeGatewayUrl
     ?? CLAUDE_GATEWAY_URL
     ?? `${publicBaseUrl.replace(/\/$/, '')}/claude`;
@@ -545,6 +548,32 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    if (path === '/onboarding.md') {
+      if (req.method !== 'GET') {
+        sendText(
+          res,
+          405,
+          'method not allowed\n',
+          'text/plain; charset=utf-8',
+          { Allow: 'GET' },
+        );
+        return;
+      }
+      const session = requireSession(req, res);
+      if (!session) return;
+      const markdown = buildOnboardingMarkdown({
+        consoleUrl: publicBaseUrl,
+        claudeGatewayUrl,
+        clientConfigVersion: CLIENT_CONFIG_VERSION,
+        accounts: await accountsWithExternalStatus(),
+        codexEndpoint,
+        codexCertPin,
+        adminAuth,
+      });
+      sendText(res, 200, markdown, 'text/markdown; charset=utf-8');
+      return;
+    }
+
     if (req.method === 'GET' && path === '/metrics') {
       const session = requireSession(req, res);
       if (!session) return;
@@ -688,6 +717,11 @@ const translations = {
   'account-selection-invalid': '账号选择配置无效；系统没有擅自猜测账号。',
   'no-claude-accounts': '尚未登记 Claude 账号。',
   'open-account-switch-warning': 'Open 模式没有可验证的操作人：任何能访问控制台的人都可以切换任意有效设备。操作人记录为 anonymous；成员标签不代表操作人。',
+  'ai-onboarding-guide': 'AI 接入指引',
+  'ai-onboarding-intro': '这是根据当前部署实时生成的内网 Markdown，包含地址、账号状态和配置版本，但绝不包含 token。',
+  'open-onboarding-warning': 'Open 模式下，任何能访问本控制台的人都可以读取这份实时指引及其中的部署/账号元数据。请把控制台保持在私有网络内；成员标签未经验证，也不代表操作人身份。',
+  'copy-onboarding-link': '复制指引链接',
+  'open-onboarding-guide': '打开指引',
   'metrics-dashboard-link': '查看请求指标',
   'metrics-label': '请求指标',
   'metrics-heading': 'Claude 网关请求指标',
@@ -796,6 +830,34 @@ function applyLanguage(language) {
 
 applyLanguage(localStorage.getItem('credential_console_language') ?? 'en');
 
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // HTTP-only private overlays are not always a secure browser context.
+      // Fall through to a user-gesture copy that does not need Clipboard API.
+    }
+  }
+  const fallback = document.createElement('textarea');
+  fallback.value = text;
+  fallback.setAttribute('readonly', '');
+  fallback.style.position = 'fixed';
+  fallback.style.opacity = '0';
+  fallback.style.pointerEvents = 'none';
+  document.body.appendChild(fallback);
+  let copied = false;
+  try {
+    fallback.focus();
+    fallback.select();
+    copied = document.execCommand('copy');
+  } finally {
+    fallback.remove();
+  }
+  if (!copied) throw new Error('copy failed');
+}
+
 document.addEventListener('click', async (event) => {
   const languageButton = event.target.closest('[data-language]');
   if (languageButton) {
@@ -806,7 +868,7 @@ document.addEventListener('click', async (event) => {
   if (button) {
     const target = document.getElementById(button.dataset.copyTarget);
     if (!target) return;
-    await navigator.clipboard.writeText(target.textContent);
+    await copyText(target.textContent);
     const previous = button.textContent;
     button.textContent = (localStorage.getItem('credential_console_language') === 'zh') ? translations.copied : 'Copied';
     setTimeout(() => { button.textContent = previous; }, 1600);
@@ -853,6 +915,7 @@ document.addEventListener('click', async (event) => {
       sendJson(res, 200, {
         status: 'ok',
         admin_auth: adminAuth,
+        client_config_version: CLIENT_CONFIG_VERSION,
         // Whether an administrator is identified at all. `tailscale` authenticates
         // one; `open` deliberately authenticates nobody, and reporting that as
         // configured would hide the only fact worth alerting on here.
@@ -891,6 +954,7 @@ document.addEventListener('click', async (event) => {
         adminIdentity: session.admin_identity,
         openMode,
         codexSelfServiceReady,
+        onboardingUrl,
         error: url.searchParams.get('error'),
       }));
       return;
