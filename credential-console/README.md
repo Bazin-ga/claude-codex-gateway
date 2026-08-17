@@ -341,6 +341,11 @@ Search validation is intentionally bounded for large archives: if a query is too
 indexed terms, enter at least three consecutive Chinese characters, remove standalone punctuation,
 or split the query into simpler terms. Other search failures use a fixed generic error message.
 
+The Usage & metrics page also offers a capped cross-device trend comparison: one synchronized
+input-side chart and one output-token chart for up to eight devices. Input-side points require all
+three input categories to be known; unknown values remain gaps. The comparison follows time, member,
+account, and model filters but intentionally ignores the single-device selector.
+
 ## Machine inventory
 
 A device row records one credential *issuance*, not a machine. It is identified by a

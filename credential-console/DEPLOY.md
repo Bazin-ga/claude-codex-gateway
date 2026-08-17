@@ -770,6 +770,9 @@ Browser checks:
 17. feed a fixture with complete, partial, unavailable, null, and known-zero usage values and
     confirm the page labels partial totals as a lower bound, renders unknown as `—` rather than
     zero, and leaves unknown hourly SVG points blank;
+17a. confirm the Usage & metrics page shows synchronized input-side and output-token device charts,
+    uses distinct colors and line patterns for up to eight devices, keeps unknown points as gaps,
+    and ignores only the single-device selector while retaining the other filters;
 18. confirm the token page states that it covers Claude gateway traffic only, excludes Codex, and
     keeps the metrics-page body-free and open-mode visibility notices.
 19. open the captured-conversations page, search for a known phrase, follow the keyset next-page

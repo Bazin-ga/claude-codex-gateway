@@ -1186,6 +1186,201 @@ test('device IDs remain distinct when machine handles are absent', async (t) => 
   );
 });
 
+test('device token hourly returns bounded top devices with nullable coverage fields', async (t) => {
+  const { store } = await newStore(t, { batchSize: 64, maxQueue: 128 });
+  const tokenRow = (deviceId, {
+    inputTokens = null,
+    cacheCreationInputTokens = null,
+    cacheReadInputTokens = null,
+    outputTokens = null,
+    usageState = 'unavailable',
+    startedAtMs = BASE_MS,
+    path = '/v1/messages',
+  } = {}) => row({
+    deviceId,
+    machineId: null,
+    memberLabel: `member-${deviceId}`,
+    accountId: `account-${deviceId}`,
+    accountAlias: `alias-${deviceId}`,
+    model: `model-${deviceId}`,
+    startedAtMs,
+    path,
+    inputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
+    outputTokens,
+    usageState,
+  });
+  const entries = [
+    tokenRow('device-a', { inputTokens: 10, outputTokens: 5, usageState: 'complete' }),
+    tokenRow('device-a', {
+      inputTokens: 20,
+      outputTokens: 5,
+      usageState: 'complete',
+      startedAtMs: BASE_MS + HOUR_MS,
+    }),
+    tokenRow('device-b', { inputTokens: 30, usageState: 'partial' }),
+    tokenRow('device-c', { inputTokens: 20, outputTokens: 5, usageState: 'complete' }),
+    tokenRow('device-d', { inputTokens: 15, outputTokens: 5, usageState: 'complete' }),
+    tokenRow('device-e', { inputTokens: 10, outputTokens: 5, usageState: 'complete' }),
+    tokenRow('device-f', { inputTokens: 8, outputTokens: 2, usageState: 'complete' }),
+    tokenRow('device-g', { inputTokens: 3, outputTokens: 2, usageState: 'complete' }),
+    tokenRow('device-0-unknown'),
+    tokenRow('device-0-zero', { inputTokens: 0, outputTokens: 0, usageState: 'complete' }),
+    tokenRow('device-count', {
+      inputTokens: 999_999,
+      outputTokens: 999_999,
+      usageState: 'complete',
+      path: '/v1/messages/count_tokens',
+    }),
+  ];
+  for (const entry of entries) assert.equal(store.enqueueRequest(entry), true);
+  assert.equal(store.flush().written, entries.length);
+
+  const result = store.queryDeviceTokenHourly();
+  assert.equal(result.truncated, false);
+  assert.equal(result.devicesTruncated, false);
+  assert.equal(result.hoursTruncated, false);
+  assert.equal(result.unavailableDeviceCount, 1);
+  assert.deepEqual(result.devices.map(({ deviceId }) => deviceId), [
+    'device-a',
+    'device-b',
+    'device-c',
+    'device-d',
+    'device-e',
+    'device-f',
+    'device-g',
+    'device-0-zero',
+  ]);
+  assert.equal(result.devices.length, 8);
+  assert.equal(result.devices.every(({ machineId }) => machineId === null), true);
+  assert.equal(result.rows.some(({ deviceId }) => deviceId === 'device-count'), false);
+  assert.equal(result.rows.some(({ deviceId }) => deviceId === 'device-0-unknown'), false);
+
+  const deviceARows = result.rows.filter(({ deviceId }) => deviceId === 'device-a');
+  assert.deepEqual(deviceARows.map(({ hourBucketMs, inputTokens, outputTokens }) => ({
+    hourBucketMs,
+    inputTokens,
+    outputTokens,
+  })), [
+    {
+      hourBucketMs: Math.floor(BASE_MS / HOUR_MS) * HOUR_MS,
+      inputTokens: 10,
+      outputTokens: 5,
+    },
+    {
+      hourBucketMs: Math.floor((BASE_MS + HOUR_MS) / HOUR_MS) * HOUR_MS,
+      inputTokens: 20,
+      outputTokens: 5,
+    },
+  ]);
+
+  const partial = result.rows.find(({ deviceId }) => deviceId === 'device-b');
+  assert.equal(partial.inputTokens, 30);
+  assert.equal(partial.outputTokens, null);
+  assert.equal(partial.inputTokensKnownCount, 1);
+  assert.equal(partial.outputTokensKnownCount, 0);
+  assert.equal(partial.usagePartialCount, 1);
+  const explicitZero = result.rows.find(({ deviceId }) => deviceId === 'device-0-zero');
+  assert.equal(explicitZero.inputTokens, 0);
+  assert.equal(explicitZero.outputTokens, 0);
+  assert.equal(explicitZero.inputTokensKnownCount, 1);
+  assert.equal(explicitZero.outputTokensKnownCount, 1);
+  assert.equal(explicitZero.usageCompleteCount, 1);
+  assert.equal(Object.hasOwn(explicitZero, 'totalInputTokens'), false);
+
+  const filtered = store.queryDeviceTokenHourly({
+    fromMs: BASE_MS + HOUR_MS,
+    toMs: BASE_MS + 2 * HOUR_MS,
+    memberLabel: 'member-device-a',
+    accountId: 'account-device-a',
+    model: 'model-device-a',
+  });
+  assert.deepEqual(filtered.devices.map(({ deviceId }) => deviceId), ['device-a']);
+  assert.deepEqual(filtered.rows.map(({ inputTokens, outputTokens }) => ({
+    inputTokens,
+    outputTokens,
+  })), [{ inputTokens: 20, outputTokens: 5 }]);
+  assert.equal(filtered.unavailableDeviceCount, 0);
+
+  assert.throws(
+    () => store.queryDeviceTokenHourly({ deviceId: 'device-a' }),
+    /does not accept a device filter/,
+  );
+  assert.throws(
+    () => store.queryDeviceTokenHourly({ machineId: 'machine-a' }),
+    /does not accept a device filter/,
+  );
+  assert.throws(
+    () => store.queryDeviceTokenHourly({ unattributedMachine: true }),
+    /does not accept a device filter/,
+  );
+  assert.throws(
+    () => store.queryDeviceTokenHourly({ scope: 'all' }),
+    /consumption-only/,
+  );
+});
+
+test('device token hourly reports bounded history truncation', async (t) => {
+  const { store } = await newStore(t, { batchSize: 1024, maxQueue: 1024 });
+  for (let index = 0; index <= 720; index += 1) {
+    assert.equal(store.enqueueRequest(row({
+      deviceId: 'device-long-history',
+      machineId: null,
+      startedAtMs: BASE_MS + index * HOUR_MS,
+      inputTokens: 1,
+      outputTokens: 1,
+      usageState: 'complete',
+    })), true);
+  }
+  assert.equal(store.flush().written, 721);
+  const result = store.queryDeviceTokenHourly();
+  assert.equal(result.devices.length, 1);
+  assert.equal(result.rows.length, 720);
+  assert.equal(result.devicesTruncated, false);
+  assert.equal(result.hoursTruncated, true);
+  assert.equal(result.truncated, true);
+  assert.equal(
+    Math.min(...result.rows.map(({ hourBucketMs }) => hourBucketMs)),
+    Math.floor((BASE_MS + HOUR_MS) / HOUR_MS) * HOUR_MS,
+  );
+  assert.equal(
+    Math.max(...result.rows.map(({ hourBucketMs }) => hourBucketMs)),
+    Math.floor((BASE_MS + 720 * HOUR_MS) / HOUR_MS) * HOUR_MS,
+  );
+});
+
+test('device token hourly reports qualifying-device truncation separately', async (t) => {
+  const { store } = await newStore(t, { batchSize: 16, maxQueue: 32 });
+  for (let index = 0; index < 9; index += 1) {
+    assert.equal(store.enqueueRequest(row({
+      deviceId: `device-${String.fromCharCode(97 + index)}`,
+      machineId: null,
+      startedAtMs: BASE_MS + index,
+      inputTokens: index + 1,
+      outputTokens: 0,
+      usageState: 'complete',
+    })), true);
+  }
+  assert.equal(store.flush().written, 9);
+  const result = store.queryDeviceTokenHourly();
+  assert.equal(result.devices.length, 8);
+  assert.deepEqual(result.devices.map(({ deviceId }) => deviceId), [
+    'device-i',
+    'device-h',
+    'device-g',
+    'device-f',
+    'device-e',
+    'device-d',
+    'device-c',
+    'device-b',
+  ]);
+  assert.equal(result.unavailableDeviceCount, 0);
+  assert.equal(result.devicesTruncated, true);
+  assert.equal(result.hoursTruncated, false);
+  assert.equal(result.truncated, true);
+});
+
 test('breakdowns are bounded before untrusted model cardinality reaches the page', async (t) => {
   const { store } = await newStore(t, { batchSize: 600, maxQueue: 600 });
   for (let index = 0; index < 510; index += 1) {

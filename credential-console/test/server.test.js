@@ -1789,6 +1789,9 @@ test('request metrics page attributes the device label and excludes count_tokens
     assert.match(html, /data-i18n="metrics-token-coverage-complete"/);
     assert.match(html, /data-i18n="metrics-claude-only"/);
     assert.match(html, /id="metrics-tokens-chart-title"/);
+    assert.match(html, /id="metrics-device-input-comparison-chart-title"/);
+    assert.match(html, /id="metrics-device-output-comparison-chart-title"/);
+    assert.match(html, /data-i18n="metrics-device-comparison-scope"/);
     assert.match(html, /data-i18n="metrics-token-input">Input tokens<\/span>\s*<strong>7<\/strong>/);
     assert.match(html, /data-i18n="metrics-token-output">Output tokens<\/span>\s*<strong>5<\/strong>/);
     assert.equal(html.includes(promptMarker), false);
@@ -1801,6 +1804,14 @@ test('request metrics page attributes the device label and excludes count_tokens
     for (const key of metricsTranslationKeys) {
       assert.match(appScript, new RegExp(`'${key}':`), `missing Chinese translation for ${key}`);
     }
+
+    const comparisonAcrossDevices = await fetch(
+      `${app.baseUrl}/metrics?machine_id=device:does-not-match&member_label=self-asserted-member&account_id=${encodeURIComponent(account.id)}&model=claude-metrics-model&hours=24`,
+    );
+    assert.equal(comparisonAcrossDevices.status, 200);
+    const comparisonHtml = await comparisonAcrossDevices.text();
+    assert.ok((comparisonHtml.match(/data-device-comparison=/g) ?? []).length >= 1);
+    assert.match(comparisonHtml, /data-i18n="metrics-device-comparison-scope"/);
 
     const databaseBytes = await readFile(join(app.home, 'metrics.sqlite'));
     const walBytes = await readFile(join(app.home, 'metrics.sqlite-wal')).catch(() => Buffer.alloc(0));

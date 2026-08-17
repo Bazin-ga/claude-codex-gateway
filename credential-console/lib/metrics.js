@@ -13,6 +13,8 @@ const DEFAULT_FLUSH_INTERVAL_MS = 250;
 const DEFAULT_MAX_QUEUE = 4096;
 const SQLITE_TIMEOUT_MS = 1000;
 const MAX_BREAKDOWN_ROWS = 500;
+const MAX_DEVICE_TOKEN_DEVICES = 8;
+const MAX_DEVICE_TOKEN_HOURS_PER_DEVICE = 720;
 const QUEUE_DROP_LOG_INTERVAL_MS = 60_000;
 const MAX_TRANSIENT_WRITE_RETRIES = 3;
 const MAX_MEMBER_LABEL = 160;
@@ -497,6 +499,35 @@ function normalizeAggregateRow(row) {
   };
 }
 
+function normalizeDeviceTokenHourlyRow(row) {
+  const inputTokens = tokenAggregate(row.input_tokens);
+  const cacheCreationInputTokens = tokenAggregate(row.cache_creation_input_tokens);
+  const cacheReadInputTokens = tokenAggregate(row.cache_read_input_tokens);
+  const outputTokens = tokenAggregate(row.output_tokens);
+  return {
+    hourBucketMs: Number(row.hour_bucket_ms),
+    deviceId: row.device_id,
+    requestCount: Number(row.request_count),
+    inputTokens: inputTokens.value,
+    inputTokensKnownCount: Number(row.input_tokens_known_count),
+    cacheCreationInputTokens: cacheCreationInputTokens.value,
+    cacheCreationInputTokensKnownCount: Number(row.cache_creation_input_tokens_known_count),
+    cacheReadInputTokens: cacheReadInputTokens.value,
+    cacheReadInputTokensKnownCount: Number(row.cache_read_input_tokens_known_count),
+    outputTokens: outputTokens.value,
+    outputTokensKnownCount: Number(row.output_tokens_known_count),
+    usageCompleteCount: Number(row.usage_complete_count),
+    usagePartialCount: Number(row.usage_partial_count),
+    usageUnavailableCount: Number(row.usage_unavailable_count),
+    tokenTotalsOverflow: [
+      inputTokens,
+      cacheCreationInputTokens,
+      cacheReadInputTokens,
+      outputTokens,
+    ].some((entry) => entry.overflow),
+  };
+}
+
 function normalizeFilters(filters = {}) {
   if (!filters || typeof filters !== 'object' || Array.isArray(filters)) {
     throw new TypeError('metrics filters must be an object');
@@ -565,6 +596,190 @@ function filterParams(filters) {
     filters.model, filters.model,
     filters.scope,
   ];
+}
+
+function normalizeDeviceTokenFilters(filters = {}) {
+  if (!filters || typeof filters !== 'object' || Array.isArray(filters)) {
+    throw new TypeError('device token hourly filters must be an object');
+  }
+  for (const name of ['deviceId', 'machineId']) {
+    if (filters[name] !== undefined && filters[name] !== null && filters[name] !== '') {
+      throw new TypeError('device token hourly query does not accept a device filter');
+    }
+  }
+  if (filters.unattributedMachine === true) {
+    throw new TypeError('device token hourly query does not accept a device filter');
+  }
+  if (filters.scope !== undefined && filters.scope !== 'consumption') {
+    throw new TypeError('device token hourly query is consumption-only');
+  }
+  return normalizeFilters({
+    ...filters,
+    deviceId: null,
+    machineId: null,
+    unattributedMachine: false,
+    scope: 'consumption',
+  });
+}
+
+function deviceTokenFilteredCte(filters) {
+  return `
+    WITH filtered AS (
+      SELECT
+        id,
+        started_at_ms,
+        hour_bucket_ms,
+        device_id,
+        machine_id,
+        member_label,
+        account_id,
+        account_alias,
+        input_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        output_tokens,
+        usage_state
+      FROM request_metrics
+      ${filterSql(filters)}
+    )`;
+}
+
+function deviceTokenStatusSql(filters) {
+  return `
+    ${deviceTokenFilteredCte(filters)},
+    device_totals AS (
+      SELECT
+        device_id,
+        COUNT(input_tokens)
+          + COUNT(cache_creation_input_tokens)
+          + COUNT(cache_read_input_tokens)
+          + COUNT(output_tokens) AS known_token_count
+      FROM filtered
+      GROUP BY device_id
+    )
+    SELECT
+      COUNT(*) AS device_count,
+      COALESCE(SUM(CASE WHEN known_token_count > 0 THEN 1 ELSE 0 END), 0)
+        AS known_device_count,
+      COALESCE(SUM(CASE WHEN known_token_count = 0 THEN 1 ELSE 0 END), 0)
+        AS unavailable_device_count
+    FROM device_totals
+  `;
+}
+
+function deviceTokenHourlySql(filters) {
+  // Every identifier is a fixed internal name. Filter values are bound by the
+  // single filterParams() call below; the only numeric limits are constants.
+  return `
+    ${deviceTokenFilteredCte(filters)},
+    device_totals AS (
+      SELECT
+        device_id,
+        COUNT(DISTINCT hour_bucket_ms) AS device_hour_count,
+        COUNT(input_tokens)
+          + COUNT(cache_creation_input_tokens)
+          + COUNT(cache_read_input_tokens)
+          + COUNT(output_tokens) AS known_token_count,
+        COALESCE(TOTAL(input_tokens), 0.0)
+          + COALESCE(TOTAL(cache_creation_input_tokens), 0.0)
+          + COALESCE(TOTAL(cache_read_input_tokens), 0.0)
+          + COALESCE(TOTAL(output_tokens), 0.0) AS known_token_sort_total
+      FROM filtered
+      GROUP BY device_id
+    ),
+    top_devices AS (
+      SELECT
+        device_id,
+        device_hour_count,
+        ROW_NUMBER() OVER (
+          ORDER BY known_token_sort_total DESC, device_id ASC
+        ) AS device_rank
+      FROM device_totals
+      WHERE known_token_count > 0
+      ORDER BY known_token_sort_total DESC, device_id ASC
+      LIMIT ${MAX_DEVICE_TOKEN_DEVICES}
+    ),
+    latest_metadata AS (
+      SELECT device_id, machine_id, member_label, account_id, account_alias
+      FROM (
+        SELECT
+          f.device_id,
+          f.machine_id,
+          f.member_label,
+          f.account_id,
+          f.account_alias,
+          ROW_NUMBER() OVER (
+            PARTITION BY f.device_id
+            ORDER BY f.started_at_ms DESC, f.id DESC
+          ) AS metadata_rank
+        FROM filtered f
+        JOIN top_devices d ON d.device_id = f.device_id
+      )
+      WHERE metadata_rank = 1
+    ),
+    hourly AS (
+      SELECT
+        f.device_id,
+        f.hour_bucket_ms,
+        COUNT(*) AS request_count,
+        CASE WHEN COUNT(f.input_tokens) = 0 THEN NULL ELSE TOTAL(f.input_tokens) END AS input_tokens,
+        COUNT(f.input_tokens) AS input_tokens_known_count,
+        CASE WHEN COUNT(f.cache_creation_input_tokens) = 0
+          THEN NULL ELSE TOTAL(f.cache_creation_input_tokens) END AS cache_creation_input_tokens,
+        COUNT(f.cache_creation_input_tokens) AS cache_creation_input_tokens_known_count,
+        CASE WHEN COUNT(f.cache_read_input_tokens) = 0
+          THEN NULL ELSE TOTAL(f.cache_read_input_tokens) END AS cache_read_input_tokens,
+        COUNT(f.cache_read_input_tokens) AS cache_read_input_tokens_known_count,
+        CASE WHEN COUNT(f.output_tokens) = 0 THEN NULL ELSE TOTAL(f.output_tokens) END AS output_tokens,
+        COUNT(f.output_tokens) AS output_tokens_known_count,
+        COALESCE(SUM(CASE WHEN f.usage_state = 'complete' THEN 1 ELSE 0 END), 0)
+          AS usage_complete_count,
+        COALESCE(SUM(CASE WHEN f.usage_state = 'partial' THEN 1 ELSE 0 END), 0)
+          AS usage_partial_count,
+        COALESCE(SUM(CASE WHEN f.usage_state = 'unavailable' THEN 1 ELSE 0 END), 0)
+          AS usage_unavailable_count
+      FROM filtered f
+      JOIN top_devices d ON d.device_id = f.device_id
+      GROUP BY f.device_id, f.hour_bucket_ms
+    ),
+    numbered_hourly AS (
+      SELECT
+        h.*,
+        d.device_hour_count,
+        d.device_rank,
+        ROW_NUMBER() OVER (
+          PARTITION BY h.device_id
+          ORDER BY h.hour_bucket_ms DESC
+        ) AS device_hour_number
+      FROM hourly h
+      JOIN top_devices d ON d.device_id = h.device_id
+    )
+    SELECT
+      n.device_id,
+      n.hour_bucket_ms,
+      n.request_count,
+      n.input_tokens,
+      n.input_tokens_known_count,
+      n.cache_creation_input_tokens,
+      n.cache_creation_input_tokens_known_count,
+      n.cache_read_input_tokens,
+      n.cache_read_input_tokens_known_count,
+      n.output_tokens,
+      n.output_tokens_known_count,
+      n.usage_complete_count,
+      n.usage_partial_count,
+      n.usage_unavailable_count,
+      n.device_hour_count,
+      n.device_rank,
+      m.machine_id,
+      m.member_label,
+      m.account_id,
+      m.account_alias
+    FROM numbered_hourly n
+    JOIN latest_metadata m ON m.device_id = n.device_id
+    WHERE n.device_hour_number <= ${MAX_DEVICE_TOKEN_HOURS_PER_DEVICE}
+    ORDER BY n.hour_bucket_ms ASC, n.device_rank ASC, n.device_id ASC
+  `;
 }
 
 function requestMetricsTableExists(db) {
@@ -1453,6 +1668,48 @@ export class MetricsStore {
       hourBucketMs: Number(row.hour_bucket_ms),
       ...normalizeAggregateRow(row),
     }));
+  }
+
+  queryDeviceTokenHourly(filters = {}) {
+    const normalized = normalizeDeviceTokenFilters(filters);
+    const status = this.#queryRows(
+      deviceTokenStatusSql(normalized),
+      filterParams(normalized),
+    )[0];
+    const rows = this.#queryRows(
+      deviceTokenHourlySql(normalized),
+      filterParams(normalized),
+    );
+    const devices = new Map();
+    const normalizedRows = rows.map((row) => {
+      const deviceId = row.device_id;
+      if (!devices.has(deviceId)) {
+        devices.set(deviceId, {
+          deviceId,
+          machineId: row.machine_id ?? null,
+          memberLabel: row.member_label,
+          accountId: row.account_id,
+          accountAlias: row.account_alias,
+          deviceRank: Number(row.device_rank),
+        });
+      }
+      return normalizeDeviceTokenHourlyRow(row);
+    });
+    return {
+      devices: [...devices.values()]
+        .sort((left, right) => left.deviceRank - right.deviceRank)
+        .map(({ deviceRank, ...device }) => device),
+      rows: normalizedRows,
+      unavailableDeviceCount: Number(status?.unavailable_device_count ?? 0),
+      devicesTruncated: Number(status?.known_device_count ?? 0) > MAX_DEVICE_TOKEN_DEVICES,
+      hoursTruncated: rows.some(
+        (row) => Number(row.device_hour_count) > MAX_DEVICE_TOKEN_HOURS_PER_DEVICE,
+      ),
+      truncated: Number(status?.known_device_count ?? 0) > MAX_DEVICE_TOKEN_DEVICES
+        || rows.some(
+          (row) => Number(row.device_hour_count) > MAX_DEVICE_TOKEN_HOURS_PER_DEVICE,
+        ),
+    };
   }
 
   queryBreakdown({ by, ...filters } = {}) {

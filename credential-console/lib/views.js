@@ -81,7 +81,8 @@ button:disabled, select:disabled, input:disabled { cursor: not-allowed; opacity:
 .button.secondary, button.secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
 button.danger { background: var(--red); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.stack { display: grid; gap: 14px; }
+.stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; }
+.stack > .card { grid-column: auto; min-width: 0; }
 .notice { border-left: 4px solid var(--amber); background: #fff7e9; padding: 12px 14px; border-radius: 0 10px 10px 0; }
 .success { border-left-color: var(--green); background: #eaf6ef; }
 .error { border-left-color: var(--red); background: #faebe9; }
@@ -159,6 +160,35 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-chart .metrics-line.cache-create, .metrics-chart .metrics-swatch.cache-create { stroke: var(--amber); background: var(--amber); }
 .metrics-chart .metrics-line.cache-read, .metrics-chart .metrics-swatch.cache-read { stroke: var(--green); background: var(--green); }
 .metrics-chart .metrics-line.output, .metrics-chart .metrics-swatch.output { stroke: var(--red); background: var(--red); }
+.metrics-chart .metrics-line.device-0, .metrics-chart .metrics-swatch.device-0 { stroke: var(--green); background: var(--green); }
+.metrics-chart .metrics-line.device-1, .metrics-chart .metrics-swatch.device-1 { stroke: var(--blue); background: var(--blue); }
+.metrics-chart .metrics-line.device-2, .metrics-chart .metrics-swatch.device-2 { stroke: var(--amber); background: var(--amber); }
+.metrics-chart .metrics-line.device-3, .metrics-chart .metrics-swatch.device-3 { stroke: var(--red); background: var(--red); }
+.metrics-chart .metrics-line.device-4, .metrics-chart .metrics-swatch.device-4 { stroke: var(--ink); background: var(--ink); }
+.metrics-chart .metrics-line.device-5, .metrics-chart .metrics-swatch.device-5 { stroke: #7b4ea3; background: #7b4ea3; }
+.metrics-chart .metrics-line.device-6, .metrics-chart .metrics-swatch.device-6 { stroke: #008b8b; background: #008b8b; }
+.metrics-chart .metrics-line.device-7, .metrics-chart .metrics-swatch.device-7 { stroke: #c26d2d; background: #c26d2d; }
+.metrics-chart .metrics-swatch.device-0, .metrics-chart .metrics-swatch.device-1,
+.metrics-chart .metrics-swatch.device-2, .metrics-chart .metrics-swatch.device-3,
+.metrics-chart .metrics-swatch.device-4, .metrics-chart .metrics-swatch.device-5,
+.metrics-chart .metrics-swatch.device-6, .metrics-chart .metrics-swatch.device-7 {
+  height: 0; border-radius: 0; background: transparent; border-top-width: 3px; border-top-style: solid;
+}
+.metrics-chart .metrics-swatch.device-1 { border-top-style: dashed; }
+.metrics-chart .metrics-swatch.device-2 { border-top-style: dotted; }
+.metrics-chart .metrics-swatch.device-3 { border-top-style: double; }
+.metrics-chart .metrics-swatch.device-4 { border-top-style: dashed; }
+.metrics-chart .metrics-swatch.device-5 { border-top-style: dotted; }
+.metrics-chart .metrics-swatch.device-6 { border-top-style: dashed; }
+.metrics-chart .metrics-swatch.device-7 { border-top-style: double; }
+.metrics-chart .metrics-swatch.device-0 { border-top-color: var(--green); }
+.metrics-chart .metrics-swatch.device-1 { border-top-color: var(--blue); }
+.metrics-chart .metrics-swatch.device-2 { border-top-color: var(--amber); }
+.metrics-chart .metrics-swatch.device-3 { border-top-color: var(--red); }
+.metrics-chart .metrics-swatch.device-4 { border-top-color: var(--ink); }
+.metrics-chart .metrics-swatch.device-5 { border-top-color: #7b4ea3; }
+.metrics-chart .metrics-swatch.device-6 { border-top-color: #008b8b; }
+.metrics-chart .metrics-swatch.device-7 { border-top-color: #c26d2d; }
 .metrics-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 12px; }
 .metrics-legend-item { display: inline-flex; gap: 6px; align-items: center; }
 .metrics-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
@@ -169,6 +199,17 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-attribution-notice p { margin: 0; }
 .account-switch-form { min-width: 190px; }
 .account-selection-details { display: grid; gap: 3px; margin-top: 5px; }
+.page-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin: -8px 0 24px; padding: 6px; border: 1px solid var(--line); border-radius: 12px; background: white; }
+.page-tabs a { padding: 8px 12px; border-radius: 8px; color: var(--muted); font-size: 13px; font-weight: 750; text-decoration: none; }
+.page-tabs a:hover, .page-tabs a[aria-current="page"] { background: var(--ink); color: white; }
+.page-tabs a:focus-visible { outline: 3px solid var(--amber); outline-offset: 2px; }
+.metrics-comparison { min-width: 0; }
+.metrics-comparison svg { width: 100%; height: auto; display: block; }
+.metrics-comparison-table-wrap { overflow-x: auto; }
+.metrics-comparison-table th, .metrics-comparison-table td { font-size: 12px; padding: 9px 8px; }
+.metrics-comparison-unknown { color: var(--amber); }
+.metrics-comparison-note { margin: 0 0 10px; }
+.metrics-comparison h3 { margin: 12px 0 8px; font-size: 15px; }
 .conversation-disclosure { margin: 0; }
 .conversation-disclosure h2 { margin-bottom: 8px; }
 .conversation-disclosure p { margin: 6px 0 0; }
@@ -205,7 +246,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 // look like something is guarding it.
 const openBanner = '<div class="notice error open-banner" role="status" data-i18n="open-banner">No authentication: anyone who can reach this console can issue and revoke credentials.</div>';
 
-function layout(title, content, { openMode = false } = {}) {
+function layout(title, content, { openMode = false, activeTab = null } = {}) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -227,6 +268,11 @@ function layout(title, content, { openMode = false } = {}) {
         </div>
       </div>
     </header>
+    ${activeTab ? `<nav class="page-tabs" aria-label="Primary navigation">
+      <a href="/" data-i18n="tab-overview"${activeTab === 'overview' ? ' aria-current="page"' : ''}>Overview</a>
+      <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
+      <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
+    </nav>` : ''}
     ${openMode ? openBanner : ''}
     ${content}
   </main>
@@ -901,7 +947,7 @@ function metricSvgChart({
     ? `<text class="metrics-axis" x="${plot.left}" y="${height - 12}" text-anchor="middle">${escapeHtml(firstLabel)}</text>`
     : `<text class="metrics-axis" x="${plot.left}" y="${height - 12}" text-anchor="start">${escapeHtml(firstLabel)}</text>
       <text class="metrics-axis" x="${plot.left + plot.width}" y="${height - 12}" text-anchor="end">${escapeHtml(lastLabel)}</text>`;
-  const paths = series.map((entry) => `<path class="metrics-line ${escapeHtml(entry.className)}" d="${escapeHtml(metricPolyline(safeRows, entry.getter, scale, plot))}"></path>`).join('');
+  const paths = series.map((entry) => `<path class="metrics-line ${escapeHtml(entry.className)}"${entry.dashArray ? ` stroke-dasharray="${escapeHtml(entry.dashArray)}"` : ''} d="${escapeHtml(metricPolyline(safeRows, entry.getter, scale, plot))}"></path>`).join('');
   return `${commonStart}
     ${grid}
     <line class="metrics-grid-line" x1="${plot.left}" x2="${plot.left}" y1="${plot.top}" y2="${plot.top + plot.height}"></line>
@@ -1029,6 +1075,231 @@ function metricsTable(rows) {
   </div>`;
 }
 
+const DEVICE_COMPARISON_INPUT_FIELDS = Object.freeze([
+  ['inputTokens', 'inputTokensKnownCount'],
+  ['cacheCreationInputTokens', 'cacheCreationInputTokensKnownCount'],
+  ['cacheReadInputTokens', 'cacheReadInputTokensKnownCount'],
+]);
+const DEVICE_COMPARISON_OUTPUT_FIELDS = Object.freeze([['outputTokens', 'outputTokensKnownCount']]);
+const DEVICE_COMPARISON_DASHES = Object.freeze([
+  null,
+  '8 5',
+  '2 4',
+  '12 4 2 4',
+  '3 3',
+  '16 4 2 4',
+  '5 3 1 3',
+  '10 3 2 3',
+]);
+
+function normalizeDeviceComparison(input = {}) {
+  const devices = [];
+  const seen = new Set();
+  for (const device of Array.isArray(input.devices) ? input.devices : []) {
+    const value = String(device?.value ?? device?.deviceId ?? device?.id ?? '');
+    if (!value || seen.has(value) || devices.length >= 8) continue;
+    seen.add(value);
+    devices.push({ value, label: String(device?.label ?? device?.name ?? value) });
+  }
+  const rows = Array.isArray(input.rows) ? input.rows : [];
+  const buckets = new Map();
+  for (const row of rows) {
+    const hourBucketMs = Number(row?.hourBucketMs ?? row?.hour_bucket_ms);
+    if (!Number.isFinite(hourBucketMs)) continue;
+    const deviceId = String(row?.deviceId ?? row?.device_id ?? row?.device ?? '');
+    if (!deviceId || !seen.has(deviceId)) continue;
+    const bucket = buckets.get(hourBucketMs) ?? { hourBucketMs };
+    bucket[`input:${deviceId}`] = deviceComparisonInputSum(row);
+    bucket[`output:${deviceId}`] = deviceComparisonOutput(row);
+    buckets.set(hourBucketMs, bucket);
+  }
+  return {
+    devices,
+    rows: [...buckets.values()].sort((left, right) => left.hourBucketMs - right.hourBucketMs),
+    sourceRows: rows,
+    devicesTruncated: input.devicesTruncated === true || (Array.isArray(input.devices) && input.devices.length > 8),
+    hoursTruncated: input.hoursTruncated === true,
+    unavailableDeviceCount: metricCount(input.unavailableDeviceCount),
+    legacyTruncated: input.truncated === true
+      && input.devicesTruncated !== true
+      && input.hoursTruncated !== true,
+  };
+}
+
+function deviceComparisonSum(row, fields) {
+  let sum = 0;
+  for (const [field, knownField] of fields) {
+    const value = metricTokenNumber(row?.[field]);
+    if (!deviceComparisonFieldKnown(row, field, knownField)) return null;
+    sum += value;
+    if (!Number.isSafeInteger(sum)) return null;
+  }
+  return sum;
+}
+
+function deviceComparisonFieldKnown(row, field, knownField) {
+  const value = metricTokenNumber(row?.[field]);
+  if (value === null) return false;
+  if (!Object.hasOwn(row ?? {}, knownField)) return true;
+  return metricCount(row?.[knownField]) === metricCount(row?.requestCount);
+}
+
+function deviceComparisonInputSum(row) {
+  return deviceComparisonSum(row, DEVICE_COMPARISON_INPUT_FIELDS);
+}
+
+function deviceComparisonOutput(row) {
+  return deviceComparisonSum(row, DEVICE_COMPARISON_OUTPUT_FIELDS);
+}
+
+function deviceComparisonAnyKnown(row) {
+  return [...DEVICE_COMPARISON_INPUT_FIELDS, ...DEVICE_COMPARISON_OUTPUT_FIELDS]
+    .some(([field, knownField]) => deviceComparisonFieldKnown(row, field, knownField));
+}
+
+function deviceComparisonUnknownCount(row) {
+  for (const key of ['unknownCount', 'unknownTokenCount', 'unknownCategories']) {
+    if (row && row[key] !== null && row[key] !== undefined && row[key] !== '') {
+      return metricCount(row[key]);
+    }
+  }
+  const fields = [...DEVICE_COMPARISON_INPUT_FIELDS, ...DEVICE_COMPARISON_OUTPUT_FIELDS];
+  const unknown = fields.reduce((count, [field, knownField]) => (
+    deviceComparisonFieldKnown(row, field, knownField) ? count : count + 1
+  ), 0);
+  return row?.tokenTotalsOverflow === true ? unknown + 1 : unknown;
+}
+
+function deviceComparisonCoverage(rows) {
+  const sourceRows = rows.filter(Boolean);
+  let complete = 0;
+  let partial = 0;
+  let unavailable = 0;
+  let knownPoints = 0;
+  let unknownPoints = 0;
+  for (const row of sourceRows) {
+    const state = String(row?.coverage ?? row?.usageState ?? row?.responseState ?? '').toLowerCase();
+    const unknown = deviceComparisonUnknownCount(row);
+    const rowPartial = metricCount(row?.usagePartialCount);
+    const rowUnavailable = metricCount(row?.usageUnavailableCount);
+    unknownPoints += unknown > 0 ? 1 : 0;
+    if (deviceComparisonAnyKnown(row)) knownPoints += 1;
+    if (rowUnavailable > 0 || state === 'unavailable' || state === 'missing') unavailable += 1;
+    else if (rowPartial > 0 || state === 'partial' || state === 'lower_bound') partial += 1;
+    else if (state === 'complete' || state === 'completed') complete += 1;
+    else if (deviceComparisonInputSum(row) === null && deviceComparisonOutput(row) === null) unavailable += 1;
+    else if (unknown > 0) partial += 1;
+    else complete += 1;
+  }
+  const state = partial > 0 || unavailable > 0
+    ? (knownPoints > 0 ? 'partial' : 'unavailable')
+    : (complete > 0 ? 'complete' : 'unavailable');
+  return { state, complete, partial, unavailable, knownPoints, unknownPoints };
+}
+
+function deviceComparisonCoverageView(coverage) {
+  const key = coverage.state === 'complete'
+    ? 'metrics-device-comparison-complete'
+    : coverage.state === 'partial'
+      ? 'metrics-device-comparison-partial'
+      : 'metrics-device-comparison-unavailable';
+  const text = coverage.state === 'complete'
+    ? 'Complete'
+    : coverage.state === 'partial'
+      ? 'Partial / lower bound'
+      : 'Unavailable';
+  return `<span data-i18n="${key}">${text}</span>`;
+}
+
+function deviceComparisonView(input) {
+  const comparison = normalizeDeviceComparison(input);
+  const sourceRowsByDevice = new Map(comparison.devices.map((device) => [device.value, []]));
+  for (const row of comparison.sourceRows) {
+    const deviceId = String(row?.deviceId ?? row?.device_id ?? row?.device ?? '');
+    if (sourceRowsByDevice.has(deviceId)) sourceRowsByDevice.get(deviceId).push(row);
+  }
+  const deviceSeries = (side) => comparison.devices.map((device, index) => ({
+    className: `device-${index}`,
+    dashArray: DEVICE_COMPARISON_DASHES[index],
+    i18n: 'metrics-device-comparison-known-sum',
+    label: device.label,
+    getter: (row) => row[`${side}:${device.value}`],
+  }));
+  const inputChart = metricSvgChart({
+    id: 'metrics-device-input-comparison-chart',
+    title: 'Hourly input-side known tokens by device',
+    titleI18n: 'metrics-device-input-comparison-heading',
+    description: 'Each line is input plus cache creation plus cache read tokens only when all three categories are known; missing categories create a gap.',
+    descriptionI18n: 'metrics-device-input-comparison-description',
+    emptyI18n: 'metrics-device-comparison-no-data',
+    emptyText: 'No cross-device token comparison data is available.',
+    rows: comparison.rows,
+    series: deviceSeries('input'),
+    formatValue: (value) => metricDisplayNumber(value),
+  });
+  const outputChart = metricSvgChart({
+    id: 'metrics-device-output-comparison-chart',
+    title: 'Hourly output tokens by device',
+    titleI18n: 'metrics-device-output-comparison-heading',
+    description: 'Each line is output_tokens; unknown output values create a gap and are not treated as zero.',
+    descriptionI18n: 'metrics-device-output-comparison-description',
+    emptyI18n: 'metrics-device-comparison-no-data',
+    emptyText: 'No cross-device token comparison data is available.',
+    rows: comparison.rows,
+    series: deviceSeries('output'),
+    formatValue: (value) => metricDisplayNumber(value),
+  });
+  const legend = comparison.devices.map((device, index) => {
+    const coverage = deviceComparisonCoverage(sourceRowsByDevice.get(device.value) ?? []);
+    return `<div class="metrics-legend-item" data-device-comparison="${escapeHtml(device.value)}">
+      <span class="metrics-swatch device-${index}" aria-hidden="true"></span>
+      <span><span data-i18n="metrics-device-comparison-device">Device</span>: ${escapeHtml(device.label)}</span>
+      <span class="tiny"><span data-i18n="metrics-device-comparison-known-points">Known points</span>: ${escapeHtml(String(coverage.knownPoints))}; <span data-i18n="metrics-device-comparison-unknown-points">Unknown points</span>: ${escapeHtml(String(coverage.unknownPoints))}; ${deviceComparisonCoverageView(coverage)}</span>
+    </div>`;
+  }).join('');
+  const tableRows = comparison.devices.flatMap((device) => (
+    (sourceRowsByDevice.get(device.value) ?? []).map((row) => `<tr>
+      <td>${escapeHtml(metricHourLabel(row.hourBucketMs ?? row.hour_bucket_ms))}</td>
+      <td>${escapeHtml(device.label)}</td>
+      <td>${escapeHtml(metricTokenText(row.inputTokens ?? row.totalInputTokens))}</td>
+      <td>${escapeHtml(metricTokenText(row.cacheCreationInputTokens ?? row.totalCacheCreationInputTokens))}</td>
+      <td>${escapeHtml(metricTokenText(row.cacheReadInputTokens ?? row.totalCacheReadInputTokens))}</td>
+      <td>${escapeHtml(metricTokenText(row.outputTokens ?? row.totalOutputTokens))}</td>
+      <td>${deviceComparisonCoverageView(deviceComparisonCoverage([row]))}</td>
+    </tr>`)
+  )).join('');
+  const truncatedNotice = [
+    comparison.devicesTruncated
+      ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-device-comparison-devices-truncated">Showing at most eight devices; additional devices are omitted.</p>'
+      : '',
+    comparison.hoursTruncated
+      ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-device-comparison-hours-truncated">The hourly comparison is bounded; some hours are omitted.</p>'
+      : '',
+    comparison.unavailableDeviceCount > 0
+      ? `<p class="notice metrics-comparison-note" role="note"><span data-i18n="metrics-device-comparison-unavailable-devices">Some devices were unavailable for comparison.</span> <strong>${escapeHtml(String(comparison.unavailableDeviceCount))}</strong></p>`
+      : '',
+    comparison.legacyTruncated
+      ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-device-comparison-truncated">Comparison data is bounded; some devices or hours may be omitted.</p>'
+      : '',
+  ].join('');
+  return `<article class="metrics-chart metrics-chart-wide metrics-comparison">
+    <h2 data-i18n="metrics-device-comparison-heading">Cross-device token comparison</h2>
+    <p class="muted tiny" data-i18n="metrics-device-comparison-description">Two synchronized charts compare input-side known tokens and output_tokens by device. Unknown values are gaps, not zeros; this is a trend view, not billing.</p>
+    <p class="muted tiny" data-i18n="metrics-device-comparison-scope">This comparison follows the member, account, model, and time filters; it intentionally ignores the single-device machine selector.</p>
+    ${truncatedNotice}
+    <h3 data-i18n="metrics-device-input-comparison-heading">Hourly input-side known tokens by device</h3>
+    ${inputChart}
+    <h3 data-i18n="metrics-device-output-comparison-heading">Hourly output tokens by device</h3>
+    ${outputChart}
+    <div class="metrics-legend">${legend || '<span class="metrics-empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</span>'}</div>
+    <div class="metrics-comparison-table-wrap"><table class="metrics-table metrics-comparison-table">
+      <caption class="muted tiny" data-i18n="metrics-device-comparison-table-caption">Raw four-category values and coverage fallback</caption>
+      <thead><tr><th scope="col" data-i18n="metrics-hour">Hour (UTC)</th><th scope="col" data-i18n="metrics-device-comparison-device">Device</th><th scope="col" data-i18n="metrics-total-input-tokens">Input tokens</th><th scope="col" data-i18n="metrics-total-cache-creation-input-tokens">Cache creation input tokens</th><th scope="col" data-i18n="metrics-total-cache-read-input-tokens">Cache read input tokens</th><th scope="col" data-i18n="metrics-total-output-tokens">Output tokens</th><th scope="col" data-i18n="metrics-device-comparison-coverage">Coverage</th></tr></thead>
+      <tbody>${tableRows || '<tr><td colspan="7" class="empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</td></tr>'}</tbody>
+    </table></div>
+  </article>`;
+}
+
 export function metricsView({
   filters = {},
   options = {},
@@ -1036,6 +1307,7 @@ export function metricsView({
   hourly = [],
   tokenTotals = {},
   tokenHourly = [],
+  deviceTokenComparison = {},
   openMode = false,
   metricsAvailable = true,
   droppedMetrics = 0,
@@ -1062,8 +1334,8 @@ export function metricsView({
     { className: 'error', i18n: 'metrics-series-error', label: 'Error requests', getter: (row) => row.errorCount },
   ];
   const latencySeries = [
-    { className: 'ttfb', i18n: 'metrics-series-ttfb', label: 'Average TTFB (ms)', getter: (row) => row.avgTtfbMs ?? 0 },
-    { className: 'duration', i18n: 'metrics-series-duration', label: 'Average duration (ms)', getter: (row) => row.avgDurationMs ?? 0 },
+    { className: 'ttfb', i18n: 'metrics-series-ttfb', label: 'Average TTFB (ms)', getter: (row) => row.avgTtfbMs },
+    { className: 'duration', i18n: 'metrics-series-duration', label: 'Average duration (ms)', getter: (row) => row.avgDurationMs },
   ];
   const tokenSeries = [
     { className: 'input', i18n: 'metrics-series-input-tokens', label: 'Input tokens', getter: (row) => row.totalInputTokens },
@@ -1107,6 +1379,7 @@ export function metricsView({
     series: tokenSeries,
     formatValue: (value) => metricDisplayNumber(value),
   });
+  const deviceComparison = deviceComparisonView(deviceTokenComparison);
   const availabilityNotice = !metricsAvailable
     ? '<div class="notice error" role="status"><span data-i18n="metrics-unavailable">Request metrics are temporarily unavailable.</span></div>'
     : '';
@@ -1135,7 +1408,10 @@ export function metricsView({
           <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not rendered here; eligible captured conversations appear in the conversation archive.</p>
           <p class="muted tiny" data-i18n="metrics-claude-only">Token accounting covers Claude gateway traffic only. Codex clients connect directly to their provider and are not included.</p>
         </div>
-        <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+        <div class="actions">
+          <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+          <a class="button secondary" href="/conversations" data-i18n="metrics-conversations-link">View conversations</a>
+        </div>
       </div>
       <div class="notice error metrics-attribution-notice" role="note">
         <p data-i18n="metrics-attribution-disclaimer">Member labels are self-entered and unverified. Use them only to observe usage trends; never use them for accountability or billing.</p>
@@ -1189,13 +1465,14 @@ export function metricsView({
           ${tokenChart}
           ${metricLegend(tokenSeries)}
         </article>
+        ${deviceComparison}
       </div>
       <article class="card">
         <h2 data-i18n="metrics-hourly-table">Hourly details</h2>
         ${metricsTable(rows)}
       </article>
     </section>
-  `, { openMode });
+  `, { openMode, activeTab: 'metrics' });
 }
 
 const CONVERSATION_RESPONSE_STATES = Object.freeze([
@@ -1389,7 +1666,7 @@ export function conversationsView({
       </div>
       ${nextHref ? `<div class="conversation-pagination"><a class="button secondary" href="${escapeHtml(nextHref)}" data-i18n="conversation-next-page">Next page</a></div>` : ''}
     </section>
-  `, { openMode });
+  `, { openMode, activeTab: 'conversations' });
 }
 
 export function conversationDetailView({
@@ -1416,7 +1693,7 @@ export function conversationDetailView({
         ${errorNotice || '<div class="notice error" role="alert" data-i18n="conversation-not-found">Conversation not found.</div>'}
         <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to conversations</a>
       </section>
-    `, { openMode });
+    `, { openMode, activeTab: 'conversations' });
   }
   const conversationId = record.id ?? id ?? '—';
   const state = conversationState(record);
@@ -1449,7 +1726,7 @@ export function conversationDetailView({
       </article>
       <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to conversations</a>
     </section>
-  `, { openMode });
+  `, { openMode, activeTab: 'conversations' });
 }
 
 export function dashboardView({
@@ -1591,10 +1868,6 @@ export function dashboardView({
           <span class="badge stored" data-i18n="admin-zone">Administrator area</span>
           <h2 data-i18n="admin-heading">Accounts, devices, and exceptional enrollment</h2>
           <p class="muted" data-i18n="admin-intro">Use this area to add provider accounts once, inspect devices, and revoke access. Routine member setup happens above.</p>
-          <div class="actions">
-            <a class="button secondary" href="/metrics" data-i18n="metrics-dashboard-link">View request metrics</a>
-            <a class="button secondary" href="/conversations" data-i18n="conversations-dashboard-link">View captured conversations</a>
-          </div>
         </div>
         <section class="grid">
           <article class="card summary"><span class="muted" data-i18n="accounts">Accounts</span><strong>${accounts.length}</strong></article>
@@ -1681,7 +1954,7 @@ export function dashboardView({
         </section>
       </section>
     </div>
-  `, { openMode });
+  `, { openMode, activeTab: 'overview' });
 }
 
 export function claudeAuthorizationView({

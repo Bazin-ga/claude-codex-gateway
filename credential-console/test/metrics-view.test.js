@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { dashboardView, metricsView } from '../lib/views.js';
+import { dashboardView, messageView, metricsView } from '../lib/views.js';
 
 const FILTERS = {
   hours: 168,
@@ -118,7 +118,7 @@ test('metrics view renders exact filter echo, totals, and dashboard-safe values'
 test('metrics view has accessible request, latency, and token SVG charts plus a textual data table', () => {
   const html = render();
 
-  assert.equal((html.match(/<svg role="img"/g) ?? []).length, 3);
+  assert.equal((html.match(/<svg role="img"/g) ?? []).length, 5);
   assert.match(html, /aria-labelledby="metrics-requests-chart-title metrics-requests-chart-description"/);
   assert.match(html, /aria-labelledby="metrics-latency-chart-title metrics-latency-chart-description"/);
   assert.match(html, /<title id="metrics-requests-chart-title"[^>]*>/);
@@ -129,6 +129,7 @@ test('metrics view has accessible request, latency, and token SVG charts plus a 
   assert.match(html, /data-i18n="metrics-series-ttfb"/);
   assert.match(html, /data-i18n="metrics-series-input-tokens"/);
   assert.match(html, /data-i18n="metrics-series-output-tokens"/);
+  assert.match(html, /href="\/conversations" data-i18n="metrics-conversations-link"/);
   assert.match(html, /id="metrics-tokens-chart-title"/);
   assert.match(html, /class="metrics-table"/);
   assert.match(html, /data-i18n="metrics-request-bytes"/);
@@ -155,7 +156,7 @@ test('metrics view renders safe empty and unavailable states without invalid SVG
   assert.match(html, /data-i18n="metrics-unavailable"/);
   assert.match(html, /data-i18n="metrics-error"/);
   assert.match(html, /&lt;database unavailable&gt;/);
-  assert.equal((html.match(/<svg role="img"/g) ?? []).length, 3);
+  assert.equal((html.match(/<svg role="img"/g) ?? []).length, 5);
   assert.match(html, /data-i18n="metrics-no-data"/);
   assert.match(html, /No matching request data for this period/);
   assert.match(html, /colspan="13"/);
@@ -323,7 +324,7 @@ test('unattributed machine filter is echoed with the fixed sentinel', () => {
   assert.equal(selectedMachineOptions(html).length, 1);
 });
 
-test('dashboard management area links to request metrics', () => {
+test('dashboard persistent tabs link to usage metrics', () => {
   const html = dashboardView({
     accounts: [],
     devices: [],
@@ -331,13 +332,112 @@ test('dashboard management area links to request metrics', () => {
     adminIdentity: 'admin@example.com',
   });
 
-  assert.match(html, /href="\/metrics"/);
-  assert.match(html, /data-i18n="metrics-dashboard-link"/);
+  assert.match(html, /href="\/metrics" data-i18n="tab-metrics"/);
+  assert.match(html, /href="\/" data-i18n="tab-overview" aria-current="page"/);
+});
+
+test('layout pins stack cards to one responsive column and marks the active usage tab', () => {
+  const html = render();
+  assert.match(html, /\.stack \{ display: grid; grid-template-columns: minmax\(0, 1fr\);/);
+  assert.match(html, /\.stack > \.card \{ grid-column: auto; min-width: 0; \}/);
+  assert.match(html, /\.page-tabs a:focus-visible/);
+  assert.match(html, /href="\/metrics" data-i18n="tab-metrics" aria-current="page"/);
+  assert.doesNotMatch(html, /href="\/" data-i18n="tab-overview" aria-current="page"/);
+  assert.match(html, /conversation-filters \{ grid-template-columns: 1fr; \}/);
+  assert.doesNotMatch(messageView('Error', 'safe message'), /class="page-tabs"/);
+});
+
+test('latency SVG preserves null gaps instead of drawing missing values at zero', () => {
+  const html = render({
+    hourly: [{
+      ...HOURLY[0],
+      avgTtfbMs: null,
+      avgDurationMs: null,
+    }],
+  });
+  const latency = html.match(/aria-labelledby="metrics-latency-chart-title metrics-latency-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  assert.doesNotMatch(latency, /metrics-line ttfb/);
+  assert.doesNotMatch(latency, /metrics-line duration/);
+});
+
+test('cross-device comparison is capped at eight, escapes labels, preserves unknown gaps, and uses two line charts', () => {
+  const comparison = {
+    devices: Array.from({ length: 9 }, (_, index) => ({
+      deviceId: `device-${index}`,
+      label: index === 0 ? '<img src=x onerror=alert(1)>' : `Device ${index}`,
+    })),
+    rows: Array.from({ length: 8 }, (_, index) => ({
+      hourBucketMs: HOURLY[0].hourBucketMs + index * 60 * 60 * 1000,
+      deviceId: `device-${index}`,
+      inputTokens: index === 1 ? null : 10,
+      cacheCreationInputTokens: index === 1 ? 1 : 2,
+      cacheReadInputTokens: index === 1 ? 2 : 3,
+      outputTokens: index === 2 ? null : 4,
+      usagePartialCount: index === 1 ? 1 : 0,
+      usageUnavailableCount: index === 2 ? 1 : 0,
+    })),
+    truncated: false,
+    hoursTruncated: true,
+    unavailableDeviceCount: 2,
+  };
+  const html = render({ deviceTokenComparison: comparison });
+  assert.match(html, /id="metrics-device-input-comparison-chart-title"/);
+  assert.match(html, /id="metrics-device-output-comparison-chart-title"/);
+  assert.equal((html.match(/data-device-comparison=/g) ?? []).length, 8);
+  assert.equal((html.match(/class="metrics-line device-/g) ?? []).length, 16);
+  assert.match(html, /data-i18n="metrics-device-comparison-devices-truncated"/);
+  assert.match(html, /data-i18n="metrics-device-comparison-hours-truncated"/);
+  assert.match(html, /data-i18n="metrics-device-comparison-unavailable-devices"/);
+  assert.match(html, /data-i18n="metrics-device-comparison-scope"/);
+  assert.match(html, /data-i18n="metrics-device-comparison-unknown-points"/);
+  assert.match(html, /<caption[^>]*metrics-device-comparison-table-caption/);
+  assert.match(html, /stroke-dasharray="8 5"/);
+  const inputChart = html.match(/aria-labelledby="metrics-device-input-comparison-chart-title metrics-device-input-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  const outputChart = html.match(/aria-labelledby="metrics-device-output-comparison-chart-title metrics-device-output-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  assert.match(inputChart, /class="metrics-line device-1"[^>]*d=""/);
+  assert.match(outputChart, /class="metrics-line device-2"[^>]*d=""/);
+  assert.equal(html.includes('<img src=x onerror=alert(1)>'), false);
+  assert.equal(html.includes('NaN'), false);
+  assert.equal(html.includes('Infinity'), false);
+});
+
+test('known counts prevent a lower-bound hour from becoming a complete chart point', () => {
+  const html = render({
+    deviceTokenComparison: {
+      devices: [{ deviceId: 'device-partial', label: 'Partial device' }],
+      rows: [{
+        hourBucketMs: HOURLY[0].hourBucketMs,
+        deviceId: 'device-partial',
+        requestCount: 2,
+        inputTokens: 10,
+        inputTokensKnownCount: 1,
+        cacheCreationInputTokens: 2,
+        cacheCreationInputTokensKnownCount: 2,
+        cacheReadInputTokens: 3,
+        cacheReadInputTokensKnownCount: 2,
+        outputTokens: 4,
+        outputTokensKnownCount: 1,
+        usagePartialCount: 1,
+        usageUnavailableCount: 0,
+      }],
+    },
+  });
+  const inputChart = html.match(/aria-labelledby="metrics-device-input-comparison-chart-title metrics-device-input-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  const outputChart = html.match(/aria-labelledby="metrics-device-output-comparison-chart-title metrics-device-output-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  assert.doesNotMatch(inputChart, /metrics-line device-0/);
+  assert.doesNotMatch(outputChart, /metrics-line device-0/);
+  assert.match(html, /data-i18n="metrics-device-comparison-partial"/);
+  assert.match(html, /<td>10<\/td>/);
+  assert.match(html, /<td>4<\/td>/);
 });
 
 test('P5 metrics labels have Chinese translation entries', async () => {
   const serverSource = await readFile(new URL('../server.js', import.meta.url), 'utf8');
   for (const key of [
+    'tab-overview',
+    'tab-metrics',
+    'tab-conversations',
+    'metrics-conversations-link',
     'metrics-claude-only',
     'metrics-token-input',
     'metrics-token-cache-creation',
@@ -367,6 +467,27 @@ test('P5 metrics labels have Chinese translation entries', async () => {
     'metrics-usage-unavailable',
     'metrics-usage-not-applicable',
     'metrics-usage-overflow',
+    'metrics-device-comparison-heading',
+    'metrics-device-comparison-description',
+    'metrics-device-comparison-scope',
+    'metrics-device-input-comparison-heading',
+    'metrics-device-input-comparison-description',
+    'metrics-device-output-comparison-heading',
+    'metrics-device-output-comparison-description',
+    'metrics-device-comparison-known-sum',
+    'metrics-device-comparison-known-points',
+    'metrics-device-comparison-unknown-points',
+    'metrics-device-comparison-coverage',
+    'metrics-device-comparison-device',
+    'metrics-device-comparison-complete',
+    'metrics-device-comparison-partial',
+    'metrics-device-comparison-unavailable',
+    'metrics-device-comparison-no-data',
+    'metrics-device-comparison-truncated',
+    'metrics-device-comparison-devices-truncated',
+    'metrics-device-comparison-hours-truncated',
+    'metrics-device-comparison-unavailable-devices',
+    'metrics-device-comparison-table-caption',
   ]) {
     assert.match(serverSource, new RegExp(`'${key}':`), `missing translation key ${key}`);
   }

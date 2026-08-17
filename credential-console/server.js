@@ -464,6 +464,10 @@ export async function createCredentialConsole(options = {}) {
       hourly: [],
       tokenTotals: {},
       tokenHourly: [],
+      deviceTokenComparison: {
+        devices: [], rows: [], truncated: false, devicesTruncated: false, hoursTruncated: false,
+        unavailableDeviceCount: 0,
+      },
       metricsAvailable: false,
       droppedMetrics: 0,
       error: null,
@@ -490,6 +494,46 @@ export async function createCredentialConsole(options = {}) {
       const memberRows = requestMetrics.queryBreakdown({ by: 'member', ...dimensions });
       const accountRows = requestMetrics.queryBreakdown({ by: 'account', ...dimensions });
       const modelRows = requestMetrics.queryBreakdown({ by: 'model', ...dimensions });
+      let deviceTokenComparison = {
+        devices: [], rows: [], truncated: false, devicesTruncated: false, hoursTruncated: false,
+        unavailableDeviceCount: 0,
+      };
+      if (typeof requestMetrics.queryDeviceTokenHourly === 'function') {
+        try {
+          const comparison = requestMetrics.queryDeviceTokenHourly({
+            fromMs,
+            toMs: now + 1,
+            ...(memberLabel ? { memberLabel } : {}),
+            ...(accountId ? { accountId } : {}),
+            ...(model ? { model } : {}),
+          });
+          deviceTokenComparison = {
+            devices: (Array.isArray(comparison?.devices) ? comparison.devices : []).map((device) => {
+              const publicDevice = deviceById.get(device.deviceId);
+              return {
+                ...device,
+                value: device.deviceId,
+                name: publicDevice?.name ?? null,
+                revoked: Boolean(publicDevice?.revoked_at),
+                label: publicDevice?.name
+                  ? `${publicDevice.name} · ${device.memberLabel ?? device.deviceId}${publicDevice.revoked_at ? ' · revoked' : ''}`
+                  : (device.memberLabel ?? device.deviceId),
+              };
+            }),
+            rows: Array.isArray(comparison?.rows) ? comparison.rows : [],
+            truncated: comparison?.truncated === true,
+            devicesTruncated: comparison?.devicesTruncated === true,
+            hoursTruncated: comparison?.hoursTruncated === true,
+            unavailableDeviceCount: Number.isSafeInteger(comparison?.unavailableDeviceCount)
+              ? comparison.unavailableDeviceCount
+              : 0,
+          };
+        } catch (comparisonError) {
+          log('metrics_device_comparison_failed', {
+            code: comparisonError?.code ?? comparisonError?.name ?? 'unknown',
+          });
+        }
+      }
       return {
         filters: viewFilters,
         options: {
@@ -528,6 +572,7 @@ export async function createCredentialConsole(options = {}) {
         hourly,
         tokenTotals: consumptionTotals,
         tokenHourly,
+        deviceTokenComparison,
         metricsAvailable: true,
         droppedMetrics: requestMetrics.stats?.dropped ?? 0,
         error: null,
@@ -911,6 +956,31 @@ const translations = {
   'metrics-response-bytes': '响应字节数',
   'metrics-avg-ttfb': '平均首字节时间（毫秒）',
   'metrics-avg-duration': '平均总耗时（毫秒）',
+  'tab-overview': '总览',
+  'tab-metrics': '用量与指标',
+  'tab-conversations': '对话',
+  'metrics-conversations-link': '查看对话',
+  'metrics-device-comparison-heading': '跨设备 token 趋势比较',
+  'metrics-device-comparison-description': '两张同步图分别比较各设备的输入侧已知 token 与 output_tokens；未知值留空，不当作零，也不是计费视图。',
+  'metrics-device-comparison-scope': '此比较沿用成员、账号、模型和时间筛选；有意忽略单设备机器选择器。',
+  'metrics-device-input-comparison-heading': '每小时按设备的输入侧已知 token',
+  'metrics-device-input-comparison-description': '仅当 input、缓存创建 input、缓存读取 input 三类都已知时绘制；缺一类就留出空档。',
+  'metrics-device-output-comparison-heading': '每小时按设备的输出 token',
+  'metrics-device-output-comparison-description': '每条线是 output_tokens；未知输出留空，不当作零。',
+  'metrics-device-comparison-known-sum': '设备趋势线',
+  'metrics-device-comparison-known-points': '已知点',
+  'metrics-device-comparison-unknown-points': '未知点',
+  'metrics-device-comparison-coverage': '覆盖情况',
+  'metrics-device-comparison-device': '设备',
+  'metrics-device-comparison-complete': '完整',
+  'metrics-device-comparison-partial': '部分 / 下界',
+  'metrics-device-comparison-unavailable': '不可用',
+  'metrics-device-comparison-no-data': '没有可用的跨设备 token 比较数据。',
+  'metrics-device-comparison-truncated': '最多显示八台设备；其余设备已省略。',
+  'metrics-device-comparison-devices-truncated': '最多显示八台设备；其余设备已省略。',
+  'metrics-device-comparison-hours-truncated': '每小时比较有界；部分小时已省略。',
+  'metrics-device-comparison-unavailable-devices': '部分设备无法用于比较。',
+  'metrics-device-comparison-table-caption': '四类原始 token 值与覆盖情况备用表',
   'conversations-dashboard-link': '查看已捕获对话',
   'conversations-label': '已捕获对话',
   'conversations-heading': '对话归档',

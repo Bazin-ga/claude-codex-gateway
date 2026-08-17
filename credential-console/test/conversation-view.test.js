@@ -132,14 +132,17 @@ test('bounded search errors give actionable guidance while unknown errors stay f
   assert.equal(unknown.includes('database_internal_detail_should_not_render'), false);
 });
 
-test('dashboard management area links to captured conversations', () => {
+test('persistent tabs link to captured conversations and mark the active page', () => {
   const html = dashboardView({
     accounts: [],
     devices: [],
     csrf: 'csrf',
     adminIdentity: 'admin@example.test',
   });
-  assert.match(html, /href="\/conversations"[^>]*data-i18n="conversations-dashboard-link"/);
+  assert.match(html, /href="\/conversations" data-i18n="tab-conversations"/);
+  assert.doesNotMatch(html, /data-i18n="conversations-dashboard-link"/);
+  const list = conversationsView({ result: { items: [], nextBeforeId: null, error: null } });
+  assert.match(list, /href="\/conversations" data-i18n="tab-conversations" aria-current="page"/);
 });
 
 test('Chinese translations and operator documentation cover permanent conversation exposure', async () => {
@@ -151,6 +154,9 @@ test('Chinese translations and operator documentation cover permanent conversati
     readFile(new URL('../DEPLOY.md', import.meta.url), 'utf8'),
   ]);
   for (const key of [
+    'tab-overview',
+    'tab-metrics',
+    'tab-conversations',
     'conversations-dashboard-link',
     'conversation-privacy-heading',
     'conversation-privacy-notice',
