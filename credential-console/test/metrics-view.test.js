@@ -344,6 +344,10 @@ test('layout pins stack cards to one responsive column and marks the active usag
   assert.match(html, /href="\/metrics" data-i18n="tab-metrics" aria-current="page"/);
   assert.doesNotMatch(html, /href="\/" data-i18n="tab-overview" aria-current="page"/);
   assert.match(html, /conversation-filters \{ grid-template-columns: 1fr; \}/);
+  assert.match(html, /machine-list \{ display: grid; grid-template-columns: minmax\(0, 1fr\);/);
+  assert.match(html, /\.machine \{ min-width: 0;/);
+  assert.match(html, /\.topbar \{ align-items: flex-start; flex-wrap: wrap; \}/);
+  assert.match(html, /button, \.button, input, select \{ min-height: 44px; \}/);
   assert.doesNotMatch(messageView('Error', 'safe message'), /class="page-tabs"/);
 });
 
