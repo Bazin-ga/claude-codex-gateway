@@ -74,6 +74,7 @@ test('one version source stamps Claude profiles and generated Codex outer instal
   });
   assert.match(claudeHtml, /CREDENTIAL_CONSOLE_CLIENT_CONFIG_VERSION/);
   assert.match(claudeHtml, /CREDENTIAL_CONSOLE_CLIENT_CONFIG_VERSION[^\n]*2/);
+  assert.match(claudeHtml, /data-completed-draft="claude-self-service"/);
 
   const codexHtml = codexConfiguredView({
     deviceName: 'codex-version-device',
@@ -88,6 +89,7 @@ test('one version source stamps Claude profiles and generated Codex outer instal
   assert.match(codexHtml, /--token-file/);
   assert.match(codexHtml, /--profile/);
   assert.match(codexHtml, /codex-profile-ready/);
+  assert.match(codexHtml, /data-completed-draft="codex-self-service"/);
   assert.match(codexHtml, /\.notice \{[^}]*overflow-wrap: anywhere/);
   assert.doesNotMatch(codexHtml, /--token synthetic-codex-token/);
   assert.doesNotMatch(codexHtml, /-Token synthetic-codex-token/);

@@ -90,11 +90,18 @@ if (dashboard) {
   const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
   const instances = new Map();
   const observers = [];
+  const deviceMetricStateKey = `credential_console_device_metric:${location.pathname}${location.search}`;
   let payload = null;
-  let deviceMetric = 'input';
+  let deviceMetric = (() => {
+    try {
+      return sessionStorage.getItem(deviceMetricStateKey) === 'output' ? 'output' : 'input';
+    } catch {
+      return 'input';
+    }
+  })();
 
   function language() {
-    return localStorage.getItem('credential_console_language') === 'zh' ? 'zh' : 'en';
+    return document.documentElement.lang === 'zh-CN' ? 'zh' : 'en';
   }
 
   function words() {
@@ -125,16 +132,31 @@ if (dashboard) {
     return numeric === null ? words().unknown : `${exactNumber.format(numeric)} ${unit}`;
   }
 
-  function visibleZoom(pointCount) {
+  function zoomStateKey(kind) {
+    return `credential_console_chart_zoom:${kind}:${location.pathname}${location.search}`;
+  }
+
+  function storedZoom(kind, fallbackStart) {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(zoomStateKey(kind)) ?? 'null');
+      if (Number.isFinite(value?.start) && Number.isFinite(value?.end)
+        && value.start >= 0 && value.end <= 100 && value.start < value.end) return value;
+    } catch {
+      // Use the bounded default window.
+    }
+    return { start: fallbackStart, end: 100 };
+  }
+
+  function visibleZoom(pointCount, kind) {
     if (pointCount <= 48) return [];
-    const start = Math.max(0, 100 - (48 / pointCount) * 100);
+    const initial = storedZoom(kind, Math.max(0, 100 - (48 / pointCount) * 100));
     return [
-      { type: 'inside', filterMode: 'none', start, end: 100, zoomOnMouseWheel: 'shift' },
+      { type: 'inside', filterMode: 'none', start: initial.start, end: initial.end, zoomOnMouseWheel: 'shift' },
       {
         type: 'slider',
         filterMode: 'none',
-        start,
-        end: 100,
+        start: initial.start,
+        end: initial.end,
         height: 16,
         bottom: 4,
         borderColor: '#d9dfd7',
@@ -146,8 +168,8 @@ if (dashboard) {
     ];
   }
 
-  function commonOption({ points = 0, legend = true, unit = words().tokens } = {}) {
-    const zoom = visibleZoom(points);
+  function commonOption({ points = 0, legend = true, unit = words().tokens, kind = 'chart' } = {}) {
+    const zoom = visibleZoom(points, kind);
     return {
       animation: !reduceMotion,
       animationDuration: 280,
@@ -217,7 +239,7 @@ if (dashboard) {
   function tokenOption() {
     const hourly = payload?.hourly;
     if (!hourly || !Object.values(hourly.tokens ?? {}).some(hasKnown)) return emptyOption();
-    const option = commonOption({ points: hourly.timestamps.length });
+    const option = commonOption({ points: hourly.timestamps.length, kind: 'tokens' });
     option.xAxis.boundaryGap = true;
     option.series = [
       ['input', words().input, colors.input],
@@ -241,7 +263,7 @@ if (dashboard) {
     if (!hourly || !hasKnown(hourly.requests?.all?.map((value, index) => [hourly.timestamps[index], value]))) {
       return emptyOption();
     }
-    const option = commonOption({ points: hourly.timestamps.length, unit: words().requests });
+    const option = commonOption({ points: hourly.timestamps.length, unit: words().requests, kind: 'requests' });
     option.xAxis.boundaryGap = true;
     option.color = [colors.total, colors.success, colors.error];
     option.series = [
@@ -279,7 +301,7 @@ if (dashboard) {
   function latencyOption() {
     const hourly = payload?.hourly;
     if (!hourly || (!hasKnown(hourly.latency?.ttfb) && !hasKnown(hourly.latency?.duration))) return emptyOption();
-    const option = commonOption({ points: hourly.timestamps.length, unit: words().milliseconds });
+    const option = commonOption({ points: hourly.timestamps.length, unit: words().milliseconds, kind: 'latency' });
     option.color = [colors.ttfb, colors.duration];
     option.series = [
       ['ttfb', words().ttfb, colors.ttfb],
@@ -412,7 +434,7 @@ if (dashboard) {
     const devices = payload?.devices;
     const series = deviceMetric === 'output' ? devices?.output : devices?.input;
     if (!devices || !Array.isArray(series) || !series.some((row) => hasKnown(row.data))) return emptyOption();
-    const option = commonOption({ points: devices.timestamps?.length ?? 0 });
+    const option = commonOption({ points: devices.timestamps?.length ?? 0, kind: 'device-trend' });
     option.color = deviceColors;
     option.series = series.map((row, index) => ({
       name: row.label,
@@ -462,6 +484,15 @@ if (dashboard) {
         throw error;
       }
       instances.set(host, chart);
+      chart.on('datazoom', (event) => {
+        const state = event?.batch?.[0] ?? event;
+        if (!Number.isFinite(state?.start) || !Number.isFinite(state?.end)) return;
+        try {
+          sessionStorage.setItem(zoomStateKey(kind), JSON.stringify({ start: state.start, end: state.end }));
+        } catch {
+          // Zoom persistence is optional.
+        }
+      });
       if ('ResizeObserver' in window) {
         let scheduled = false;
         const observer = new ResizeObserver(() => {
@@ -523,6 +554,11 @@ if (dashboard) {
     const button = event.target.closest('[data-device-metric]');
     if (!button || !payload) return;
     deviceMetric = button.dataset.deviceMetric === 'output' ? 'output' : 'input';
+    try {
+      sessionStorage.setItem(deviceMetricStateKey, deviceMetric);
+    } catch {
+      // This preference is optional; charts still work without storage.
+    }
     const host = document.querySelector('[data-metrics-chart="device-trend"]');
     if (host) renderHost(host);
     document.querySelectorAll('[data-device-metric]').forEach((candidate) => {

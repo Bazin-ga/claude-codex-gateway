@@ -614,6 +614,7 @@ test('an administrator registers a Codex account and authorizes it from the fail
       body: new URLSearchParams({ csrf, provider: 'codex', alias: 'codex-shared-1' }),
     });
     assert.equal(added.status, 303);
+    assert.equal(added.headers.get('location'), '/?draft_completed=register-codex-account');
     const account = app.store.state.accounts[0];
     assert.equal(account.provider, 'codex');
     assert.equal(account.status, 'login_required');
@@ -1970,6 +1971,9 @@ test('P3 console and machine API switch only the authenticated device from the n
       'allowed-accounts',
       'selected-account',
       'switch-account',
+      'account-switch-working',
+      'account-switch-saved',
+      'account-switch-failed',
       'account-selection-invalid',
       'no-claude-accounts',
       'open-account-switch-warning',
@@ -1978,6 +1982,19 @@ test('P3 console and machine API switch only the authenticated device from the n
     }
     assert.match(appScript, /\[data-account-option\], \[data-account-label\]/);
     assert.match(appScript, /translations\[key\]/);
+    assert.match(appScript, /credential_console_language/);
+    assert.match(appScript, /credential_console_language_updated_at/);
+    assert.match(appScript, /value\.split\('\.'\)/);
+    assert.match(appScript, /\^\[0-9\]\{1,16\}\$/);
+    assert.match(appScript, /SameSite=Strict/);
+    assert.match(appScript, /data-account-switch/);
+    assert.match(appScript, /X-Credential-Console-Async/);
+    assert.match(appScript, /credential_console_details:/);
+    assert.match(appScript, /credential_console_scroll:/);
+    assert.match(appScript, /SAFE_DRAFT_FIELDS/);
+    assert.match(appScript, /SAFE_DRAFT_KEYS/);
+    assert.match(appScript, /data.*completedDraft|completedDraft/);
+    assert.doesNotMatch(appScript, /SAFE_DRAFT_FIELDS[^;]*(?:authorization|csrf|token)/);
     const configure = (deviceId, accountId, csrfValue = csrf) => fetch(
       `${app.baseUrl}/devices/${deviceId}/account`,
       {
@@ -1986,6 +2003,23 @@ test('P3 console and machine API switch only the authenticated device from the n
         headers: {
           Cookie: cookie,
           'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          csrf: csrfValue,
+          selected_account_id: accountId,
+        }),
+      },
+    );
+    const configureAsync = (deviceId, accountId, csrfValue = csrf) => fetch(
+      `${app.baseUrl}/devices/${deviceId}/account`,
+      {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          Cookie: cookie,
+          Accept: 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-Credential-Console-Async': 'account-switch',
         },
         body: new URLSearchParams({
           csrf: csrfValue,
@@ -2006,8 +2040,30 @@ test('P3 console and machine API switch only the authenticated device from the n
     assert.equal(badCsrf.status, 403);
     assert.equal(app.store.resolveDeviceAccount(first.device.id).effective_account_id, primary.id);
 
-    const toSecondary = await configure(first.device.id, secondary.id);
-    assert.equal(toSecondary.status, 303);
+    const asyncBadCsrf = await configureAsync(first.device.id, secondary.id, 'wrong');
+    assert.equal(asyncBadCsrf.status, 403);
+    assert.deepEqual(await asyncBadCsrf.json(), { ok: false, error: 'invalid_csrf' });
+
+    const toSecondary = await configureAsync(first.device.id, secondary.id);
+    assert.equal(toSecondary.status, 200);
+    const asyncResult = await toSecondary.json();
+    assert.equal(asyncResult.ok, true);
+    assert.equal(asyncResult.device_id, first.device.id);
+    assert.equal(asyncResult.selected_account_id, secondary.id);
+    assert.deepEqual(asyncResult.account, {
+      id: secondary.id,
+      alias: 'p3-secondary',
+      status: 'stored',
+    });
+    assert.deepEqual(asyncResult.allowed_accounts.map(({ id }) => id), [primary.id, secondary.id]);
+    assert.deepEqual(
+      asyncResult.account_options.map(({ id }) => id),
+      [primary.id, secondary.id, placeholder.id],
+    );
+    assert.equal(asyncResult.account_device_counts.find(({ id }) => id === secondary.id).active_devices, 1);
+    assert.equal(JSON.stringify(asyncResult).includes('upstream-token'), false);
+    const noJsFallback = await configure(first.device.id, secondary.id);
+    assert.equal(noJsFallback.status, 303);
     const configured = app.store.deviceAccountSummary(first.device.id);
     assert.equal(configured.original_account_id, primary.id);
     assert.equal(configured.selected_account_id, secondary.id);
@@ -2286,7 +2342,7 @@ function machineArticle(html, key) {
 }
 
 function credentialRows(fragment, state) {
-  const pattern = new RegExp(`<tr data-credential-state="${state}">([\\s\\S]*?)</tr>`, 'g');
+  const pattern = new RegExp(`<tr data-credential-state="${state}"[^>]*>([\\s\\S]*?)</tr>`, 'g');
   return [...fragment.matchAll(pattern)].map((match) => match[1]);
 }
 

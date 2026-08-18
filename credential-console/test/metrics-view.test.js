@@ -109,6 +109,10 @@ test('metrics view renders exact filter echo, totals, and dashboard-safe values'
   assert.match(html, /data-i18n="metrics-token-coverage-lower-bound"/);
   assert.match(html, /self-entered and unverified/);
   assert.match(html, /href="\/metrics"[^>]*data-i18n="metrics-reset-filters"/);
+  assert.match(html, /data-language-pending/);
+  assert.match(html, /html\[data-language-pending\] body/);
+  assert.match(html, /<noscript><style>html\[data-language-pending\] body/);
+  assert.match(html, /data-reset-scroll/);
   assert.equal((html.match(/<script/g) ?? []).length, 1);
   assert.equal(html.includes('<script>alert'), false);
   assert.equal(html.includes('onerror='), false);
@@ -117,6 +121,10 @@ test('metrics view renders exact filter echo, totals, and dashboard-safe values'
 
 test('metrics view has accessible request, latency, and token SVG charts plus a textual data table', () => {
   const html = render();
+
+  assert.match(html, /data-metric-point-title/);
+  assert.match(html, /data-metric-series-key="metrics-series-total"/);
+  assert.match(html, /data-metric-point-tail="2026-08-17 10:00Z · 4"/);
 
   assert.equal((html.match(/<svg role="img"/g) ?? []).length, 3);
   assert.match(html, /aria-labelledby="metrics-requests-chart-title metrics-requests-chart-description"/);

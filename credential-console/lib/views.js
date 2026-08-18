@@ -36,6 +36,11 @@ const styles = `
   --focus: #d78226;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
+html[data-language-pending] body {
+  visibility: hidden;
+  animation: language-failsafe 0s 1500ms forwards;
+}
+@keyframes language-failsafe { to { visibility: visible; } }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--paper); color: var(--ink); line-height: 1.45; }
 a { color: var(--green); }
@@ -360,6 +365,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .metrics-table-card { padding: 14px; border-radius: 15px; }
 }
 .account-switch-form { min-width: 190px; }
+.account-switch-form[aria-busy="true"] { opacity: .72; }
+.account-switch-status { min-height: 1.4em; color: var(--muted); overflow-wrap: anywhere; }
+.account-switch-status.success { color: var(--green); }
+.account-switch-status.error { color: var(--red); }
 .account-selection-details { display: grid; gap: 3px; margin-top: 5px; }
 .accounts-table { width: 100%; min-width: 1000px; table-layout: fixed; }
 .accounts-table th:nth-child(1) { width: 16%; }
@@ -482,18 +491,24 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 // look like something is guarding it.
 const openBanner = '<div class="notice error open-banner" role="status" data-i18n="open-banner">No authentication: anyone who can reach this console can issue and revoke credentials.</div>';
 
-function layout(title, content, { openMode = false, activeTab = null, metricsAsset = null } = {}) {
+function layout(title, content, {
+  openMode = false,
+  activeTab = null,
+  metricsAsset = null,
+  completedDraft = null,
+} = {}) {
   const metricsScript = metricsAsset?.url && metricsAsset?.integrity
     ? `<script src="${escapeHtml(metricsAsset.url)}" integrity="${escapeHtml(metricsAsset.integrity)}" crossorigin="anonymous" defer></script>`
     : '';
   return `<!doctype html>
-<html lang="en">
+<html lang="en" data-language-pending${completedDraft ? ` data-completed-draft="${escapeHtml(completedDraft)}"` : ''}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
   <title>${escapeHtml(title)} · Credential Console</title>
   <style>${styles}</style>
+  <noscript><style>html[data-language-pending] body { visibility: visible; animation: none; }</style></noscript>
   <script src="/assets/app.js" defer></script>
   ${metricsScript}
 </head>
@@ -699,11 +714,12 @@ function credentialBadge(state) {
  * revoked credential is the normal end state of a retired laptop, and the list
  * has to be able to say that without looking like an outage.
  */
-function accountCell(account) {
+function accountCell(account, { selected = false } = {}) {
+  const selectedAttribute = selected ? ' data-selected-account-cell' : '';
   if (!account) {
-    return '<td data-account-status="unknown"><span class="muted" data-i18n="unknown-account">Unknown account</span></td>';
+    return `<td data-account-status="unknown"${selectedAttribute}><strong class="muted" data-selected-account-alias data-i18n="unknown-account">Unknown account</strong></td>`;
   }
-  return `<td data-account-status="${escapeHtml(account.status)}"><strong>${escapeHtml(account.alias)}</strong><div class="tiny">${statusBadge(account.status)}</div></td>`;
+  return `<td data-account-status="${escapeHtml(account.status)}"${selectedAttribute}><strong data-selected-account-alias>${escapeHtml(account.alias)}</strong><div class="tiny" data-selected-account-status>${statusBadge(account.status)}</div></td>`;
 }
 
 function accountForId(accounts, id) {
@@ -796,7 +812,7 @@ function accountSelectionDetails(selection, accounts) {
     : '—';
   return `<div class="account-selection-details tiny">
     <div><span data-i18n="original-account">Original account</span>: ${original}</div>
-    <div><span data-i18n="allowed-accounts">Allowed accounts</span>: ${allowed}</div>
+    <div><span data-i18n="allowed-accounts">Allowed accounts</span>: <span data-allowed-account-list>${allowed}</span></div>
   </div>`;
 }
 
@@ -809,12 +825,13 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   if (!options) {
     return '<div class="muted tiny" data-i18n="no-claude-accounts">No Claude accounts are registered.</div>';
   }
-  return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/account" class="stack account-switch-form">
+  return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/account" class="stack account-switch-form" data-account-switch data-device-id="${escapeHtml(device.id)}">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
     <label><span data-i18n="selected-account">Selected account</span>
       <select name="selected_account_id" required>${options}</select>
     </label>
     <button type="submit" data-i18n="switch-account">Switch account</button>
+    <span class="tiny account-switch-status" data-account-switch-status role="status" aria-live="polite"></span>
   </form>`;
 }
 
@@ -822,10 +839,10 @@ function claudeCredentialRow(device, accounts, csrf) {
   const state = device.revoked_at ? 'revoked' : 'active';
   const selection = accountSelectionForDevice(device, accounts);
   const selectedAccount = selection.invalid ? null : selection.selectedAccount;
-  return `<tr data-credential-state="${state}">
+  return `<tr data-credential-state="${state}" data-device-row="${escapeHtml(device.id)}" data-selected-account-id="${escapeHtml(selection.selectedAccountId ?? '')}">
     <td data-device-id="${escapeHtml(device.id)}"><strong>${escapeHtml(device.name)}</strong><div class="muted tiny">${escapeHtml(device.member_label || '—')}</div></td>
     <td>Claude Code</td>
-    ${accountCell(selectedAccount)}
+    ${accountCell(selectedAccount, { selected: true })}
     <td>${credentialBadge(state)}</td>
     <td>${escapeHtml(dateText(device.last_seen_at))}</td>
     <td><div class="stack">
@@ -1000,7 +1017,7 @@ function machineEntryView(entry, { accounts, csrf, machineOptions }) {
     </div>
     <div class="table-wrap"><table>${head}<tbody>${activeRows
       || '<tr><td colspan="6" class="empty" data-i18n="no-active-credentials">No active credential.</td></tr>'}</tbody></table></div>
-    ${revokedCount ? `<details data-revoked-credentials="${revokedCount}">
+    ${revokedCount ? `<details data-revoked-credentials="${revokedCount}" data-persist-details="revoked-${escapeHtml(entry.key)}">
       <summary><span data-i18n="revoked-credentials">Revoked credentials</span> (${revokedCount})</summary>
       <div class="table-wrap"><table>${head}<tbody>${revokedRows}</tbody></table></div>
     </details>` : ''}
@@ -1245,7 +1262,11 @@ function metricPolyline(rows, getter, maxValue, plot) {
   }).filter(Boolean).join(' ');
 }
 
-function metricPoints(rows, getter, maxValue, plot, className, { label = className, formatValue = metricDisplayNumber } = {}) {
+function metricPoints(rows, getter, maxValue, plot, className, {
+  label = className,
+  labelI18n = '',
+  formatValue = metricDisplayNumber,
+} = {}) {
   if (!rows.length) return '';
   const denominator = Math.max(rows.length - 1, 1);
   // Sample known values, not raw row positions. Otherwise a sparse singleton
@@ -1268,8 +1289,9 @@ function metricPoints(rows, getter, maxValue, plot, className, { label = classNa
     const value = finiteMetricNumber(rawValue, { max: maxValue });
     const x = plot.left + (plot.width * index) / denominator;
     const y = plot.top + plot.height - (plot.height * value) / Math.max(maxValue, 1);
-    const pointLabel = `${label} · ${metricHourLabel(row.hourBucketMs)} · ${formatValue(value)}`;
-    return `<circle class="metrics-point ${escapeHtml(className)}" cx="${metricSvgNumber(x)}" cy="${metricSvgNumber(y)}" r="3" aria-hidden="true"><title>${escapeHtml(pointLabel)}</title></circle>`;
+    const pointTail = `${metricHourLabel(row.hourBucketMs)} · ${formatValue(value)}`;
+    const pointLabel = `${label} · ${pointTail}`;
+    return `<circle class="metrics-point ${escapeHtml(className)}" cx="${metricSvgNumber(x)}" cy="${metricSvgNumber(y)}" r="3" aria-hidden="true"><title data-metric-point-title data-metric-series-key="${escapeHtml(labelI18n)}" data-metric-point-tail="${escapeHtml(pointTail)}">${escapeHtml(pointLabel)}</title></circle>`;
   }).filter(Boolean).join('');
 }
 
@@ -1330,7 +1352,7 @@ function metricSvgChart({
     scale,
     plot,
     entry.className,
-    { label: entry.label, formatValue },
+    { label: entry.label, labelI18n: entry.i18n, formatValue },
   )).join('');
   return `${commonStart}
     ${grid}
@@ -1728,7 +1750,7 @@ function deviceComparisonView(input) {
         </div>
       </div>
       <div class="metrics-chart-host metrics-chart-host-compact" data-metrics-chart="device-trend" hidden></div>
-      <details class="metrics-chart-fallback">
+      <details class="metrics-chart-fallback" data-persist-details="device-static-fallback">
         <summary data-i18n="metrics-static-fallback-toggle">Show static chart fallback</summary>
         <h3 data-i18n="metrics-device-input-comparison-heading">Hourly input-side known tokens by device</h3>
         ${inputChart}
@@ -1737,7 +1759,7 @@ function deviceComparisonView(input) {
       </details>
     </article>
     <div class="metrics-device-notes">${truncatedNotice}</div>
-    <details class="metrics-comparison-raw metrics-table-card">
+    <details class="metrics-comparison-raw metrics-table-card" data-persist-details="device-raw-table">
       <summary data-i18n="metrics-device-comparison-table-toggle">Show raw comparison table</summary>
       <p class="metrics-scroll-hint" data-i18n="metrics-scroll-table-hint">Swipe horizontally to inspect every column.</p>
       <div class="metrics-comparison-table-wrap"><table class="metrics-table metrics-comparison-table">
@@ -1974,9 +1996,9 @@ export function metricsView({
         <span><span data-i18n="metrics-status-coverage">Complete coverage</span>: <strong>${coveragePercent === null ? '—' : `${escapeHtml(metricDisplayNumber(coveragePercent, { decimals: 1 }))}%`}</strong></span>
         <span data-i18n="metrics-unknown-zero">— means unknown, never zero</span>
       </div>
-      <details class="metrics-filter-details" open>
+      <details class="metrics-filter-details" data-persist-details="filters" open>
         <summary data-i18n="metrics-filter-toggle">Filters</summary>
-        <form method="get" action="/metrics" class="card metrics-filters">
+        <form method="get" action="/metrics" class="card metrics-filters" data-reset-scroll>
           <h2 class="metrics-filter-heading" data-i18n="metrics-filter-heading">Filter usage</h2>
           <label><span data-i18n="metrics-filter-hours">Period</span>
             <select name="hours">${hourOptions}</select>
@@ -2058,12 +2080,12 @@ export function metricsView({
         ${breakdownPanels}
         ${deviceComparison}
       </div>
-      <details class="metrics-table-card metrics-hourly-details">
+      <details class="metrics-table-card metrics-hourly-details" data-persist-details="hourly-table">
         <summary data-i18n="metrics-hourly-table-toggle">Show hourly details</summary>
         <p class="metrics-scroll-hint" data-i18n="metrics-scroll-table-hint">Swipe horizontally to inspect every column.</p>
         ${metricsTable(rows, { wrapped: false })}
       </details>
-      <details class="metrics-privacy-details">
+      <details class="metrics-privacy-details" data-persist-details="methodology">
         <summary data-i18n="metrics-methodology-toggle">Scope, privacy, and attribution</summary>
         <p class="muted tiny" data-i18n="metrics-claude-only">Token accounting covers Claude gateway traffic only. Codex clients connect directly to their provider and are not included.</p>
         <p class="muted tiny" data-i18n="metrics-intro-long">This page renders request metadata only. Request and response bodies are not shown here; eligible captured API turns appear under Conversations.</p>
@@ -2425,7 +2447,7 @@ export function conversationsView({
   ].join('');
   const nextForm = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
     ? ''
-    : `<form method="post" action="/conversation-turns" class="conversation-pagination-form">
+    : `<form method="post" action="/conversation-turns" class="conversation-pagination-form" data-reset-scroll>
         ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
@@ -2434,9 +2456,9 @@ export function conversationsView({
       ${conversationPrivacyView(openMode)}
       ${conversationSubnav('turns')}
       <div class="conversation-layout">
-        <details class="conversation-filter-details" open>
+        <details class="conversation-filter-details" data-persist-details="turn-filters" open>
           <summary data-i18n="conversation-filters-heading">Filters</summary>
-          <form method="post" action="/conversation-turns" class="card conversation-rail conversation-filters" aria-label="API-turn filters">
+          <form method="post" action="/conversation-turns" class="card conversation-rail conversation-filters" aria-label="API-turn filters" data-reset-scroll>
           <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
           <p class="muted tiny conversation-filter-hint" data-i18n="conversation-filter-hint">Type to search member suggestions; leave the field blank for everyone.</p>
           <label><span data-i18n="conversation-search">Search captured API turns</span>
@@ -2611,7 +2633,7 @@ export function conversationSessionsView({
   ].join('');
   const nextForm = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
     ? ''
-    : `<form method="post" action="/conversations" class="conversation-pagination-form">
+    : `<form method="post" action="/conversations" class="conversation-pagination-form" data-reset-scroll>
         ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
@@ -2622,9 +2644,9 @@ export function conversationSessionsView({
       ${conversationSubnav('sessions')}
       ${standaloneTurnsNotice(standaloneCount)}
       <div class="conversation-layout">
-        <details class="conversation-filter-details" open>
+        <details class="conversation-filter-details" data-persist-details="session-filters" open>
           <summary data-i18n="conversation-filters-heading">Filters</summary>
-          <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters">
+          <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters" data-reset-scroll>
           <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
           <p class="muted tiny conversation-filter-hint" data-i18n="conversation-session-filter-hint">Filters match any captured turn inside a correlated client session; each result card shows the latest turn's attribution and preview.</p>
           <label><span data-i18n="conversation-session-search">Search conversations</span>
@@ -2871,6 +2893,7 @@ export function dashboardView({
   codexSelfServiceReady = false,
   onboardingUrl = null,
   error = null,
+  completedDraft = null,
   credentialAlerts = null,
   now = Date.now(),
 }) {
@@ -2899,11 +2922,11 @@ export function dashboardView({
       ?? alerts.accounts.find((entry) => entry.alias === account.alias)
       ?? null;
     return `
-    <tr>
+    <tr data-account-row="${escapeHtml(account.id)}">
       <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(account.provider === 'claude' ? 'Claude Code' : 'Codex')} · ${escapeHtml(account.email_label || 'No email label')}</div></td>
       <td><div class="account-status-stack">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}</div>
         ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}
-        <div class="muted tiny"><span data-i18n="devices">Devices</span>: ${escapeHtml(account.active_devices ?? '—')}</div></td>
+        <div class="muted tiny"><span data-i18n="devices">Devices</span>: <span data-account-device-count>${escapeHtml(account.active_devices ?? '—')}</span></div></td>
       <td>${expiryView(alert)}</td>
       <td class="account-history">${credentialCheckText(alert?.lastSuccessAt, 'last-successful-check')}${credentialCheckText(alert?.lastRotationAt, 'last-rotation')}</td>
       <td>${accountUsageView(account)}</td>
@@ -2930,7 +2953,7 @@ export function dashboardView({
   // Open mode has no verified identity, so the member types the label that keeps their
   // device names from colliding with somebody else's.
   const memberLabelField = openMode ? `<label><span data-i18n="member-label">Your label (self-asserted, not verified)</span>
-                <input name="member_label" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="alex" maxlength="64">
+                <input name="member_label" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="alex" maxlength="64" data-draft-field>
               </label>` : '';
   const memberFormClass = openMode ? ' with-label' : '';
   const inventory = machineInventory({ machines, codexClients });
@@ -2970,14 +2993,14 @@ export function dashboardView({
             <div class="provider-title"><h2>Claude Code</h2>${selfServiceAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
             <p class="muted" data-i18n="claude-description">Get a public-internet configuration scoped to this member and device. The provider OAuth token never leaves the server.</p>
             ${selfServiceAccounts.length ? `<div class="quota-list">${claudeUsage}</div>` : ''}
-            ${selfServiceAccounts.length ? `<form method="post" action="/self-service" class="member-form${memberFormClass}">
+            ${selfServiceAccounts.length ? `<form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="claude-self-service">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <label><span data-i18n="team-account">Team account</span>
-                <select name="account_id" required>${selfServiceOptions}</select>
+                <select name="account_id" required data-draft-field>${selfServiceOptions}</select>
               </label>
               ${memberLabelField}
               <label><span data-i18n="device-name">Device name</span>
-                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-macbook" maxlength="64">
+                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-macbook" maxlength="64" data-draft-field>
               </label>
               <div><button type="submit" data-i18n="get-claude">Get Claude Code setup</button></div>
             </form>` : `<div class="member-form">
@@ -2991,11 +3014,11 @@ export function dashboardView({
             ${primaryCodex ? `<p><strong>${escapeHtml(primaryCodex.alias)}</strong></p>` : ''}
             <p class="muted" data-i18n="codex-description">The refresh center rotates the master credential. Get a self-contained installer and independent device token that do not require tailnet access.</p>
             ${primaryCodex ? `<div class="quota-list">${accountUsageView(primaryCodex)}</div>` : ''}
-            ${primaryCodex && codexSelfServiceReady ? `<form method="post" action="/codex/self-service" class="member-form codex-form${memberFormClass}">
+            ${primaryCodex && codexSelfServiceReady ? `<form method="post" action="/codex/self-service" class="member-form codex-form${memberFormClass}" data-persist-draft="codex-self-service">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               ${memberLabelField}
               <label><span data-i18n="device-name">Device name</span>
-                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64">
+                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
               </label>
               <div><button type="submit" data-i18n="get-codex">Get Codex installer</button></div>
             </form>` : '<div class="notice" data-i18n="codex-unavailable">Codex self-service enrollment is not configured yet. An administrator must connect dispenser enrollment.</div>'}
@@ -3037,14 +3060,14 @@ export function dashboardView({
           <article class="card split">
             <h2 data-i18n="add-claude-heading">Add a Claude Code team account</h2>
             <div class="notice"><span data-i18n="add-claude-help">Register the expected owner email once. The owner completes OAuth later from the account's permanent authorization page; no token is handed to an administrator.</span></div>
-            <form method="post" action="/accounts" class="stack" autocomplete="off">
+            <form method="post" action="/accounts" class="stack" autocomplete="off" data-persist-draft="register-claude-account">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <input type="hidden" name="provider" value="claude">
               <label><span data-i18n="account-alias">Account alias</span>
-                <input name="alias" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,63}" placeholder="claude-max-1">
+                <input name="alias" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,63}" placeholder="claude-max-1" data-draft-field>
               </label>
               <label><span data-i18n="account-email">Account email label</span>
-                <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160" required>
+                <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160" required data-draft-field>
               </label>
               <button type="submit" data-i18n="register-account">Register account</button>
             </form>
@@ -3052,14 +3075,14 @@ export function dashboardView({
           <article class="card split">
             <h2 data-i18n="add-codex-heading">Add a Codex team account</h2>
             <div class="notice"><span data-i18n="add-codex-help">Register the alias, then authorize the ChatGPT subscription from the account's own page. No separate codex login on another machine is needed.</span></div>
-            <form method="post" action="/accounts" class="stack" autocomplete="off">
+            <form method="post" action="/accounts" class="stack" autocomplete="off" data-persist-draft="register-codex-account">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <input type="hidden" name="provider" value="codex">
               <label><span data-i18n="account-alias">Account alias</span>
-                <input name="alias" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,63}" placeholder="codex-shared-1">
+                <input name="alias" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,63}" placeholder="codex-shared-1" data-draft-field>
               </label>
               <label><span data-i18n="account-email-optional">Account email label (optional, checked at authorization)</span>
-                <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160">
+                <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160" data-draft-field>
               </label>
               <button type="submit" data-i18n="register-account">Register account</button>
             </form>
@@ -3088,7 +3111,7 @@ export function dashboardView({
               <p class="muted tiny" data-i18n="unattributed-intro">Issued before machine handles existed, or through a path that reports none — a browser is not an agent and has none to give. Nothing is inferred from a matching name or member label; file one under a machine to have it counted there.</p>
               <div class="machine-list">${unattributed.map(entryView).join('')}</div>
             </section>` : ''}
-            ${retiredMachines.length ? `<details class="machine-group" data-retired-machines="${retiredMachines.length}">
+            ${retiredMachines.length ? `<details class="machine-group" data-retired-machines="${retiredMachines.length}" data-persist-details="retired-machines">
               <summary><span data-i18n="retired-machines">Machines with no active credential</span> (${retiredMachines.length})</summary>
               <div class="machine-list">${retiredMachines.map(entryView).join('')}</div>
             </details>` : ''}
@@ -3096,7 +3119,7 @@ export function dashboardView({
         </section>
       </section>
     </div>
-  `, { openMode, activeTab: 'overview' });
+  `, { openMode, activeTab: 'overview', completedDraft });
 }
 
 export function claudeAuthorizationView({
@@ -3458,7 +3481,7 @@ export function codexConfiguredView({
       <div class="notice"><span data-i18n="do-not-codex-login">Do not run codex login after installation. The agent writes the subscription credential and refreshes it automatically.</span></div>
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
     </section>
-  `, { openMode });
+  `, { openMode, completedDraft: 'codex-self-service' });
 }
 
 export function deviceConfiguredView({ account, device, token, claudeGatewayUrl, openMode = false }) {
@@ -3567,7 +3590,7 @@ Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
       <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
     </section>
-  `, { openMode });
+  `, { openMode, completedDraft: 'claude-self-service' });
 }
 
 export function messageView(title, message, {

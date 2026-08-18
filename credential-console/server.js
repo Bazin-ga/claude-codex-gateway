@@ -87,6 +87,12 @@ const MAX_METRICS_PAGE_CACHE_BYTES = 12 * 1024 * 1024;
 const METRICS_CHART_RATE_WINDOW_MS = 60_000;
 const METRICS_CHART_RATE_LIMIT = 120;
 const MAX_METRICS_CHART_RATE_KEYS = 1_024;
+const COMPLETED_DRAFTS = new Set([
+  'claude-self-service',
+  'codex-self-service',
+  'register-claude-account',
+  'register-codex-account',
+]);
 const DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const BOUNDED_CONVERSATION_SEARCH_ERRORS = new Set([
   'search_query_too_short',
@@ -156,6 +162,14 @@ function routeMatch(path, pattern) {
     else if (expected[index] !== actual[index]) return null;
   }
   return params;
+}
+
+function expectsAsyncJson(req, operation) {
+  const requested = req.headers['x-credential-console-async'];
+  const accept = String(req.headers.accept ?? '').toLowerCase();
+  return requested === operation && accept.split(',').some((entry) => (
+    entry.trim().startsWith('application/json')
+  ));
 }
 
 const SAFE_HEALTH_OUTCOMES = new Set([
@@ -1528,6 +1542,9 @@ const translations = {
   'allowed-accounts': '允许切换的账号',
   'selected-account': '当前所选账号',
   'switch-account': '切换账号',
+  'account-switch-working': '正在切换…',
+  'account-switch-saved': '已切换到',
+  'account-switch-failed': '切换失败，当前页面未刷新；请重试或重新载入页面。',
   'account-selection-invalid': '账号选择配置无效；系统没有擅自猜测账号。',
   'no-claude-accounts': '尚未登记 Claude 账号。',
   'open-account-switch-warning': 'Open 模式没有可验证的操作人：任何能访问控制台的人都可以切换任意有效设备。操作人记录为 anonymous；成员标签不代表操作人。',
@@ -1857,6 +1874,78 @@ const translations = {
   'accounts-table-caption': '账号及安全健康元数据'
 };
 
+const LANGUAGE_STORAGE_KEY = 'credential_console_language';
+const LANGUAGE_UPDATED_STORAGE_KEY = 'credential_console_language_updated_at';
+const LANGUAGE_COOKIE = 'credential_console_language';
+
+function languageCookie() {
+  try {
+    for (const entry of document.cookie.split(';')) {
+      const index = entry.indexOf('=');
+      if (index < 1 || entry.slice(0, index).trim() !== LANGUAGE_COOKIE) continue;
+      const value = decodeURIComponent(entry.slice(index + 1).trim());
+      const parts = value.split('.');
+      if (parts.length > 2 || (parts[0] !== 'zh' && parts[0] !== 'en')) return null;
+      if (parts[1] !== undefined && !/^[0-9]{1,16}$/.test(parts[1])) return null;
+      const updatedAt = Number(parts[1] ?? 0);
+      return {
+        language: parts[0],
+        updatedAt: Number.isSafeInteger(updatedAt) && updatedAt >= 0 ? updatedAt : 0,
+      };
+    }
+  } catch {
+    // Cookies can be unavailable in sandboxed or hardened browser contexts.
+  }
+  return null;
+}
+
+function localLanguage() {
+  try {
+    const language = localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    if (language !== 'zh' && language !== 'en') return null;
+    const updatedAt = Number(localStorage.getItem(LANGUAGE_UPDATED_STORAGE_KEY) ?? 0);
+    return {
+      language,
+      updatedAt: Number.isSafeInteger(updatedAt) && updatedAt >= 0 ? updatedAt : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function storedLanguage() {
+  const local = localLanguage();
+  const cookie = languageCookie();
+  if (local && cookie) {
+    // Timestamped writes resolve partial/silently ignored browser storage. A
+    // tie keeps the legacy localStorage preference for backward compatibility.
+    return cookie.updatedAt > local.updatedAt ? cookie.language : local.language;
+  }
+  if (local) return local.language;
+  if (cookie) return cookie.language;
+  return String(navigator.language ?? '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+}
+
+function persistLanguage(language) {
+  const updatedAt = Date.now();
+  try {
+    localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
+    localStorage.setItem(LANGUAGE_UPDATED_STORAGE_KEY, String(updatedAt));
+  } catch {
+    // Cookie fallback still applies.
+  }
+  try {
+    document.cookie = LANGUAGE_COOKIE + '=' + encodeURIComponent(language + '.' + updatedAt)
+      + '; Path=/; Max-Age=31536000; SameSite=Strict';
+  } catch {
+    // A language preference is optional; never break the rest of the UI.
+  }
+}
+
+function currentLanguage() {
+  return document.documentElement.lang === 'zh-CN' ? 'zh' : 'en';
+}
+
 function applyLanguage(language) {
   const selected = language === 'zh' ? 'zh' : 'en';
   document.documentElement.lang = selected === 'zh' ? 'zh-CN' : 'en';
@@ -1879,41 +1968,212 @@ function applyLanguage(language) {
       ? (element.dataset.placeholderZh ?? element.dataset.placeholderEn)
       : element.dataset.placeholderEn;
   });
+  document.querySelectorAll('[data-metric-point-title]').forEach((element) => {
+    if (!element.dataset.metricPointTitleEn) element.dataset.metricPointTitleEn = element.textContent;
+    const key = element.dataset.metricSeriesKey ?? '';
+    const tail = element.dataset.metricPointTail ?? '';
+    element.textContent = selected === 'zh'
+      ? (translations[key] ?? element.dataset.metricPointTitleEn.split(' · ')[0]) + ' · ' + tail
+      : element.dataset.metricPointTitleEn;
+  });
   document.querySelectorAll('[data-language]').forEach((button) => {
     button.classList.toggle('active', button.dataset.language === selected);
     button.setAttribute('aria-pressed', button.dataset.language === selected ? 'true' : 'false');
   });
-  localStorage.setItem('credential_console_language', selected);
+  document.querySelectorAll('[data-account-switch-status][data-account-switch-result]').forEach((node) => {
+    renderAccountSwitchStatus(
+      node,
+      node.dataset.accountSwitchResult,
+      node.dataset.accountAlias ?? '',
+    );
+  });
+  persistLanguage(selected);
+  document.documentElement.removeAttribute('data-language-pending');
   window.dispatchEvent(new CustomEvent('credential-console-language', { detail: { language: selected } }));
 }
 
-applyLanguage(localStorage.getItem('credential_console_language') ?? 'en');
+applyLanguage(storedLanguage());
 
-// Keep the result list near the top on narrow screens while preserving an
-// expanded, no-JavaScript fallback and the always-open desktop filter rail.
-// Reconcile breakpoint changes as well, so rotating a phone cannot leave a
-// closed details element behind a hidden desktop summary.
+function sessionStateGet(key) {
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function sessionStateSet(key, value) {
+  try {
+    sessionStorage.setItem(key, value);
+  } catch {
+    // State restoration is progressive enhancement only.
+  }
+}
+
+function sessionStateRemove(key) {
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    // State restoration is progressive enhancement only.
+  }
+}
+
+const pageStateUrl = new URL(location.href);
+pageStateUrl.searchParams.delete('draft_completed');
+const pageStateKey = pageStateUrl.pathname + pageStateUrl.search;
 const conversationFilterMedia = window.matchMedia?.('(max-width: 800px)');
-const syncConversationFilters = (media) => {
-  document.querySelectorAll('.conversation-filter-details').forEach((details) => {
-    details.open = !media.matches;
-  });
-};
-if (conversationFilterMedia) {
-  syncConversationFilters(conversationFilterMedia);
-  conversationFilterMedia.addEventListener?.('change', syncConversationFilters);
+const metricsFilterMedia = window.matchMedia?.('(max-width: 640px)');
+
+function detailsStateKey(details) {
+  return 'credential_console_details:' + pageStateKey + ':' + details.dataset.persistDetails;
 }
 
-const metricsFilterMedia = window.matchMedia?.('(max-width: 640px)');
-const syncMetricsFilters = (media) => {
-  document.querySelectorAll('.metrics-filter-details').forEach((details) => {
-    details.open = !media.matches;
-  });
-};
-if (metricsFilterMedia) {
-  syncMetricsFilters(metricsFilterMedia);
-  metricsFilterMedia.addEventListener?.('change', syncMetricsFilters);
+function forcedDesktopFilter(details) {
+  return (details.classList.contains('conversation-filter-details')
+      && conversationFilterMedia && !conversationFilterMedia.matches)
+    || (details.classList.contains('metrics-filter-details')
+      && metricsFilterMedia && !metricsFilterMedia.matches);
 }
+
+function mobileFilterDefault(details) {
+  return (details.classList.contains('conversation-filter-details')
+      && conversationFilterMedia?.matches)
+    || (details.classList.contains('metrics-filter-details')
+      && metricsFilterMedia?.matches);
+}
+
+function restoreDetails(details) {
+  const stored = sessionStateGet(detailsStateKey(details));
+  if (forcedDesktopFilter(details)) details.open = true;
+  else if (stored === 'open' || stored === 'closed') details.open = stored === 'open';
+  else if (mobileFilterDefault(details)) details.open = false;
+}
+
+document.querySelectorAll('details[data-persist-details]').forEach((details) => {
+  restoreDetails(details);
+  details.addEventListener('toggle', () => {
+    // Desktop filter rails are forced open by layout. Do not let that
+    // temporary presentation overwrite the member's mobile preference.
+    if (!forcedDesktopFilter(details)) {
+      sessionStateSet(detailsStateKey(details), details.open ? 'open' : 'closed');
+    }
+  });
+});
+
+function syncResponsiveDetails(selector) {
+  document.querySelectorAll(selector).forEach(restoreDetails);
+}
+conversationFilterMedia?.addEventListener?.('change', () => {
+  syncResponsiveDetails('.conversation-filter-details[data-persist-details]');
+});
+metricsFilterMedia?.addEventListener?.('change', () => {
+  syncResponsiveDetails('.metrics-filter-details[data-persist-details]');
+});
+
+const SAFE_DRAFT_FIELDS = new Set([
+  'account_id',
+  'alias',
+  'device_name',
+  'email_label',
+  'member_label',
+]);
+const SAFE_DRAFT_KEYS = new Set([
+  'claude-self-service',
+  'codex-self-service',
+  'register-claude-account',
+  'register-codex-account',
+]);
+
+const completedDraft = document.documentElement.dataset.completedDraft ?? '';
+if (SAFE_DRAFT_KEYS.has(completedDraft)) {
+  sessionStateRemove('credential_console_draft:/:' + completedDraft);
+  try {
+    const canonical = new URL(location.href);
+    if (canonical.searchParams.get('draft_completed') === completedDraft) {
+      canonical.searchParams.delete('draft_completed');
+      history.replaceState(history.state, '', canonical.pathname + canonical.search + canonical.hash);
+    }
+  } catch {
+    // The draft is already cleared; URL cleanup is cosmetic.
+  }
+}
+
+function formDraftKey(form) {
+  return 'credential_console_draft:' + location.pathname + ':' + form.dataset.persistDraft;
+}
+
+function formDraftFields(form) {
+  return [...form.querySelectorAll('[data-draft-field][name]')]
+    .filter((field) => SAFE_DRAFT_FIELDS.has(field.name));
+}
+
+function saveFormDraft(form) {
+  const values = {};
+  formDraftFields(form).forEach((field) => {
+    values[field.name] = String(field.value ?? '').slice(0, 256);
+  });
+  sessionStateSet(formDraftKey(form), JSON.stringify(values));
+}
+
+function restoreFormDraft(form) {
+  const stored = sessionStateGet(formDraftKey(form));
+  if (!stored || stored.length > 4096) return;
+  let values;
+  try {
+    values = JSON.parse(stored);
+  } catch {
+    return;
+  }
+  if (!values || typeof values !== 'object' || Array.isArray(values)) return;
+  formDraftFields(form).forEach((field) => {
+    if (typeof values[field.name] !== 'string') return;
+    const value = values[field.name].slice(0, 256);
+    if (field instanceof HTMLSelectElement
+      && ![...field.options].some((option) => option.value === value)) return;
+    field.value = value;
+  });
+}
+
+document.querySelectorAll('form[data-persist-draft]').forEach((form) => {
+  restoreFormDraft(form);
+  form.addEventListener('input', () => saveFormDraft(form));
+  form.addEventListener('change', () => saveFormDraft(form));
+});
+
+const scrollStateKey = 'credential_console_scroll:' + pageStateKey;
+const skipScrollStateKey = 'credential_console_skip_scroll:' + pageStateKey;
+const skipScrollRestore = sessionStateGet(skipScrollStateKey) === 'true';
+if (skipScrollRestore) {
+  sessionStateRemove(skipScrollStateKey);
+  sessionStateSet(scrollStateKey, '0');
+}
+const navigationType = performance.getEntriesByType?.('navigation')?.[0]?.type;
+if (!skipScrollRestore && navigationType !== 'back_forward') {
+  const savedScroll = Number(sessionStateGet(scrollStateKey));
+  if (Number.isFinite(savedScroll) && savedScroll > 0) {
+    requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo({ top: savedScroll })));
+  }
+}
+window.addEventListener('pagehide', () => {
+  sessionStateSet(scrollStateKey, String(Math.max(0, Math.round(window.scrollY))));
+});
+
+document.addEventListener('submit', (event) => {
+  const form = event.target.closest?.('form[data-reset-scroll]');
+  if (!form) return;
+  try {
+    const destination = new URL(form.action, location.href);
+    if (String(form.method).toLowerCase() === 'get') {
+      destination.search = new URLSearchParams(new FormData(form)).toString();
+    }
+    sessionStateSet(
+      'credential_console_skip_scroll:' + destination.pathname + destination.search,
+      'true',
+    );
+  } catch {
+    // Navigation remains functional without scroll-state enhancement.
+  }
+});
 
 async function copyText(text) {
   if (navigator.clipboard?.writeText) {
@@ -1943,6 +2203,153 @@ async function copyText(text) {
   if (!copied) throw new Error('copy failed');
 }
 
+function translatedText(key, english) {
+  return currentLanguage() === 'zh' ? (translations[key] ?? english) : english;
+}
+
+function safeAccountStatus(value) {
+  const status = String(value ?? 'unavailable');
+  return /^[a-z][a-z0-9_]{0,31}$/.test(status) ? status : 'unavailable';
+}
+
+function accountStatusText(status) {
+  const key = 'status-' + status.replaceAll('_', '-');
+  return translatedText(key, status.replaceAll('_', ' '));
+}
+
+function renderAccountSwitchStatus(node, state, alias = '') {
+  if (!node) return;
+  node.dataset.accountSwitchResult = state;
+  node.dataset.accountAlias = alias;
+  node.className = 'tiny account-switch-status';
+  if (state === 'saved') {
+    node.classList.add('success');
+    node.textContent = translatedText('account-switch-saved', 'Switched to') + ' ' + alias;
+  } else if (state === 'failed') {
+    node.classList.add('error');
+    node.textContent = translatedText(
+      'account-switch-failed',
+      'Switch failed without refreshing this page. Try again or reload.',
+    );
+  } else {
+    node.textContent = translatedText('account-switch-working', 'Switching…');
+  }
+}
+
+function updateAllowedAccounts(form, accounts) {
+  const target = form.closest('[data-device-row]')?.querySelector('[data-allowed-account-list]');
+  if (!target || !Array.isArray(accounts)) return;
+  const fragment = document.createDocumentFragment();
+  accounts.forEach((account, index) => {
+    if (index > 0) fragment.append(document.createTextNode(', '));
+    const span = document.createElement('span');
+    const status = safeAccountStatus(account?.status);
+    span.dataset.accountLabel = '';
+    span.dataset.accountAlias = String(account?.alias ?? account?.id ?? '');
+    span.dataset.accountStatus = status;
+    span.textContent = span.dataset.accountAlias + ' · ' + accountStatusText(status);
+    fragment.append(span);
+  });
+  if (!accounts.length) fragment.append(document.createTextNode('—'));
+  target.replaceChildren(fragment);
+}
+
+function updateAccountOptions(form, accounts) {
+  if (!Array.isArray(accounts)) return;
+  const byId = new Map(accounts.map((account) => [String(account?.id ?? ''), account]));
+  form.querySelectorAll('[data-account-option]').forEach((option) => {
+    const account = byId.get(option.value);
+    if (!account) return;
+    option.dataset.accountAlias = String(account.alias ?? account.id ?? '');
+    option.dataset.accountStatus = safeAccountStatus(account.status);
+    option.textContent = option.dataset.accountAlias + ' · ' + accountStatusText(option.dataset.accountStatus);
+  });
+}
+
+function updateAccountCounts(counts) {
+  if (!Array.isArray(counts)) return;
+  counts.forEach((entry) => {
+    const id = String(entry?.id ?? '');
+    const count = Number(entry?.active_devices);
+    if (!id || !Number.isSafeInteger(count) || count < 0) return;
+    document.querySelectorAll('[data-account-row]').forEach((row) => {
+      if (row.dataset.accountRow !== id) return;
+      const target = row.querySelector('[data-account-device-count]');
+      if (target) target.textContent = String(count);
+    });
+  });
+}
+
+document.addEventListener('submit', async (event) => {
+  const form = event.target.closest?.('form[data-account-switch]');
+  if (!form || typeof fetch !== 'function' || typeof FormData !== 'function') return;
+  event.preventDefault();
+  if (form.dataset.submitting === 'true') return;
+  const row = form.closest('[data-device-row]');
+  const select = form.elements.selected_account_id;
+  const button = form.querySelector('button[type="submit"]');
+  const statusNode = form.querySelector('[data-account-switch-status]');
+  const committedAccountId = row?.dataset.selectedAccountId ?? '';
+  form.dataset.submitting = 'true';
+  form.setAttribute('aria-busy', 'true');
+  renderAccountSwitchStatus(statusNode, 'working');
+  try {
+    const submittedForm = new FormData(form);
+    if (button) button.disabled = true;
+    if (select) select.disabled = true;
+    const body = new URLSearchParams();
+    for (const [key, value] of submittedForm) body.append(key, String(value));
+    const response = await fetch(form.action, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'X-Credential-Console-Async': 'account-switch',
+      },
+      body,
+    });
+    const contentType = response.headers.get('content-type') ?? '';
+    const result = contentType.includes('application/json') ? await response.json() : null;
+    if (!response.ok || result?.ok !== true || !result.account) throw new Error('account switch failed');
+    const accountId = String(result.selected_account_id ?? '');
+    const alias = String(result.account.alias ?? '');
+    const accountStatus = safeAccountStatus(result.account.status);
+    if (!accountId || !alias || accountId !== String(result.account.id ?? '')) {
+      throw new Error('account switch response invalid');
+    }
+    if (row) row.dataset.selectedAccountId = accountId;
+    if (select) select.value = accountId;
+    const cell = row?.querySelector('[data-selected-account-cell]');
+    if (cell) {
+      cell.dataset.accountStatus = accountStatus;
+      const aliasNode = cell.querySelector('[data-selected-account-alias]');
+      if (aliasNode) aliasNode.textContent = alias;
+      const statusTarget = cell.querySelector('[data-selected-account-status]');
+      if (statusTarget) {
+        const badge = document.createElement('span');
+        badge.className = 'badge ' + accountStatus;
+        badge.dataset.i18n = 'status-' + accountStatus.replaceAll('_', '-');
+        badge.textContent = accountStatus.replaceAll('_', ' ');
+        statusTarget.replaceChildren(badge);
+      }
+    }
+    updateAllowedAccounts(form, result.allowed_accounts);
+    updateAccountOptions(form, result.account_options);
+    updateAccountCounts(result.account_device_counts);
+    applyLanguage(currentLanguage());
+    renderAccountSwitchStatus(statusNode, 'saved', alias);
+  } catch {
+    if (select && committedAccountId) select.value = committedAccountId;
+    renderAccountSwitchStatus(statusNode, 'failed');
+  } finally {
+    form.dataset.submitting = 'false';
+    form.removeAttribute('aria-busy');
+    if (button) button.disabled = false;
+    if (select) select.disabled = false;
+  }
+});
+
 document.addEventListener('click', async (event) => {
   const languageButton = event.target.closest('[data-language]');
   if (languageButton) {
@@ -1955,7 +2362,7 @@ document.addEventListener('click', async (event) => {
     if (!target) return;
     await copyText(target.textContent);
     const previous = button.textContent;
-    button.textContent = (localStorage.getItem('credential_console_language') === 'zh') ? translations.copied : 'Copied';
+    button.textContent = currentLanguage() === 'zh' ? translations.copied : 'Copied';
     setTimeout(() => { button.textContent = previous; }, 1600);
     return;
   }
@@ -2025,6 +2432,7 @@ document.addEventListener('click', async (event) => {
       const session = requireSession(req, res);
       if (!session) return;
       const codex = await codexMachineReport();
+      const completedDraft = url.searchParams.get('draft_completed');
       sendHtml(res, 200, dashboardView({
         accounts: await accountsWithExternalStatus(),
         devices: store.publicDevices(),
@@ -2041,6 +2449,7 @@ document.addEventListener('click', async (event) => {
         codexSelfServiceReady,
         onboardingUrl,
         error: url.searchParams.get('error'),
+        completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
       }));
       return;
     }
@@ -2189,7 +2598,7 @@ document.addEventListener('click', async (event) => {
           alias: String(form.alias ?? '').trim(),
           emailLabel,
         });
-        redirect(res, '/');
+        redirect(res, `/?draft_completed=${encodeURIComponent(`register-${provider}-account`)}`);
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }
@@ -2595,11 +3004,13 @@ document.addEventListener('click', async (event) => {
 
     const switchAccountParams = routeMatch(path, '/devices/:id/account');
     if (req.method === 'POST' && switchAccountParams) {
+      const asyncJson = expectsAsyncJson(req, 'account-switch');
       const session = requireSession(req, res);
       if (!session) return;
       const form = await readForm(req).catch(() => ({}));
       if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        if (asyncJson) sendJson(res, 403, { ok: false, error: 'invalid_csrf' });
+        else sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
       const actor = session.admin_identity ?? 'anonymous';
@@ -2617,14 +3028,52 @@ document.addEventListener('click', async (event) => {
           selected_account_id: summary.selected_account_id,
           actor,
         });
-        redirect(res, '/');
+        if (asyncJson) {
+          const accountOptions = store.publicAccounts()
+            .filter((account) => account.provider === 'claude')
+            .map((account) => ({
+              id: account.id,
+              alias: account.alias,
+              status: account.status,
+              active_devices: account.active_devices,
+            }));
+          const accountById = new Map(accountOptions.map((account) => [account.id, account]));
+          const allowedAccounts = summary.allowed_account_ids
+            .map((id) => accountById.get(id))
+            .filter(Boolean)
+            .map(({ id, alias, status }) => ({ id, alias, status }));
+          sendJson(res, 200, {
+            ok: true,
+            device_id: summary.device_id,
+            selected_account_id: summary.selected_account_id,
+            account: {
+              id: summary.account.id,
+              alias: summary.account.alias,
+              status: summary.account.status,
+            },
+            allowed_accounts: allowedAccounts,
+            account_options: accountOptions.map(({ id, alias, status }) => ({ id, alias, status })),
+            account_device_counts: accountOptions
+              .map(({ id, active_devices }) => ({ id, active_devices })),
+          });
+        } else {
+          redirect(res, '/');
+        }
       } catch (error) {
         log('device_account_configuration_failed', {
           device_id: switchAccountParams.id,
           actor,
           code: error.code ?? error.name ?? 'unknown',
         });
-        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+        if (asyncJson) {
+          const code = String(error.code ?? '');
+          const status = code === 'ACCOUNT_NOT_ALLOWED'
+            ? 403
+            : (code === 'ACCOUNT_UNAVAILABLE' || code.startsWith('DEVICE_') ? 409 : 500);
+          sendJson(res, status, { ok: false, error: 'account_switch_failed' });
+        } else {
+          redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+        }
       }
       return;
     }

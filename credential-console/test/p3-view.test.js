@@ -97,7 +97,7 @@ const INVALID_UNATTRIBUTED = activeDevice({
   },
 });
 
-function render({ openMode = true } = {}) {
+function render({ openMode = true, completedDraft = null } = {}) {
   return dashboardView({
     accounts: [ACCOUNT_A, ACCOUNT_B, CODEX_ACCOUNT],
     devices: [SHARED_SELECTED_B, SHARED_SELECTED_A, REVOKED, LEGACY_UNATTRIBUTED, INVALID_UNATTRIBUTED],
@@ -134,6 +134,7 @@ function render({ openMode = true } = {}) {
     csrf: 'csrf-p3',
     adminIdentity: null,
     openMode,
+    completedDraft,
   });
 }
 
@@ -166,6 +167,9 @@ test('each valid active Claude credential gets its own selected-account form and
     assert.match(row, /data-i18n="allowed-accounts"/);
     assert.match(row, /data-i18n="selected-account"/);
     assert.match(row, /data-i18n="switch-account"/);
+    assert.match(row, /data-account-switch data-device-id=/);
+    assert.match(row, /data-account-switch-status role="status" aria-live="polite"/);
+    assert.match(row, /data-selected-account-cell/);
     assert.match(row, /value='account-a'/);
     assert.match(row, /value='account-b'/);
     assert.match(row, /data-account-status="login_required"/);
@@ -176,6 +180,27 @@ test('each valid active Claude credential gets its own selected-account form and
   assert.match(sharedA, /value='account-a'[^>]* selected/);
   assert.match(legacy, /value='account-a'[^>]* selected/);
   assert.equal(accountActions(html).length, 3);
+});
+
+test('safe dashboard drafts are opt-in and never include credential or authorization fields', () => {
+  const html = render();
+  for (const key of [
+    'claude-self-service',
+    'register-claude-account',
+    'register-codex-account',
+  ]) {
+    assert.match(html, new RegExp(`data-persist-draft="${key}"`));
+  }
+  assert.match(html, /name="account_id" required data-draft-field/);
+  assert.match(html, /name="device_name"[^>]*data-draft-field/);
+  assert.match(html, /name="alias"[^>]*data-draft-field/);
+  assert.match(html, /name="email_label"[^>]*data-draft-field/);
+  assert.doesNotMatch(html, /type="hidden"[^>]*data-draft-field/);
+  assert.doesNotMatch(html, /name="(?:csrf|authorization|token)"[^>]*data-draft-field/);
+  assert.match(
+    render({ completedDraft: 'register-claude-account' }),
+    /data-completed-draft="register-claude-account"/,
+  );
 });
 
 test('same machine rows and null-machine rows keep independent switch targets', () => {
