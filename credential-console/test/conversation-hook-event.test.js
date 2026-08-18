@@ -60,6 +60,26 @@ test('normalizes Stop and preserves complete Unicode response text', () => {
   });
 });
 
+test('accepts re-entrant Stop revisions but ignores background-paused events', () => {
+  assert.equal(normalizeConversationHookEvent(common('Stop', {
+    prompt_id: promptId,
+    stop_hook_active: true,
+    last_assistant_message: 'not final',
+  })).kind, CONVERSATION_HOOK_KINDS.STOP);
+  assert.equal(normalizeConversationHookEvent(common('Stop', {
+    prompt_id: promptId,
+    stop_hook_active: false,
+    last_assistant_message: 'paused',
+    background_tasks: [{ id: 'not-retained' }],
+    session_crons: [],
+  })).kind, CONVERSATION_HOOK_KINDS.IGNORED_ACTIVE_WORK);
+  assert.equal(normalizeConversationHookEvent(common('Stop', {
+    stop_hook_active: false,
+    last_assistant_message: 'bad shape',
+    background_tasks: {},
+  })), null);
+});
+
 test('normalizes StopFailure by retaining only the safe failure enum', () => {
   for (const error of STOP_FAILURE_CODES) {
     const result = normalizeConversationHookEvent(common('StopFailure', {
@@ -142,6 +162,7 @@ test('rejects arrays, wrong prototypes, accessors, proxies, and invalid field ty
     prompt: 'safe',
     prompt_id: 'not-a-uuid',
   })), null);
+  assert.equal(normalizeConversationHookEvent(common('UserPromptSubmit', { prompt: '' })), null);
 });
 
 test('enforces session and prompt identifier formats', () => {
@@ -180,6 +201,16 @@ test('truncates oversized prompt and response at complete UTF-8 boundaries', () 
   assert.equal(Buffer.byteLength(responseResult.text, 'utf8') <= CONVERSATION_HOOK_RESPONSE_MAX_BYTES, true);
   assert.equal(responseResult.text.endsWith('\uFFFD'), false);
   assert.equal(responseResult.text, 'b'.repeat(CONVERSATION_HOOK_RESPONSE_MAX_BYTES - 1));
+
+  const clientTruncated = normalizeConversationHookEvent(common('UserPromptSubmit', {
+    prompt: 'already bounded by the installed sender',
+    truncated: true,
+  }));
+  assert.equal(clientTruncated.truncated, true);
+  assert.equal(normalizeConversationHookEvent(common('UserPromptSubmit', {
+    prompt: 'invalid truncation marker',
+    truncated: 'yes',
+  })), null);
 });
 
 test('rejects invalid UTF-16 text rather than allowing replacement characters', () => {

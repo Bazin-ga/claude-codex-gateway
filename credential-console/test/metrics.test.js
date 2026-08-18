@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { access, copyFile, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -222,7 +223,7 @@ async function createV3Database(home, options = {}) {
 
 test('initializes a private WAL/NORMAL database with schema version and indexes', async (t) => {
   const { store, dbPath } = await newStore(t);
-  assert.equal(METRICS_SCHEMA_VERSION, 4);
+  assert.equal(METRICS_SCHEMA_VERSION, 5);
   assert.equal((await stat(dbPath)).mode & 0o777, 0o600);
 
   const db = readOnly(dbPath);
@@ -268,7 +269,7 @@ test('migrates a v1 database in place and keeps old rows readable', async (t) =>
   t.after(() => db.close());
   assert.equal(
     db.prepare('SELECT schema_version FROM schema_meta WHERE singleton = 1').get().schema_version,
-    4,
+    METRICS_SCHEMA_VERSION,
   );
   assert.deepEqual(store.queryTotals({ scope: 'all' }), {
     requestCount: 1,
@@ -313,7 +314,7 @@ test('migrates a v2 database to v3 with FTS in one transaction', async (t) => {
 
   const db = readOnly(dbPath);
   t.after(() => db.close());
-  assert.equal(db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 4);
+  assert.equal(db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, METRICS_SCHEMA_VERSION);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM conversation_turns").get().count, 0);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns_fts'").get().count, 1);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns_trigram_fts'").get().count, 1);
@@ -681,7 +682,7 @@ test('schema v4 migrates v3 turns to standalone defaults without guessing a sess
   t.after(() => store.close());
   const db = readOnly(dbPath);
   t.after(() => db.close());
-  assert.equal(db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 4);
+  assert.equal(db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, METRICS_SCHEMA_VERSION);
   const legacy = db.prepare(`
     SELECT conversation_session_id, turn_index, prompt_source, prompt_suffix_omitted
     FROM conversation_turns WHERE id = 1
@@ -2270,4 +2271,430 @@ test('checkpoint-metrics CLI integrity-checks and truncates an existing database
   assert.equal(reported.integrity, 'ok');
   assert.equal(reported.checkpoint.busy, 0);
   assert.equal((await stat(dbPath)).mode & 0o777, 0o600);
+});
+
+function roundHook(overrides = {}) {
+  return {
+    kind: 'prompt',
+    threadKey: 'a'.repeat(64),
+    promptKey: 'b'.repeat(64),
+    occurredAtMs: BASE_MS,
+    text: 'hook prompt',
+    truncated: false,
+    deviceId: 'hook-device',
+    machineId: 'hook-machine',
+    memberLabel: 'hook-member',
+    accountId: 'hook-account',
+    accountAlias: 'hook-account-alias',
+    ...overrides,
+  };
+}
+
+async function makeV4RoundlessDatabase(t) {
+  const { home, store, dbPath } = await newStore(t);
+  store.close();
+  const db = new DatabaseSync(dbPath);
+  for (const name of [
+    'conversation_rounds_fts_au',
+    'conversation_rounds_trigram_fts_au',
+    'conversation_rounds_fts_ai',
+    'conversation_rounds_trigram_fts_ai',
+    'conversation_rounds_no_update',
+    'conversation_rounds_terminal_update',
+    'conversation_rounds_no_delete',
+  ]) db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  for (const name of [
+    'conversation_rounds_session_idx',
+    'conversation_rounds_activity_idx',
+    'conversation_rounds_device_activity_idx',
+    'conversation_rounds_member_activity_idx',
+    'conversation_rounds_account_activity_idx',
+    'conversation_rounds_prompt_key_idx',
+    'conversation_hook_inbox_order_idx',
+    'conversation_hook_inbox_thread_idx',
+    'conversation_round_summary_activity_idx',
+    'conversation_round_summary_member_idx',
+    'conversation_round_summary_device_idx',
+    'conversation_round_summary_account_idx',
+  ]) db.exec(`DROP INDEX IF EXISTS ${name}`);
+  db.exec('DROP TABLE IF EXISTS conversation_round_session_summaries');
+  db.exec('DROP TABLE IF EXISTS conversation_hook_receipts');
+  db.exec('DROP TABLE IF EXISTS conversation_hook_inbox');
+  db.exec('DROP TABLE IF EXISTS conversation_rounds_fts');
+  db.exec('DROP TABLE IF EXISTS conversation_rounds_trigram_fts');
+  db.exec('DROP TABLE IF EXISTS conversation_rounds');
+  db.exec('UPDATE schema_meta SET schema_version = 4 WHERE singleton = 1');
+  db.close();
+  return { home, dbPath };
+}
+
+test('schema v5 creates additive conversation rounds and keeps the legacy archive visible', async (t) => {
+  const { store, dbPath } = await newStore(t);
+  assert.equal(store.db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 5);
+  for (const object of [
+    'conversation_rounds',
+    'conversation_rounds_fts',
+    'conversation_rounds_trigram_fts',
+    'conversation_rounds_fts_ai',
+    'conversation_rounds_trigram_fts_ai',
+    'conversation_rounds_fts_au',
+    'conversation_rounds_trigram_fts_au',
+    'conversation_rounds_no_update',
+    'conversation_rounds_terminal_update',
+    'conversation_rounds_no_delete',
+    'conversation_hook_inbox',
+    'conversation_hook_receipts',
+    'conversation_round_session_summaries',
+    'conversation_round_summary_activity_idx',
+  ]) {
+    assert.equal(
+      store.db.prepare('SELECT COUNT(*) AS count FROM sqlite_master WHERE name = ?').get(object).count,
+      1,
+      object,
+    );
+  }
+  const columns = readOnly(dbPath).prepare('PRAGMA table_info(conversation_rounds)').all()
+    .map(({ name }) => name);
+  assert.deepEqual(columns, [
+    'id', 'conversation_session_id', 'turn_index', 'prompt_key', 'prompt_text',
+    'prompt_bytes', 'prompt_truncated', 'response_text', 'response_bytes',
+    'response_truncated', 'response_state', 'failure_code', 'source',
+    'prompt_at_ms', 'completed_at_ms', 'device_id', 'machine_id', 'member_label',
+    'account_id', 'account_alias', 'model',
+  ]);
+});
+
+test('v4 to v5 migration is transactional and refuses partial round objects', async (t) => {
+  const { home, dbPath } = await makeV4RoundlessDatabase(t);
+  const migrated = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await migrated.init();
+  assert.equal(migrated.db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 5);
+  assert.equal(migrated.db.prepare('SELECT COUNT(*) AS count FROM conversation_rounds').get().count, 0);
+  migrated.close();
+
+  const partial = await makeV4RoundlessDatabase(t);
+  const partialDb = new DatabaseSync(partial.dbPath);
+  partialDb.exec('CREATE TABLE conversation_rounds (id INTEGER PRIMARY KEY)');
+  partialDb.close();
+  const partialStore = new MetricsStore({ home: partial.home, flushIntervalMs: 60_000 });
+  await assert.rejects(partialStore.init(), /partial v5 objects/);
+  assert.equal(partialStore.db, null);
+  const verifyPartial = new DatabaseSync(partial.dbPath, { readOnly: true });
+  assert.equal(verifyPartial.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 4);
+  verifyPartial.close();
+
+  const rollback = await makeV4RoundlessDatabase(t);
+  const rollbackDb = new DatabaseSync(rollback.dbPath);
+  rollbackDb.exec(`
+    CREATE TRIGGER v4_round_migration_rollback
+    BEFORE UPDATE OF schema_version ON schema_meta
+    WHEN NEW.schema_version = 5
+    BEGIN SELECT RAISE(ABORT, 'round migration rollback'); END
+  `);
+  rollbackDb.close();
+  const rollbackStore = new MetricsStore({ home: rollback.home, flushIntervalMs: 60_000 });
+  await assert.rejects(rollbackStore.init(), /round migration rollback/);
+  const verifyRollback = new DatabaseSync(rollback.dbPath, { readOnly: true });
+  assert.equal(verifyRollback.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 4);
+  assert.equal(verifyRollback.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_rounds'").get().count, 0);
+  verifyRollback.close();
+});
+
+test('durable hook inbox folds stop-before-prompt after restart and rejects missing keys', async (t) => {
+  const { home, store } = await newStore(t);
+  const event = roundHook({
+    threadKey: 'c'.repeat(64),
+    promptKey: 'd'.repeat(64),
+  });
+  assert.equal(store.recordConversationHookEvent({
+    ...event,
+    kind: 'stop',
+    occurredAtMs: BASE_MS + 2,
+    text: 'terminal arrived first',
+  }), true);
+  assert.equal(store.conversationHookEventStats().orphanCount, 1);
+  store.close();
+
+  const reopened = await new MetricsStore({ home, flushIntervalMs: 60_000 }).init();
+  assert.equal(reopened.conversationHookEventStats().orphanCount, 1);
+  assert.equal(reopened.recordConversationHookEvent({
+    ...event,
+    kind: 'prompt',
+    occurredAtMs: BASE_MS + 1,
+    text: 'durable prompt',
+  }), true);
+  const round = reopened.db.prepare(`
+    SELECT prompt_text, response_text, response_state
+    FROM conversation_rounds
+  `).get();
+  assert.equal(round.prompt_text, 'durable prompt');
+  assert.equal(round.response_text, 'terminal arrived first');
+  assert.equal(round.response_state, 'complete');
+  assert.equal(reopened.conversationHookEventStats().orphanCount, 0);
+  assert.equal(reopened.recordConversationHookEvent(roundHook({ promptKey: null })), false);
+  assert.equal(reopened.recordConversationHookEvent(roundHook({ threadKey: null })), false);
+  assert.equal(reopened.recordConversationHookEvent(roundHook({ text: null })), false);
+  assert.equal(reopened.recordConversationHookEvent(roundHook({ text: '' })), false);
+  assert.equal(reopened.recordConversationHookEvent(roundHook({
+    kind: 'session_end', promptKey: null, text: '',
+  })), false);
+  reopened.close();
+});
+
+test('keyed terminal events never cross session/device and delayed events cannot close a newer round', async (t) => {
+  const { store } = await newStore(t);
+  const threadKey = '1'.repeat(64);
+  const firstKey = '2'.repeat(64);
+  const secondKey = '3'.repeat(64);
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    threadKey, promptKey: firstKey, occurredAtMs: BASE_MS, text: 'first prompt',
+  })), true);
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey, promptKey: firstKey, occurredAtMs: BASE_MS + 1,
+    text: 'first response',
+  })), true);
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    threadKey, promptKey: secondKey, occurredAtMs: BASE_MS + 2, text: 'second prompt',
+  })), true);
+
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey, promptKey: firstKey, occurredAtMs: BASE_MS + 3,
+    text: 'first response',
+  })), true);
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    kind: 'session_end', threadKey, promptKey: firstKey, occurredAtMs: BASE_MS + 4,
+    text: '',
+  })), true);
+  const rows = store.db.prepare(`
+    SELECT prompt_key, response_text, response_state
+    FROM conversation_rounds ORDER BY turn_index
+  `).all();
+  assert.equal(rows[0].response_text, 'first response');
+  assert.equal(rows[0].response_state, 'complete');
+  assert.equal(rows[1].response_text, '');
+  assert.equal(rows[1].response_state, 'pending');
+
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey: '4'.repeat(64), promptKey: secondKey,
+    occurredAtMs: BASE_MS + 5, text: 'wrong device/session', deviceId: 'other-device',
+  })), false);
+  assert.equal(store.db.prepare(`
+    SELECT response_state FROM conversation_rounds WHERE prompt_key = ?
+  `).get(secondKey).response_state, 'pending');
+});
+
+test('Stop revisions update complete rounds once while failed/unavailable rounds remain terminal', async (t) => {
+  const { store } = await newStore(t);
+  const threadKey = '5'.repeat(64);
+  const promptKey = '6'.repeat(64);
+  store.recordConversationHookEvent(roundHook({ threadKey, promptKey, text: 'prompt' }));
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey, promptKey, occurredAtMs: BASE_MS + 1, text: 'draft',
+  }));
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey, promptKey, occurredAtMs: BASE_MS + 2, text: 'draft',
+  }));
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey, promptKey, occurredAtMs: BASE_MS + 3, text: 'final',
+  }));
+  const complete = store.db.prepare(`
+    SELECT id, response_text, completed_at_ms FROM conversation_rounds WHERE prompt_key = ?
+  `).get(promptKey);
+  assert.equal(complete.response_text, 'final');
+  assert.equal(complete.completed_at_ms, BASE_MS + 3);
+  assert.equal(store.conversationHookEventStats().duplicateCount, 1);
+  assert.equal(store.conversationHookEventStats().revisionCount, 1);
+  assert.equal(store.searchConversationRounds({ q: 'final' }).items.length, 1);
+  assert.equal(store.searchConversationRounds({ q: 'draft' }).items.length, 0);
+
+  assert.throws(() => store.db.prepare(`
+    UPDATE conversation_rounds
+    SET id = 999, response_text = 'mutated', response_bytes = 7,
+        response_state = 'complete', completed_at_ms = ?
+    WHERE id = ?
+  `).run(BASE_MS + 4, complete.id), /immutable/);
+
+  const failedKey = '7'.repeat(64);
+  store.recordConversationHookEvent(roundHook({ threadKey, promptKey: failedKey, text: 'fails' }));
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop_failure', threadKey, promptKey: failedKey,
+    occurredAtMs: BASE_MS + 5, text: '', failureCode: 'rate_limit',
+  }));
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey, promptKey: failedKey,
+    occurredAtMs: BASE_MS + 6, text: 'must not replace failure',
+  }));
+  const failed = store.db.prepare(`
+    SELECT response_state, failure_code, response_text
+    FROM conversation_rounds WHERE prompt_key = ?
+  `).get(failedKey);
+  assert.equal(failed.response_state, 'failed');
+  assert.equal(failed.failure_code, 'rate_limit');
+  assert.equal(failed.response_text, '');
+});
+
+test('conversation hook inbox is bounded, persists orphan/duplicate counts, and lets prompts drain it', async (t) => {
+  const { store } = await newStore(t);
+  const threadKey = '8'.repeat(64);
+  for (let index = 1; index <= 1024; index += 1) {
+    const promptKey = index.toString(16).padStart(64, '0');
+    assert.equal(store.recordConversationHookEvent(roundHook({
+      kind: 'stop', threadKey, promptKey, occurredAtMs: BASE_MS + index,
+      text: `orphan-${index}`,
+    })), true);
+  }
+  assert.equal(store.conversationHookEventStats().orphanCount, 1024);
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey, promptKey: 'f'.repeat(64),
+    occurredAtMs: BASE_MS + 2000, text: 'over capacity',
+  })), false);
+  const firstKey = (1).toString(16).padStart(64, '0');
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey, promptKey: firstKey,
+    occurredAtMs: BASE_MS + 1, text: 'orphan-1',
+  })), true);
+  assert.equal(store.conversationHookEventStats().duplicateCount, 1);
+  assert.equal(store.recordConversationHookEvent(roundHook({
+    kind: 'prompt', threadKey, promptKey: firstKey,
+    occurredAtMs: BASE_MS, text: 'prompt drains full inbox',
+  })), true);
+  assert.equal(store.conversationHookEventStats().orphanCount, 1023);
+});
+
+test('conversation round search uses FTS, stable activity cursors, and legacy count', async (t) => {
+  const { store } = await newStore(t);
+  const oldConversation = {
+    promptText: 'legacy fragment',
+    responseText: 'legacy response',
+    responseBytes: Buffer.byteLength('legacy response'),
+    responseState: 'complete',
+  };
+  store.enqueueCompletion({ metrics: row(), conversation: oldConversation });
+
+  const threadA = '3'.repeat(64);
+  const threadB = '4'.repeat(64);
+  store.recordConversationHookEvent(roundHook({
+    threadKey: threadA, promptKey: '5'.repeat(64), occurredAtMs: BASE_MS + 100,
+    text: 'alpha search 阿尔', memberLabel: 'alice', model: 'model-a',
+  }));
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey: threadA, promptKey: '5'.repeat(64), occurredAtMs: BASE_MS + 200,
+    text: 'alpha answer',
+  }));
+  store.recordConversationHookEvent(roundHook({
+    threadKey: threadA, promptKey: '7'.repeat(64), occurredAtMs: BASE_MS + 300,
+    text: 'newer unrelated prompt', memberLabel: 'alice-new', model: 'model-new',
+    accountId: 'account-new', accountAlias: 'account-new-alias',
+  }));
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey: threadA, promptKey: '7'.repeat(64), occurredAtMs: BASE_MS + 400,
+    text: 'newer unrelated answer',
+  }));
+  store.recordConversationHookEvent(roundHook({
+    threadKey: threadB, promptKey: '6'.repeat(64), occurredAtMs: BASE_MS + 50,
+    text: 'beta search', memberLabel: 'bob', model: 'model-b',
+  }));
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey: threadB, promptKey: '6'.repeat(64), occurredAtMs: BASE_MS + 500,
+    text: 'beta answer',
+  }));
+  store.flush();
+
+  const searched = store.searchConversationRounds({ q: 'alpha' });
+  assert.equal(searched.items.length, 1);
+  assert.equal(searched.items[0].responseText, 'alpha answer');
+  assert.equal(searched.legacyFragmentCount, 1);
+  assert.equal(store.searchConversationRounds({ memberLabel: 'alice', responseState: 'complete' }).items.length, 1);
+
+  const sessions = store.searchConversationRoundSessions({});
+  assert.equal(sessions.items.length, 2);
+  assert.ok(sessions.items[0].lastActivityAtMs > sessions.items[1].lastActivityAtMs);
+  assert.equal(sessions.legacyFragmentCount, 1);
+  const next = store.searchConversationRoundSessions({
+    beforeId: sessions.items[0].id,
+    beforeActivityMs: sessions.items[0].lastActivityAtMs,
+  });
+  assert.deepEqual(next.items.map((item) => item.id), [sessions.items[1].id]);
+  const detail = store.readConversationRoundSession(sessions.items[0].id);
+  assert.equal(detail.session.turns.length, 1);
+  assert.equal(detail.session.turns[0].responseText, 'beta answer');
+  assert.equal(detail.legacyFragmentCount, 1);
+  assert.equal(Object.hasOwn(detail.session.turns[0], 'promptKey'), false);
+  assert.equal(store.searchConversationRounds({ q: '阿尔' }).items.length, 1);
+  assert.equal(store.searchConversationRoundSessions({ q: '阿尔' }).items.length, 1);
+  const matchingPreview = store.searchConversationRoundSessions({ q: 'alpha' });
+  assert.equal(matchingPreview.items.length, 1);
+  assert.equal(matchingPreview.items[0].turnCount, 2);
+  assert.equal(matchingPreview.items[0].latestPromptText, 'alpha search 阿尔');
+  assert.equal(matchingPreview.items[0].latestResponseText, 'alpha answer');
+  assert.equal(matchingPreview.items[0].memberLabel, 'alice');
+  assert.equal(matchingPreview.items[0].accountId, 'hook-account');
+  assert.equal(matchingPreview.items[0].accountAlias, 'hook-account-alias');
+  assert.equal(matchingPreview.items[0].model, 'model-a');
+});
+
+test('caller-owned activity cursors do not drift when pending rounds complete between pages', async (t) => {
+  const { store } = await newStore(t);
+  const add = (digit, promptAt, stopAt = null) => {
+    const threadKey = digit.repeat(64);
+    const promptKey = (Number(digit) + 10).toString(16).repeat(64).slice(0, 64);
+    store.recordConversationHookEvent(roundHook({
+      threadKey, promptKey, occurredAtMs: promptAt, text: `prompt-${digit}`,
+    }));
+    if (stopAt !== null) store.recordConversationHookEvent(roundHook({
+      kind: 'stop', threadKey, promptKey, occurredAtMs: stopAt, text: `response-${digit}`,
+    }));
+    return promptKey;
+  };
+  add('1', BASE_MS + 100, BASE_MS + 300);
+  const moving = add('2', BASE_MS + 200);
+  add('3', BASE_MS + 50, BASE_MS + 100);
+  const roundsPage = store.searchConversationRounds({ limit: 2 });
+  const sessionsPage = store.searchConversationRoundSessions({ limit: 2 });
+  store.recordConversationHookEvent(roundHook({
+    kind: 'stop', threadKey: '2'.repeat(64), promptKey: moving,
+    occurredAtMs: BASE_MS + 500, text: 'late completion',
+  }));
+  const nextRounds = store.searchConversationRounds({
+    limit: 5,
+    beforeId: roundsPage.nextBeforeId,
+    beforeActivityMs: roundsPage.nextBeforeActivityMs,
+  });
+  const nextSessions = store.searchConversationRoundSessions({
+    limit: 5,
+    beforeId: sessionsPage.nextBeforeId,
+    beforeActivityMs: sessionsPage.nextBeforeActivityMs,
+  });
+  assert.deepEqual(nextRounds.items.map((item) => item.promptText), ['prompt-3']);
+  assert.equal(nextSessions.items.length, 1);
+  assert.equal(nextSessions.items[0].firstPromptText, 'prompt-3');
+});
+
+test('default 100k-session query stays on the summary index fast path', async (t) => {
+  const { store } = await newStore(t);
+  const seed = roundHook({ threadKey: '9'.repeat(64), promptKey: 'a'.repeat(64) });
+  store.recordConversationHookEvent(seed);
+  const db = store.db;
+  const sessionInsert = db.prepare(`
+    INSERT INTO conversation_sessions (thread_key, created_at_ms) VALUES (?, ?)
+  `);
+  const summaryInsert = db.prepare(`
+    INSERT INTO conversation_round_session_summaries (
+      conversation_session_id, turn_count, pending_count, complete_count,
+      failed_count, unavailable_count, first_round_id, latest_round_id,
+      first_prompt_at_ms, last_activity_at_ms, device_id, machine_id,
+      member_label, account_id, account_alias, model
+    ) VALUES (?, 1, 1, 0, 0, 0, 1, 1, ?, ?, 'd', NULL, 'm', 'a', 'a', NULL)
+  `);
+  db.exec('BEGIN IMMEDIATE');
+  for (let index = 2; index <= 100_000; index += 1) {
+    sessionInsert.run(index.toString(16).padStart(64, '0'), index);
+    summaryInsert.run(index, index, index);
+  }
+  db.exec('COMMIT');
+  const started = performance.now();
+  const result = store.searchConversationRoundSessions({ limit: 25 });
+  const elapsed = performance.now() - started;
+  assert.equal(result.items.length, 25);
+  assert.ok(elapsed < 1_500, `summary query should stay below 1.5s (${elapsed.toFixed(1)}ms)`);
 });

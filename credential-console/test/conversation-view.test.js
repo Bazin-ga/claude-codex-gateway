@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
   conversationDetailView,
+  conversationRoundDetailView,
   conversationSessionDetailView,
   conversationSessionsView,
   conversationsView,
@@ -146,14 +147,15 @@ test('conversation detail trusts persisted prompt provenance and keeps long text
   assert.match(html, /overflow-wrap: anywhere/);
 });
 
-test('conversation session list groups only correlated sessions and links standalone turns separately', () => {
+test('conversation session list renders only hook-backed rounds and links legacy fragments separately', () => {
   const html = conversationSessionsView({
     openMode: true,
     q: '<script>query</script>',
     result: {
       totalMatches: 1,
       nextBeforeId: 6,
-      standaloneCount: 4,
+      nextBeforeActivityMs: Date.parse('2026-08-17T12:30:00Z'),
+      legacyFragmentCount: 4,
       droppedConversations: 2,
       facets: {
         members: [{ value: 'alice', count: 3 }],
@@ -164,17 +166,20 @@ test('conversation session list groups only correlated sessions and links standa
         threadKey: 'must-never-render-thread-key',
         rawSessionId: 'must-never-render-session-id',
         turnCount: 3,
-        firstStartedAtMs: Date.parse('2026-08-17T12:00:00Z'),
-        lastStartedAtMs: Date.parse('2026-08-17T12:30:00Z'),
+        firstPromptAtMs: Date.parse('2026-08-17T12:00:00Z'),
+        lastActivityAtMs: Date.parse('2026-08-17T12:30:00Z'),
         deviceId: 'device-7',
         memberLabel: HOSTILE,
         accountAlias: 'account-safe',
         model: 'model-safe',
-        latestPromptSnippet: 'already unwrapped prompt',
-        latestPromptSource: 'wrapper_removed',
-        latestPromptSuffixOmitted: true,
-        latestResponseSnippet: HOSTILE,
+        firstPromptText: 'exact first prompt',
+        latestPromptText: 'exact latest prompt',
+        latestResponseText: HOSTILE,
         latestResponseState: 'complete',
+        pendingCount: 0,
+        completeCount: 3,
+        failedCount: 0,
+        unavailableCount: 0,
       }],
       error: null,
     },
@@ -182,11 +187,12 @@ test('conversation session list groups only correlated sessions and links standa
   assert.match(html, /href="\/conversations\/session\/7"/);
   assert.match(html, /method="post" action="\/conversations"/);
   assert.match(html, /name="before_id" value="6"/);
+  assert.match(html, /name="before_activity_ms" value="1786969800000"/);
   assert.match(html, /data-i18n="conversation-session-turn-count">Turns<\/span>: 3/);
-  assert.match(html, /data-i18n="conversation-standalone-notice"/);
+  assert.match(html, /data-i18n="conversation-legacy-fragments-notice"/);
   assert.match(html, /href="\/conversation-turns"/);
-  assert.match(html, /data-prompt-source="wrapper_removed"/);
-  assert.match(html, /data-prompt-suffix-omitted="true"/);
+  assert.match(html, /data-prompt-source="claude_hook"/);
+  assert.match(html, /data-prompt-suffix-omitted="false"/);
   assert.equal(html.includes('must-never-render-thread-key'), false);
   assert.equal(html.includes('must-never-render-session-id'), false);
   assert.equal(html.includes('<img src=x'), false);
@@ -199,19 +205,20 @@ test('conversation session detail renders a bounded forward timeline with explic
     return {
       id: 1_000 + turnIndex,
       turnIndex,
-      startedAtMs: Date.parse('2026-08-17T00:00:00Z') + turnIndex,
+      promptAtMs: Date.parse('2026-08-17T00:00:00Z') + turnIndex,
+      completedAtMs: Date.parse('2026-08-17T00:00:01Z') + turnIndex,
       memberLabel: `member-${turnIndex}`,
       accountAlias: 'account-safe',
       model: 'model-safe',
       promptText: turnIndex === 2 ? 'safe prompt' : `prompt-${String(turnIndex).padStart(3, '0')}`,
-      promptSource: turnIndex === 2 ? 'wrapper_removed' : 'captured_api_user_text',
-      promptSuffixOmitted: turnIndex === 2,
+      source: 'claude_hook',
       responseText: turnIndex === 1
         ? ''
         : turnIndex === 3
           ? 'r'.repeat((16 * 1024) + 20)
           : `response-${turnIndex}`,
-      responseState: turnIndex === 1 ? 'complete' : turnIndex === 2 ? 'incomplete' : 'complete',
+      responseState: turnIndex === 1 ? 'complete' : turnIndex === 2 ? 'failed' : 'complete',
+      failureCode: turnIndex === 2 ? 'server_error' : null,
       responseDisplayTruncated: turnIndex === 3,
       threadKey: 'must-never-render-turn-thread-key',
     };
@@ -221,15 +228,13 @@ test('conversation session detail renders a bounded forward timeline with explic
       session: {
         id: 7,
         turnCount: 201,
-        firstStartedAtMs: Date.parse('2026-08-17T00:00:00Z') + 1,
-        lastStartedAtMs: Date.parse('2026-08-17T00:00:00Z') + 201,
+        firstPromptAtMs: Date.parse('2026-08-17T00:00:00Z') + 1,
+        lastActivityAtMs: Date.parse('2026-08-17T00:00:01Z') + 201,
         turns,
         truncated: true,
-        standaloneCount: 2,
         threadKey: 'must-never-render-session-thread-key',
         rawSessionId: 'must-never-render-raw-session-id',
       },
-      standaloneCount: 2,
       error: null,
     },
   });
@@ -238,8 +243,8 @@ test('conversation session detail renders a bounded forward timeline with explic
   assert.match(html, /prompt-200/);
   assert.equal(html.includes('prompt-201'), false);
   assert.match(html, /data-i18n="conversation-session-truncated"/);
-  assert.match(html, /data-i18n="conversation-session-empty-assistant"/);
-  assert.match(html, /data-i18n="conversation-session-incomplete-turn"/);
+  assert.match(html, /data-i18n="conversation-round-empty-response"/);
+  assert.match(html, /data-i18n="conversation-round-failed"/);
   assert.match(html, /data-i18n="conversation-session-timeline-clipped"/);
   assert.equal(html.includes('<img src=x'), false);
   assert.equal(html.includes('<tail>'), false);
@@ -260,6 +265,35 @@ test('conversation session detail has safe 404 and unavailable states', () => {
   });
   assert.match(unavailable, /data-i18n="conversation-session-read-error"/);
   assert.equal(unavailable.includes('private_database_detail'), false);
+});
+
+test('reliable round detail keeps hook text exact, paired, escaped, and linked to its session', () => {
+  const literalWrapper = '<session>\nliteral user text\n</session>';
+  const html = conversationRoundDetailView({
+    result: {
+      round: {
+        id: 9,
+        conversationSessionId: 7,
+        turnIndex: 2,
+        promptAtMs: Date.parse('2026-08-17T12:00:00Z'),
+        completedAtMs: Date.parse('2026-08-17T12:00:01Z'),
+        memberLabel: HOSTILE,
+        deviceId: 'device-safe',
+        accountAlias: 'account-safe',
+        promptText: literalWrapper,
+        source: 'claude_hook',
+        responseText: HOSTILE,
+        responseState: 'complete',
+      },
+      error: null,
+    },
+  });
+  assert.match(html, /data-conversation-round-id="9"/);
+  assert.match(html, /href="\/conversations\/session\/7"/);
+  assert.match(html, /data-prompt-source="claude_hook"/);
+  assert.match(html, /&lt;session&gt;\nliteral user text\n&lt;\/session&gt;/);
+  assert.equal(html.includes('<img src=x'), false);
+  assert.match(html, /data-i18n="conversation-final-response"/);
 });
 
 test('null and read/search errors fail closed without undefined content', () => {
@@ -379,6 +413,28 @@ test('persistent tabs link to captured conversations and mark the active page', 
   assert.match(sessions, /href="\/conversations" data-i18n="conversation-subnav-sessions" aria-current="page"/);
 });
 
+test('dashboard exposes a token-free, profile-scoped hook updater for existing Claude installs', () => {
+  const html = dashboardView({
+    accounts: [{
+      id: 'account-1', provider: 'claude', alias: 'claude-team', status: 'healthy',
+      active_devices: 1, email_label: 'owner@example.test', expires_at: null,
+    }],
+    devices: [],
+    csrf: 'csrf',
+    adminIdentity: 'admin@example.test',
+    claudeGatewayUrl: 'https://gateway.example.test/claude',
+  });
+  assert.match(html, /id="conversation-capture-upgrade"/);
+  assert.match(html, /data-download-name="install-conversation-hooks\.mjs"/);
+  assert.match(html, /claude\/control\/v1\/conversation-hooks/);
+  assert.match(html, /node &quot;\$HOME\/Downloads\/install-conversation-hooks\.mjs&quot; claude-team/);
+  assert.match(html, /UserPromptSubmit/);
+  assert.match(html, /Claude user-submitted prompts and final visible assistant responses are permanently stored[\s\S]*do not deny or terminate Claude[\s\S]*failed synchronous command hook[\s\S]*bounded delay/i);
+  assert.match(html, /Reliable prompt pairing requires Claude Code 2\.1\.196 or newer/);
+  assert.doesNotMatch(html, /Bearer [A-Za-z0-9_-]{16,}/);
+  assert.doesNotMatch(html, /oauth_token|token_sha256/);
+});
+
 test('Chinese translations and operator documentation cover permanent captured-turn exposure', async () => {
   const [server, rootReadme, rootReadmeZh, consoleReadme, deploy] = await Promise.all([
     readFile(new URL('../server.js', import.meta.url), 'utf8'),
@@ -403,6 +459,7 @@ test('Chinese translations and operator documentation cover permanent captured-t
     'conversation-search-requires-indexed-terms',
     'conversation-filter-invalid',
     'conversation-queue-dropped',
+    'conversation-round-dropped',
     'conversation-response-complete',
     'conversation-response-incomplete',
     'conversation-response-truncated',
@@ -448,16 +505,60 @@ test('Chinese translations and operator documentation cover permanent captured-t
     'conversation-standalone-heading',
     'conversation-standalone-notice',
     'conversation-standalone-link',
+    'conversation-round-privacy-heading',
+    'conversation-round-privacy-notice',
+    'conversation-legacy-fragments-heading',
+    'conversation-legacy-fragments-notice',
+    'conversation-legacy-fragments-link',
+    'conversation-round-empty-heading',
+    'conversation-round-empty-copy',
+    'conversation-round-install-hooks',
+    'conversation-user-message',
+    'conversation-final-response',
+    'conversation-hook-prompt-disclaimer',
+    'conversation-prompt-source-hook',
+    'conversation-response-pending',
+    'conversation-response-failed',
+    'conversation-round-pending',
+    'conversation-round-failed',
+    'conversation-round-unavailable',
+    'conversation-round-response-pending',
+    'conversation-round-empty-response',
+    'conversation-round-prompt-truncated',
+    'conversation-round-response-truncated',
+    'conversation-hook-upgrade-heading',
+    'conversation-hook-upgrade-copy',
+    'conversation-hook-upgrade-privacy',
+    'conversation-hook-version-note',
+    'conversation-hook-download',
+    'conversation-hook-copy',
+    'conversation-hook-run-heading',
+    'conversation-hook-restart-note',
+    'conversation-hook-installer-privacy',
+    'conversation-failure-rate-limit',
+    'conversation-failure-overloaded',
+    'conversation-failure-authentication-failed',
+    'conversation-failure-oauth-org-not-allowed',
+    'conversation-failure-billing-error',
+    'conversation-failure-invalid-request',
+    'conversation-failure-model-not-found',
+    'conversation-failure-server-error',
+    'conversation-failure-max-output-tokens',
+    'conversation-failure-session-end',
+    'conversation-failure-unavailable',
+    'conversation-failure-unknown',
   ]) {
     assert.match(server, new RegExp(`'${key}':`), `missing translation key ${key}`);
   }
+  assert.match(server, /'conversation-hook-upgrade-privacy':\s*'[^']*永久保存[^']*提示词[^']*最终可见[^']*拒绝或终止 Claude[^']*同步命令 Hook[^']*有界延迟/);
+  assert.match(server, /'conversation-hook-installer-privacy':\s*'[^']*永久保存[^']*提示词[^']*最终可见[^']*拒绝或终止 Claude[^']*同步命令 Hook[^']*有界延迟/);
   assert.match(consoleReadme, /three consecutive Chinese characters/i);
   assert.match(deploy, /three consecutive Chinese characters/i);
   for (const document of [rootReadme, rootReadmeZh, consoleReadme, deploy]) {
-    assert.match(document, /permanently (?:stores|retain)|永久(?:保存|保留)/i);
-    assert.match(document, /captured[\s\S]{0,40}(?:API )?turn|已捕获[\s\S]{0,40}(?:API )?轮次/i);
+    assert.match(document, /permanently (?:store|stores|retain|send)|永久(?:保存|保留|发送)/i);
+    assert.match(document, /API[\s-]*(?:fragment|request)|API[^\n]{0,40}片段/i);
     assert.match(document, /Codex[^\n]{0,80}(?:not covered|outside|不在|范围)/i);
     assert.match(document, /open[^\n]{0,180}(?:anyone|tailnet|没有身份|无身份|阅读审计|read)/i);
-    assert.match(document, /(?:not guaranteed|rather than)[\s\S]{0,120}original|不保证[\s\S]{0,60}原话/i);
+    assert.match(document, /(?:(?:not|never) (?:represented|presented) as|rather than)\s+(?:a )?human|不是(?:用户|人类)回合|不.*冒充人类对话/i);
   }
 });

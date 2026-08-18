@@ -88,6 +88,18 @@ test('view adapter trusts persisted provenance from a newer capture row', () => 
   });
 });
 
+test('Claude hook prompts remain exact even when the user types wrapper-shaped text', () => {
+  const text = '<session>\nthis is literal user text\n</session>';
+  assert.deepEqual(derivePromptDisplay({
+    promptText: text,
+    promptSource: PROMPT_DISPLAY_SOURCES.CLAUDE_HOOK,
+  }), {
+    text,
+    source: PROMPT_DISPLAY_SOURCES.CLAUDE_HOOK,
+    suffixOmitted: false,
+  });
+});
+
 test('legacy unclassified rows use the strict wrapper heuristic instead of trusting a default', () => {
   assert.deepEqual(derivePromptDisplay({
     promptText: '<session>\nlegacy user body\n</session>\n\nlegacy client suffix',

@@ -7,8 +7,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
+  CLAUDE_PROMPT_ID_PATTERN,
   CLAUDE_SESSION_ID_PATTERN,
   CredentialStore,
+  PROMPT_KEY_VERSION,
   THREAD_KEY_VERSION,
 } from '../lib/store.js';
 import { sha256 } from '../lib/security.js';
@@ -86,6 +88,31 @@ test('derives stable per-device thread keys without retaining the Claude session
 
   const reopened = await new CredentialStore(home).init();
   assert.equal(reopened.threadKeyForSession({ deviceId: 'device-alpha', sessionId }), first);
+});
+
+test('derives stable hook prompt keys without retaining the Claude prompt id', async () => {
+  const { store } = await newStore();
+  const promptId = '550E8400-E29B-41D4-A716-446655440000';
+  assert.equal(CLAUDE_PROMPT_ID_PATTERN.test(promptId), true);
+  const input = {
+    version: PROMPT_KEY_VERSION,
+    deviceId: 'device-alpha',
+    sessionId: 'session-0123456789abcdef',
+    promptId,
+  };
+  const first = store.promptKeyForHook(input);
+  assert.match(first, /^[0-9a-f]{64}$/);
+  assert.equal(store.promptKeyForHook({ ...input, promptId: promptId.toLowerCase() }), first);
+  assert.notEqual(store.promptKeyForHook({ ...input, deviceId: 'device-beta' }), first);
+  assert.notEqual(
+    store.promptKeyForHook({ ...input, sessionId: 'session-fedcba9876543210' }),
+    first,
+  );
+  assert.equal(first.includes(promptId.toLowerCase()), false);
+  assert.throws(
+    () => store.promptKeyForHook({ ...input, promptId: 'not-a-uuid' }),
+    /prompt key prompt id is invalid/,
+  );
 });
 
 test('thread key input rejects malformed ids without echoing them', async () => {

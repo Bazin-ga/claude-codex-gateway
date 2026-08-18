@@ -64,8 +64,20 @@ function generatedUnixInstaller(assets = generatedAssets()) {
   return htmlDecode(match[1]);
 }
 
+function generatedClaudeUnixInstaller() {
+  const html = deviceConfiguredView({
+    account: { alias: 'claude-version-test' },
+    device: { name: 'version-device' },
+    token: 'synthetic-device-token',
+    claudeGatewayUrl: 'https://gateway.example/claude',
+  });
+  const match = html.match(/<pre id="unix-config">([\s\S]*?)<\/pre>/);
+  assert.ok(match, 'generated Claude Unix installer should be rendered');
+  return htmlDecode(match[1]);
+}
+
 test('one version source stamps Claude profiles and generated Codex outer installers', () => {
-  assert.equal(CLIENT_CONFIG_VERSION, '2');
+  assert.equal(CLIENT_CONFIG_VERSION, '3');
   const claudeHtml = deviceConfiguredView({
     account: { alias: 'claude-version-test' },
     device: { name: 'version-device' },
@@ -73,8 +85,19 @@ test('one version source stamps Claude profiles and generated Codex outer instal
     claudeGatewayUrl: 'https://gateway.example/claude',
   });
   assert.match(claudeHtml, /CREDENTIAL_CONSOLE_CLIENT_CONFIG_VERSION/);
-  assert.match(claudeHtml, /CREDENTIAL_CONSOLE_CLIENT_CONFIG_VERSION[^\n]*2/);
+  assert.match(claudeHtml, /CREDENTIAL_CONSOLE_CLIENT_CONFIG_VERSION[^\n]*3/);
   assert.match(claudeHtml, /data-completed-draft="claude-self-service"/);
+  assert.match(claudeHtml, /WriteAllBytes\(\$hookUpdater, \[Convert\]::FromBase64String/);
+  assert.match(claudeHtml, /data-i18n="conversation-hook-installer-privacy"/);
+  assert.match(claudeHtml, /Claude user-submitted prompts and final visible assistant responses[\s\S]*do not deny or terminate Claude[\s\S]*failed synchronous command hook[\s\S]*bounded delay/i);
+  assert.ok(
+    claudeHtml.indexOf('data-i18n="conversation-hook-installer-privacy"')
+      < claudeHtml.indexOf('id="unix-config"'),
+    'Claude privacy notice must precede the mobile-scrollable installer payload',
+  );
+  assert.match(claudeHtml, /\.card \{[^}]*min-width: 0/);
+  assert.match(claudeHtml, /\.setup-actions \{[^}]*flex-wrap: wrap/);
+  assert.match(claudeHtml, /pre \{[^}]*overflow-x: auto;[^}]*white-space: pre-wrap/);
 
   const codexHtml = codexConfiguredView({
     deviceName: 'codex-version-device',
@@ -90,6 +113,7 @@ test('one version source stamps Claude profiles and generated Codex outer instal
   assert.match(codexHtml, /--profile/);
   assert.match(codexHtml, /codex-profile-ready/);
   assert.match(codexHtml, /data-completed-draft="codex-self-service"/);
+  assert.doesNotMatch(codexHtml, /conversation-hook|Claude user-submitted prompts|final visible assistant responses|synchronous command hook|bounded delay/i);
   assert.match(codexHtml, /\.notice \{[^}]*overflow-wrap: anywhere/);
   assert.doesNotMatch(codexHtml, /--token synthetic-codex-token/);
   assert.doesNotMatch(codexHtml, /-Token synthetic-codex-token/);
@@ -123,6 +147,49 @@ test('generated Unix outer installer stamps only after the original installer su
   assert.equal((await stat(stamp)).mode & 0o777, 0o600);
 });
 
+test('generated Claude installer adds exact-round hooks without replacing the device token', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'credential-console-claude-hooks-'));
+  const home = join(root, 'home');
+  const bin = join(root, 'bin');
+  const scriptPath = join(root, 'installer.sh');
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await execFileAsync('mkdir', ['-p', bin]);
+  const preexistingConfig = join(home, '.config', 'claude-codex-gateway');
+  await execFileAsync('mkdir', ['-p', preexistingConfig]);
+  await writeFile(
+    join(preexistingConfig, 'claude-claude-version-test.settings.json'),
+    JSON.stringify({ model: 'preserve-existing-model' }),
+    { mode: 0o600 },
+  );
+  const fakeClaude = join(bin, 'claude');
+  await writeFile(fakeClaude, '#!/usr/bin/env bash\nexit 0\n', { mode: 0o700 });
+  await writeFile(scriptPath, generatedClaudeUnixInstaller(), { mode: 0o700 });
+  await execFileAsync('bash', [scriptPath], {
+    env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` },
+  });
+
+  const config = join(home, '.config', 'claude-codex-gateway');
+  const settings = JSON.parse(await readFile(
+    join(config, 'claude-claude-version-test.settings.json'),
+    'utf8',
+  ));
+  assert.equal(settings.model, 'preserve-existing-model');
+  for (const event of ['UserPromptSubmit', 'Stop', 'StopFailure', 'SessionEnd']) {
+    const handlers = settings.hooks[event].flatMap((group) => group.hooks ?? []);
+    assert.equal(handlers.length, 1);
+    assert.deepEqual(handlers[0].args, [
+      join(config, 'conversation-hook-client.mjs'),
+      'https://gateway.example/claude/control/v1/conversation-hooks',
+      join(config, 'claude-claude-version-test.token'),
+    ]);
+  }
+  assert.equal(
+    await readFile(join(config, 'claude-claude-version-test.token'), 'utf8'),
+    'synthetic-device-token',
+  );
+  assert.equal((await stat(join(config, 'conversation-hook-client.mjs'))).mode & 0o777, 0o700);
+});
+
 test('legacy client-agent installers remain unchanged and Windows outer script owns the stamp', async () => {
   const install = await readFile(INSTALL_SH, 'utf8');
   const windowsInstall = await readFile(INSTALL_PS1, 'utf8');
@@ -135,7 +202,7 @@ test('legacy client-agent installers remain unchanged and Windows outer script o
   const fetchCall = generated.indexOf('$ROOT/install/install.sh');
   const stampWrite = generated.indexOf('config-version');
   assert.ok(fetchCall >= 0 && stampWrite > fetchCall, 'stamp must follow original installer call');
-  assert.match(generated, /printf .*2/);
+  assert.match(generated, /printf .*3/);
   assert.equal(generated.includes('synthetic-device-token'), true, 'installer keeps its existing one-time token path');
 });
 

@@ -2,6 +2,11 @@ import { escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { derivePromptDisplay } from './prompt-display.js';
 import {
+  buildClaudeConversationHookEndpoint,
+  CLAUDE_CONVERSATION_HOOK_UPDATER_FILENAME,
+  renderClaudeConversationHookUpdaterSource,
+} from './claude-conversation-hooks.js';
+import {
   CLAUDE_CLIENT_CONFIG_VERSION_KEY,
   CLIENT_CONFIG_VERSION,
   CODEX_UNIX_CLIENT_CONFIG_VERSION_FILE,
@@ -71,6 +76,9 @@ tr:last-child td { border-bottom: 0; }
 .badge.unhealthy, .badge.expired { background: #f8e4e1; color: var(--red); }
 .badge.stored { background: #e5edf4; color: var(--blue); }
 .badge.login_required { background: #faecd7; color: var(--amber); }
+.badge.pending { background: #faecd7; color: var(--amber); }
+.badge.failed { background: #f8e4e1; color: var(--red); }
+.badge.unavailable { background: #e8eee9; color: var(--muted); }
 /* A revoked credential is an ordinary end of life, not a fault, so it is
    deliberately not given the red of an unhealthy account. */
 .badge.credential-active { background: #dff2e8; color: var(--green); }
@@ -438,6 +446,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-filters label { margin: 0; }
 .conversation-state { flex: 0 0 auto; white-space: nowrap; }
 .conversation-queue-dropped { margin: 0; }
+.conversation-legacy-notice { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 14px; }
+.conversation-legacy-notice > div { min-width: 0; }
+.conversation-legacy-notice p { margin: 3px 0 0; }
+.conversation-legacy-notice .button { flex: 0 0 auto; }
 .conversation-detail-shell { width: min(100%, 900px); margin: 0 auto; }
 .conversation-detail-meta { display: flex; gap: 8px 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
 .conversation-detail-meta span { min-width: 0; overflow-wrap: anywhere; }
@@ -447,6 +459,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-session-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .conversation-session-summary .summary { grid-column: auto; }
 .conversation-session-summary .summary strong { font-size: 20px; overflow-wrap: anywhere; }
+.conversation-round-state-counts { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 10px; color: var(--muted); }
+.conversation-round-state-counts span { white-space: nowrap; }
+.conversation-round-empty { border-style: dashed; background: #fbfcf9; }
+.conversation-round-empty h2 { margin-bottom: 8px; }
 .conversation-timeline { display: grid; gap: 16px; min-width: 0; }
 .conversation-timeline-turn { min-width: 0; border: 1px solid var(--line); border-radius: 16px; padding: 16px; background: #fbfcf9; box-shadow: var(--shadow-soft); }
 .conversation-timeline-turn-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
@@ -456,7 +472,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-message-user { margin-left: auto; background: #e8f2ec; border: 1px solid #cadfd2; }
 .conversation-message-assistant { margin-right: auto; background: white; border: 1px solid var(--line); }
 .conversation-message h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
-.conversation-message pre { margin: 0; padding: 13px; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.conversation-message pre { margin: 0; padding: 13px; max-width: 100%; color: var(--ink); background: rgba(255,255,255,.78); border: 1px solid rgba(22,33,29,.1); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .conversation-message .conversation-prompt-disclaimer { margin: 0 0 8px; }
 .conversation-session-state-note { margin: 8px 0 0; }
 @media (max-width: 800px) {
@@ -480,6 +496,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .conversation-result-actions { justify-content: flex-start; }
   .conversation-subnav { display: grid; width: 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .conversation-subnav a { text-align: center; }
+  .conversation-legacy-notice { align-items: stretch; flex-direction: column; }
+  .conversation-legacy-notice .button { width: 100%; text-align: center; }
   .conversation-session-summary { grid-template-columns: 1fr; }
   .conversation-message { width: 100%; }
   .conversation-timeline-turn { padding: 12px; }
@@ -2095,11 +2113,21 @@ export function metricsView({
   `, { openMode, activeTab: 'metrics', metricsAsset });
 }
 
-const CONVERSATION_RESPONSE_STATES = Object.freeze([
+const API_FRAGMENT_RESPONSE_STATES = Object.freeze([
   'complete',
   'incomplete',
   'truncated',
   'unavailable',
+]);
+const CONVERSATION_RESPONSE_STATES = Object.freeze([
+  'pending',
+  'complete',
+  'failed',
+  'unavailable',
+]);
+const ALL_CONVERSATION_RESPONSE_STATES = new Set([
+  ...API_FRAGMENT_RESPONSE_STATES,
+  ...CONVERSATION_RESPONSE_STATES,
 ]);
 const CONVERSATION_PERIOD_OPTIONS = Object.freeze([
   { value: 'all', label: 'All time', i18n: 'conversation-period-all' },
@@ -2121,7 +2149,7 @@ function conversationState(item) {
     ?? item?.responseStatus
     ?? item?.response?.state
     ?? item?.response?.status;
-  return CONVERSATION_RESPONSE_STATES.includes(candidate) ? candidate : 'unavailable';
+  return ALL_CONVERSATION_RESPONSE_STATES.has(candidate) ? candidate : 'unavailable';
 }
 
 function conversationDateText(value) {
@@ -2148,13 +2176,39 @@ function conversationCount(value) {
 
 function conversationStatusView(state) {
   const label = state.replaceAll('_', ' ');
-  return `<span class="badge conversation-state" data-i18n="conversation-response-${escapeHtml(state)}">${escapeHtml(label)}</span>`;
+  return `<span class="badge conversation-state ${escapeHtml(state)}" data-i18n="conversation-response-${escapeHtml(state)}">${escapeHtml(label)}</span>`;
 }
 
-function conversationPrivacyView(openMode) {
+const CONVERSATION_FAILURE_LABELS = Object.freeze({
+  rate_limit: 'Rate limited',
+  overloaded: 'Provider overloaded',
+  authentication_failed: 'Authentication failed',
+  oauth_org_not_allowed: 'Organization not allowed',
+  billing_error: 'Billing error',
+  invalid_request: 'Invalid request',
+  model_not_found: 'Model not found',
+  server_error: 'Provider server error',
+  max_output_tokens: 'Maximum output reached',
+  session_end: 'Session ended before final response',
+  unavailable: 'Response unavailable',
+  unknown: 'Unknown failure',
+});
+
+function conversationFailureView(value) {
+  const code = Object.hasOwn(CONVERSATION_FAILURE_LABELS, value) ? value : 'unknown';
+  return `<span class="tiny" data-i18n="conversation-failure-${code.replaceAll('_', '-')}">${CONVERSATION_FAILURE_LABELS[code]}</span>`;
+}
+
+function conversationPrivacyView(openMode, { reliable = false } = {}) {
+  const heading = reliable
+    ? '<h2 data-i18n="conversation-round-privacy-heading">Reliable conversation privacy</h2>'
+    : '<h2 data-i18n="conversation-privacy-heading">Captured API fragment privacy</h2>';
+  const notice = reliable
+    ? '<p data-i18n="conversation-round-privacy-notice">Hook-enabled Claude Code profiles permanently store the exact Claude user-submitted prompt and final visible assistant response in this console. Every console member can read it. Hooks do not deny or terminate Claude, but a failed synchronous command hook may cause bounded delay. The device asserts this data; the gateway does not authenticate the human identity. Codex traffic is not covered.</p>'
+    : '<p data-i18n="conversation-privacy-notice">This diagnostic archive permanently stores bounded Claude API request/response fragments. They may be client wrappers, reminders, or tool-loop intermediates and are not verified human conversations. Every console member can read them. Codex traffic is not covered.</p>';
   return `<div class="notice error conversation-disclosure" role="note">
-    <h2 data-i18n="conversation-privacy-heading">Captured API turn privacy</h2>
-    <p data-i18n="conversation-privacy-notice">This feature permanently stores every captured Claude API turn and makes captured turn text visible to everyone who can reach this console. Member labels are self-entered and unverified. Codex traffic is not covered.</p>
+    ${heading}
+    ${notice}
     ${openMode ? '<p data-i18n="conversation-open-warning"><strong>Open mode:</strong> anyone on the tailnet who can reach this console can read every captured API turn; there is no identity and no reading audit. A member label is not an actor identity.</p>' : ''}
   </div>`;
 }
@@ -2162,7 +2216,7 @@ function conversationPrivacyView(openMode) {
 function conversationSubnav(active) {
   return `<nav class="conversation-subnav" aria-label="Conversation views">
     <a href="/conversations" data-i18n="conversation-subnav-sessions"${active === 'sessions' ? ' aria-current="page"' : ''}>Conversations</a>
-    <a href="/conversation-turns" data-i18n="conversation-subnav-turns"${active === 'turns' ? ' aria-current="page"' : ''}>Captured API turns</a>
+    <a href="/conversation-turns" data-i18n="conversation-subnav-turns"${active === 'turns' ? ' aria-current="page"' : ''}>API fragment diagnostics</a>
   </nav>`;
 }
 
@@ -2170,7 +2224,18 @@ function conversationFormField(name, value) {
   return `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value ?? '')}">`;
 }
 
-function conversationFormFields({ q, period, memberLabel, deviceId, accountId, model, responseState, limit, beforeId = null }) {
+function conversationFormFields({
+  q,
+  period,
+  memberLabel,
+  deviceId,
+  accountId,
+  model,
+  responseState,
+  limit,
+  beforeId = null,
+  beforeActivityMs = null,
+}) {
   return [
     conversationFormField('q', q),
     conversationFormField('period', period),
@@ -2181,6 +2246,9 @@ function conversationFormFields({ q, period, memberLabel, deviceId, accountId, m
     conversationFormField('response_state', responseState),
     conversationFormField('limit', limit),
     beforeId === null || beforeId === undefined ? '' : conversationFormField('before_id', beforeId),
+    beforeActivityMs === null || beforeActivityMs === undefined
+      ? ''
+      : conversationFormField('before_activity_ms', beforeActivityMs),
   ].join('');
 }
 
@@ -2203,6 +2271,9 @@ function conversationTimelineText(value) {
 }
 
 function promptSourceI18n(source) {
+  if (source === 'claude_hook') {
+    return ['conversation-prompt-source-hook', 'Source: Claude Code UserPromptSubmit hook'];
+  }
   if (source === 'wrapper_removed') {
     return ['conversation-prompt-source-wrapper', 'Source: recognized client wrapper removed'];
   }
@@ -2229,7 +2300,7 @@ function promptDisplayInput(item, value) {
   return {
     text: value,
     promptBytes: item?.promptBytes,
-    promptSource: item?.promptSource ?? item?.promptDisplay?.source,
+    promptSource: item?.promptSource ?? item?.source ?? item?.promptDisplay?.source,
     promptSuffixOmitted: item?.promptSuffixOmitted === true
       || item?.promptDisplay?.suffixOmitted === true,
   };
@@ -2299,7 +2370,7 @@ function conversationSnippetView(labelI18n, label, value, emptyI18n) {
   </div>`;
 }
 
-function conversationPromptSnippetView(item) {
+function conversationPromptSnippetView(item, { reliable = false } = {}) {
   // Schema v4 returns the bounded complete prompt alongside any FTS snippet so
   // legacy wrapper suffixes can be removed before display. Older callers only
   // have promptSnippet and keep the previous bounded fallback.
@@ -2308,11 +2379,13 @@ function conversationPromptSnippetView(item) {
     maxChars: MAX_CONVERSATION_SNIPPET_CHARS,
   });
   return `<div class="conversation-result-snippet">
-    <strong data-i18n="conversation-prompt">Captured API user text</strong>
+    <strong data-i18n="${reliable ? 'conversation-user-message' : 'conversation-prompt'}">${reliable ? 'User-submitted message' : 'Captured API user text'}</strong>
     ${display.text
       ? `<p>${escapeHtml(display.text)}</p>`
       : '<div class="empty tiny" data-i18n="conversation-empty-prompt">Not captured</div>'}
-    <p class="conversation-prompt-disclaimer" data-i18n="conversation-prompt-disclaimer">Captured from the final API user message; it may include client wrappers and is not guaranteed to be the user's original words.</p>
+    <p class="conversation-prompt-disclaimer" data-i18n="${reliable ? 'conversation-hook-prompt-disclaimer' : 'conversation-prompt-disclaimer'}">${reliable
+      ? 'Captured directly from Claude Code UserPromptSubmit. It is exact client-submitted text, but the device does not authenticate the human identity.'
+      : 'Captured from the final API user message; it may include client wrappers and is not guaranteed to be the user\'s original words.'}</p>
     ${promptDisplayMetaView(display)}
   </div>`;
 }
@@ -2325,19 +2398,19 @@ function conversationItemView(item) {
     || item?.captureState === 'dropped'
     || item?.queueState === 'dropped';
   const detailLink = id
-    ? `<a class="button secondary" href="/conversation-turns/${escapeHtml(encodeURIComponent(id))}" data-i18n="conversation-open">Open captured turn</a>`
+    ? `<a class="button secondary" href="/conversation-turns/${escapeHtml(encodeURIComponent(id))}" data-i18n="conversation-open">Open API fragment</a>`
     : '';
   const device = item?.deviceName ?? item?.deviceId ?? '—';
   return `<article class="conversation-result-row" data-conversation-id="${escapeHtml(id)}">
     <div class="conversation-result-head">
       <div>
-        <h2>${id ? `#${escapeHtml(id)}` : '<span data-i18n="conversation-unknown-id">Captured turn</span>'}</h2>
+        <h2>${id ? `#${escapeHtml(id)}` : '<span data-i18n="conversation-unknown-id">API fragment</span>'}</h2>
         <div class="conversation-result-meta">
           <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(item?.startedAtMs))}</span>
           <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(item?.memberLabel ?? '—')}</span>
           <span><span data-i18n="conversation-device">Device</span>: ${escapeHtml(device)}</span>
           <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(item?.accountAlias ?? '—')}</span>
-          <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(item?.model ?? '—')}</span>
+          ${item?.model ? `<span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(item.model)}</span>` : ''}
         </div>
       </div>
       <div class="conversation-result-actions">${conversationStatusView(state)}${detailLink}</div>
@@ -2350,11 +2423,20 @@ function conversationItemView(item) {
   </article>`;
 }
 
-function conversationEnvelope({ result, searchResult, search, items, nextBeforeId, error }) {
+function conversationEnvelope({
+  result,
+  searchResult,
+  search,
+  items,
+  nextBeforeId,
+  nextBeforeActivityMs,
+  error,
+}) {
   const source = result ?? searchResult ?? search ?? {};
   return {
     items: Array.isArray(items) ? items : (Array.isArray(source.items) ? source.items : []),
     nextBeforeId: nextBeforeId ?? source.nextBeforeId ?? null,
+    nextBeforeActivityMs: nextBeforeActivityMs ?? source.nextBeforeActivityMs ?? null,
     error: error ?? source.error ?? null,
     dropped: source.droppedConversations ?? source.queueDropped ?? null,
     facets: source.facets && typeof source.facets === 'object' && !Array.isArray(source.facets)
@@ -2413,7 +2495,7 @@ export function conversationsView({
   const normalizedDevice = String(deviceId ?? '');
   const normalizedAccount = String(accountId ?? '');
   const normalizedModel = String(model ?? '');
-  const normalizedState = CONVERSATION_RESPONSE_STATES.includes(String(responseState))
+  const normalizedState = API_FRAGMENT_RESPONSE_STATES.includes(String(responseState))
     ? String(responseState)
     : '';
   const facets = envelope.facets ?? {};
@@ -2443,7 +2525,7 @@ export function conversationsView({
   )).join('');
   const stateOptions = [
     '<option value="" data-i18n="conversation-all-states">All response states</option>',
-    ...CONVERSATION_RESPONSE_STATES.map((state) => `<option value="${escapeHtml(state)}"${normalizedState === state ? ' selected' : ''} data-i18n="conversation-response-${escapeHtml(state)}">${escapeHtml(state)}</option>`),
+    ...API_FRAGMENT_RESPONSE_STATES.map((state) => `<option value="${escapeHtml(state)}"${normalizedState === state ? ' selected' : ''} data-i18n="conversation-response-${escapeHtml(state)}">${escapeHtml(state)}</option>`),
   ].join('');
   const nextForm = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
     ? ''
@@ -2451,7 +2533,7 @@ export function conversationsView({
         ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
-  return layout('Captured API turns', `
+  return layout('API fragment diagnostics', `
     <section class="stack">
       ${conversationPrivacyView(openMode)}
       ${conversationSubnav('turns')}
@@ -2495,9 +2577,9 @@ export function conversationsView({
         <section class="conversation-results" aria-labelledby="conversation-results-heading">
           <div class="conversation-results-head">
             <div>
-              <span class="badge stored" data-i18n="conversations-label">Captured API turns</span>
-              <h1 id="conversation-results-heading" data-i18n="conversations-heading">Captured API turns</h1>
-              <p class="muted" data-i18n="conversations-intro">Search permanently retained Claude API turns captured from eligible requests. These are per-request captures, not reconstructed threads.</p>
+              <span class="badge stored" data-i18n="conversations-label">API fragment diagnostics</span>
+              <h1 id="conversation-results-heading" data-i18n="conversations-heading">API fragment diagnostics</h1>
+              <p class="muted" data-i18n="conversations-intro">Search immutable per-request Claude API fragments. They may contain wrappers, reminders, or tool-loop intermediates and are not user rounds.</p>
               ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
             </div>
             <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
@@ -2529,13 +2611,13 @@ function conversationSessionSearchErrorView(error) {
   return '<div class="notice error" role="alert" data-i18n="conversation-session-search-error">Conversation search could not be completed.</div>';
 }
 
-function standaloneTurnsNotice(count) {
+function legacyFragmentsNotice(count) {
   const normalized = conversationCount(count);
   if (!normalized) return '';
-  return `<div class="notice conversation-standalone-notice" role="note">
-    <strong data-i18n="conversation-standalone-heading">Standalone captured turns</strong>
-    <p><span data-i18n="conversation-standalone-notice">These older or uncorrelated API turns have no validated session identifier. They are never grouped by a time guess.</span> <strong>${escapeHtml(String(normalized))}</strong></p>
-    <a class="button secondary" href="/conversation-turns" data-i18n="conversation-standalone-link">View standalone and all captured API turns</a>
+  return `<div class="notice conversation-legacy-notice" role="note">
+    <div><strong data-i18n="conversation-legacy-fragments-heading">Legacy API fragments kept for diagnostics</strong>
+    <p><span data-i18n="conversation-legacy-fragments-notice">These older rows were captured from individual API requests. They are not user rounds and are never guessed into conversations.</span> <strong>${escapeHtml(String(normalized))}</strong></p></div>
+    <a class="button secondary" href="/conversation-turns" data-i18n="conversation-legacy-fragments-link">Open API fragment diagnostics</a>
   </div>`;
 }
 
@@ -2544,10 +2626,19 @@ function conversationSessionItemView(item) {
   const state = conversationState({ responseState: item?.latestResponseState });
   const device = item?.deviceName ?? item?.deviceId ?? '—';
   const promptItem = {
-    promptSnippet: item?.latestPromptSnippet,
-    promptSource: item?.latestPromptSource,
-    promptSuffixOmitted: item?.latestPromptSuffixOmitted === true,
+    promptText: item?.latestPromptText ?? '',
+    promptSource: 'claude_hook',
+    promptSuffixOmitted: false,
   };
+  const stateCounts = [
+    ['complete', item?.completeCount],
+    ['pending', item?.pendingCount],
+    ['failed', item?.failedCount],
+    ['unavailable', item?.unavailableCount],
+  ].map(([name, value]) => [name, conversationCount(value)])
+    .filter(([, value]) => value > 0)
+    .map(([name, value]) => `<span><span data-i18n="conversation-response-${name}">${name}</span>: ${escapeHtml(String(value))}</span>`)
+    .join('');
   const detailLink = id
     ? `<a class="button secondary" href="/conversations/session/${escapeHtml(encodeURIComponent(id))}" data-i18n="conversation-session-open">Open conversation</a>`
     : '';
@@ -2557,20 +2648,23 @@ function conversationSessionItemView(item) {
         <h2><span data-i18n="conversation-session-heading">Conversation</span>${id ? ` #${escapeHtml(id)}` : ''}</h2>
         <div class="conversation-result-meta">
           <span><span data-i18n="conversation-session-turn-count">Turns</span>: ${escapeHtml(String(conversationCount(item?.turnCount)))}</span>
-          <span><span data-i18n="conversation-session-first-at">First captured</span>: ${escapeHtml(conversationDateText(item?.firstStartedAtMs))}</span>
-          <span><span data-i18n="conversation-session-last-at">Latest captured</span>: ${escapeHtml(conversationDateText(item?.lastStartedAtMs))}</span>
+          <span><span data-i18n="conversation-session-first-at">First prompt</span>: ${escapeHtml(conversationDateText(item?.firstPromptAtMs))}</span>
+          <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${escapeHtml(conversationDateText(item?.lastActivityAtMs))}</span>
           <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(item?.memberLabel ?? '—')}</span>
           <span><span data-i18n="conversation-device">Device</span>: ${escapeHtml(device)}</span>
           <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(item?.accountAlias ?? '—')}</span>
-          <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(item?.model ?? '—')}</span>
+          ${item?.model ? `<span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(item.model)}</span>` : ''}
         </div>
       </div>
       <div class="conversation-result-actions">${conversationStatusView(state)}${detailLink}</div>
     </div>
-    <p class="muted tiny" data-i18n="conversation-session-latest-preview">Latest captured turn</p>
+    <div class="conversation-round-state-counts tiny" aria-label="Round state counts">
+      ${stateCounts}
+    </div>
+    <p class="muted tiny" data-i18n="conversation-session-latest-preview">Round preview</p>
     <div class="conversation-result-snippets">
-      ${conversationPromptSnippetView(promptItem)}
-      ${conversationSnippetView('conversation-response', 'Response', item?.latestResponseSnippet, 'conversation-empty-response')}
+      ${conversationPromptSnippetView(promptItem, { reliable: true })}
+      ${conversationSnippetView('conversation-final-response', 'Final response', item?.latestResponseText, 'conversation-empty-response')}
     </div>
   </article>`;
 }
@@ -2581,6 +2675,7 @@ export function conversationSessionsView({
   search = null,
   items = null,
   nextBeforeId = null,
+  nextBeforeActivityMs = null,
   q = '',
   period = 'all',
   memberLabel = '',
@@ -2592,8 +2687,17 @@ export function conversationSessionsView({
   openMode = false,
   error = null,
   queueDropped = null,
+  legacyFragmentCount = null,
 } = {}) {
-  const envelope = conversationEnvelope({ result, searchResult, search, items, nextBeforeId, error });
+  const envelope = conversationEnvelope({
+    result,
+    searchResult,
+    search,
+    items,
+    nextBeforeId,
+    nextBeforeActivityMs,
+    error,
+  });
   const source = result ?? searchResult ?? search ?? {};
   const query = typeof q === 'string' ? q : String(q ?? '');
   const normalizedLimit = Number(limit) === 1
@@ -2611,7 +2715,9 @@ export function conversationSessionsView({
     : '';
   const facets = envelope.facets ?? {};
   const droppedCount = conversationCount(envelope.dropped ?? queueDropped);
-  const standaloneCount = conversationCount(source?.standaloneCount);
+  const legacyCount = conversationCount(
+    legacyFragmentCount ?? source?.legacyFragmentCount,
+  );
   const totalMatches = envelope.totalMatches === null || envelope.totalMatches === undefined
     ? envelope.items.length
     : envelope.totalMatches;
@@ -2619,7 +2725,7 @@ export function conversationSessionsView({
     ? ''
     : conversationSessionSearchErrorView(envelope.error);
   const droppedNotice = droppedCount > 0
-    ? `<div class="notice error conversation-queue-dropped" role="alert"><span data-i18n="conversation-queue-dropped">API-turn capture was dropped by the bounded queue.</span> <strong>${escapeHtml(String(droppedCount))}</strong></div>`
+    ? `<div class="notice error conversation-queue-dropped" role="alert"><span data-i18n="conversation-round-dropped">A reliable round could not be stored.</span> <strong>${escapeHtml(String(droppedCount))}</strong></div>`
     : '';
   const facetNotice = facets.truncated === true
     ? '<div class="notice" role="note" data-i18n="conversation-facets-truncated">Some filter values are omitted from the list; a selected value remains available.</div>'
@@ -2631,26 +2737,45 @@ export function conversationSessionsView({
     '<option value="" data-i18n="conversation-all-states">All response states</option>',
     ...CONVERSATION_RESPONSE_STATES.map((state) => `<option value="${escapeHtml(state)}"${normalizedState === state ? ' selected' : ''} data-i18n="conversation-response-${escapeHtml(state)}">${escapeHtml(state)}</option>`),
   ].join('');
-  const nextForm = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
+  const nextForm = envelope.nextBeforeId === null
+    || envelope.nextBeforeId === undefined
+    || envelope.nextBeforeActivityMs === null
+    || envelope.nextBeforeActivityMs === undefined
     ? ''
     : `<form method="post" action="/conversations" class="conversation-pagination-form" data-reset-scroll>
-        ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
+        ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId, beforeActivityMs: envelope.nextBeforeActivityMs })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
   const itemsView = envelope.items.map(conversationSessionItemView).join('');
+  const hasActiveFilters = Boolean(
+    query
+    || normalizedPeriod !== 'all'
+    || normalizedMember
+    || normalizedDevice
+    || normalizedAccount
+    || normalizedModel
+    || normalizedState,
+  );
+  const emptyRounds = `<div class="card conversation-round-empty">
+    <h2 data-i18n="conversation-round-empty-heading">No reliable user rounds yet</h2>
+    <p data-i18n="conversation-round-empty-copy">Reliable conversations begin when a Claude Code profile sends UserPromptSubmit and Stop hooks. Existing API fragments remain available only in diagnostics and are not guessed into conversations.</p>
+    <div class="actions">
+      <a class="button" href="/#conversation-capture-upgrade" data-i18n="conversation-round-install-hooks">Install conversation capture update</a>
+    </div>
+  </div>`;
   return layout('Conversations', `
     <section class="stack">
-      ${conversationPrivacyView(openMode)}
+      ${conversationPrivacyView(openMode, { reliable: true })}
       ${conversationSubnav('sessions')}
-      ${standaloneTurnsNotice(standaloneCount)}
+      ${legacyFragmentsNotice(legacyCount)}
       <div class="conversation-layout">
         <details class="conversation-filter-details" data-persist-details="session-filters" open>
           <summary data-i18n="conversation-filters-heading">Filters</summary>
           <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters" data-reset-scroll>
           <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
-          <p class="muted tiny conversation-filter-hint" data-i18n="conversation-session-filter-hint">Filters match any captured turn inside a correlated client session; each result card shows the latest turn's attribution and preview.</p>
+          <p class="muted tiny conversation-filter-hint" data-i18n="conversation-session-filter-hint">Filters match reliable hook-backed user rounds. API fragments are searched separately in diagnostics.</p>
           <label><span data-i18n="conversation-session-search">Search conversations</span>
-            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Captured API user text or response" data-placeholder-en="Captured API user text or response" data-placeholder-zh="已捕获 API 用户文本或回复">
+            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Exact submitted prompt or final response" data-placeholder-en="Exact submitted prompt or final response" data-placeholder-zh="原始提交文字或最终回复">
           </label>
           <label><span data-i18n="conversation-filter-period-label">Period</span><select name="period">${periodOptions}</select></label>
           <label><span data-i18n="conversation-filter-member-label">Member</span>
@@ -2659,7 +2784,6 @@ export function conversationSessionsView({
           </label>
           <label><span data-i18n="conversation-filter-device-label">Device</span><select name="device_id">${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select></label>
           <label><span data-i18n="conversation-filter-account-label">Account</span><select name="account_id">${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select></label>
-          <label><span data-i18n="conversation-filter-model-label">Model</span><select name="model">${conversationFacetOptions(facets.models, normalizedModel, 'All models', 'conversation-all-models')}</select></label>
           <label><span data-i18n="conversation-filter-state-label">Response state</span><select name="response_state">${stateOptions}</select></label>
           <label><span data-i18n="conversation-filter-limit-label">Rows per page</span><select name="limit">${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label>
           <div class="filter-actions">
@@ -2671,9 +2795,9 @@ export function conversationSessionsView({
         <section class="conversation-results" aria-labelledby="conversation-sessions-results-heading">
           <div class="conversation-results-head">
             <div>
-              <span class="badge stored" data-i18n="conversation-sessions-label">Correlated client sessions</span>
+              <span class="badge stored" data-i18n="conversation-sessions-label">Reliable hook-backed conversations</span>
               <h1 id="conversation-sessions-results-heading" data-i18n="conversation-sessions-heading">Conversations</h1>
-              <p class="muted" data-i18n="conversation-sessions-intro">Captured turns are grouped only when Claude Code supplies a validated session identifier. This correlation does not authenticate the user; standalone turns are never grouped by time.</p>
+              <p class="muted" data-i18n="conversation-sessions-intro">Each round pairs the exact prompt emitted by Claude Code UserPromptSubmit with the final visible response emitted by Stop. Tool-loop API requests do not become fake user turns. Session and prompt identifiers are stored only as device-bound HMACs.</p>
               ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
             </div>
             <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-session-total-matches">matching conversations</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
@@ -2682,9 +2806,11 @@ export function conversationSessionsView({
           ${droppedNotice}
           ${facetNotice}
           <div class="conversation-list" aria-live="polite">
-            ${itemsView || '<p class="empty" data-i18n="conversation-session-no-results">No correlated conversations match this search.</p>'}
+            ${itemsView || (hasActiveFilters
+              ? '<p class="empty" data-i18n="conversation-session-no-results">No reliable conversations match these filters.</p>'
+              : emptyRounds)}
           </div>
-          ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-session-pagination-hint">Conversations are ordered by their internal session record, newest first.</span>${nextForm}</div>` : ''}
+          ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-session-pagination-hint">Conversations are ordered by latest hook activity, newest first.</span>${nextForm}</div>` : ''}
         </section>
       </div>
     </section>
@@ -2703,44 +2829,47 @@ function conversationSessionTurnView(turn, fallbackIndex) {
   const responseDisplay = conversationTimelineText(turn?.responseText ?? turn?.response);
   const response = responseDisplay.text;
   const turnId = Number.isSafeInteger(turn?.id) && turn.id > 0 ? turn.id : null;
-  const stateNotice = state === 'incomplete'
-    ? '<p class="notice conversation-session-state-note" data-i18n="conversation-session-incomplete-turn">This API turn ended before a complete assistant response was captured.</p>'
-    : state === 'truncated'
-      ? '<p class="notice conversation-session-state-note" data-i18n="conversation-session-truncated-turn">The captured assistant text reached a bounded limit and is incomplete.</p>'
-      : '';
+  const stateNotice = state === 'failed'
+      ? `<p class="notice error conversation-session-state-note"><span data-i18n="conversation-round-failed">Claude Code reported that this round failed.</span> ${conversationFailureView(turn?.failureCode)}</p>`
+      : state === 'unavailable'
+        ? '<p class="notice conversation-session-state-note" data-i18n="conversation-round-unavailable">The prompt is preserved, but no final response hook was available before the session ended.</p>'
+        : '';
   const timelineClipNotice = responseDisplay.omitted || turn?.responseDisplayTruncated === true
     ? '<p class="notice conversation-session-state-note" data-i18n="conversation-session-timeline-clipped">Long assistant text is shortened in this timeline. Open the individual turn to read the complete captured text.</p>'
     : '';
   const responseView = response
     ? `<pre>${escapeHtml(response)}</pre>`
-    : '<p class="empty" data-i18n="conversation-session-empty-assistant">No assistant text was captured. This turn may contain tool activity, or its response body may have been unavailable.</p>';
+    : `<p class="empty" data-i18n="${state === 'pending' ? 'conversation-round-response-pending' : 'conversation-round-empty-response'}">${state === 'pending' ? 'Waiting for the final response.' : 'No final assistant text was reported for this round.'}</p>`;
   return `<article class="conversation-timeline-turn" data-turn-index="${escapeHtml(String(displayIndex))}">
     <div class="conversation-timeline-turn-head">
       <div>
-        <h2><span data-i18n="conversation-session-turn">Turn</span> ${escapeHtml(String(displayIndex))}</h2>
+        <h2><span data-i18n="conversation-session-turn">Round</span> ${escapeHtml(String(displayIndex))}</h2>
         <div class="conversation-detail-meta">
-          <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(turn?.startedAtMs))}</span>
+          <span><span data-i18n="conversation-round-prompt-at">Prompt submitted</span>: ${escapeHtml(conversationDateText(turn?.promptAtMs))}</span>
+          <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${escapeHtml(conversationDateText(turn?.lastActivityAtMs ?? turn?.completedAtMs ?? turn?.promptAtMs))}</span>
           <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(turn?.memberLabel ?? '—')}</span>
           <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(turn?.accountAlias ?? '—')}</span>
-          <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(turn?.model ?? '—')}</span>
+          ${turn?.model ? `<span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(turn.model)}</span>` : ''}
         </div>
       </div>
       <div class="conversation-result-actions">
         ${conversationStatusView(state)}
-        ${turnId ? `<a class="button secondary" href="/conversation-turns/${turnId}" data-i18n="conversation-session-open-turn">Open turn</a>` : ''}
+        ${turnId ? `<a class="button secondary" href="/conversation-rounds/${turnId}" data-i18n="conversation-session-open-turn">Open round</a>` : ''}
       </div>
     </div>
     <div class="conversation-turn-messages">
       <section class="conversation-message conversation-message-user">
-        <h3 data-i18n="conversation-prompt">Captured API user text</h3>
-        <p class="conversation-prompt-disclaimer muted tiny" data-i18n="conversation-prompt-disclaimer">Captured from the final API user message; it may include client wrappers and is not guaranteed to be the user's original words.</p>
+        <h3 data-i18n="conversation-user-message">User-submitted message</h3>
+        <p class="conversation-prompt-disclaimer muted tiny" data-i18n="conversation-hook-prompt-disclaimer">Captured directly from Claude Code UserPromptSubmit. It is exact client-submitted text, but the device does not authenticate the human identity.</p>
         ${promptDisplay.text ? `<pre>${escapeHtml(promptDisplay.text)}</pre>` : '<p class="empty" data-i18n="conversation-empty-prompt">Not captured</p>'}
         ${promptDisplayMetaView(promptDisplay)}
+        ${turn?.promptTruncated === true ? '<p class="notice conversation-session-state-note" data-i18n="conversation-round-prompt-truncated">The submitted prompt exceeded the storage bound; only a complete UTF-8 prefix is retained.</p>' : ''}
       </section>
       <section class="conversation-message conversation-message-assistant">
-        <h3 data-i18n="conversation-response">Response</h3>
+        <h3 data-i18n="conversation-final-response">Final response</h3>
         ${responseView}
         ${stateNotice}
+        ${turn?.responseTruncated === true ? '<p class="notice conversation-session-state-note" data-i18n="conversation-round-response-truncated">The final response exceeded the storage bound; only a complete UTF-8 prefix is retained.</p>' : ''}
         ${timelineClipNotice}
       </section>
     </div>
@@ -2763,7 +2892,7 @@ export function conversationSessionDetailView({
   if (!record || typeof record !== 'object' || Array.isArray(record)) {
     return layout('Conversation unavailable', `
       <section class="stack conversation-session-detail-shell">
-        ${conversationPrivacyView(openMode)}
+        ${conversationPrivacyView(openMode, { reliable: true })}
         ${conversationSubnav('sessions')}
         ${errorNotice || '<div class="notice error" role="alert" data-i18n="conversation-session-not-found">Conversation not found.</div>'}
         <a class="button secondary" href="/conversations" data-i18n="conversation-session-back">Back to conversations</a>
@@ -2779,39 +2908,108 @@ export function conversationSessionDetailView({
     const leftIndex = Number.isSafeInteger(left?.turnIndex) ? left.turnIndex : Number.MAX_SAFE_INTEGER;
     const rightIndex = Number.isSafeInteger(right?.turnIndex) ? right.turnIndex : Number.MAX_SAFE_INTEGER;
     if (leftIndex !== rightIndex) return leftIndex - rightIndex;
-    const leftAt = Number.isFinite(Number(left?.startedAtMs)) ? Number(left.startedAtMs) : 0;
-    const rightAt = Number.isFinite(Number(right?.startedAtMs)) ? Number(right.startedAtMs) : 0;
+    const leftAt = Number.isFinite(Number(left?.promptAtMs)) ? Number(left.promptAtMs) : 0;
+    const rightAt = Number.isFinite(Number(right?.promptAtMs)) ? Number(right.promptAtMs) : 0;
     return leftAt - rightAt;
   }).slice(0, 200);
   const turnCount = Number.isSafeInteger(record.turnCount) && record.turnCount >= 0
     ? record.turnCount
     : suppliedTurns.length;
   const truncated = record.truncated === true || suppliedTurns.length > 200 || turnCount > turns.length;
-  const standaloneCount = conversationCount(record.standaloneCount ?? envelope.standaloneCount);
   const sessionId = record.id ?? id ?? '—';
   const timeline = turns.map(conversationSessionTurnView).join('');
   return layout('Conversation', `
     <section class="stack conversation-session-detail-shell">
-      ${conversationPrivacyView(openMode)}
+      ${conversationPrivacyView(openMode, { reliable: true })}
       ${conversationSubnav('sessions')}
-      ${standaloneTurnsNotice(standaloneCount)}
       <div class="metrics-heading">
         <div>
-          <span class="badge stored" data-i18n="conversation-sessions-label">Correlated client session</span>
+          <span class="badge stored" data-i18n="conversation-sessions-label">Reliable hook-backed conversation</span>
           <h1><span data-i18n="conversation-session-heading">Conversation</span> #${escapeHtml(String(sessionId))}</h1>
-          <p class="muted" data-i18n="conversation-session-detail-intro">Turns are shown oldest to newest from one correlated client session. The identifier is format-validated and HMAC-hidden, but it does not authenticate the user; the raw value is never displayed or stored here.</p>
+          <p class="muted" data-i18n="conversation-session-detail-intro">Rounds are ordered by prompt submission inside one Claude Code session. Each panel pairs UserPromptSubmit with the terminal Stop event for the same prompt. Raw session and prompt identifiers are never stored; the device-reported identity is not human authentication.</p>
         </div>
         <a class="button secondary" href="/conversations" data-i18n="conversation-session-back">Back to conversations</a>
       </div>
       <div class="conversation-session-summary">
         <article class="card summary"><span class="muted" data-i18n="conversation-session-turn-count">Turns</span><strong>${escapeHtml(String(turnCount))}</strong></article>
-        <article class="card summary"><span class="muted" data-i18n="conversation-session-first-at">First captured</span><strong>${escapeHtml(conversationDateText(record.firstStartedAtMs))}</strong></article>
-        <article class="card summary"><span class="muted" data-i18n="conversation-session-last-at">Latest captured</span><strong>${escapeHtml(conversationDateText(record.lastStartedAtMs))}</strong></article>
+        <article class="card summary"><span class="muted" data-i18n="conversation-session-first-at">First prompt</span><strong>${escapeHtml(conversationDateText(record.firstPromptAtMs))}</strong></article>
+        <article class="card summary"><span class="muted" data-i18n="conversation-session-last-at">Latest activity</span><strong>${escapeHtml(conversationDateText(record.lastActivityAtMs))}</strong></article>
       </div>
       ${truncated ? '<div class="notice" role="status" data-i18n="conversation-session-truncated">This conversation exceeds the bounded timeline budget. Only the oldest contiguous prefix, up to 200 turns and 8 MiB of stored text, is shown; open an individual turn for its full stored text.</div>' : ''}
       <div class="conversation-timeline">
         ${timeline || '<p class="empty" data-i18n="conversation-session-empty">No captured turns are available in this conversation.</p>'}
       </div>
+    </section>
+  `, { openMode, activeTab: 'conversations' });
+}
+
+export function conversationRoundDetailView({
+  result = null,
+  round = null,
+  id = null,
+  error = null,
+  openMode = false,
+} = {}) {
+  const envelope = result ?? {};
+  const record = round ?? envelope.round ?? null;
+  const errorText = error ?? envelope.error ?? null;
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return layout('Conversation round unavailable', `
+      <section class="stack conversation-detail-shell">
+        ${conversationPrivacyView(openMode, { reliable: true })}
+        ${conversationSubnav('sessions')}
+        ${errorText
+          ? '<div class="notice error" role="alert" data-i18n="conversation-round-read-error">Conversation round could not be loaded.</div>'
+          : '<div class="notice error" role="alert" data-i18n="conversation-round-not-found">Reliable conversation round not found.</div>'}
+        <a class="button secondary" href="/conversations" data-i18n="conversation-session-back">Back to conversations</a>
+      </section>
+    `, { openMode, activeTab: 'conversations' });
+  }
+  const roundId = record.id ?? id ?? '—';
+  const state = conversationState(record);
+  const prompt = conversationText(record.promptText);
+  const response = conversationText(record.responseText);
+  const backHref = Number.isSafeInteger(record.conversationSessionId)
+    ? `/conversations/session/${record.conversationSessionId}`
+    : '/conversations';
+  const stateNotice = state === 'failed'
+      ? `<div class="notice error"><span data-i18n="conversation-round-failed">Claude Code reported that this round failed.</span> ${conversationFailureView(record.failureCode)}</div>`
+      : state === 'unavailable'
+        ? '<div class="notice" data-i18n="conversation-round-unavailable">The prompt is preserved, but no final response hook was available before the session ended.</div>'
+        : '';
+  return layout('Conversation round', `
+    <section class="stack conversation-detail-shell" data-conversation-round-id="${escapeHtml(String(roundId))}">
+      ${conversationPrivacyView(openMode, { reliable: true })}
+      ${conversationSubnav('sessions')}
+      ${errorText ? '<div class="notice error" data-i18n="conversation-round-read-error">Conversation round could not be loaded.</div>' : ''}
+      <div class="topbar">
+        <div>
+          <span class="badge stored" data-i18n="conversation-round-label">Reliable user round</span>
+          <h1><span data-i18n="conversation-session-turn">Round</span> ${escapeHtml(String(record.turnIndex ?? roundId))}</h1>
+          <div class="conversation-detail-meta">
+            <span><span data-i18n="conversation-round-prompt-at">Prompt submitted</span>: ${escapeHtml(conversationDateText(record.promptAtMs))}</span>
+            <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${escapeHtml(conversationDateText(record.lastActivityAtMs ?? record.completedAtMs ?? record.promptAtMs))}</span>
+            <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(record.memberLabel ?? '—')}</span>
+            <span><span data-i18n="conversation-device">Device</span>: ${escapeHtml(record.deviceName ?? record.deviceId ?? '—')}</span>
+            <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(record.accountAlias ?? '—')}</span>
+          </div>
+        </div>
+        ${conversationStatusView(state)}
+      </div>
+      <article class="card conversation-text conversation-message conversation-message-user">
+        <h2 data-i18n="conversation-user-message">User-submitted message</h2>
+        <p class="conversation-prompt-disclaimer muted tiny" data-i18n="conversation-hook-prompt-disclaimer">Captured directly from Claude Code UserPromptSubmit. It is exact client-submitted text, but the device does not authenticate the human identity.</p>
+        ${prompt ? `<pre>${escapeHtml(prompt)}</pre>` : '<p class="empty" data-i18n="conversation-empty-prompt">Not captured</p>'}
+        ${promptDisplayMetaView({ source: 'claude_hook', suffixOmitted: false })}
+        ${record.promptTruncated === true ? '<p class="notice" data-i18n="conversation-round-prompt-truncated">The submitted prompt exceeded the storage bound; only a complete UTF-8 prefix is retained.</p>' : ''}
+      </article>
+      <article class="card conversation-text conversation-message conversation-message-assistant">
+        <h2 data-i18n="conversation-final-response">Final response</h2>
+        ${response ? `<pre>${escapeHtml(response)}</pre>` : `<p class="empty" data-i18n="${state === 'pending' ? 'conversation-round-response-pending' : 'conversation-round-empty-response'}">${state === 'pending' ? 'Waiting for the final response.' : 'No final assistant text was reported for this round.'}</p>`}
+        ${record.responseTruncated === true ? '<p class="notice" data-i18n="conversation-round-response-truncated">The final response exceeded the storage bound; only a complete UTF-8 prefix is retained.</p>' : ''}
+        ${stateNotice}
+      </article>
+      <a class="button secondary" href="${escapeHtml(backHref)}" data-i18n="conversation-session-back">Back to conversation</a>
     </section>
   `, { openMode, activeTab: 'conversations' });
 }
@@ -2848,15 +3046,15 @@ export function conversationDetailView({
   const promptDisplay = derivePromptDisplay(promptDisplayInput(record, record.promptText ?? record.prompt));
   const prompt = promptDisplay.text;
   const response = conversationText(record.responseText ?? record.response);
-  return layout('Captured turn', `
+  return layout('API fragment', `
     <section class="stack conversation-detail-shell">
       ${conversationPrivacyView(openMode)}
       ${conversationSubnav('turns')}
       ${errorNotice}
       <div class="topbar">
         <div>
-          <span class="badge stored" data-i18n="conversations-label">Captured API turns</span>
-          <h1><span data-i18n="conversation-detail-heading">Captured turn</span> #${escapeHtml(String(conversationId))}</h1>
+          <span class="badge stored" data-i18n="conversations-label">API fragment diagnostics</span>
+          <h1><span data-i18n="conversation-detail-heading">API fragment</span> #${escapeHtml(String(conversationId))}</h1>
           <div class="conversation-detail-meta">
             <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(record.startedAtMs))}</span>
             <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(record.memberLabel ?? '—')}</span>
@@ -2891,6 +3089,7 @@ export function dashboardView({
   adminIdentity = null,
   openMode = false,
   codexSelfServiceReady = false,
+  claudeGatewayUrl = null,
   onboardingUrl = null,
   error = null,
   completedDraft = null,
@@ -2911,6 +3110,44 @@ export function dashboardView({
   const selfServiceOptions = selfServiceAccounts.map((account) => (
     `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
   )).join('');
+  const claudeHookProfiles = accounts
+    .filter((account) => account.provider === 'claude')
+    .map((account) => String(account.alias ?? '')
+      .replace(/[^A-Za-z0-9._-]/g, '-')
+      .replace(/^[^A-Za-z0-9]+/, '')
+      .slice(0, 64))
+    .filter(Boolean);
+  let conversationHookUpgrade = '';
+  try {
+    if (claudeGatewayUrl && claudeHookProfiles.length) {
+      const endpoint = buildClaudeConversationHookEndpoint(claudeGatewayUrl);
+      const updater = renderClaudeConversationHookUpdaterSource({ endpoint });
+      const updaterId = 'claude-conversation-hooks-updater';
+      const filename = CLAUDE_CONVERSATION_HOOK_UPDATER_FILENAME;
+      const commands = claudeHookProfiles.map((profile) => (
+        `<div class="run-command">${escapeHtml(`node "$HOME/Downloads/${filename}" ${profile}`)}</div>`
+      )).join('');
+      conversationHookUpgrade = `<article class="card" id="conversation-capture-upgrade">
+        <h2 data-i18n="conversation-hook-upgrade-heading">Enable reliable conversations on existing Claude profiles</h2>
+        <p data-i18n="conversation-hook-upgrade-copy">This token-free updater preserves existing settings and installs synchronous Claude Code command hooks. It reads each profile's existing mode-600 device token only at event delivery time; it does not log in, rotate, print, or replace any credential.</p>
+        <div class="notice"><span data-i18n="conversation-hook-upgrade-privacy">After installation, Claude user-submitted prompts and final visible assistant responses are permanently stored in this console and visible to every console member. Hooks do not deny or terminate Claude, but a failed synchronous command hook may cause bounded delay.</span></div>
+        <p class="muted tiny" data-i18n="conversation-hook-version-note">Reliable prompt pairing requires Claude Code 2.1.196 or newer; older clients do not provide the prompt ID needed for reliable rounds.</p>
+        <div class="setup-actions">
+          <button type="button" data-download-target="${updaterId}" data-download-name="${escapeHtml(filename)}" data-i18n="conversation-hook-download">Download hook updater</button>
+          <button type="button" class="secondary" data-copy-target="${updaterId}" data-i18n="conversation-hook-copy">Copy updater source</button>
+        </div>
+        <details data-persist-details="conversation-hook-updater-source">
+          <summary data-i18n="view-script">View script</summary>
+          <pre id="${updaterId}">${escapeHtml(updater)}</pre>
+        </details>
+        <h3 data-i18n="conversation-hook-run-heading">Run once for each installed profile on this device</h3>
+        ${commands}
+        <p class="muted tiny" data-i18n="conversation-hook-restart-note">Restart Claude Code after the updater completes. Hook failures do not deny or terminate Claude, but a failed synchronous command hook may add bounded delay; delivery failures otherwise exit silently.</p>
+      </article>`;
+    }
+  } catch {
+    conversationHookUpgrade = '';
+  }
   const codexAccounts = accounts.filter((account) => account.provider === 'codex');
   const primaryCodex = codexAccounts[0] ?? null;
   const claudeUsage = selfServiceAccounts.map((account) => accountUsageView(account, {
@@ -3037,6 +3274,7 @@ export function dashboardView({
           <article class="card summary"><span class="muted" data-i18n="accounts">Accounts</span><strong>${accounts.length}</strong></article>
           <article class="card summary"><span class="muted" data-i18n="healthy">Healthy</span><strong>${healthy}</strong></article>
           <article class="card summary"><span class="muted" data-i18n="active-claude-credentials">Active Claude credentials</span><strong>${activeDevices.length}</strong></article>
+          ${conversationHookUpgrade}
           ${onboardingUrl ? `<article class="card">
             <h2 data-i18n="ai-onboarding-guide">AI onboarding guide</h2>
             <p class="muted" data-i18n="ai-onboarding-intro">This tailnet-internal Markdown is generated from current deployment state. It contains endpoints, account status, and the client config version, but never a token.</p>
@@ -3487,6 +3725,9 @@ export function codexConfiguredView({
 export function deviceConfiguredView({ account, device, token, claudeGatewayUrl, openMode = false }) {
   const gateway = claudeGatewayUrl.replace(/\/$/, '');
   const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
+  const hookEndpoint = buildClaudeConversationHookEndpoint(gateway);
+  const hookUpdater = renderClaudeConversationHookUpdaterSource({ endpoint: hookEndpoint });
+  const hookUpdaterBase64 = Buffer.from(hookUpdater, 'utf8').toString('base64');
   const unix = `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -3498,6 +3739,7 @@ SETTINGS_FILE="$CONFIG_ROOT/claude-${profile}.settings.json"
 PROFILE_FILE="$CONFIG_ROOT/claude-${profile}.env"
 LAUNCHER_FILE="$HOME/.local/bin/claude-${profile}"
 DEFAULT_LAUNCHER="$HOME/.local/bin/claude-gateway"
+HOOK_UPDATER_FILE="$CONFIG_ROOT/${CLAUDE_CONVERSATION_HOOK_UPDATER_FILENAME}"
 
 install -d -m 700 "$CONFIG_ROOT" "$HOME/.local/bin"
 umask 077
@@ -3509,7 +3751,7 @@ exec cat "$HOME/.config/claude-codex-gateway/claude-${profile}.token"
 HELPER
 chmod 700 "$HELPER_FILE"
 ln -sfn "$HELPER_FILE" "$DEFAULT_HELPER"
-printf '{}\n' > "$SETTINGS_FILE"
+if [ ! -f "$SETTINGS_FILE" ]; then printf '{}\n' > "$SETTINGS_FILE"; fi
 cat > "$PROFILE_FILE" <<'PROFILE'
 export ANTHROPIC_BASE_URL=${shellSingleQuote(gateway)}
 export ${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${shellSingleQuote(CLIENT_CONFIG_VERSION)}
@@ -3529,6 +3771,11 @@ LAUNCHER
 chmod 600 "$TOKEN_FILE" "$SETTINGS_FILE" "$PROFILE_FILE"
 chmod 700 "$LAUNCHER_FILE"
 ln -sfn "$LAUNCHER_FILE" "$DEFAULT_LAUNCHER"
+cat > "$HOOK_UPDATER_FILE" <<'HOOK_UPDATER'
+${hookUpdater}
+HOOK_UPDATER
+chmod 700 "$HOOK_UPDATER_FILE"
+node "$HOOK_UPDATER_FILE" ${shellSingleQuote(profile)} || true
 unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 exec "$DEFAULT_LAUNCHER"`;
   const windows = `$dir = Join-Path $HOME '.config\\claude-codex-gateway'
@@ -3539,12 +3786,15 @@ $defaultHelper = Join-Path $dir 'claude-gateway-api-key-helper.ps1'
 $settings = Join-Path $dir 'claude-${profile}.settings.json'
 $wrapper = Join-Path $dir 'claude-${profile}.ps1'
 $defaultWrapper = Join-Path $dir 'claude-gateway.ps1'
+$hookUpdater = Join-Path $dir '${CLAUDE_CONVERSATION_HOOK_UPDATER_FILENAME}'
 [IO.File]::WriteAllText($tokenFile, ${powerShellSingleQuote(token)}, [Text.UTF8Encoding]::new($false))
 @'
 [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $HOME '.config\\claude-codex-gateway\\claude-${profile}.token')))
 '@ | Set-Content -Encoding UTF8 $helper
 Copy-Item -Force $helper $defaultHelper
-@{} | ConvertTo-Json | Set-Content -Encoding UTF8 $settings
+if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) {
+  @{} | ConvertTo-Json | Set-Content -Encoding UTF8 $settings
+}
 @'
 $tokenFile = [IO.Path]::Combine($HOME, '.config', 'claude-codex-gateway', 'claude-${profile}.token')
 $env:ANTHROPIC_BASE_URL=${powerShellSingleQuote(gateway)}
@@ -3561,6 +3811,8 @@ $settings = Join-Path $HOME '.config\\claude-codex-gateway\\claude-${profile}.se
 exit $LASTEXITCODE
 '@ | Set-Content -Encoding UTF8 $wrapper
 Copy-Item -Force $wrapper $defaultWrapper
+[IO.File]::WriteAllBytes($hookUpdater, [Convert]::FromBase64String('${hookUpdaterBase64}'))
+& node $hookUpdater ${powerShellSingleQuote(profile)}
 Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
@@ -3571,6 +3823,7 @@ Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
       <div class="notice success">Device <strong>${escapeHtml(device.name)}</strong> is enrolled for <strong>${escapeHtml(account.alias)}</strong>.</div>
       <h1 data-i18n="claude-copy-now">Copy or download this configuration now</h1>
       <p class="muted" data-i18n="claude-one-time-token">This device token is displayed once and cannot be recovered from the control plane. The launcher injects it only into Claude Code's explicit gateway mode, which scrubs it from child-process environments, so no local sandbox package is required. Re-enroll if it is lost, and delete the downloaded installer after use.</p>
+      <div class="notice error" data-i18n="conversation-hook-installer-privacy">This profile permanently stores Claude user-submitted prompts and final visible assistant responses in the console, where all console members can read them. Hooks do not deny or terminate Claude and do not change the device token, but a failed synchronous command hook may cause bounded delay.</div>
       <h2>macOS / Linux</h2>
       <pre id="unix-config">${escapeHtml(unix)}</pre>
       <div class="setup-actions">

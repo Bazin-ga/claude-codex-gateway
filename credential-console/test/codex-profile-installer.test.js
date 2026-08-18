@@ -105,5 +105,5 @@ test('the generated Codex profile installer works in a clean home without touchi
   assert.equal(auth.tokens.refresh_token, '');
   assert.equal(JSON.parse(await readFile(join(profileRoot, 'selected.json'), 'utf8')).profile, 'team-a');
   assert.equal((await stat(join(home, '.local', 'bin', 'codex-gateway'))).mode & 0o777, 0o700);
-  assert.equal(await readFile(join(home, '.config', 'claude-codex-gateway', 'client-agent', 'config-version'), 'utf8'), '2\n');
+  assert.equal(await readFile(join(home, '.config', 'claude-codex-gateway', 'client-agent', 'config-version'), 'utf8'), '3\n');
 });

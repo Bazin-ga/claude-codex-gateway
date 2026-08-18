@@ -4,12 +4,14 @@ Multi-account control plane for subscription-backed Codex and Claude Code access
 
 > **Telemetry and conversation notice:** every proxied Claude gateway request produces a persistent
 > metadata row that is visible to every member who can reach the console. It includes routing, model,
-> status, timing, byte-count, and four provider-reported token-count fields. P6 permanently stores
-> eligible captured Claude API turns and makes their API-user/assistant text visible to everyone who can
+> status, timing, byte-count, and four provider-reported token-count fields. Hook-enabled Claude profiles
+> permanently store exact Claude user-submitted prompts and final visible assistant responses as paired rounds. Legacy
+> P6 API fragments remain available only in diagnostics. Both are visible to everyone who can
 > reach the console; in `open` mode that means anyone on the tailnet, with no identity and no reading
 > audit. Member labels are self-entered and unverified, so metrics must not be used for accountability
-> or billing. Captured API-user text may contain client wrappers and is not guaranteed to be the
-> human's original words. Codex traffic is not covered by turn capture.
+> or billing. Hook events are device-asserted rather than human-authenticated; raw session and prompt IDs are
+> replaced by HMACs. Hooks do not deny or terminate Claude, but a failed synchronous command hook may cause bounded
+> delay; hook delivery never rotates or replaces a credential. Codex traffic is not covered.
 
 It solves two related operational problems:
 
@@ -326,9 +328,9 @@ synthetic/lifetime aggregate exceeds JavaScript's exact-integer range,
 the page reports that overflow instead of rounding it or failing the entire metrics query; the
 per-request integer rows remain stored.
 
-The metrics page remains body-free: request and response bodies are not rendered there. P6 separately
-permanently stores eligible captured Claude API turns and exposes them through the captured-turn
-archive to every member who can reach the console; in `open` mode that means anyone on
+The metrics page remains body-free: request and response bodies are not rendered there. Reliable
+Hook-backed rounds separately permanently store eligible Claude user-submitted prompts and final visible
+assistant responses, while legacy P6 API fragments remain in the diagnostic archive exposed to every member who can reach the console; in `open` mode that means anyone on
 the tailnet, with no identity and no reading audit. Self-entered member labels remain unverified and
 must not be used for accountability or billing. Codex traffic is not covered by API-turn capture.
 
@@ -360,30 +362,32 @@ only the matching pre-upgrade `metrics.sqlite` from the checkpointed backup (rem
 `-wal`/`-shm` sidecars); do not replace `master.key`
 or `state.json` merely to roll back metrics code or conversation UI.
 
-## Conversations and captured API turns
+## Reliable conversations and API fragment diagnostics
 
-P6 permanently retains the captured API-user and assistant text for eligible Claude requests and makes the archive
-available to every member who can reach the console. The list supports full-text search,
-period/member/device/account/model/state filters, facet counts, and keyset pagination. Filter and
-pagination forms use bounded read-only POST bodies so prompt text and labels do not enter URLs; a
-plain GET is only the default landing page. `/conversation-turns` keeps this per-request archive.
-The final API `user` message can contain client-generated wrappers and is not proof of a human's
-original terminal text. Opening a row shows the complete stored display text with its
-`complete`, `incomplete`, `truncated`, or `unavailable` response state. Result previews are capped
-server-side at 600 characters and two visual lines. A bounded capture queue can drop a conversation
-before it is stored; the archive reports that condition prominently rather than implying that the
-API turn was saved. Codex traffic does not pass through this gateway and is not covered.
+`/conversations` reads the additive schema-5 `conversation_rounds` archive. A hook-enabled Claude Code profile emits
+`UserPromptSubmit.prompt` and `Stop.last_assistant_message`; the console pairs them with device-bound HMACs of
+`session_id` and `prompt_id`. Tool-loop API requests do not become user turns. The list supports full-text search,
+period/member/device/account/model/state filters and keyset pagination. Filter and
+pagination forms use bounded read-only POST bodies so prompt text and labels do not enter URLs; a plain GET is only
+the default landing page. A conversation detail renders paired rounds oldest first under an 8 MiB / 200-round bound,
+and each round links to its complete stored detail. States are `pending`, `complete`, `failed`, or `unavailable`.
+The event fields come from the official [Claude Code hooks reference](https://code.claude.com/docs/en/hooks):
+`UserPromptSubmit.prompt` is the submitted prompt and `Stop.last_assistant_message` is the final response text.
+Reliable prompt pairing requires Claude Code `2.1.196` or newer because that is when the official hook input
+provides `prompt_id`; older clients may still run the hooks, but they cannot form reliable user rounds.
 
-`/conversations` is the grouped view for future turns carrying a strictly bounded
-`x-claude-code-session-id`. The console derives an HMAC from the master key, device ID, and session
-ID; it stores only the 64-hex HMAC, never the raw header. HMAC correlation prevents raw-ID disclosure
-but does not authenticate the person using the client. A conversation detail renders turns by their
-persisted `turn_index`, oldest first. Legacy rows and requests without a valid session header remain
-standalone and link back to the API-turn archive. Timeline responses are previewed under an 8 MiB
-total budget and a 200-turn cap; each turn retains a link to its complete stored detail.
+`/conversation-turns` preserves the old immutable per-request P6 archive as **API fragment diagnostics**. Those rows
+may contain wrappers, reminders, or tool-loop intermediates and are not represented as human prompts or reconstructed
+conversations. Existing schema-4 rows are not modified, deleted, or guessed together during the schema-5 migration.
+
+Existing profiles can install the token-free updater from the dashboard. It merges four synchronous command hooks
+(`UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd`) into one named profile without replacing its settings or token.
+The sender reads the existing mode-600 token file at event time, posts to the authenticated control endpoint, emits no
+prompt/token output, refuses redirects, and silently exits zero on timeout or gateway failure. A hook failure does not
+deny or terminate Claude, but the synchronous command hook may add bounded delay while it fails.
 
 This is a deliberate disclosure, not an access-control boundary. In `open` mode, anyone on the
-tailnet who can reach the console can read every captured API turn; there is no identity and no
+tailnet who can reach the console can read every reliable round and API fragment; there is no identity and no
 reading audit. Member labels are self-entered and unverified and do not identify an actor. Treat the
 captured-turn archive and its backups as permanent sensitive content.
 
@@ -483,6 +487,8 @@ The machine control API lives under the same token-authenticated `/claude` runti
 GET  /claude/control/v1/status
 POST /claude/control/v1/account
      {"account_id":"<allowed-account-id>"}
+POST /claude/control/v1/conversation-hooks
+     {"hook_event_name":"UserPromptSubmit|Stop|StopFailure|SessionEnd", ...}
 ```
 
 It accepts the device's existing `Authorization: Bearer` or `X-Api-Key` token, checks revocation on
@@ -491,6 +497,12 @@ the URL or body. The status response is a safe device/account summary without to
 credentials or audit history. A machine may switch only among accounts already granted from the
 console. There is deliberately no machine-control enroll endpoint: a new machine still receives
 its first device token through the existing console self-service page.
+
+The hook endpoint uses the same device authentication and accepts only a fixed projection of official
+Claude Code events. Transcript paths, cwd, tool payloads, error details, raw session/prompt IDs, and
+bearer values are never persisted. The installed sender always exits zero on timeout, network, HTTP,
+or validation failure, so a failed hook cannot deny or terminate Claude or invalidate a credential;
+the synchronous command hook may nevertheless add bounded delay while that failure is handled.
 
 ## Security boundaries
 

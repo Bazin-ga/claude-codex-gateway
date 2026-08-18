@@ -9,16 +9,17 @@ simply unavailable when the Codex credential home is on a different machine.
 built-in `node:sqlite` module. The shipped service suppresses Node 22's known experimental-module
 warning; it does not suppress application errors.
 
-P6 permanently stores captured API-user and assistant text for eligible Claude API turns in the
-captured-turn archive. Each row is one provider request, and API-user
-text may contain client wrappers rather than the human's original terminal words. Everyone who can
-reach the console can read those captured turns; in
+Hook-enabled Claude Code profiles permanently store exact Claude user-submitted prompts and final visible
+assistant responses as paired schema-5 conversation rounds. Legacy P6 rows remain immutable in a separate
+API-fragment diagnostic archive; each is one provider request and may contain wrappers, reminders, or tool-loop
+intermediates rather than a human conversation. Everyone who can
+reach the console can read both archives; in
 `open` mode that means anyone on the tailnet, with no identity and no reading audit. Member labels
-are self-entered and unverified, and Codex traffic is not covered by API-turn capture.
-Schema 4 additionally correlates future turns carrying a format-valid Claude Code session header into
-conversation timelines. Only a master-key HMAC of device + session is stored; the raw header is not,
-and correlation is not user authentication. Existing turns remain standalone rather than being
-time-guessed into a thread.
+are self-entered and unverified, hook events are device-asserted, and Codex traffic is not covered.
+Only master-key HMACs of device + session + prompt identifiers are stored; raw identifiers are not,
+and correlation is not human authentication. Existing API fragments are never migrated or time-guessed into rounds.
+Reliable prompt pairing requires Claude Code `2.1.196` or newer; older clients do not provide the official
+`prompt_id` field and therefore do not form reliable rounds.
 
 ## Network
 
@@ -369,7 +370,7 @@ The `/claude` suffix on both sides is intentional. `--set-path` strips the publi
 prefix before proxying; adding it to the target preserves the path expected by the
 credential console (`/claude/v1/...`).
 
-The same mount intentionally includes two device-token-authenticated control endpoints:
+The same mount intentionally includes three device-token-authenticated control endpoints:
 
 ```text
 GET  https://<console-host>.<your-tailnet>.ts.net:10000/claude/control/v1/status
@@ -377,6 +378,10 @@ POST https://<console-host>.<your-tailnet>.ts.net:10000/claude/control/v1/accoun
      Authorization: Bearer <device-token>
      Content-Type: application/json
      {"account_id":"<allowed-account-id>"}
+POST https://<console-host>.<your-tailnet>.ts.net:10000/claude/control/v1/conversation-hooks
+     Authorization: Bearer <device-token>
+     Content-Type: application/json
+     {"hook_event_name":"UserPromptSubmit|Stop|StopFailure|SessionEnd", ...}
 ```
 
 They derive the device exclusively from its existing token, check revocation on every call and
@@ -810,25 +815,28 @@ Browser checks:
     response, provider credential, or device bearer value;
 18. confirm the token page states that it covers Claude gateway traffic only, excludes Codex, and
     keeps the metrics-page body-free and open-mode visibility notices.
-19. open `/conversations` and confirm a client session with several turns renders one bounded,
-    oldest-first timeline without exposing its raw session identifier; then open
+19. install the token-free conversation-hook updater for one test Claude profile and confirm
+    `UserPromptSubmit` + `Stop` render one paired round in `/conversations`, ordered oldest first without
+    exposing raw session or prompt identifiers. Exercise `StopFailure`, `SessionEnd`, a duplicate prompt event,
+    a subagent event, and a gateway timeout; confirm fixed safe states, idempotency, subagent exclusion, and that
+    Claude execution plus the existing device token remain unaffected. Then open
     `/conversation-turns`, submit its POST filter form with a known phrase, follow the POST
-    keyset next-page form, and open a detail row; confirm prompt text does not enter the
-    URL, the permanent-storage/open-mode disclosure is prominent, full text preserves whitespace,
-    all four response states are distinguishable, and a dropped conversation queue count is shown
-    as dropped rather than silently treated as stored. Verify period/member/device/account/model
-    facets show bounded counts and that a mobile filter rail can collapse. For a bounded search
+    keyset next-page form, and open a legacy fragment detail; confirm it is visibly labeled diagnostic rather
+    than a user turn. Prompt text must not enter the URL, disclosure must be prominent, full text preserves whitespace,
+    round states `pending/complete/failed/unavailable` are distinct, and dropped queues are shown rather than silently
+    treated as stored. Verify bounded period/member/device/account/model filters and a collapsible mobile rail. For a bounded search
     error, enter at least three consecutive Chinese characters, remove standalone punctuation, or
     split the query; an unknown search failure must remain a fixed generic message.
 
 The first start with token accounting migrates `metrics.sqlite` schema 1 to 2 transactionally.
 The first P6 start migrates schema 2 to schema 3 transactionally, adding permanent turn tables and
 full-text indexes. The session/timeline release migrates schema 3 to schema 4 transactionally; old
-turns remain standalone and retain searchable text. Take the normal checkpointed backup immediately
-before every schema upgrade. If code must be rolled back to a pre-v4 release, stop the console and
-restore the matching pre-v4 `metrics.sqlite` only,
+turns remain standalone and retain searchable text. The reliable-round release migrates schema 4 to 5
+additively by creating `conversation_rounds` and its own FTS/index/trigger set; it never rewrites
+`conversation_turns`. Take the normal checkpointed backup immediately before every schema upgrade.
+If code must be rolled back to a pre-v5 release, stop the console and restore the matching pre-v5 `metrics.sqlite` only,
 remove `metrics.sqlite-wal` and `metrics.sqlite-shm`, then start the old code. Do not roll
-`master.key` or `state.json` back for a metrics-only or conversation-UI rollback. Because schema 4
+`master.key` or `state.json` back for a metrics-only or conversation-UI rollback. Because schema 5
 contains permanently retained conversation text, every `metrics.sqlite` snapshot and off-host copy is
 sensitive and must stay root-only/encrypted.
 

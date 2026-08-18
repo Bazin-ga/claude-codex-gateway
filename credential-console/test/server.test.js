@@ -193,7 +193,7 @@ test('tailnet identity mode has no sign-in and binds sessions to the user', asyn
     const health = await fetch(`${app.baseUrl}/health`);
     assert.deepEqual(await health.json(), {
       status: 'ok',
-      client_config_version: '2',
+      client_config_version: '3',
       admin_auth: 'tailscale',
       admin_configured: true,
     });
@@ -229,7 +229,7 @@ test('open mode issues Claude device configs with no login while still enforcing
     const health = await fetch(`${app.baseUrl}/health`);
     assert.deepEqual(await health.json(), {
       status: 'ok',
-      client_config_version: '2',
+      client_config_version: '3',
       admin_auth: 'open',
       admin_configured: false,
     });
@@ -466,7 +466,7 @@ test('an unset CREDENTIAL_CONSOLE_ADMIN_AUTH defaults to tailscale, not open', a
   const observed = JSON.parse(stdout);
   assert.deepEqual(observed.health, {
     status: 'ok',
-    client_config_version: '2',
+    client_config_version: '3',
     admin_auth: 'tailscale',
     admin_configured: true,
   });
@@ -1888,6 +1888,81 @@ test('metrics chart data keeps the same console-session boundary as the HTML pag
     assert.equal(limited.status, 429);
     assert.equal(limited.headers.get('retry-after'), '60');
     assert.deepEqual(await limited.json(), { error: 'metrics_chart_rate_limited' });
+  } finally {
+    await app.close();
+  }
+});
+
+test('Claude hooks persist one exact paired user round without changing the device credential', async () => {
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'hook-round-account',
+      credential: { oauth_token: 'hook-round-upstream-token' },
+    });
+    const issued = await app.store.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'hook-round-member',
+      deviceName: 'hook-round-device',
+    });
+    const sessionId = 'hook-session-0123456789abcdef';
+    const promptId = '550e8400-e29b-41d4-a716-446655440000';
+    const prompt = '<session>\nliteral user markup & <img src=x onerror=alert(1)>\n</session>';
+    const responseText = 'final response & <script>must stay text</script>';
+    const sendHook = (body) => fetch(`${app.baseUrl}/claude/control/v1/conversation-hooks`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${issued.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ session_id: sessionId, prompt_id: promptId, ...body }),
+    });
+
+    assert.equal((await sendHook({ hook_event_name: 'UserPromptSubmit', prompt })).status, 204);
+    assert.equal((await sendHook({
+      hook_event_name: 'Stop',
+      stop_hook_active: false,
+      last_assistant_message: responseText,
+      background_tasks: [],
+      session_crons: [],
+    })).status, 204);
+    // Claude Code may retry a hook POST. Prompt IDs make the pair idempotent.
+    assert.equal((await sendHook({ hook_event_name: 'UserPromptSubmit', prompt })).status, 204);
+    app.requestMetrics.flush();
+
+    const sessions = app.requestMetrics.searchConversationRoundSessions({ limit: 25 });
+    assert.equal(sessions.error, null);
+    assert.equal(sessions.totalMatches, 1);
+    assert.equal(sessions.items[0].turnCount, 1);
+    const session = app.requestMetrics.readConversationRoundSession(sessions.items[0].id).session;
+    assert.equal(session.turns.length, 1);
+    assert.equal(session.turns[0].promptText, prompt);
+    assert.equal(session.turns[0].responseText, responseText);
+    assert.equal(session.turns[0].responseState, 'complete');
+    assert.equal(session.turns[0].source, 'claude_hook');
+
+    const page = await fetch(`${app.baseUrl}/`);
+    const cookie = cookieFrom(page);
+    await page.arrayBuffer();
+    const conversations = await fetch(`${app.baseUrl}/conversations`, { headers: { Cookie: cookie } });
+    assert.equal(conversations.status, 200);
+    const html = await conversations.text();
+    assert.match(html, /Reliable hook-backed conversations/);
+    assert.match(html, /literal user markup/);
+    assert.equal(html.includes('<img src=x'), false);
+    assert.equal(html.includes('<script>must stay text</script>'), false);
+
+    assert.equal(app.store.deviceByToken(issued.token).id, issued.device.id);
+    assert.deepEqual(app.store.accountCredential(account.id), {
+      oauth_token: 'hook-round-upstream-token',
+    });
+    const database = await readFile(join(app.home, 'metrics.sqlite'));
+    const wal = await readFile(join(app.home, 'metrics.sqlite-wal')).catch(() => Buffer.alloc(0));
+    const persisted = Buffer.concat([database, wal]);
+    assert.equal(persisted.includes(Buffer.from(sessionId)), false);
+    assert.equal(persisted.includes(Buffer.from(promptId)), false);
+    assert.equal(persisted.includes(Buffer.from(issued.token)), false);
   } finally {
     await app.close();
   }

@@ -38,6 +38,8 @@ export const MACHINE_ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
 // accepted only as a strict ASCII token and is never persisted or emitted.
 export const CLAUDE_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 export const THREAD_KEY_VERSION = 1;
+export const CLAUDE_PROMPT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+export const PROMPT_KEY_VERSION = 1;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 function nowIso() {
@@ -297,6 +299,37 @@ export class CredentialStore {
   // Descriptive alias for callers that use the conversation terminology.
   conversationThreadKey(input) {
     return this.threadKeyForSession(input);
+  }
+
+  /**
+   * Derive a stable opaque hook-turn handle without persisting Claude Code's
+   * raw prompt UUID. Device and session are included so UUID reuse cannot
+   * merge turns across credential boundaries.
+   */
+  promptKeyForHook({
+    version = PROMPT_KEY_VERSION,
+    deviceId,
+    sessionId,
+    promptId,
+  } = {}) {
+    if (!this.masterKey || this.masterKey.length !== 32) {
+      throw new Error('master key is unavailable');
+    }
+    if (!Number.isSafeInteger(version) || version < 1 || version > 255) {
+      throw new Error('prompt key version is invalid');
+    }
+    if (typeof deviceId !== 'string' || !DEVICE_ID_PATTERN.test(deviceId)) {
+      throw new Error('prompt key device id is invalid');
+    }
+    if (typeof sessionId !== 'string' || !CLAUDE_SESSION_ID_PATTERN.test(sessionId)) {
+      throw new Error('prompt key session id is invalid');
+    }
+    if (typeof promptId !== 'string' || !CLAUDE_PROMPT_ID_PATTERN.test(promptId)) {
+      throw new Error('prompt key prompt id is invalid');
+    }
+    return createHmac('sha256', this.masterKey)
+      .update(`${version}\u0000${deviceId}\u0000${sessionId}\u0000${promptId.toLowerCase()}`, 'utf8')
+      .digest('hex');
   }
 
   #deviceRecord(deviceOrId) {

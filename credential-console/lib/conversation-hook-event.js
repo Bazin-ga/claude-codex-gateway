@@ -21,6 +21,7 @@ export const CONVERSATION_HOOK_KINDS = Object.freeze({
   STOP_FAILURE: 'stop_failure',
   SESSION_END: 'session_end',
   IGNORED_SUBAGENT: 'ignored_subagent',
+  IGNORED_ACTIVE_WORK: 'ignored_active_work',
 });
 
 export const STOP_FAILURE_CODES = Object.freeze([
@@ -141,6 +142,10 @@ function ignoredSubagent(sessionId, promptId) {
   });
 }
 
+function ignoredEvent(kind, sessionId, promptId) {
+  return output({ kind, sessionId, promptId });
+}
+
 /**
  * Normalize one official Claude Code hook input. Invalid or unsupported input
  * returns null. The returned object has exactly seven public fields and never
@@ -171,9 +176,11 @@ export function normalizeConversationHookEvent(input) {
 
     if (event === CONVERSATION_HOOK_EVENTS.USER_PROMPT_SUBMIT) {
       const prompt = ownDataValue(input, 'prompt');
+      const senderTruncated = ownDataValue(input, 'truncated');
       if (prompt === MISSING) return null;
+      if (senderTruncated !== MISSING && typeof senderTruncated !== 'boolean') return null;
       const bounded = boundedText(prompt, CONVERSATION_HOOK_PROMPT_MAX_BYTES);
-      if (!bounded) return null;
+      if (!bounded || bounded.text.length === 0) return null;
       return hasAgentId
         ? ignoredSubagent(sessionId, promptId)
         : output({
@@ -181,26 +188,35 @@ export function normalizeConversationHookEvent(input) {
           sessionId,
           promptId,
           text: bounded.text,
-          truncated: bounded.truncated,
+          truncated: bounded.truncated || senderTruncated === true,
         });
     }
 
     if (event === CONVERSATION_HOOK_EVENTS.STOP) {
       const assistantMessage = ownDataValue(input, 'last_assistant_message');
       const stopHookActive = ownDataValue(input, 'stop_hook_active');
+      const senderTruncated = ownDataValue(input, 'truncated');
       if (assistantMessage === MISSING || stopHookActive === MISSING || typeof stopHookActive !== 'boolean') {
         return null;
       }
+      if (senderTruncated !== MISSING && typeof senderTruncated !== 'boolean') return null;
+      const backgroundTasks = ownDataValue(input, 'background_tasks');
+      const sessionCrons = ownDataValue(input, 'session_crons');
+      if ((backgroundTasks !== MISSING && !Array.isArray(backgroundTasks))
+        || (sessionCrons !== MISSING && !Array.isArray(sessionCrons))) return null;
       const bounded = boundedText(assistantMessage, CONVERSATION_HOOK_RESPONSE_MAX_BYTES);
       if (!bounded) return null;
-      return hasAgentId
-        ? ignoredSubagent(sessionId, promptId)
-        : output({
+      if (hasAgentId) return ignoredSubagent(sessionId, promptId);
+      if ((backgroundTasks !== MISSING && backgroundTasks.length > 0)
+        || (sessionCrons !== MISSING && sessionCrons.length > 0)) {
+        return ignoredEvent(CONVERSATION_HOOK_KINDS.IGNORED_ACTIVE_WORK, sessionId, promptId);
+      }
+      return output({
           kind: CONVERSATION_HOOK_KINDS.STOP,
           sessionId,
           promptId,
           text: bounded.text,
-          truncated: bounded.truncated,
+          truncated: bounded.truncated || senderTruncated === true,
         });
     }
 
@@ -237,4 +253,3 @@ export function normalizeConversationHookEvent(input) {
 
 // Explicit alias for callers that prefer parser terminology.
 export const parseConversationHookEvent = normalizeConversationHookEvent;
-

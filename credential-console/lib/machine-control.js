@@ -1,21 +1,32 @@
 import { TextDecoder } from 'node:util';
-import { sendJson } from './http.js';
+import { sendJson, sendText } from './http.js';
 import {
   assertDeviceScope,
   authenticateDevice,
   DeviceAuthError,
 } from './device-auth.js';
+import {
+  CONVERSATION_HOOK_KINDS,
+  normalizeConversationHookEvent,
+} from './conversation-hook-event.js';
 
 export const MACHINE_STATUS_PATH = '/claude/control/v1/status';
 export const MACHINE_ACCOUNT_PATH = '/claude/control/v1/account';
+export const CONVERSATION_HOOK_PATH = '/claude/control/v1/conversation-hooks';
 export const MACHINE_CONTROL_PREFIX = '/claude/control/v1/';
 export const MACHINE_CONTROL_BODY_LIMIT = 16 * 1024;
+export const CONVERSATION_HOOK_BODY_LIMIT = 3 * 1024 * 1024;
+export const CONVERSATION_HOOK_BODY_TIMEOUT_MS = 5_000;
+export const CONVERSATION_HOOK_MAX_CONCURRENT_PER_DEVICE = 2;
+export const CONVERSATION_HOOK_GLOBAL_RESERVATION_LIMIT = 12 * 1024 * 1024;
 
 const ACCOUNT_ID_LIMIT = 256;
 const AUTH_FAILURE_LIMIT = { windowMs: 60_000, max: 30 };
 const DEVICE_REQUEST_LIMIT = { windowMs: 60_000, max: 120 };
 const authFailures = new Map();
 const deviceRequests = new Map();
+const conversationHookRequests = new Map();
+let conversationHookReservedBytes = 0;
 
 setInterval(() => {
   const now = Date.now();
@@ -41,6 +52,37 @@ function bodyError() {
 
 function bodyTooLarge() {
   return new MachineControlError('BODY_TOO_LARGE');
+}
+
+function bodyTimeout() {
+  return new MachineControlError('BODY_TIMEOUT');
+}
+
+function conversationHookBusy() {
+  return new MachineControlError('CONVERSATION_HOOK_BUSY');
+}
+
+function reserveConversationHookRequest(deviceId) {
+  const current = conversationHookRequests.get(deviceId) ?? 0;
+  if (current >= CONVERSATION_HOOK_MAX_CONCURRENT_PER_DEVICE
+    || conversationHookReservedBytes + CONVERSATION_HOOK_BODY_LIMIT
+      > CONVERSATION_HOOK_GLOBAL_RESERVATION_LIMIT) {
+    return null;
+  }
+  conversationHookRequests.set(deviceId, current + 1);
+  conversationHookReservedBytes += CONVERSATION_HOOK_BODY_LIMIT;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = (conversationHookRequests.get(deviceId) ?? 1) - 1;
+    if (next > 0) conversationHookRequests.set(deviceId, next);
+    else conversationHookRequests.delete(deviceId);
+    conversationHookReservedBytes = Math.max(
+      0,
+      conversationHookReservedBytes - CONVERSATION_HOOK_BODY_LIMIT,
+    );
+  };
 }
 
 function isObject(value) {
@@ -151,6 +193,9 @@ function errorResponse(res, error, req = null) {
     DEVICE_RATE_LIMITED: [429, 'rate_limit_error', 'device control request limit exceeded'],
     BODY_INVALID: [400, 'invalid_request_error', 'invalid machine control request body'],
     BODY_TOO_LARGE: [400, 'invalid_request_error', 'machine control request body too large'],
+    BODY_TIMEOUT: [408, 'invalid_request_error', 'machine control request body timed out'],
+    CONVERSATION_HOOK_BUSY: [429, 'rate_limit_error', 'conversation capture is busy'],
+    CONVERSATION_HOOK_UNAVAILABLE: [503, 'api_error', 'conversation capture unavailable'],
     ACCOUNT_NOT_ALLOWED: [403, 'permission_error', 'account is not allowed for this device'],
     DEVICE_SCOPE: [403, 'permission_error', 'device is outside the authenticated scope'],
     ACCOUNT_UNAVAILABLE: [409, 'conflict_error', 'account is unavailable'],
@@ -159,12 +204,17 @@ function errorResponse(res, error, req = null) {
     NOT_FOUND: [404, 'not_found_error', 'machine control endpoint not found'],
   }[code] ?? [500, 'api_error', 'machine control unavailable'];
   if (!res.headersSent) {
+    const closeRequest = code === 'BODY_TOO_LARGE'
+      || code === 'BODY_TIMEOUT'
+      || code === 'CONVERSATION_HOOK_BUSY';
     const headers = {
-      ...(code === 'BODY_TOO_LARGE' ? { Connection: 'close' } : {}),
+      ...(closeRequest ? { Connection: 'close' } : {}),
       ...(code === 'AUTHENTICATION_RATE_LIMITED' ? { 'Retry-After': '60' } : {}),
       ...(code === 'DEVICE_RATE_LIMITED' ? { 'Retry-After': '60' } : {}),
+      ...(code === 'CONVERSATION_HOOK_BUSY' ? { 'Retry-After': '1' } : {}),
     };
-    if (code === 'BODY_TOO_LARGE' && req) {
+    if (closeRequest && req) {
+      req.pause?.();
       res.once('finish', () => req.destroy?.());
     }
     sendJson(res, definition[0], {
@@ -177,28 +227,35 @@ function errorResponse(res, error, req = null) {
   return definition[0];
 }
 
-function declaredBodyTooLarge(req) {
+function declaredBodyTooLarge(req, limit = MACHINE_CONTROL_BODY_LIMIT) {
   const value = req?.headers?.['content-length'];
   const length = Number(value);
-  return Number.isFinite(length) && length > MACHINE_CONTROL_BODY_LIMIT;
+  return Number.isFinite(length) && length > limit;
 }
 
-function readJsonBody(req) {
-  if (declaredBodyTooLarge(req)) return Promise.reject(bodyTooLarge());
+function readJsonBody(req, limit = MACHINE_CONTROL_BODY_LIMIT, { timeoutMs = 0 } = {}) {
+  if (declaredBodyTooLarge(req, limit)) return Promise.reject(bodyTooLarge());
   return new Promise((resolve, reject) => {
     let bytes = 0;
     const chunks = [];
     let settled = false;
+    const timeout = timeoutMs > 0
+      ? setTimeout(() => fail(bodyTimeout()), timeoutMs).unref()
+      : null;
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+    };
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      cleanup();
       req.pause?.();
       reject(error);
     };
     req.on('data', (chunk) => {
       if (settled) return;
       bytes += chunk.length;
-      if (bytes > MACHINE_CONTROL_BODY_LIMIT) {
+      if (bytes > limit) {
         fail(bodyTooLarge());
         return;
       }
@@ -206,9 +263,13 @@ function readJsonBody(req) {
     });
     req.once('aborted', () => fail(bodyError()));
     req.once('error', () => fail(bodyError()));
+    req.once('close', () => {
+      if (!settled && !req.complete) fail(bodyError());
+    });
     req.once('end', () => {
       if (settled) return;
       settled = true;
+      cleanup();
       try {
         const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const parsed = JSON.parse(text);
@@ -242,12 +303,20 @@ function methodError() {
  * route so server.js can continue its normal routing; any path below the
  * reserved control prefix is answered here, including /enroll (404).
  */
-export async function handleMachineControl(req, res, { store, log = () => {} } = {}) {
+export async function handleMachineControl(req, res, {
+  store,
+  requestMetrics = null,
+  log = () => {},
+} = {}) {
   const url = new URL(req.url, 'https://credential-console.invalid');
   const path = url.pathname;
-  const recognized = path === MACHINE_STATUS_PATH || path === MACHINE_ACCOUNT_PATH;
+  const recognized = path === MACHINE_STATUS_PATH
+    || path === MACHINE_ACCOUNT_PATH
+    || path === CONVERSATION_HOOK_PATH;
   if (!recognized && !path.startsWith(MACHINE_CONTROL_PREFIX)) return false;
-  if (path !== MACHINE_STATUS_PATH && path !== MACHINE_ACCOUNT_PATH) {
+  if (path !== MACHINE_STATUS_PATH
+    && path !== MACHINE_ACCOUNT_PATH
+    && path !== CONVERSATION_HOOK_PATH) {
     errorResponse(res, new MachineControlError('NOT_FOUND'));
     return true;
   }
@@ -279,6 +348,79 @@ export async function handleMachineControl(req, res, { store, log = () => {} } =
       const summary = await store.deviceAccountSummary(device.id);
       sendJson(res, 200, safeDeviceAccountSummary(summary, device.id));
       return true;
+    }
+
+    if (path === CONVERSATION_HOOK_PATH) {
+      if (req.method !== 'POST') throw methodError();
+      const release = reserveConversationHookRequest(device.id);
+      if (!release) throw conversationHookBusy();
+      try {
+        const normalized = normalizeConversationHookEvent(
+          await readJsonBody(req, CONVERSATION_HOOK_BODY_LIMIT, {
+            timeoutMs: CONVERSATION_HOOK_BODY_TIMEOUT_MS,
+          }),
+        );
+        if (!normalized) throw bodyError();
+        if (normalized.kind.startsWith('ignored_')) {
+          sendText(res, 204, '');
+          return true;
+        }
+        // Claude Code before 2.1.196 does not provide prompt_id. A session-only
+        // event cannot be paired without guessing, so acknowledge and ignore it
+        // instead of retrying or polluting the reliable-round failure counter.
+        if (normalized.promptId === null) {
+          try { log('conversation_hook_prompt_id_unavailable', { device_id: device.id }); } catch {}
+          sendText(res, 204, '');
+          return true;
+        }
+        if (typeof store.threadKeyForSession !== 'function'
+          || typeof store.deviceAccountSummary !== 'function') {
+          throw new MachineControlError('DEVICE_CONFIGURATION_INVALID');
+        }
+        const threadKey = store.threadKeyForSession({
+          deviceId: device.id,
+          sessionId: normalized.sessionId,
+        });
+        const promptKey = store.promptKeyForHook({
+          deviceId: device.id,
+          sessionId: normalized.sessionId,
+          promptId: normalized.promptId,
+        });
+        const summary = safeDeviceAccountSummary(
+          await store.deviceAccountSummary(device.id),
+          device.id,
+        );
+        const kind = normalized.kind === CONVERSATION_HOOK_KINDS.USER_PROMPT_SUBMIT
+          ? 'prompt'
+          : normalized.kind === CONVERSATION_HOOK_KINDS.STOP_FAILURE
+            ? 'failure'
+            : normalized.kind;
+        const accepted = await Promise.resolve(
+          requestMetrics?.recordConversationHookEvent?.({
+            kind,
+            threadKey,
+            promptKey,
+            occurredAtMs: Date.now(),
+            text: normalized.text,
+            truncated: normalized.truncated,
+            failureCode: normalized.failureCode,
+            reason: normalized.reason,
+            deviceId: device.id,
+            machineId: summary.machine_id,
+            memberLabel: summary.member_label ?? '',
+            accountId: summary.account_id ?? summary.selected_account_id ?? 'unavailable-account',
+            accountAlias: summary.account_alias ?? 'unavailable-account',
+          }),
+        );
+        if (accepted !== true) {
+          try { log('conversation_hook_event_dropped', { device_id: device.id, kind }); } catch {}
+          throw new MachineControlError('CONVERSATION_HOOK_UNAVAILABLE');
+        }
+        sendText(res, 204, '');
+        return true;
+      } finally {
+        release();
+      }
     }
 
     if (req.method !== 'POST') throw methodError();

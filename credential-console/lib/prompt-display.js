@@ -9,6 +9,7 @@ export const PROMPT_DISPLAY_SOURCES = Object.freeze({
   CAPTURED_API_USER_TEXT: 'captured_api_user_text',
   WRAPPER_REMOVED: 'wrapper_removed',
   FALLBACK_RAW: 'fallback_raw',
+  CLAUDE_HOOK: 'claude_hook',
   EMPTY: 'empty',
 });
 

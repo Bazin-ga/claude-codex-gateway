@@ -4,13 +4,13 @@
 
 > **Telemetry notice / conversation notice:** `credential-console` records metadata for every proxied
 > Claude gateway request, including four provider-reported token counts, and makes those metrics
-> visible to every member who can reach the console. P6 permanently stores eligible captured
-> Claude API turns and makes their captured API-user/assistant text visible to everyone who can reach the console;
+> visible to every member who can reach the console. Hook-enabled Claude Code profiles permanently store the exact
+> client-submitted prompt and final visible assistant response as paired user rounds. Legacy P6 API request/response
+> fragments remain in a separate diagnostic archive and are never presented as human conversations. Both archives are visible to everyone who can reach the console;
 > in `open` mode that means anyone on the tailnet, with no identity and no reading audit. Member
-> labels are self-entered and unverified. Captured API-user text may contain client wrappers and is
-> not guaranteed to be the human's original words. Turns are correlated into conversations only
-> when a bounded Claude Code session identifier is present; only its HMAC is stored, and this
-> correlation does not authenticate the user. Codex traffic is not covered by turn capture.
+> labels and hook events are device-asserted and do not authenticate a human. Raw session and prompt identifiers are
+> replaced with device-bound HMACs. Claude hooks do not deny or terminate Claude, but a failed synchronous command Hook
+> may cause bounded delay; hook delivery never rotates or replaces a device credential. Codex traffic is not covered by conversation capture.
 
 A self-hostable credential distribution centre for **Codex** (ChatGPT subscription) and
 **Claude Code** subscriptions.
@@ -150,14 +150,14 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
   Claude gateway allowlists paths, strips the device authorization header before attaching the
   provider credential, rate-limits failed authentication by source IP, and applies per-device
   request and concurrency budgets.
-- **Separated request telemetry and captured API turns.** The Claude gateway persists request metadata
+- **Separated request telemetry, reliable rounds, and API diagnostics.** The Claude gateway persists request metadata
   and separate input, cache-creation input, cache-read input, and output token counts for shared
   metrics. The body-free metrics page progressively enhances its server-rendered fallback with a
   locally bundled, SRI-pinned Apache ECharts dashboard for token composition, account/model rankings,
-  and cross-device hourly trends; it makes no CDN request. P6 separately and permanently stores eligible captured
-  Claude API turns for console-wide browsing. Validated client session identifiers are HMAC-hidden
-  and group future turns into conversation timelines; legacy/unidentified turns remain standalone
-  rather than being guessed together by time. API-user text may include client-added wrappers.
+  and cross-device hourly trends; it makes no CDN request. Hook-enabled profiles permanently store exact
+  client-submitted prompts with final visible responses, while immutable P6 request fragments remain a clearly separated diagnostic archive.
+  Session and prompt identifiers are HMAC-hidden; old fragments are never guessed into conversations. Reliable prompt
+  pairing requires Claude Code 2.1.196 or newer because older clients do not provide the official `prompt_id` field.
   Codex traffic is outside that boundary.
 - **The centre is a high-value host by design.** A root compromise of the centre can recover
   all active provider credentials. Keep OS access narrow, patch it, and keep an emergency

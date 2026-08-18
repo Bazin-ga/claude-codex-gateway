@@ -93,8 +93,8 @@ test('open mode serves live Markdown without leaking canaries', async (t) => {
   const health = await fetch(`${baseUrl}/health`);
   assert.equal(health.status, 200);
   const healthBody = await health.json();
-  assert.equal(healthBody.client_config_version, '2');
-  assert.match(firstMarkdown, /"client_config_version":"2"/);
+  assert.equal(healthBody.client_config_version, '3');
+  assert.match(firstMarkdown, /"client_config_version":"3"/);
 
   await store.addAccount({
     provider: 'claude',

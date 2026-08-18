@@ -52,6 +52,7 @@ import {
   conversationDetailView,
   conversationSessionsView,
   conversationSessionDetailView,
+  conversationRoundDetailView,
 } from './lib/views.js';
 import { requestEnrollment as requestCodexEnrollment } from '../codex-credential/client-agent/enroll.js';
 
@@ -104,6 +105,12 @@ const CONVERSATION_RESPONSE_STATES = new Set([
   'complete',
   'incomplete',
   'truncated',
+  'unavailable',
+]);
+const CONVERSATION_ROUND_RESPONSE_STATES = new Set([
+  'pending',
+  'complete',
+  'failed',
   'unavailable',
 ]);
 const CONVERSATION_QUERY_MAX_BYTES = 256;
@@ -976,19 +983,29 @@ export async function createCredentialConsole(options = {}) {
     return page;
   }
 
-  function conversationSearchPage(url, { mode = 'sessions' } = {}) {
+  function conversationSearchPage(url, { mode = 'rounds' } = {}) {
+    const reliableRounds = mode === 'rounds';
     const searchMethod = mode === 'turns'
       ? 'searchConversations'
-      : 'searchConversationSessions';
+      : 'searchConversationRoundSessions';
     const facetMethod = mode === 'turns'
       ? 'queryConversationFacets'
-      : 'queryConversationSessionFacets';
+      : null;
+    const allowedResponseStates = reliableRounds
+      ? CONVERSATION_ROUND_RESPONSE_STATES
+      : CONVERSATION_RESPONSE_STATES;
     const q = String(url.searchParams.get('q') ?? '');
     const beforeValue = url.searchParams.get('before_id');
+    const beforeActivityValue = reliableRounds
+      ? url.searchParams.get('before_activity_ms')
+      : null;
     const limitValue = Number(url.searchParams.get('limit') ?? 25);
     const beforeId = beforeValue === null || beforeValue === ''
       ? null
       : Number(beforeValue);
+    const beforeActivityMs = beforeActivityValue === null || beforeActivityValue === ''
+      ? null
+      : Number(beforeActivityValue);
     // Keep the old one-row route fixture usable while the public UI offers the
     // bounded 25/50 choices. MetricsStore clamps again at its own boundary.
     const limit = limitValue === 1 || CONVERSATION_LIMITS.has(limitValue) ? limitValue : 25;
@@ -1007,17 +1024,26 @@ export async function createCredentialConsole(options = {}) {
     const accountId = boundedParam('account_id', CONVERSATION_IDENTIFIER_MAX_BYTES);
     const model = boundedParam('model', CONVERSATION_MODEL_MAX_BYTES);
     const requestedResponseState = boundedParam('response_state', CONVERSATION_QUERY_MAX_BYTES);
-    const responseState = CONVERSATION_RESPONSE_STATES.has(requestedResponseState)
+    const responseState = allowedResponseStates.has(requestedResponseState)
       ? requestedResponseState
       : null;
-    const invalidCursor = beforeValue !== null && beforeValue !== ''
-      && (!Number.isSafeInteger(beforeId) || beforeId < 1);
+    const hasBeforeId = beforeValue !== null && beforeValue !== '';
+    const hasBeforeActivity = beforeActivityValue !== null && beforeActivityValue !== '';
+    const invalidCursor = reliableRounds
+      ? hasBeforeId !== hasBeforeActivity
+        || (hasBeforeId && (
+          !Number.isSafeInteger(beforeId)
+          || beforeId < 1
+          || !Number.isSafeInteger(beforeActivityMs)
+          || beforeActivityMs < 0
+        ))
+      : hasBeforeId && (!Number.isSafeInteger(beforeId) || beforeId < 1);
     const invalidPeriod = requestedPeriod !== 'all' && !CONVERSATION_PERIODS.has(requestedPeriod);
     const invalidLimit = !Number.isSafeInteger(limitValue)
       || (limitValue !== 1 && !CONVERSATION_LIMITS.has(limitValue));
     const invalidResponseState = requestedResponseState !== null
       && requestedResponseState !== ''
-      && !CONVERSATION_RESPONSE_STATES.has(requestedResponseState);
+      && !allowedResponseStates.has(requestedResponseState);
     const hasExtendedFilters = url.searchParams.has('period')
       || memberLabel !== null
       || deviceId !== null
@@ -1034,16 +1060,18 @@ export async function createCredentialConsole(options = {}) {
       .filter((device) => device.member_label)
       .map((device) => [device.member_label, { value: device.member_label, label: device.member_label }]))
       .values()];
-    const fallbackAccounts = store.publicAccounts().map((account) => ({
+    const fallbackAccounts = store.publicAccounts()
+      .filter((account) => account.provider === 'claude')
+      .map((account) => ({
       value: account.id,
       label: account.alias,
-    }));
+      }));
     const fallbackFacets = {
       members: fallbackMembers,
       devices: fallbackDevices,
       accounts: fallbackAccounts,
       models: [],
-      responseStates: [...CONVERSATION_RESPONSE_STATES].map((value) => ({ value, label: value })),
+      responseStates: [...allowedResponseStates].map((value) => ({ value, label: value })),
     };
     if (invalidCursor || invalidPeriod || invalidLimit || invalidResponseState || invalidFilterLength) {
       return {
@@ -1051,6 +1079,7 @@ export async function createCredentialConsole(options = {}) {
         result: {
           items: [],
           nextBeforeId: null,
+          nextBeforeActivityMs: null,
           error: 'conversation_filter_invalid',
           totalMatches: null,
           standaloneCount: null,
@@ -1058,6 +1087,7 @@ export async function createCredentialConsole(options = {}) {
         },
         q: '',
         beforeId: null,
+        beforeActivityMs: null,
         limit: 25,
         period: 'all',
         memberLabel: null,
@@ -1065,7 +1095,9 @@ export async function createCredentialConsole(options = {}) {
         accountId: null,
         model: null,
         responseState: null,
-        queueDropped: requestMetrics?.stats?.conversation?.dropped ?? 0,
+        queueDropped: reliableRounds
+          ? requestMetrics?.stats?.conversationRounds?.dropped ?? 0
+          : requestMetrics?.stats?.conversation?.dropped ?? 0,
       };
     }
     const enrichItems = (items) => {
@@ -1089,6 +1121,7 @@ export async function createCredentialConsole(options = {}) {
       result: {
         items: [],
         nextBeforeId: null,
+        nextBeforeActivityMs: null,
         error: 'conversation_archive_unavailable',
         totalMatches: null,
         standaloneCount: null,
@@ -1096,6 +1129,7 @@ export async function createCredentialConsole(options = {}) {
       },
       q,
       beforeId,
+      beforeActivityMs,
       limit,
       period,
       memberLabel,
@@ -1103,7 +1137,9 @@ export async function createCredentialConsole(options = {}) {
       accountId,
       model,
       responseState,
-      queueDropped: requestMetrics?.stats?.conversation?.dropped ?? 0,
+      queueDropped: reliableRounds
+        ? requestMetrics?.stats?.conversationRounds?.dropped ?? 0
+        : requestMetrics?.stats?.conversation?.dropped ?? 0,
     };
     if (typeof requestMetrics?.[searchMethod] !== 'function') return empty;
     try {
@@ -1111,6 +1147,7 @@ export async function createCredentialConsole(options = {}) {
       // The proxy completion path itself never waits on SQLite.
       requestMetrics.flush?.();
       const searchOptions = { q, beforeId, limit };
+      if (reliableRounds && beforeId !== null) searchOptions.beforeActivityMs = beforeActivityMs;
       if (hasExtendedFilters) {
         if (fromMs !== null) {
           searchOptions.fromMs = fromMs;
@@ -1127,7 +1164,7 @@ export async function createCredentialConsole(options = {}) {
         ? rawResult
         : { items: [], nextBeforeId: null, error: 'conversation_archive_unavailable' };
       let facetSource = null;
-      if (typeof requestMetrics?.[facetMethod] === 'function') {
+      if (facetMethod && typeof requestMetrics?.[facetMethod] === 'function') {
         const facetOptions = { q };
         if (fromMs !== null) {
           facetOptions.fromMs = fromMs;
@@ -1173,10 +1210,16 @@ export async function createCredentialConsole(options = {}) {
       const result = {
         items: enrichItems(source.items),
         nextBeforeId: source.nextBeforeId ?? null,
+        nextBeforeActivityMs: reliableRounds
+          ? source.nextBeforeActivityMs ?? null
+          : null,
         error: source.error ?? null,
         droppedConversations: source.droppedConversations ?? null,
         standaloneCount: Number.isSafeInteger(source.standaloneCount)
           ? source.standaloneCount
+          : null,
+        legacyFragmentCount: Number.isSafeInteger(source.legacyFragmentCount)
+          ? source.legacyFragmentCount
           : null,
         totalMatches: Number.isSafeInteger(source.totalMatches)
           ? source.totalMatches
@@ -1193,6 +1236,7 @@ export async function createCredentialConsole(options = {}) {
         result,
         q,
         beforeId,
+        beforeActivityMs,
         limit,
         period,
         memberLabel,
@@ -1200,7 +1244,9 @@ export async function createCredentialConsole(options = {}) {
         accountId,
         model,
         responseState,
-        queueDropped: requestMetrics.stats?.conversation?.dropped ?? 0,
+        queueDropped: reliableRounds
+          ? requestMetrics.stats?.conversationRounds?.dropped ?? 0
+          : requestMetrics.stats?.conversation?.dropped ?? 0,
       };
     } catch (error) {
       log('conversation_search_route_failed', {
@@ -1215,7 +1261,7 @@ export async function createCredentialConsole(options = {}) {
     const path = url.pathname;
 
     if (path.startsWith(MACHINE_CONTROL_PREFIX)) {
-      await handleMachineControl(req, res, { store, log });
+      await handleMachineControl(req, res, { store, requestMetrics, log });
       return;
     }
 
@@ -1289,7 +1335,7 @@ export async function createCredentialConsole(options = {}) {
     }
 
     const conversationCollection = path === '/conversations'
-      ? { mode: 'sessions', view: conversationSessionsView }
+      ? { mode: 'rounds', view: conversationSessionsView }
       : path === '/conversation-turns'
         ? { mode: 'turns', view: conversationsView }
         : null;
@@ -1333,28 +1379,74 @@ export async function createCredentialConsole(options = {}) {
       const adminSession = requireSession(req, res);
       if (!adminSession) return;
       const sessionId = Number(sessionParams.id);
-      let result = { session: null, standaloneCount: null, error: null };
+      let result = { session: null, error: null };
       if (Number.isSafeInteger(sessionId) && sessionId > 0
-        && typeof requestMetrics?.readConversationSession === 'function') {
+        && typeof requestMetrics?.readConversationRoundSession === 'function') {
         try {
           requestMetrics.flush?.();
-          const rawResult = requestMetrics.readConversationSession(sessionId);
+          const rawResult = requestMetrics.readConversationRoundSession(sessionId);
           result = rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
             ? rawResult
-            : { session: null, standaloneCount: null, error: 'conversation_unavailable' };
+            : { session: null, error: 'conversation_unavailable' };
         } catch (error) {
           log('conversation_session_read_route_failed', {
             code: error?.code ?? error?.name ?? 'unknown',
           });
-          result = { session: null, standaloneCount: null, error: 'conversation_unavailable' };
+          result = { session: null, error: 'conversation_unavailable' };
         }
-      } else if (typeof requestMetrics?.readConversationSession !== 'function') {
-        result = { session: null, standaloneCount: null, error: 'conversation_archive_unavailable' };
+      } else if (typeof requestMetrics?.readConversationRoundSession !== 'function') {
+        result = { session: null, error: 'conversation_archive_unavailable' };
       }
       const statusCode = result?.error ? 503 : (result?.session ? 200 : 404);
       sendHtml(res, statusCode, conversationSessionDetailView({
         result,
         id: sessionParams.id,
+        openMode,
+      }));
+      return;
+    }
+
+    const roundParams = routeMatch(path, '/conversation-rounds/:id');
+    if (roundParams && req.method !== 'GET') {
+      sendText(res, 405, 'method not allowed\n', 'text/plain; charset=utf-8', { Allow: 'GET' });
+      return;
+    }
+    if (req.method === 'GET' && roundParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const roundId = Number(roundParams.id);
+      let result = { round: null, error: null };
+      if (Number.isSafeInteger(roundId) && roundId > 0
+        && typeof requestMetrics?.readConversationRound === 'function') {
+        try {
+          requestMetrics.flush?.();
+          const rawResult = requestMetrics.readConversationRound(roundId);
+          result = rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+            ? rawResult
+            : { round: null, error: 'round_unavailable' };
+          if (result.round) {
+            const device = store.publicDevices().find((entry) => entry.id === result.round.deviceId);
+            result = {
+              ...result,
+              round: {
+                ...result.round,
+                deviceName: typeof device?.name === 'string' ? device.name : null,
+              },
+            };
+          }
+        } catch (error) {
+          log('conversation_round_read_route_failed', {
+            code: error?.code ?? error?.name ?? 'unknown',
+          });
+          result = { round: null, error: 'round_unavailable' };
+        }
+      } else if (typeof requestMetrics?.readConversationRound !== 'function') {
+        result = { round: null, error: 'conversation_archive_unavailable' };
+      }
+      const statusCode = result?.error ? 503 : (result?.round ? 200 : 404);
+      sendHtml(res, statusCode, conversationRoundDetailView({
+        result,
+        id: roundParams.id,
         openMode,
       }));
       return;
@@ -1684,25 +1776,25 @@ const translations = {
   'metrics-scroll-table-hint': '可横向滑动查看全部列。',
   'metrics-methodology-toggle': '统计范围、隐私与归因说明',
   'conversations-dashboard-link': '查看对话',
-  'conversations-label': '已捕获 API 轮次',
-  'conversations-heading': '已捕获 API 轮次',
-  'conversations-intro': '搜索符合条件且永久保留的 Claude API 轮次。这些是按请求捕获的轮次，不是还原出的完整线程。',
+  'conversations-label': 'API 片段诊断',
+  'conversations-heading': 'API 片段诊断',
+  'conversations-intro': '这里保留按请求捕获的 Claude API 片段用于诊断；它们可能是包装、提醒或工具循环中间态，不是用户回合，也不会被猜测拼成对话。',
   'conversation-subnav-sessions': '对话',
-  'conversation-subnav-turns': '已捕获 API 轮次',
-  'conversation-sessions-label': '客户端会话关联',
+  'conversation-subnav-turns': 'API 片段诊断',
+  'conversation-sessions-label': '可靠的 Hook 对话',
   'conversation-sessions-heading': '对话',
-  'conversation-sessions-intro': '只有 Claude Code 提供格式校验通过的会话标识时，已捕获轮次才会关联到同一对话；这种关联不代表用户身份认证。无会话标识的单轮绝不会按时间猜测归组。',
+  'conversation-sessions-intro': '每一轮把 Claude Code UserPromptSubmit 提交的原始文字与同一 prompt 的最终 Stop 回复配对；工具循环 API 请求不会再伪装成用户轮次。session/prompt 标识只保存设备绑定的 HMAC。',
   'conversation-session-heading': '对话',
   'conversation-session-open': '打开对话',
-  'conversation-session-open-turn': '打开单轮',
+  'conversation-session-open-turn': '打开本轮',
   'conversation-session-turn-count': '轮次数',
-  'conversation-session-first-at': '首次捕获',
-  'conversation-session-last-at': '最近捕获',
-  'conversation-session-latest-preview': '最近捕获的轮次',
+  'conversation-session-first-at': '首次提问',
+  'conversation-session-last-at': '最近活动',
+  'conversation-session-latest-preview': '轮次预览',
   'conversation-session-total-matches': '个匹配对话',
-  'conversation-session-no-results': '没有符合当前搜索条件的关联对话。',
-  'conversation-session-pagination-hint': '对话按内部会话记录编号从新到旧排列。',
-  'conversation-session-filter-hint': '筛选条件只要匹配客户端会话关联中的任一已捕获轮次，该对话就会出现；结果卡片展示最近轮次的归因与摘要。',
+  'conversation-session-no-results': '没有符合当前筛选条件的可靠对话。',
+  'conversation-session-pagination-hint': '对话按最近活动时间从新到旧排列。',
+  'conversation-session-filter-hint': '筛选只匹配 Hook 支持的可靠用户轮次；API 片段请在诊断页单独搜索。',
   'conversation-session-search': '搜索对话',
   'conversation-session-filter-invalid': '一个或多个对话筛选值无效或过长。请清除筛选条件后重试。',
   'conversation-session-search-query-too-short': '搜索词对当前对话归档太短。大库中至少输入连续 3 个中文字符或更多可检索文字；请去掉单独特殊标点，并拆开查询。',
@@ -1711,20 +1803,55 @@ const translations = {
   'conversation-session-read-error': '对话无法载入。',
   'conversation-session-not-found': '找不到这个对话。',
   'conversation-session-back': '返回对话列表',
-  'conversation-session-detail-intro': '以下轮次来自同一个客户端会话关联，并按从旧到新排列。标识只做格式校验与 HMAC 隐藏，不代表用户身份认证；原始值不会显示或入库。',
-  'conversation-session-turn': '轮次',
+  'conversation-session-detail-intro': '以下轮次按同一 Claude Code session 的提问顺序排列；每个面板把 UserPromptSubmit 与同一 prompt 的 Stop 终态配对。原始标识不入库，设备上报也不等于真人身份认证。',
+  'conversation-session-turn': '轮',
   'conversation-session-incomplete-turn': '这个 API 轮次结束时，尚未捕获到完整的助手回复。',
   'conversation-session-truncated-turn': '助手正文达到有界上限，当前捕获内容并不完整。',
   'conversation-session-empty-assistant': '未捕获助手正文。这个轮次可能包含工具活动，或者回复正文当时不可用。',
   'conversation-session-timeline-clipped': '时间线会缩短过长的助手正文；请打开对应单轮查看完整的已捕获文本。',
   'conversation-session-truncated': '此对话超过时间线的有界预算；仅显示最早的连续前缀（最多 200 轮、8 MiB 已存文本），完整正文可逐轮打开查看。',
-  'conversation-session-empty': '这个对话中没有可显示的已捕获轮次。',
+  'conversation-session-empty': '这个对话中没有可显示的可靠轮次。',
+  'conversation-legacy-fragments-heading': '保留用于诊断的旧 API 片段',
+  'conversation-legacy-fragments-notice': '这些旧行来自单个 API 请求，不是用户回合，系统绝不会按时间把它们猜测成对话。',
+  'conversation-legacy-fragments-link': '打开 API 片段诊断',
+  'conversation-round-privacy-heading': '可靠对话隐私告知',
+  'conversation-round-privacy-notice': '启用 Hook 的 Claude Code profile 会把客户端提交的原始提问与最终显示的助手回复永久发送到本控制台，并向所有控制台成员公开。Hook 不会拒绝或终止 Claude，但同步命令 Hook 失败时可能产生有界延迟。数据由设备上报，网关不认证真人身份；Codex 流量不在范围内。',
+  'conversation-round-empty-heading': '还没有可靠的用户轮次',
+  'conversation-round-empty-copy': '安装 Claude Code 对话采集更新后，UserPromptSubmit 与 Stop 才会组成可靠对话。现有 API 片段只保留在诊断页，绝不会被猜测归组。',
+  'conversation-round-install-hooks': '安装对话采集更新',
+  'conversation-user-message': '用户提交的消息',
+  'conversation-final-response': '最终回复',
+  'conversation-hook-prompt-disclaimer': '直接取自 Claude Code UserPromptSubmit，是客户端提交的原始文字；但设备上报不等于真人身份认证。',
+  'conversation-prompt-source-hook': '来源：Claude Code UserPromptSubmit Hook',
+  'conversation-round-prompt-at': '提问时间',
+  'conversation-round-pending': '已收到提问，正在等待最终 Stop Hook。',
+  'conversation-round-failed': 'Claude Code 报告本轮失败。',
+  'conversation-round-unavailable': '提问已保留，但 session 结束前没有收到最终回复 Hook。',
+  'conversation-round-response-pending': '正在等待最终回复。',
+  'conversation-round-empty-response': '本轮没有上报最终助手文字。',
+  'conversation-round-prompt-truncated': '提问超过存储上限；仅保留完整 UTF-8 前缀。',
+  'conversation-round-response-truncated': '最终回复超过存储上限；仅保留完整 UTF-8 前缀。',
+  'conversation-round-not-found': '找不到这条可靠对话轮次。',
+  'conversation-round-read-error': '对话轮次无法载入。',
+  'conversation-round-label': '可靠用户轮次',
+  'conversation-failure-rate-limit': '受到速率限制',
+  'conversation-failure-overloaded': '服务商负载过高',
+  'conversation-failure-authentication-failed': '认证失败',
+  'conversation-failure-oauth-org-not-allowed': '当前组织不允许使用',
+  'conversation-failure-billing-error': '计费状态错误',
+  'conversation-failure-invalid-request': '请求无效',
+  'conversation-failure-model-not-found': '找不到模型',
+  'conversation-failure-server-error': '服务商服务器错误',
+  'conversation-failure-max-output-tokens': '已达到最大输出长度',
+  'conversation-failure-session-end': 'Session 在最终回复前结束',
+  'conversation-failure-unavailable': '回复不可用',
+  'conversation-failure-unknown': '未知失败',
   'conversation-standalone-heading': '未归组的已捕获轮次',
   'conversation-standalone-notice': '这些旧轮次或无法关联的 API 轮次没有格式校验通过的会话标识，系统绝不会按时间猜测归组。',
   'conversation-standalone-link': '查看未归组轮次和全部已捕获 API 轮次',
-  'conversation-privacy-heading': '已捕获 API 轮次隐私告知',
-  'conversation-privacy-notice': '此功能会永久保存每一条已捕获的 Claude API 轮次，并把轮次正文公开给所有能访问本控制台的人。成员标签由本人填写且未经验证。Codex 流量不在采集范围内。',
-  'conversation-open-warning': 'Open 模式：tailnet 中任何能访问本控制台的人都可以读取所有已捕获 API 轮次；没有身份识别，也没有阅读审计。成员标签不代表操作人身份。',
+  'conversation-privacy-heading': 'API 片段隐私告知',
+  'conversation-privacy-notice': '此诊断归档会永久保存有界的 Claude API 请求/响应片段。它们可能包含客户端包装、提醒或工具中间态，不是经过验证的人类对话；所有控制台成员都可读取。Codex 流量不在范围内。',
+  'conversation-open-warning': 'Open 模式：tailnet 中任何能访问本控制台的人都可以读取所有对话与 API 片段；没有身份识别，也没有阅读审计。成员标签不代表操作人身份。',
   'conversation-search': '搜索已捕获 API 轮次',
   'conversation-search-submit': '搜索',
   'conversation-search-clear': '清除',
@@ -1747,8 +1874,8 @@ const translations = {
   'conversation-all-accounts': '全部账号',
   'conversation-all-models': '全部模型',
   'conversation-all-states': '全部回复状态',
-  'conversation-total-matches': '条匹配 API 轮次',
-  'conversation-pagination-hint': 'API 轮次按最新时间优先排列。',
+  'conversation-total-matches': '条匹配 API 片段',
+  'conversation-pagination-hint': 'API 片段按最新时间优先排列。',
   'conversation-facets-truncated': '部分筛选值未列出；当前选中的值仍然可用。',
   'conversation-filter-query': '查询',
   'conversation-filter-period': '时间',
@@ -1758,17 +1885,17 @@ const translations = {
   'conversation-filter-model': '模型',
   'conversation-filter-state': '状态',
   'conversation-device': '设备',
-  'conversation-open': '打开已捕获轮次',
-  'conversation-no-results': '没有符合此搜索条件的已捕获 API 轮次。',
+  'conversation-open': '打开 API 片段',
+  'conversation-no-results': '没有符合此搜索条件的 API 片段。',
   'conversation-search-error': 'API 轮次搜索无法完成。',
   'conversation-search-query-too-short': '搜索词对当前 API 轮次归档太短。大库中至少输入连续 3 个中文字符或更多可检索文字；请去掉单独特殊标点，并拆开查询。',
   'conversation-search-requires-indexed-terms': 'API 轮次搜索需要可建立索引的词。大库中请输入至少连续 3 个中文字符，去掉特殊标点，或拆开查询。',
   'conversation-filter-invalid': '一个或多个 API 轮次筛选值无效或过长。请清除筛选条件后重试。',
   'conversation-read-error': '已捕获 API 轮次无法载入。',
   'conversation-not-found': '找不到这条已捕获 API 轮次。',
-  'conversation-detail-heading': '已捕获轮次',
-  'conversation-back': '返回 API 轮次列表',
-  'conversation-unknown-id': '已捕获轮次',
+  'conversation-detail-heading': 'API 片段',
+  'conversation-back': '返回 API 片段诊断',
+  'conversation-unknown-id': 'API 片段',
   'conversation-captured-at': '捕获时间',
   'conversation-member-label': '成员标签',
   'conversation-account': '账号',
@@ -1784,10 +1911,22 @@ const translations = {
   'conversation-empty-prompt': '未捕获 API 用户文本',
   'conversation-empty-response': '未捕获回复正文',
   'conversation-queue-dropped': '有 API 轮次采集任务被有界队列丢弃。',
+  'conversation-round-dropped': '有可靠对话轮次未能写入持久化存储。',
   'conversation-response-complete': '回复完整',
+  'conversation-response-pending': '等待回复',
+  'conversation-response-failed': '本轮失败',
   'conversation-response-incomplete': '回复不完整',
   'conversation-response-truncated': '回复已截断',
   'conversation-response-unavailable': '回复不可用',
+  'conversation-hook-upgrade-heading': '为现有 Claude profile 启用可靠对话',
+  'conversation-hook-upgrade-copy': '这个不含 Token 的更新器会保留现有设置并安装同步 Claude Code 命令 Hook。它只在发送事件时读取 profile 已有的 mode-600 设备 Token；不会登录、轮换、打印或替换任何凭证。',
+  'conversation-hook-upgrade-privacy': '安装后，本控制台会永久保存 Claude 用户提交的提示词与最终可见助手回复，并向所有控制台成员公开。Hook 不会拒绝或终止 Claude，但同步命令 Hook 失败时可能产生有界延迟。',
+  'conversation-hook-version-note': '可靠配对要求 Claude Code 2.1.196 或更高版本；旧版本没有形成可靠轮次所需的 prompt ID。',
+  'conversation-hook-download': '下载 Hook 更新器',
+  'conversation-hook-copy': '复制更新器源码',
+  'conversation-hook-run-heading': '在本机对每个已安装 profile 各运行一次',
+  'conversation-hook-restart-note': '更新完成后重启 Claude Code。Hook 失败不会拒绝或终止 Claude，但同步命令 Hook 失败时可能增加有界延迟；其他投递失败会静默退出。',
+  'conversation-hook-installer-privacy': '此 profile 会在控制台永久保存 Claude 用户提交的提示词与最终可见助手回复，所有控制台成员均可读取。Hook 不会拒绝或终止 Claude，也不会修改设备 Token，但同步命令 Hook 失败时可能产生有界延迟。',
   'choose-codex-platform': '选择这台设备的操作系统',
   'codex-profile-ready': '此安装器会新增一个隔离的 Codex profile，不会修改默认的 ~/.codex 账号。',
   'one-platform-only': '请只在刚登记的这台设备上选择一种安装器使用，不要把这些脚本复用到其他机器。',
@@ -2447,6 +2586,7 @@ document.addEventListener('click', async (event) => {
         adminIdentity: session.admin_identity,
         openMode,
         codexSelfServiceReady,
+        claudeGatewayUrl,
         onboardingUrl,
         error: url.searchParams.get('error'),
         completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
@@ -3232,7 +3372,7 @@ async function main() {
     log('privacy_metadata_recording', {
       enabled: metricsEnabled,
       detail: metricsEnabled
-        ? 'proxied Claude request metadata, including four provider-reported token counts, is stored; eligible final API user text and assistant text are permanently stored as per-request turns and visible to every console member; API user text may contain client wrappers and is not guaranteed to be the human original words; in open mode anyone on the tailnet who can reach the console can read the turns with no identity and no reading audit; member labels are self-entered and unverified and must not be used for accountability or billing; Codex traffic is not captured'
+        ? 'proxied Claude request metadata, including four provider-reported token counts, is stored; hook-enabled Claude profiles permanently store exact Claude user-submitted prompts and final visible assistant responses as paired rounds visible to every console member; reliable pairing requires Claude Code 2.1.196+; these synchronous command hooks never deny or terminate Claude but a failed delivery may add bounded delay; legacy bounded API request/response fragments remain in a separate diagnostic archive and are not represented as human conversations; in open mode anyone on the tailnet who can reach the console can read both archives with no identity and no reading audit; member labels are self-entered and unverified and must not be used for accountability or billing; hook events are device-asserted and do not authenticate a human; Codex traffic is not captured'
         : 'request metadata and Claude API-turn capture are unavailable, so requests and captured API text are not currently being stored',
     });
     server.once('close', () => {

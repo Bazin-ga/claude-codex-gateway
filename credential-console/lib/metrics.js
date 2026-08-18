@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { TextDecoder } from 'node:util';
 
 export const METRICS_FILENAME = 'metrics.sqlite';
-export const METRICS_SCHEMA_VERSION = 4;
+export const METRICS_SCHEMA_VERSION = 5;
 
 const HOUR_MS = 60 * 60 * 1000;
 const DEFAULT_BATCH_SIZE = 64;
@@ -48,12 +48,52 @@ const MAX_CONVERSATION_SESSION_TURNS = 200;
 const MAX_CONVERSATION_SESSION_BYTES = 8 * 1024 * 1024;
 const MAX_CONVERSATION_SESSION_RESPONSE_CHARS = 16 * 1024;
 const CONVERSATION_QUEUE_OVERHEAD_BYTES = 4 * 1024;
+const MAX_CONVERSATION_HOOK_INBOX_ITEMS = 1024;
+const MAX_CONVERSATION_HOOK_INBOX_BYTES = 16 * 1024 * 1024;
+const MAX_CONVERSATION_ROUND_SEARCH_SNIPPET_BYTES = 4 * 1024;
+const MAX_CONVERSATION_ROUND_PROMPT_BYTES = 256 * 1024;
+const MAX_CONVERSATION_ROUND_SESSION_TURNS = 200;
+const MAX_CONVERSATION_ROUND_SESSION_BYTES = 8 * 1024 * 1024;
+const MAX_CONVERSATION_ROUND_RESPONSE_BYTES = 1024 * 1024;
 const MAX_SHORT_HAN_SEARCH_ROWS = 20_000;
 const MAX_SHORT_HAN_SEARCH_BYTES = 64 * 1024 * 1024;
 const HAN_PATTERN = /\p{Script=Han}/u;
+export const CONVERSATION_ROUND_RESPONSE_STATES = Object.freeze([
+  'pending',
+  'complete',
+  'failed',
+  'unavailable',
+]);
+export const CONVERSATION_ROUND_FAILURE_CODES = Object.freeze([
+  'rate_limit',
+  'overloaded',
+  'authentication_failed',
+  'oauth_org_not_allowed',
+  'billing_error',
+  'invalid_request',
+  'model_not_found',
+  'server_error',
+  'max_output_tokens',
+  'unknown',
+  'session_end',
+  'unavailable',
+]);
+const CONVERSATION_ROUND_HOOK_KINDS = Object.freeze([
+  'prompt',
+  'stop',
+  'failure',
+  'session_end',
+]);
+const CONVERSATION_ROUND_HOOK_KIND_MAP = Object.freeze({
+  user_prompt_submit: 'prompt',
+  stop_failure: 'failure',
+});
+const CONVERSATION_ROUND_SOURCE = 'claude_hook';
 const CONVERSATION_FTS_TABLES = Object.freeze([
   'conversation_turns_fts',
   'conversation_turns_trigram_fts',
+  'conversation_rounds_fts',
+  'conversation_rounds_trigram_fts',
 ]);
 
 const CREATE_SCHEMA_META = `
@@ -218,6 +258,258 @@ const CREATE_CONVERSATION_TRIGGERS = [
    BEGIN
      SELECT RAISE(ABORT, 'conversation turns are permanent');
    END`,
+];
+
+// Conversation rounds are an additive hook-backed archive.  The older
+// conversation_turns contract is intentionally left untouched: it stores the
+// P6 request/response pairs and remains the compatibility API for the UI.
+// Rounds have a different lifecycle because a hook emits a prompt first and a
+// terminal stop/failure later.
+const CREATE_CONVERSATION_ROUNDS = `
+  CREATE TABLE IF NOT EXISTS conversation_rounds (
+    id INTEGER PRIMARY KEY,
+    conversation_session_id INTEGER NOT NULL
+      REFERENCES conversation_sessions(id) ON DELETE RESTRICT,
+    turn_index INTEGER NOT NULL CHECK (turn_index >= 1),
+    prompt_key TEXT NOT NULL UNIQUE
+      CHECK (length(prompt_key) = 64 AND prompt_key NOT GLOB '*[^0-9a-f]*'),
+    prompt_text TEXT NOT NULL CHECK (length(prompt_text) > 0),
+    prompt_bytes INTEGER NOT NULL DEFAULT 0 CHECK (prompt_bytes >= 0),
+    prompt_truncated INTEGER NOT NULL DEFAULT 0
+      CHECK (prompt_truncated IN (0, 1)),
+    response_text TEXT NOT NULL DEFAULT '',
+    response_bytes INTEGER NOT NULL DEFAULT 0 CHECK (response_bytes >= 0),
+    response_truncated INTEGER NOT NULL DEFAULT 0
+      CHECK (response_truncated IN (0, 1)),
+    response_state TEXT NOT NULL DEFAULT 'pending'
+      CHECK (response_state IN ('pending', 'complete', 'failed', 'unavailable')),
+    failure_code TEXT
+      CHECK (failure_code IS NULL OR failure_code IN (
+        'rate_limit', 'overloaded', 'authentication_failed',
+        'oauth_org_not_allowed', 'billing_error', 'invalid_request',
+        'model_not_found', 'server_error', 'max_output_tokens', 'unknown',
+        'session_end', 'unavailable'
+      )),
+    source TEXT NOT NULL DEFAULT 'claude_hook'
+      CHECK (source = 'claude_hook'),
+    prompt_at_ms INTEGER NOT NULL CHECK (prompt_at_ms >= 0),
+    completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= 0),
+    device_id TEXT NOT NULL,
+    machine_id TEXT,
+    member_label TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    account_alias TEXT NOT NULL,
+    model TEXT,
+    CHECK (
+      (response_state = 'failed' AND failure_code IS NOT NULL)
+      OR (response_state IN ('pending', 'complete') AND failure_code IS NULL)
+      OR response_state = 'unavailable'
+    ),
+    UNIQUE (conversation_session_id, turn_index)
+  )
+`;
+
+const CREATE_CONVERSATION_ROUNDS_FTS = `
+  CREATE VIRTUAL TABLE IF NOT EXISTS conversation_rounds_fts USING fts5(
+    prompt_text,
+    response_text,
+    content='conversation_rounds',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+  )
+`;
+
+const CREATE_CONVERSATION_ROUNDS_TRIGRAM_FTS = `
+  CREATE VIRTUAL TABLE IF NOT EXISTS conversation_rounds_trigram_fts USING fts5(
+    prompt_text,
+    response_text,
+    content='conversation_rounds',
+    content_rowid='id',
+    tokenize='trigram'
+  )
+`;
+
+const CREATE_CONVERSATION_ROUND_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS conversation_rounds_session_idx ON conversation_rounds(conversation_session_id, turn_index)',
+  'CREATE INDEX IF NOT EXISTS conversation_rounds_activity_idx ON conversation_rounds(COALESCE(completed_at_ms, prompt_at_ms), id)',
+  'CREATE INDEX IF NOT EXISTS conversation_rounds_device_activity_idx ON conversation_rounds(device_id, COALESCE(completed_at_ms, prompt_at_ms), id)',
+  'CREATE INDEX IF NOT EXISTS conversation_rounds_member_activity_idx ON conversation_rounds(member_label, COALESCE(completed_at_ms, prompt_at_ms), id)',
+  'CREATE INDEX IF NOT EXISTS conversation_rounds_account_activity_idx ON conversation_rounds(account_id, COALESCE(completed_at_ms, prompt_at_ms), id)',
+  'CREATE INDEX IF NOT EXISTS conversation_rounds_prompt_key_idx ON conversation_rounds(prompt_key)',
+];
+
+const CREATE_CONVERSATION_ROUND_TRIGGERS = [
+  `CREATE TRIGGER IF NOT EXISTS conversation_rounds_fts_ai
+   AFTER INSERT ON conversation_rounds
+   BEGIN
+     INSERT INTO conversation_rounds_fts(rowid, prompt_text, response_text)
+     VALUES (new.id, COALESCE(new.prompt_text, ''), new.response_text);
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS conversation_rounds_trigram_fts_ai
+   AFTER INSERT ON conversation_rounds
+   BEGIN
+     INSERT INTO conversation_rounds_trigram_fts(rowid, prompt_text, response_text)
+     VALUES (new.id, COALESCE(new.prompt_text, ''), new.response_text);
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS conversation_rounds_fts_au
+   AFTER UPDATE ON conversation_rounds
+   BEGIN
+     INSERT INTO conversation_rounds_fts(
+       conversation_rounds_fts, rowid, prompt_text, response_text
+     ) VALUES (
+       'delete', old.id, COALESCE(old.prompt_text, ''), old.response_text
+     );
+     INSERT INTO conversation_rounds_fts(rowid, prompt_text, response_text)
+     VALUES (new.id, COALESCE(new.prompt_text, ''), new.response_text);
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS conversation_rounds_trigram_fts_au
+   AFTER UPDATE ON conversation_rounds
+   BEGIN
+     INSERT INTO conversation_rounds_trigram_fts(
+       conversation_rounds_trigram_fts, rowid, prompt_text, response_text
+     ) VALUES (
+       'delete', old.id, COALESCE(old.prompt_text, ''), old.response_text
+     );
+     INSERT INTO conversation_rounds_trigram_fts(rowid, prompt_text, response_text)
+     VALUES (new.id, COALESCE(new.prompt_text, ''), new.response_text);
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS conversation_rounds_no_update
+   BEFORE UPDATE ON conversation_rounds
+   WHEN NOT (
+     new.conversation_session_id IS old.conversation_session_id
+     AND new.id IS old.id
+     AND new.turn_index IS old.turn_index
+     AND new.prompt_key IS old.prompt_key
+     AND new.prompt_text IS old.prompt_text
+     AND new.prompt_bytes IS old.prompt_bytes
+     AND new.prompt_truncated IS old.prompt_truncated
+     AND new.source IS old.source
+     AND new.prompt_at_ms IS old.prompt_at_ms
+     AND new.device_id IS old.device_id
+     AND new.machine_id IS old.machine_id
+     AND new.member_label IS old.member_label
+     AND new.account_id IS old.account_id
+     AND new.account_alias IS old.account_alias
+     AND new.model IS old.model
+   )
+   BEGIN
+     SELECT RAISE(ABORT, 'conversation round prompt and attribution are immutable');
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS conversation_rounds_terminal_update
+   BEFORE UPDATE ON conversation_rounds
+   WHEN (
+       old.response_state = 'pending'
+       AND (
+         new.response_state = 'pending'
+         OR (new.response_state = 'failed' AND new.failure_code IS NULL)
+         OR new.completed_at_ms IS NULL
+       )
+     )
+     OR (
+       old.response_state = 'complete'
+       AND (
+         new.response_state <> 'complete'
+         OR new.completed_at_ms IS NULL
+         OR new.completed_at_ms <= old.completed_at_ms
+       )
+     )
+     OR old.response_state IN ('failed', 'unavailable')
+   BEGIN
+     SELECT RAISE(ABORT, 'conversation round response is already terminal');
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS conversation_rounds_no_delete
+   BEFORE DELETE ON conversation_rounds
+   BEGIN
+     SELECT RAISE(ABORT, 'conversation rounds are permanent');
+   END`,
+];
+
+const CREATE_CONVERSATION_HOOK_INBOX = `
+  CREATE TABLE IF NOT EXISTS conversation_hook_inbox (
+    id INTEGER PRIMARY KEY,
+    prompt_key TEXT NOT NULL
+      CHECK (length(prompt_key) = 64 AND prompt_key NOT GLOB '*[^0-9a-f]*'),
+    event_slot TEXT NOT NULL CHECK (event_slot IN ('prompt', 'terminal')),
+    kind TEXT NOT NULL CHECK (kind IN ('prompt', 'stop', 'failure', 'session_end')),
+    thread_key TEXT NOT NULL
+      CHECK (length(thread_key) = 64 AND thread_key NOT GLOB '*[^0-9a-f]*'),
+    occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
+    text TEXT,
+    text_bytes INTEGER NOT NULL CHECK (text_bytes >= 0),
+    truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+    failure_code TEXT
+      CHECK (failure_code IS NULL OR failure_code IN (
+        'rate_limit', 'overloaded', 'authentication_failed',
+        'oauth_org_not_allowed', 'billing_error', 'invalid_request',
+        'model_not_found', 'server_error', 'max_output_tokens', 'unknown',
+        'session_end', 'unavailable'
+      )),
+    source TEXT NOT NULL CHECK (source = 'claude_hook'),
+    device_id TEXT NOT NULL,
+    machine_id TEXT,
+    member_label TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    account_alias TEXT NOT NULL,
+    model TEXT,
+    duplicate_count INTEGER NOT NULL DEFAULT 0 CHECK (duplicate_count >= 0),
+    CHECK (
+      (event_slot = 'prompt' AND kind = 'prompt' AND failure_code IS NULL)
+      OR (event_slot = 'terminal' AND kind IN ('stop', 'failure', 'session_end'))
+    ),
+    UNIQUE (prompt_key, event_slot)
+  )
+`;
+
+const CREATE_CONVERSATION_HOOK_RECEIPTS = `
+  CREATE TABLE IF NOT EXISTS conversation_hook_receipts (
+    prompt_key TEXT NOT NULL
+      CHECK (length(prompt_key) = 64 AND prompt_key NOT GLOB '*[^0-9a-f]*'),
+    event_slot TEXT NOT NULL CHECK (event_slot IN ('prompt', 'terminal')),
+    kind TEXT NOT NULL CHECK (kind IN ('prompt', 'stop', 'failure', 'session_end')),
+    thread_key TEXT NOT NULL
+      CHECK (length(thread_key) = 64 AND thread_key NOT GLOB '*[^0-9a-f]*'),
+    device_id TEXT NOT NULL,
+    applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0),
+    duplicate_count INTEGER NOT NULL DEFAULT 0 CHECK (duplicate_count >= 0),
+    revision_count INTEGER NOT NULL DEFAULT 0 CHECK (revision_count >= 0),
+    PRIMARY KEY (prompt_key, event_slot)
+  ) WITHOUT ROWID
+`;
+
+const CREATE_CONVERSATION_ROUND_SESSION_SUMMARIES = `
+  CREATE TABLE IF NOT EXISTS conversation_round_session_summaries (
+    conversation_session_id INTEGER PRIMARY KEY
+      REFERENCES conversation_sessions(id) ON DELETE RESTRICT,
+    turn_count INTEGER NOT NULL CHECK (turn_count > 0),
+    pending_count INTEGER NOT NULL CHECK (pending_count >= 0),
+    complete_count INTEGER NOT NULL CHECK (complete_count >= 0),
+    failed_count INTEGER NOT NULL CHECK (failed_count >= 0),
+    unavailable_count INTEGER NOT NULL CHECK (unavailable_count >= 0),
+    first_round_id INTEGER NOT NULL
+      REFERENCES conversation_rounds(id) ON DELETE RESTRICT,
+    latest_round_id INTEGER NOT NULL
+      REFERENCES conversation_rounds(id) ON DELETE RESTRICT,
+    first_prompt_at_ms INTEGER NOT NULL CHECK (first_prompt_at_ms >= 0),
+    last_activity_at_ms INTEGER NOT NULL CHECK (last_activity_at_ms >= 0),
+    device_id TEXT NOT NULL,
+    machine_id TEXT,
+    member_label TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    account_alias TEXT NOT NULL,
+    model TEXT,
+    CHECK (
+      turn_count = pending_count + complete_count + failed_count + unavailable_count
+    )
+  )
+`;
+
+const CREATE_CONVERSATION_HOOK_AUX_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS conversation_hook_inbox_order_idx ON conversation_hook_inbox(id)',
+  'CREATE INDEX IF NOT EXISTS conversation_hook_inbox_thread_idx ON conversation_hook_inbox(thread_key, prompt_key)',
+  'CREATE INDEX IF NOT EXISTS conversation_round_summary_activity_idx ON conversation_round_session_summaries(last_activity_at_ms DESC, conversation_session_id DESC)',
+  'CREATE INDEX IF NOT EXISTS conversation_round_summary_member_idx ON conversation_round_session_summaries(member_label, last_activity_at_ms DESC, conversation_session_id DESC)',
+  'CREATE INDEX IF NOT EXISTS conversation_round_summary_device_idx ON conversation_round_session_summaries(device_id, last_activity_at_ms DESC, conversation_session_id DESC)',
+  'CREATE INDEX IF NOT EXISTS conversation_round_summary_account_idx ON conversation_round_session_summaries(account_id, last_activity_at_ms DESC, conversation_session_id DESC)',
 ];
 
 const CREATE_INDEXES = [
@@ -1158,6 +1450,227 @@ function assertV4Schema(db) {
   }
 }
 
+function assertConversationRoundSchema(db) {
+  if (!sqliteObjectExists(db, 'table', 'conversation_rounds')) {
+    throw new Error('metrics schema is missing conversation_rounds');
+  }
+  const columns = new Map(
+    db.prepare('PRAGMA table_info(conversation_rounds)').all()
+      .map((column) => [column.name, column]),
+  );
+  const required = {
+    id: { type: 'INTEGER', notnull: 0 },
+    conversation_session_id: { type: 'INTEGER', notnull: 1 },
+    turn_index: { type: 'INTEGER', notnull: 1 },
+    prompt_key: { type: 'TEXT', notnull: 1 },
+    prompt_text: { type: 'TEXT', notnull: 1 },
+    prompt_bytes: { type: 'INTEGER', notnull: 1 },
+    prompt_truncated: { type: 'INTEGER', notnull: 1 },
+    response_text: { type: 'TEXT', notnull: 1 },
+    response_bytes: { type: 'INTEGER', notnull: 1 },
+    response_truncated: { type: 'INTEGER', notnull: 1 },
+    response_state: { type: 'TEXT', notnull: 1 },
+    failure_code: { type: 'TEXT', notnull: 0 },
+    source: { type: 'TEXT', notnull: 1 },
+    prompt_at_ms: { type: 'INTEGER', notnull: 1 },
+    completed_at_ms: { type: 'INTEGER', notnull: 0 },
+    device_id: { type: 'TEXT', notnull: 1 },
+    machine_id: { type: 'TEXT', notnull: 0 },
+    member_label: { type: 'TEXT', notnull: 1 },
+    account_id: { type: 'TEXT', notnull: 1 },
+    account_alias: { type: 'TEXT', notnull: 1 },
+    model: { type: 'TEXT', notnull: 0 },
+  };
+  for (const [name, contract] of Object.entries(required)) {
+    const column = columns.get(name);
+    if (!column || String(column.type).toUpperCase() !== contract.type
+      || column.notnull !== contract.notnull) {
+      throw new Error(`conversation_rounds column ${name} has an incompatible contract`);
+    }
+  }
+  if (columns.get('response_text').dflt_value !== "''"
+    || columns.get('response_state').dflt_value !== "'pending'"
+    || columns.get('source').dflt_value !== "'claude_hook'") {
+    throw new Error('conversation_rounds defaults are incompatible');
+  }
+
+  const tableSql = String(db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversation_rounds'
+  `).get()?.sql ?? '').replace(/\s+/g, ' ').toLowerCase();
+  for (const fragment of [
+    'prompt_key text not null unique',
+    'prompt_text text not null check (length(prompt_text) > 0)',
+    "check (source = 'claude_hook')",
+    "check (response_state in ('pending', 'complete', 'failed', 'unavailable'))",
+    'check (prompt_bytes >= 0)',
+    'check (response_bytes >= 0)',
+    'unique (conversation_session_id, turn_index)',
+  ]) {
+    if (!tableSql.includes(fragment)) {
+      throw new Error(`conversation_rounds is missing canonical constraint: ${fragment}`);
+    }
+  }
+  if (!tableSql.includes('check (length(prompt_key) = 64')) {
+    throw new Error('conversation_rounds prompt_key has an incompatible contract');
+  }
+  if (!CONVERSATION_ROUND_FAILURE_CODES.every((code) => tableSql.includes(`'${code}'`))) {
+    throw new Error('conversation_rounds failure_code has an incomplete allowlist');
+  }
+  const foreignKeys = db.prepare('PRAGMA foreign_key_list(conversation_rounds)').all();
+  if (!foreignKeys.some((entry) => entry.table === 'conversation_sessions'
+    && entry.from === 'conversation_session_id' && entry.to === 'id'
+    && entry.on_delete === 'RESTRICT')) {
+    throw new Error('conversation_rounds is missing its conversation session foreign key');
+  }
+
+  for (const table of ['conversation_rounds_fts', 'conversation_rounds_trigram_fts']) {
+    if (!sqliteObjectExists(db, 'table', table)) {
+      throw new Error(`metrics schema is missing ${table}`);
+    }
+    const columnsForFts = db.prepare(`PRAGMA table_info(${table})`).all()
+      .map((column) => column.name);
+    if (!columnsForFts.includes('prompt_text') || !columnsForFts.includes('response_text')) {
+      throw new Error(`${table} has an incompatible contract`);
+    }
+    const sql = String(db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?
+    `).get(table)?.sql ?? '').replace(/\s+/g, '').toLowerCase();
+    const fragments = [
+      "content='conversation_rounds'",
+      "content_rowid='id'",
+      table.endsWith('trigram_fts') ? "tokenize='trigram'" : "tokenize='unicode61remove_diacritics2'",
+    ];
+    if (fragments.some((fragment) => !sql.includes(fragment))) {
+      throw new Error(`${table} has an incompatible tokenizer/content contract`);
+    }
+  }
+
+  const triggerNames = [
+    'conversation_rounds_fts_ai',
+    'conversation_rounds_trigram_fts_ai',
+    'conversation_rounds_fts_au',
+    'conversation_rounds_trigram_fts_au',
+    'conversation_rounds_no_update',
+    'conversation_rounds_terminal_update',
+    'conversation_rounds_no_delete',
+  ];
+  const triggers = new Map(db.prepare(`
+    SELECT name, sql FROM sqlite_master
+    WHERE type = 'trigger' AND name IN (${triggerNames.map(() => '?').join(', ')})
+  `).all(...triggerNames).map((trigger) => [
+    trigger.name,
+    String(trigger.sql ?? '').replace(/\s+/g, '').toLowerCase(),
+  ]));
+  for (const name of triggerNames) {
+    if (!triggers.has(name)) throw new Error(`conversation_rounds trigger ${name} is missing`);
+  }
+  for (const [name, fragments] of Object.entries({
+    conversation_rounds_fts_ai: ['afterinsertonconversation_rounds', 'insertintoconversation_rounds_fts'],
+    conversation_rounds_trigram_fts_ai: ['afterinsertonconversation_rounds', 'insertintoconversation_rounds_trigram_fts'],
+    conversation_rounds_fts_au: ['afterupdateonconversation_rounds', "'delete'", 'insertintoconversation_rounds_fts'],
+    conversation_rounds_trigram_fts_au: ['afterupdateonconversation_rounds', "'delete'", 'insertintoconversation_rounds_trigram_fts'],
+    conversation_rounds_no_update: [
+      'beforeupdateonconversation_rounds',
+      'new.idisold.id',
+      'promptandattributionareimmutable',
+    ],
+    conversation_rounds_terminal_update: [
+      'beforeupdateonconversation_rounds',
+      "old.response_state='complete'",
+      'new.completed_at_ms<=old.completed_at_ms',
+      "old.response_statein('failed','unavailable')",
+      'responseisalreadyterminal',
+    ],
+    conversation_rounds_no_delete: ['beforedeleteonconversation_rounds', 'conversationroundsarepermanent'],
+  })) {
+    if (fragments.some((fragment) => !triggers.get(name).includes(fragment))) {
+      throw new Error(`conversation_rounds trigger ${name} has incompatible semantics`);
+    }
+  }
+}
+
+function assertConversationHookAuxSchema(db) {
+  const requiredTables = [
+    'conversation_hook_inbox',
+    'conversation_hook_receipts',
+    'conversation_round_session_summaries',
+  ];
+  for (const table of requiredTables) {
+    if (!sqliteObjectExists(db, 'table', table)) {
+      throw new Error(`metrics schema is missing ${table}`);
+    }
+  }
+  const inboxSql = String(db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversation_hook_inbox'
+  `).get()?.sql ?? '').replace(/\s+/g, ' ').toLowerCase();
+  for (const fragment of [
+    'prompt_key text not null',
+    "check (event_slot in ('prompt', 'terminal'))",
+    "check (kind in ('prompt', 'stop', 'failure', 'session_end'))",
+    "check (source = 'claude_hook')",
+    'unique (prompt_key, event_slot)',
+    'duplicate_count integer not null default 0 check (duplicate_count >= 0)',
+  ]) {
+    if (!inboxSql.includes(fragment)) {
+      throw new Error(`conversation_hook_inbox is missing canonical constraint: ${fragment}`);
+    }
+  }
+  const receiptSql = String(db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversation_hook_receipts'
+  `).get()?.sql ?? '').replace(/\s+/g, ' ').toLowerCase();
+  for (const fragment of [
+    'primary key (prompt_key, event_slot)',
+    "check (event_slot in ('prompt', 'terminal'))",
+    'duplicate_count integer not null default 0 check (duplicate_count >= 0)',
+    'revision_count integer not null default 0 check (revision_count >= 0)',
+    'without rowid',
+  ]) {
+    if (!receiptSql.includes(fragment)) {
+      throw new Error(`conversation_hook_receipts is missing canonical constraint: ${fragment}`);
+    }
+  }
+  const summarySql = String(db.prepare(`
+    SELECT sql FROM sqlite_master
+    WHERE type = 'table' AND name = 'conversation_round_session_summaries'
+  `).get()?.sql ?? '').replace(/\s+/g, ' ').toLowerCase();
+  for (const fragment of [
+    'conversation_session_id integer primary key',
+    'first_round_id integer not null',
+    'latest_round_id integer not null',
+    'last_activity_at_ms integer not null',
+    'turn_count = pending_count + complete_count + failed_count + unavailable_count',
+  ]) {
+    if (!summarySql.includes(fragment)) {
+      throw new Error(`conversation_round_session_summaries is missing canonical constraint: ${fragment}`);
+    }
+  }
+  const summaryForeignKeys = db.prepare(
+    'PRAGMA foreign_key_list(conversation_round_session_summaries)',
+  ).all();
+  for (const [from, table] of [
+    ['conversation_session_id', 'conversation_sessions'],
+    ['first_round_id', 'conversation_rounds'],
+    ['latest_round_id', 'conversation_rounds'],
+  ]) {
+    if (!summaryForeignKeys.some((entry) => entry.from === from
+      && entry.table === table && entry.on_delete === 'RESTRICT')) {
+      throw new Error(`conversation_round_session_summaries is missing ${from} foreign key`);
+    }
+  }
+  for (const sql of CREATE_CONVERSATION_HOOK_AUX_INDEXES) {
+    const name = /INDEX IF NOT EXISTS ([A-Za-z0-9_]+)/.exec(sql)?.[1];
+    if (!name || !sqliteObjectExists(db, 'index', name)) {
+      throw new Error(`metrics schema is missing conversation hook index ${name ?? 'unknown'}`);
+    }
+  }
+}
+
+function assertV5Schema(db) {
+  assertV4Schema(db);
+  assertConversationRoundSchema(db);
+  assertConversationHookAuxSchema(db);
+}
+
 function migrateRequestMetricsToV2(db) {
   if (!requestMetricsTableExists(db)) {
     throw new Error('existing metrics database has no request_metrics table');
@@ -1263,6 +1776,153 @@ function migrateRequestMetricsToV4(db) {
   assertV4Schema(db);
 }
 
+function conversationRoundObjectExists(db, type, name) {
+  return sqliteObjectExists(db, type, name);
+}
+
+const CONVERSATION_HOOK_AUX_TABLES = Object.freeze([
+  'conversation_hook_inbox',
+  'conversation_hook_receipts',
+  'conversation_round_session_summaries',
+]);
+
+function rebuildConversationRoundSessionSummaries(db, conversationSessionId = null) {
+  if (conversationSessionId === null) {
+    db.exec('DELETE FROM conversation_round_session_summaries');
+  } else {
+    db.prepare(`
+      DELETE FROM conversation_round_session_summaries
+      WHERE conversation_session_id = ?
+    `).run(conversationSessionId);
+  }
+  const where = conversationSessionId === null
+    ? 'WHERE r.conversation_session_id IS NOT NULL'
+    : 'WHERE r.conversation_session_id = ?';
+  const params = conversationSessionId === null ? [] : [conversationSessionId];
+  db.prepare(`
+    INSERT INTO conversation_round_session_summaries (
+      conversation_session_id,
+      turn_count,
+      pending_count,
+      complete_count,
+      failed_count,
+      unavailable_count,
+      first_round_id,
+      latest_round_id,
+      first_prompt_at_ms,
+      last_activity_at_ms,
+      device_id,
+      machine_id,
+      member_label,
+      account_id,
+      account_alias,
+      model
+    )
+    WITH ranked AS (
+      SELECT
+        r.*,
+        COALESCE(r.completed_at_ms, r.prompt_at_ms) AS activity_at_ms,
+        ROW_NUMBER() OVER (
+          PARTITION BY r.conversation_session_id
+          ORDER BY r.prompt_at_ms ASC, r.id ASC
+        ) AS first_rank,
+        ROW_NUMBER() OVER (
+          PARTITION BY r.conversation_session_id
+          ORDER BY COALESCE(r.completed_at_ms, r.prompt_at_ms) DESC, r.id DESC
+        ) AS latest_rank
+      FROM conversation_rounds r
+      ${where}
+    )
+    SELECT
+      conversation_session_id,
+      COUNT(*),
+      SUM(CASE WHEN response_state = 'pending' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN response_state = 'complete' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN response_state = 'failed' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN response_state = 'unavailable' THEN 1 ELSE 0 END),
+      MAX(CASE WHEN first_rank = 1 THEN id END),
+      MAX(CASE WHEN latest_rank = 1 THEN id END),
+      MIN(prompt_at_ms),
+      MAX(activity_at_ms),
+      MAX(CASE WHEN latest_rank = 1 THEN device_id END),
+      MAX(CASE WHEN latest_rank = 1 THEN machine_id END),
+      MAX(CASE WHEN latest_rank = 1 THEN member_label END),
+      MAX(CASE WHEN latest_rank = 1 THEN account_id END),
+      MAX(CASE WHEN latest_rank = 1 THEN account_alias END),
+      MAX(CASE WHEN latest_rank = 1 THEN model END)
+    FROM ranked
+    GROUP BY conversation_session_id
+  `).run(...params);
+}
+
+function createConversationHookAuxSchema(db) {
+  db.exec(CREATE_CONVERSATION_HOOK_INBOX);
+  db.exec(CREATE_CONVERSATION_HOOK_RECEIPTS);
+  db.exec(CREATE_CONVERSATION_ROUND_SESSION_SUMMARIES);
+  for (const sql of CREATE_CONVERSATION_HOOK_AUX_INDEXES) db.exec(sql);
+  rebuildConversationRoundSessionSummaries(db);
+}
+
+function ensureConversationHookAuxSchema(db) {
+  const present = CONVERSATION_HOOK_AUX_TABLES.filter((name) => (
+    sqliteObjectExists(db, 'table', name)
+  ));
+  if (present.length === 0) {
+    for (const name of [
+      'conversation_rounds_no_update',
+      'conversation_rounds_terminal_update',
+    ]) db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    for (const sql of CREATE_CONVERSATION_ROUND_TRIGGERS.filter((entry) => (
+      entry.includes('conversation_rounds_no_update')
+        || entry.includes('conversation_rounds_terminal_update')
+    ))) db.exec(sql);
+    createConversationHookAuxSchema(db);
+    return;
+  }
+  if (present.length !== CONVERSATION_HOOK_AUX_TABLES.length) {
+    throw new Error(`metrics schema v5 has partial conversation hook objects: ${present.join(', ')}`);
+  }
+  for (const sql of CREATE_CONVERSATION_HOOK_AUX_INDEXES) db.exec(sql);
+  assertConversationHookAuxSchema(db);
+}
+
+function migrateRequestMetricsToV5(db) {
+  if (!requestMetricsTableExists(db)) {
+    throw new Error('existing metrics database has no request_metrics table');
+  }
+  assertV4Schema(db);
+  const partialNames = [
+    'conversation_rounds',
+    'conversation_rounds_fts',
+    'conversation_rounds_trigram_fts',
+    'conversation_rounds_session_idx',
+    'conversation_rounds_activity_idx',
+    'conversation_rounds_device_activity_idx',
+    'conversation_rounds_member_activity_idx',
+    'conversation_rounds_account_activity_idx',
+    'conversation_rounds_prompt_key_idx',
+    'conversation_rounds_fts_ai',
+    'conversation_rounds_trigram_fts_ai',
+    'conversation_rounds_fts_au',
+    'conversation_rounds_trigram_fts_au',
+    'conversation_rounds_no_update',
+    'conversation_rounds_terminal_update',
+    'conversation_rounds_no_delete',
+  ].filter((name) => conversationRoundObjectExists(db, 'table', name)
+    || conversationRoundObjectExists(db, 'index', name)
+    || conversationRoundObjectExists(db, 'trigger', name));
+  if (partialNames.length) {
+    throw new Error(`metrics schema v4 contains untrusted partial v5 objects: ${partialNames.join(', ')}`);
+  }
+  db.exec(CREATE_CONVERSATION_ROUNDS);
+  db.exec(CREATE_CONVERSATION_ROUNDS_FTS);
+  db.exec(CREATE_CONVERSATION_ROUNDS_TRIGRAM_FTS);
+  for (const sql of CREATE_CONVERSATION_ROUND_INDEXES) db.exec(sql);
+  for (const sql of CREATE_CONVERSATION_ROUND_TRIGGERS) db.exec(sql);
+  createConversationHookAuxSchema(db);
+  assertV5Schema(db);
+}
+
 function ensureConversationTrigramSearch(db) {
   const table = sqliteObjectExists(db, 'table', 'conversation_turns_trigram_fts');
   const trigger = sqliteObjectExists(db, 'trigger', 'conversation_turns_trigram_fts_ai');
@@ -1358,16 +2018,20 @@ function normalizeConversationSearch({
   };
 }
 
-function conversationSearchPlan(filters) {
+function conversationSearchPlan(filters, {
+  ftsTable = null,
+  trigramTable = null,
+  tableAlias = 't',
+} = {}) {
   const useTrigram = Boolean(filters.trigramQuery);
   const useFts = Boolean(filters.ftsQuery) && !filters.containsHan && !useTrigram;
   const useSubstring = filters.substringTerms.length > 0;
   const searchTable = useTrigram
-    ? 'conversation_turns_trigram_fts'
-    : 'conversation_turns_fts';
+    ? (trigramTable ?? 'conversation_turns_trigram_fts')
+    : (ftsTable ?? 'conversation_turns_fts');
   const substringPredicate = useSubstring
     ? filters.substringTerms
-      .map(() => '(instr(t.prompt_text, ?) > 0 OR instr(t.response_text, ?) > 0)')
+      .map(() => `(instr(${tableAlias}.prompt_text, ?) > 0 OR instr(${tableAlias}.response_text, ?) > 0)`)
       .join(' AND ')
     : null;
   return {
@@ -1515,6 +2179,262 @@ function clipConversationText(value, maxBytes) {
   return '';
 }
 
+function boundedRoundText(value, maxBytes, name) {
+  if (value === null || value === undefined) {
+    return { text: null, bytes: 0, truncated: false };
+  }
+  if (typeof value !== 'string') throw new TypeError(`${name} must be a string or null`);
+  if (value.includes('\u0000') || hasUnpairedSurrogate(value)) {
+    throw new TypeError(`${name} contains invalid text`);
+  }
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.byteLength <= maxBytes) {
+    return { text: value, bytes: bytes.byteLength, truncated: false };
+  }
+  const clipped = clipConversationText(value, maxBytes);
+  return {
+    text: clipped,
+    bytes: Buffer.byteLength(clipped, 'utf8'),
+    truncated: true,
+  };
+}
+
+const ROUND_UNKNOWN_DEVICE = 'unavailable-device';
+const ROUND_UNKNOWN_MEMBER = 'unavailable-member';
+const ROUND_UNKNOWN_ACCOUNT = 'unavailable-account';
+
+function roundAttribution(input = {}) {
+  const source = input && typeof input === 'object' && !Array.isArray(input)
+    ? input
+    : {};
+  const nested = source.attribution && typeof source.attribution === 'object'
+    && !Array.isArray(source.attribution)
+    ? source.attribution
+    : {};
+  const value = (camel, snake, fallback = null) => (
+    source[camel] ?? source[snake] ?? nested[camel] ?? nested[snake] ?? fallback
+  );
+  return {
+    deviceId: boundedString(value('deviceId', 'device_id', ROUND_UNKNOWN_DEVICE), 'deviceId', MAX_IDENTIFIER, { nullable: false }),
+    machineId: boundedString(value('machineId', 'machine_id'), 'machineId', MAX_MACHINE_ID, { emptyAsNull: true }),
+    memberLabel: boundedString(value('memberLabel', 'member_label', ROUND_UNKNOWN_MEMBER), 'memberLabel', MAX_MEMBER_LABEL, { nullable: false }),
+    accountId: boundedString(value('accountId', 'account_id', ROUND_UNKNOWN_ACCOUNT), 'accountId', MAX_IDENTIFIER, { nullable: false }),
+    accountAlias: boundedString(value('accountAlias', 'account_alias', ROUND_UNKNOWN_ACCOUNT), 'accountAlias', MAX_IDENTIFIER, { nullable: false }),
+    model: boundedString(value('model'), 'model', MAX_MODEL, { emptyAsNull: true }),
+  };
+}
+
+function normalizeConversationRoundHookEvent(event) {
+  if (!event || typeof event !== 'object' || Array.isArray(event)) {
+    throw new TypeError('conversation round hook event must be an object');
+  }
+  const rawKind = String(event.kind ?? '');
+  if (!rawKind) {
+    throw new TypeError('conversation round hook event kind is invalid');
+  }
+  const kind = CONVERSATION_ROUND_HOOK_KIND_MAP[rawKind] ?? rawKind;
+  if (!CONVERSATION_ROUND_HOOK_KINDS.includes(kind)) return null;
+  if (event.source !== undefined && event.source !== CONVERSATION_ROUND_SOURCE) {
+    throw new TypeError('conversation round hook event source is invalid');
+  }
+  const occurredAtMs = finiteInteger(event.occurredAtMs ?? event.occurred_at_ms, 'occurredAtMs');
+  const threadKey = normalizeThreadKey(event.threadKey ?? event.thread_key);
+  const promptKey = normalizeThreadKey(event.promptKey ?? event.prompt_key);
+  if (threadKey === null || promptKey === null) {
+    throw new TypeError('reliable conversation hook events require threadKey and promptKey');
+  }
+  const rawText = event.text
+    ?? (kind === 'prompt' ? event.promptText ?? event.prompt_text : event.responseText ?? event.response_text)
+    ?? null;
+  const text = boundedRoundText(
+    rawText,
+    kind === 'prompt' ? MAX_CONVERSATION_ROUND_PROMPT_BYTES : MAX_CONVERSATION_ROUND_RESPONSE_BYTES,
+    kind === 'prompt' ? 'prompt text' : 'response text',
+  );
+  if (kind === 'prompt' && (text.text === null || text.text.length === 0)) {
+    throw new TypeError('reliable conversation prompt text must be non-empty');
+  }
+  if (event.truncated !== undefined && typeof event.truncated !== 'boolean') {
+    throw new TypeError('conversation round hook event truncated must be boolean');
+  }
+  let failureCode = null;
+  if (kind === 'failure') {
+    failureCode = event.failureCode ?? event.failure_code ?? 'unknown';
+    if (!CONVERSATION_ROUND_FAILURE_CODES.includes(failureCode)) {
+      throw new TypeError('conversation round failure code is invalid');
+    }
+  }
+  const attribution = roundAttribution(event);
+  return {
+    retryCount: 0,
+    kind,
+    source: CONVERSATION_ROUND_SOURCE,
+    threadKey,
+    promptKey,
+    occurredAtMs,
+    text: text.text,
+    textBytes: text.bytes,
+    truncated: Boolean(event.truncated) || text.truncated,
+    failureCode,
+    ...attribution,
+    queueBytes: text.bytes + CONVERSATION_QUEUE_OVERHEAD_BYTES,
+  };
+}
+
+function normalizeConversationRoundFilters(options = {}) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError('conversation round filters must be an object');
+  }
+  const requestedState = options.responseState ?? options.state ?? null;
+  const state = requestedState === '' ? null : requestedState;
+  if (state !== null && state !== undefined && !CONVERSATION_ROUND_RESPONSE_STATES.includes(state)) {
+    throw new TypeError('conversation round response state is invalid');
+  }
+  const normalized = normalizeConversationSearch({
+    ...options,
+    responseState: null,
+  });
+  const beforeActivityMs = normalizeOptionalTime(
+    options.beforeActivityMs ?? options.before_activity_ms,
+    'beforeActivityMs',
+  );
+  if ((normalized.beforeId === null) !== (beforeActivityMs === null)) {
+    throw new TypeError('conversation round cursor requires beforeId and beforeActivityMs together');
+  }
+  return {
+    ...normalized,
+    responseState: state ?? null,
+    beforeActivityMs,
+  };
+}
+
+function conversationRoundSearchPlan(filters) {
+  return conversationSearchPlan(filters, {
+    ftsTable: 'conversation_rounds_fts',
+    trigramTable: 'conversation_rounds_trigram_fts',
+    tableAlias: 'r',
+  });
+}
+
+function conversationRoundFilterSql(plan, { includeBefore = false } = {}) {
+  return `
+    WHERE (${plan.textPredicate})
+      AND (? IS NULL OR r.prompt_at_ms >= ?)
+      AND (? IS NULL OR r.prompt_at_ms < ?)
+      AND (? IS NULL OR r.device_id = ?)
+      AND (? IS NULL OR r.machine_id = ?)
+      AND (? = 0 OR r.machine_id IS NULL)
+      AND (? IS NULL OR r.member_label = ?)
+      AND (? IS NULL OR r.account_id = ?)
+      AND (? IS NULL OR r.model = ?)
+      AND (? IS NULL OR r.response_state = ?)
+      ${includeBefore ? `AND (
+        ? IS NULL
+        OR COALESCE(r.completed_at_ms, r.prompt_at_ms) < ?
+        OR (
+          COALESCE(r.completed_at_ms, r.prompt_at_ms) = ?
+          AND r.id < ?
+        )
+      )` : ''}
+  `;
+}
+
+function conversationRoundFilterParams(filters, plan, {
+  includeBefore = false,
+  activityBeforeMs = null,
+} = {}) {
+  return [
+    ...plan.textParams,
+    filters.fromMs, filters.fromMs,
+    filters.toMs, filters.toMs,
+    filters.deviceId, filters.deviceId,
+    filters.machineId, filters.machineId,
+    filters.unattributedMachine,
+    filters.memberLabel, filters.memberLabel,
+    filters.accountId, filters.accountId,
+    filters.model, filters.model,
+    filters.responseState, filters.responseState,
+    ...(includeBefore
+      ? [activityBeforeMs, activityBeforeMs, activityBeforeMs, filters.beforeId]
+      : []),
+  ];
+}
+
+function normalizeConversationRoundAggregate(row) {
+  return normalizeConversationRoundRecord(row, { snippet: true });
+}
+
+function normalizeConversationRoundRecord(row, { snippet = false } = {}) {
+  const promptLimit = snippet
+    ? MAX_CONVERSATION_ROUND_SEARCH_SNIPPET_BYTES
+    : MAX_CONVERSATION_ROUND_PROMPT_BYTES;
+  const responseLimit = snippet
+    ? MAX_CONVERSATION_ROUND_SEARCH_SNIPPET_BYTES
+    : MAX_CONVERSATION_ROUND_RESPONSE_BYTES;
+  return {
+    id: Number(row.id),
+    conversationSessionId: row.conversation_session_id === null
+      ? null : Number(row.conversation_session_id),
+    turnIndex: row.turn_index === null ? null : Number(row.turn_index),
+    promptText: row.prompt_text === null ? null : clipConversationText(row.prompt_text, promptLimit),
+    promptBytes: Number(row.prompt_bytes),
+    promptTruncated: Boolean(row.prompt_truncated),
+    responseText: clipConversationText(row.response_text, responseLimit),
+    responseBytes: Number(row.response_bytes),
+    responseTruncated: Boolean(row.response_truncated),
+    responseState: row.response_state,
+    failureCode: row.failure_code ?? null,
+    source: row.source,
+    promptAtMs: Number(row.prompt_at_ms),
+    completedAtMs: row.completed_at_ms === null ? null : Number(row.completed_at_ms),
+    lastActivityAtMs: Number(row.completed_at_ms ?? row.prompt_at_ms),
+    deviceId: row.device_id,
+    machineId: row.machine_id ?? null,
+    memberLabel: row.member_label,
+    accountId: row.account_id,
+    accountAlias: row.account_alias,
+    model: row.model ?? null,
+  };
+}
+
+function normalizeConversationRoundSessionSummary(row) {
+  return {
+    id: Number(row.id ?? row.conversation_session_id),
+    turnCount: Number(row.turn_count),
+    firstPromptAtMs: Number(row.first_prompt_at_ms),
+    lastActivityAtMs: Number(row.last_activity_at_ms),
+    pendingCount: Number(row.pending_count),
+    completeCount: Number(row.complete_count),
+    failedCount: Number(row.failed_count),
+    unavailableCount: Number(row.unavailable_count),
+    stateCounts: {
+      pending: Number(row.pending_count),
+      complete: Number(row.complete_count),
+      failed: Number(row.failed_count),
+      unavailable: Number(row.unavailable_count),
+    },
+    firstPromptText: clipConversationText(
+      row.first_prompt_text,
+      MAX_CONVERSATION_ROUND_SEARCH_SNIPPET_BYTES,
+    ),
+    latestPromptText: clipConversationText(
+      row.latest_prompt_text,
+      MAX_CONVERSATION_ROUND_SEARCH_SNIPPET_BYTES,
+    ),
+    latestResponseText: clipConversationText(
+      row.latest_response_text,
+      MAX_CONVERSATION_ROUND_SEARCH_SNIPPET_BYTES,
+    ),
+    latestResponseState: row.latest_response_state,
+    deviceId: row.device_id,
+    machineId: row.machine_id ?? null,
+    memberLabel: row.member_label,
+    accountId: row.account_id,
+    accountAlias: row.account_alias,
+    model: row.model ?? null,
+  };
+}
+
 export class MetricsStore {
   constructor({
     home,
@@ -1562,6 +2482,12 @@ export class MetricsStore {
       dropped: 0,
       failed: 0,
       conversation: {
+        enqueued: 0,
+        written: 0,
+        dropped: 0,
+        failed: 0,
+      },
+      conversationRounds: {
         enqueued: 0,
         written: 0,
         dropped: 0,
@@ -1711,7 +2637,13 @@ export class MetricsStore {
           this.db.exec(CREATE_CONVERSATION_TRIGRAM_FTS);
           for (const sql of CREATE_CONVERSATION_INDEXES) this.db.exec(sql);
           for (const sql of CREATE_CONVERSATION_TRIGGERS) this.db.exec(sql);
-          assertV4Schema(this.db);
+          this.db.exec(CREATE_CONVERSATION_ROUNDS);
+          this.db.exec(CREATE_CONVERSATION_ROUNDS_FTS);
+          this.db.exec(CREATE_CONVERSATION_ROUNDS_TRIGRAM_FTS);
+          for (const sql of CREATE_CONVERSATION_ROUND_INDEXES) this.db.exec(sql);
+          for (const sql of CREATE_CONVERSATION_ROUND_TRIGGERS) this.db.exec(sql);
+          createConversationHookAuxSchema(this.db);
+          assertV5Schema(this.db);
           schemaVersion = METRICS_SCHEMA_VERSION;
         } else if (schemaVersion === 1) {
           migrateRequestMetricsToV2(this.db);
@@ -1724,9 +2656,14 @@ export class MetricsStore {
         if (schemaVersion === 3) {
           migrateRequestMetricsToV4(this.db);
           schemaVersion = 4;
+        }
+        if (schemaVersion === 4) {
+          migrateRequestMetricsToV5(this.db);
+          schemaVersion = 5;
         } else if (schemaVersion === METRICS_SCHEMA_VERSION) {
           ensureConversationTrigramSearch(this.db);
-          assertV4Schema(this.db);
+          ensureConversationHookAuxSchema(this.db);
+          assertV5Schema(this.db);
         } else if (schemaVersion !== null) {
           throw new Error(
             `metrics schema_version ${schemaVersion} cannot be migrated to ${METRICS_SCHEMA_VERSION}`,
@@ -1734,6 +2671,8 @@ export class MetricsStore {
         }
         for (const sql of CREATE_INDEXES) this.db.exec(sql);
         for (const sql of CREATE_CONVERSATION_INDEXES) this.db.exec(sql);
+        for (const sql of CREATE_CONVERSATION_ROUND_INDEXES) this.db.exec(sql);
+        for (const sql of CREATE_CONVERSATION_HOOK_AUX_INDEXES) this.db.exec(sql);
         if (schemaMeta && schemaMeta.schema_version !== METRICS_SCHEMA_VERSION) {
           this.db.prepare(`
             UPDATE schema_meta
@@ -1888,6 +2827,16 @@ export class MetricsStore {
     }
   }
 
+  #persistentLegacyConversationFragmentCount() {
+    try {
+      return Number(this.db.prepare(`
+        SELECT COUNT(*) AS count FROM conversation_turns
+      `).get().count);
+    } catch {
+      return null;
+    }
+  }
+
   #ensureConversationSession(threadKey, startedAtMs) {
     if (threadKey === null) return null;
     this.db.prepare(`
@@ -1979,6 +2928,414 @@ export class MetricsStore {
       this.#insertMetric(droppedMetrics);
       this.#safeLog('conversation_write_failed', { code: error.code ?? 'unknown' });
       return 'dropped';
+    }
+  }
+
+  #nextConversationRoundTurnIndex(sessionId) {
+    const row = this.db.prepare(`
+      SELECT COALESCE(MAX(turn_index), 0) + 1 AS turn_index
+      FROM conversation_rounds
+      WHERE conversation_session_id = ?
+    `).get(sessionId);
+    return Number(row.turn_index);
+  }
+
+  #conversationHookReceipt(promptKey, eventSlot) {
+    return this.db.prepare(`
+      SELECT prompt_key, event_slot, kind, thread_key, device_id,
+             applied_at_ms, duplicate_count, revision_count
+      FROM conversation_hook_receipts
+      WHERE prompt_key = ? AND event_slot = ?
+    `).get(promptKey, eventSlot) ?? null;
+  }
+
+  #recordConversationHookReceipt(event, eventSlot, { duplicate = false, revision = false } = {}) {
+    this.db.prepare(`
+      INSERT INTO conversation_hook_receipts (
+        prompt_key, event_slot, kind, thread_key, device_id, applied_at_ms,
+        duplicate_count, revision_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(prompt_key, event_slot) DO UPDATE SET
+        kind = CASE WHEN ? THEN excluded.kind ELSE kind END,
+        applied_at_ms = CASE WHEN ? THEN excluded.applied_at_ms ELSE applied_at_ms END,
+        duplicate_count = duplicate_count + ?,
+        revision_count = revision_count + ?
+    `).run(
+      event.promptKey,
+      eventSlot,
+      event.kind,
+      event.threadKey,
+      event.deviceId,
+      event.occurredAtMs,
+      duplicate ? 1 : 0,
+      revision ? 1 : 0,
+      revision ? 1 : 0,
+      revision ? 1 : 0,
+      duplicate ? 1 : 0,
+      revision ? 1 : 0,
+    );
+  }
+
+  #conversationHookInboxHasCapacity(event) {
+    const totals = this.db.prepare(`
+      SELECT COUNT(*) AS item_count,
+             COALESCE(SUM(text_bytes + ?), 0) AS retained_bytes
+      FROM conversation_hook_inbox
+    `).get(CONVERSATION_QUEUE_OVERHEAD_BYTES);
+    return Number(totals.item_count) < MAX_CONVERSATION_HOOK_INBOX_ITEMS
+      && Number(totals.retained_bytes) + event.queueBytes <= MAX_CONVERSATION_HOOK_INBOX_BYTES;
+  }
+
+  #persistConversationHookInbox(event) {
+    const eventSlot = event.kind === 'prompt' ? 'prompt' : 'terminal';
+    const keyedRound = this.db.prepare(`
+      SELECT r.device_id, s.thread_key
+      FROM conversation_rounds r
+      JOIN conversation_sessions s ON s.id = r.conversation_session_id
+      WHERE r.prompt_key = ?
+    `).get(event.promptKey);
+    if (keyedRound
+      && (keyedRound.thread_key !== event.threadKey || keyedRound.device_id !== event.deviceId)) {
+      throw new Error('conversation hook round correlation mismatch');
+    }
+    const receipt = this.#conversationHookReceipt(event.promptKey, eventSlot);
+    if (receipt && (receipt.thread_key !== event.threadKey || receipt.device_id !== event.deviceId)) {
+      throw new Error('conversation hook receipt correlation mismatch');
+    }
+    if (eventSlot === 'prompt' && receipt) {
+      this.#recordConversationHookReceipt(event, eventSlot, { duplicate: true });
+      return { status: 'duplicate', eventSlot };
+    }
+    if (eventSlot === 'terminal' && receipt && receipt.kind !== 'stop') {
+      this.#recordConversationHookReceipt(event, eventSlot, { duplicate: true });
+      return { status: 'duplicate', eventSlot };
+    }
+
+    const existing = this.db.prepare(`
+      SELECT * FROM conversation_hook_inbox
+      WHERE prompt_key = ? AND event_slot = ?
+    `).get(event.promptKey, eventSlot);
+    if (existing) {
+      if (existing.thread_key !== event.threadKey || existing.device_id !== event.deviceId) {
+        throw new Error('conversation hook inbox correlation mismatch');
+      }
+      const same = existing.kind === event.kind
+        && existing.text === event.text
+        && Boolean(existing.truncated) === event.truncated
+        && (existing.failure_code ?? null) === event.failureCode;
+      if (same || existing.kind !== 'stop' || event.kind !== 'stop'
+        || event.occurredAtMs <= Number(existing.occurred_at_ms)) {
+        this.db.prepare(`
+          UPDATE conversation_hook_inbox
+          SET duplicate_count = duplicate_count + 1
+          WHERE id = ?
+        `).run(existing.id);
+        return { status: 'duplicate', eventSlot };
+      }
+      this.db.prepare(`
+        UPDATE conversation_hook_inbox
+        SET occurred_at_ms = ?, text = ?, text_bytes = ?, truncated = ?,
+            duplicate_count = duplicate_count + 1
+        WHERE id = ?
+      `).run(
+        event.occurredAtMs,
+        event.text,
+        event.textBytes,
+        event.truncated ? 1 : 0,
+        existing.id,
+      );
+      return { status: 'revision', eventSlot };
+    }
+    if (eventSlot === 'terminal' && !this.#conversationHookInboxHasCapacity(event)) {
+      return { status: 'full', eventSlot };
+    }
+    this.db.prepare(`
+      INSERT INTO conversation_hook_inbox (
+        prompt_key, event_slot, kind, thread_key, occurred_at_ms,
+        text, text_bytes, truncated, failure_code, source,
+        device_id, machine_id, member_label, account_id, account_alias, model
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      event.promptKey,
+      eventSlot,
+      event.kind,
+      event.threadKey,
+      event.occurredAtMs,
+      event.text,
+      event.textBytes,
+      event.truncated ? 1 : 0,
+      event.failureCode,
+      CONVERSATION_ROUND_SOURCE,
+      event.deviceId,
+      event.machineId,
+      event.memberLabel,
+      event.accountId,
+      event.accountAlias,
+      event.model,
+    );
+    return { status: 'stored', eventSlot };
+  }
+
+  #foldConversationHookTerminal(promptKey) {
+    const terminal = this.db.prepare(`
+      SELECT * FROM conversation_hook_inbox
+      WHERE prompt_key = ? AND event_slot = 'terminal'
+    `).get(promptKey);
+    if (!terminal) return 'none';
+    const round = this.db.prepare(`
+      SELECT r.*, s.thread_key
+      FROM conversation_rounds r
+      JOIN conversation_sessions s ON s.id = r.conversation_session_id
+      WHERE r.prompt_key = ? AND s.thread_key = ? AND r.device_id = ?
+    `).get(promptKey, terminal.thread_key, terminal.device_id);
+    if (!round) return 'orphan';
+
+    let result = 'duplicate';
+    if (round.response_state === 'pending') {
+      const state = terminal.kind === 'stop'
+        ? 'complete'
+        : terminal.kind === 'failure'
+          ? 'failed'
+          : 'unavailable';
+      const failureCode = terminal.kind === 'failure'
+        ? terminal.failure_code ?? 'unknown'
+        : terminal.kind === 'session_end'
+          ? 'session_end'
+          : null;
+      this.db.prepare(`
+        UPDATE conversation_rounds
+        SET response_text = ?, response_bytes = ?, response_truncated = ?,
+            response_state = ?, failure_code = ?, completed_at_ms = ?
+        WHERE id = ? AND response_state = 'pending'
+      `).run(
+        terminal.text ?? '',
+        terminal.text_bytes,
+        terminal.truncated,
+        state,
+        failureCode,
+        terminal.occurred_at_ms,
+        round.id,
+      );
+      result = 'applied';
+      this.#recordConversationHookReceipt({
+        promptKey,
+        kind: terminal.kind,
+        threadKey: terminal.thread_key,
+        deviceId: terminal.device_id,
+        occurredAtMs: terminal.occurred_at_ms,
+      }, 'terminal');
+    } else if (round.response_state === 'complete' && terminal.kind === 'stop') {
+      const same = round.response_text === (terminal.text ?? '')
+        && Boolean(round.response_truncated) === Boolean(terminal.truncated);
+      if (!same && Number(terminal.occurred_at_ms) > Number(round.completed_at_ms)) {
+        this.db.prepare(`
+          UPDATE conversation_rounds
+          SET response_text = ?, response_bytes = ?, response_truncated = ?,
+              response_state = 'complete', failure_code = NULL, completed_at_ms = ?
+          WHERE id = ? AND response_state = 'complete'
+        `).run(
+          terminal.text ?? '',
+          terminal.text_bytes,
+          terminal.truncated,
+          terminal.occurred_at_ms,
+          round.id,
+        );
+        result = 'revision';
+        this.#recordConversationHookReceipt({
+          promptKey,
+          kind: 'stop',
+          threadKey: terminal.thread_key,
+          deviceId: terminal.device_id,
+          occurredAtMs: terminal.occurred_at_ms,
+        }, 'terminal', { revision: true });
+      } else {
+        this.#recordConversationHookReceipt({
+          promptKey,
+          kind: 'stop',
+          threadKey: terminal.thread_key,
+          deviceId: terminal.device_id,
+          occurredAtMs: terminal.occurred_at_ms,
+        }, 'terminal', { duplicate: true });
+      }
+    } else {
+      this.#recordConversationHookReceipt({
+        promptKey,
+        kind: terminal.kind,
+        threadKey: terminal.thread_key,
+        deviceId: terminal.device_id,
+        occurredAtMs: terminal.occurred_at_ms,
+      }, 'terminal', { duplicate: true });
+    }
+    if (Number(terminal.duplicate_count) > 0) {
+      this.db.prepare(`
+        UPDATE conversation_hook_receipts
+        SET duplicate_count = duplicate_count + ?
+        WHERE prompt_key = ? AND event_slot = 'terminal'
+      `).run(Number(terminal.duplicate_count), promptKey);
+    }
+    this.db.prepare(`
+      DELETE FROM conversation_hook_inbox
+      WHERE id = ?
+    `).run(terminal.id);
+    rebuildConversationRoundSessionSummaries(this.db, Number(round.conversation_session_id));
+    return result;
+  }
+
+  #foldConversationHookPrompt(promptKey) {
+    const prompt = this.db.prepare(`
+      SELECT * FROM conversation_hook_inbox
+      WHERE prompt_key = ? AND event_slot = 'prompt'
+    `).get(promptKey);
+    if (!prompt) return 'none';
+    const existing = this.db.prepare(`
+      SELECT r.id, r.conversation_session_id, r.device_id, s.thread_key
+      FROM conversation_rounds r
+      JOIN conversation_sessions s ON s.id = r.conversation_session_id
+      WHERE r.prompt_key = ?
+    `).get(promptKey);
+    if (existing) {
+      if (existing.thread_key !== prompt.thread_key || existing.device_id !== prompt.device_id) {
+        throw new Error('conversation round prompt correlation mismatch');
+      }
+      this.#recordConversationHookReceipt({
+        promptKey,
+        kind: 'prompt',
+        threadKey: prompt.thread_key,
+        deviceId: prompt.device_id,
+        occurredAtMs: prompt.occurred_at_ms,
+      }, 'prompt', { duplicate: true });
+      this.db.prepare('DELETE FROM conversation_hook_inbox WHERE id = ?').run(prompt.id);
+      return this.#foldConversationHookTerminal(promptKey);
+    }
+
+    const sessionId = this.#ensureConversationSession(prompt.thread_key, prompt.occurred_at_ms);
+    this.db.prepare(`
+      UPDATE conversation_rounds
+      SET response_state = 'unavailable', failure_code = 'unavailable', completed_at_ms = ?
+      WHERE id = (
+        SELECT id FROM conversation_rounds
+        WHERE conversation_session_id = ? AND response_state = 'pending'
+        ORDER BY turn_index DESC, id DESC LIMIT 1
+      )
+    `).run(prompt.occurred_at_ms, sessionId);
+    const turnIndex = this.#nextConversationRoundTurnIndex(sessionId);
+    this.db.prepare(`
+      INSERT INTO conversation_rounds (
+        conversation_session_id, turn_index, prompt_key,
+        prompt_text, prompt_bytes, prompt_truncated,
+        response_text, response_bytes, response_truncated,
+        response_state, failure_code, source, prompt_at_ms, completed_at_ms,
+        device_id, machine_id, member_label, account_id, account_alias, model
+      ) VALUES (?, ?, ?, ?, ?, ?, '', 0, 0, 'pending', NULL, 'claude_hook', ?, NULL,
+                ?, ?, ?, ?, ?, ?)
+    `).run(
+      sessionId,
+      turnIndex,
+      prompt.prompt_key,
+      prompt.text,
+      prompt.text_bytes,
+      prompt.truncated,
+      prompt.occurred_at_ms,
+      prompt.device_id,
+      prompt.machine_id,
+      prompt.member_label,
+      prompt.account_id,
+      prompt.account_alias,
+      prompt.model,
+    );
+    this.#recordConversationHookReceipt({
+      promptKey,
+      kind: 'prompt',
+      threadKey: prompt.thread_key,
+      deviceId: prompt.device_id,
+      occurredAtMs: prompt.occurred_at_ms,
+    }, 'prompt');
+    this.db.prepare('DELETE FROM conversation_hook_inbox WHERE id = ?').run(prompt.id);
+    rebuildConversationRoundSessionSummaries(this.db, sessionId);
+    const terminalResult = this.#foldConversationHookTerminal(promptKey);
+    return terminalResult === 'none' || terminalResult === 'orphan' ? 'applied' : terminalResult;
+  }
+
+  recordConversationHookEvent(event) {
+    let normalized;
+    try {
+      normalized = normalizeConversationRoundHookEvent(event);
+    } catch (error) {
+      this.stats.conversationRounds.dropped += 1;
+      this.#safeLog('conversation_round_event_rejected', {
+        code: error.code ?? error.name ?? 'invalid_event',
+      });
+      return false;
+    }
+    if (normalized === null) return true;
+    if (!this.initialized || !this.db?.isOpen || this.closed || this.closing) return false;
+    try {
+      this.db.exec('BEGIN IMMEDIATE');
+      const persisted = this.#persistConversationHookInbox(normalized);
+      if (persisted.status === 'full') {
+        this.db.exec('ROLLBACK');
+        this.stats.conversationRounds.dropped += 1;
+        return false;
+      }
+      let folded = persisted.status;
+      if (persisted.status !== 'duplicate') {
+        folded = normalized.kind === 'prompt'
+          ? this.#foldConversationHookPrompt(normalized.promptKey)
+          : this.#foldConversationHookTerminal(normalized.promptKey);
+      }
+      this.db.exec('COMMIT');
+      this.stats.enqueued += 1;
+      this.stats.conversationRounds.enqueued += 1;
+      if (['applied', 'revision'].includes(folded)) {
+        this.stats.written += 1;
+        this.stats.conversationRounds.written += 1;
+      }
+      return true;
+    } catch (error) {
+      this.#rollback();
+      this.stats.failed += 1;
+      this.stats.conversationRounds.failed += 1;
+      this.#safeLog('conversation_round_event_persist_failed', {
+        code: error.code ?? error.name ?? 'unknown',
+      });
+      return false;
+    }
+  }
+
+  enqueueConversationHookEvent(event) {
+    return this.recordConversationHookEvent(event);
+  }
+
+  conversationHookEventStats() {
+    try {
+      this.#assertOpen();
+      const inbox = this.db.prepare(`
+        SELECT COUNT(*) AS orphan_count,
+               COALESCE(SUM(duplicate_count), 0) AS inbox_duplicate_count,
+               COALESCE(SUM(text_bytes), 0) AS orphan_text_bytes
+        FROM conversation_hook_inbox
+      `).get();
+      const receipts = this.db.prepare(`
+        SELECT COUNT(*) AS applied_receipt_count,
+               COALESCE(SUM(duplicate_count), 0) AS duplicate_count,
+               COALESCE(SUM(revision_count), 0) AS revision_count
+        FROM conversation_hook_receipts
+      `).get();
+      return {
+        orphanCount: Number(inbox.orphan_count),
+        orphanTextBytes: Number(inbox.orphan_text_bytes),
+        appliedReceiptCount: Number(receipts.applied_receipt_count),
+        duplicateCount: Number(inbox.inbox_duplicate_count) + Number(receipts.duplicate_count),
+        revisionCount: Number(receipts.revision_count),
+      };
+    } catch {
+      return {
+        orphanCount: null,
+        orphanTextBytes: null,
+        appliedReceiptCount: null,
+        duplicateCount: null,
+        revisionCount: null,
+      };
     }
   }
 
@@ -2424,6 +3781,7 @@ export class MetricsStore {
         return {
           items: [],
           nextBeforeId: null,
+          nextBeforeActivityMs: null,
           totalMatches: 0,
           droppedConversations: this.#persistentConversationDroppedCount(),
           error: null,
@@ -2435,6 +3793,7 @@ export class MetricsStore {
         return {
           items: [],
           nextBeforeId: null,
+          nextBeforeActivityMs: null,
           totalMatches: null,
           droppedConversations: this.#persistentConversationDroppedCount(),
           error: filters.shortHanQuery ? 'search_query_too_short' : 'search_query_requires_indexed_terms',
@@ -2444,6 +3803,7 @@ export class MetricsStore {
         return {
           items: [],
           nextBeforeId: null,
+          nextBeforeActivityMs: null,
           totalMatches: null,
           droppedConversations: this.#persistentConversationDroppedCount(),
           error: 'search_query_requires_indexed_terms',
@@ -2524,6 +3884,7 @@ export class MetricsStore {
       return {
         items: [],
         nextBeforeId: null,
+        nextBeforeActivityMs: null,
         totalMatches: null,
         droppedConversations: this.#persistentConversationDroppedCount(),
         error: 'search_unavailable',
@@ -2856,6 +4217,457 @@ export class MetricsStore {
         session: null,
         standaloneCount: this.#persistentStandaloneConversationCount(),
         error: 'conversation_unavailable',
+      };
+    }
+  }
+
+  searchConversationRounds(options = {}) {
+    try {
+      this.#assertOpen();
+      const filters = normalizeConversationRoundFilters(options);
+      if (filters.emptyLiteralQuery) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          nextBeforeActivityMs: null,
+          totalMatches: 0,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+          error: null,
+        };
+      }
+      const plan = conversationRoundSearchPlan(filters);
+      const workload = plan.useSubstring ? this.db.prepare(`
+        SELECT COUNT(*) AS count,
+          CASE WHEN COUNT(*) = 0 THEN 0 ELSE TOTAL(prompt_bytes + response_bytes) END AS bytes
+        FROM conversation_rounds
+      `).get() : null;
+      if (workload && Number(workload.count) > MAX_SHORT_HAN_SEARCH_ROWS) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          nextBeforeActivityMs: null,
+          totalMatches: null,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+          error: filters.shortHanQuery
+            ? 'search_query_too_short'
+            : 'search_query_requires_indexed_terms',
+        };
+      }
+      if (workload && Number(workload.bytes) > MAX_SHORT_HAN_SEARCH_BYTES) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          nextBeforeActivityMs: null,
+          totalMatches: null,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+          error: 'search_query_requires_indexed_terms',
+        };
+      }
+      const textJoin = plan.useFts || plan.useTrigram
+        ? `JOIN ${plan.searchTable} ON ${plan.searchTable}.rowid = r.id`
+        : '';
+      const countSql = `
+        SELECT COUNT(*) AS total_matches
+        FROM conversation_rounds r
+        ${textJoin}
+        ${conversationRoundFilterSql(plan)}
+      `;
+      const totalMatches = Number(this.db.prepare(countSql).get(
+        ...conversationRoundFilterParams(filters, plan),
+      )?.total_matches ?? 0);
+      const sql = `
+        SELECT
+          r.id,
+          r.conversation_session_id,
+          r.turn_index,
+          r.prompt_key,
+          r.prompt_text,
+          r.prompt_bytes,
+          r.prompt_truncated,
+          r.response_text,
+          r.response_bytes,
+          r.response_truncated,
+          r.response_state,
+          r.failure_code,
+          r.source,
+          r.prompt_at_ms,
+          r.completed_at_ms,
+          r.device_id,
+          r.machine_id,
+          r.member_label,
+          r.account_id,
+          r.account_alias,
+          r.model
+        FROM conversation_rounds r
+        ${textJoin}
+        ${conversationRoundFilterSql(plan, { includeBefore: true })}
+        ORDER BY COALESCE(r.completed_at_ms, r.prompt_at_ms) DESC, r.id DESC
+        LIMIT ?
+      `;
+      const rows = this.db.prepare(sql).all(
+        ...conversationRoundFilterParams(filters, plan, {
+          includeBefore: true,
+          activityBeforeMs: filters.beforeActivityMs,
+        }),
+        filters.limit,
+      );
+      const items = rows.map((row) => normalizeConversationRoundAggregate(row));
+      return {
+        items,
+        nextBeforeId: items.length === filters.limit ? items.at(-1).id : null,
+        nextBeforeActivityMs: items.length === filters.limit
+          ? items.at(-1).lastActivityAtMs : null,
+        totalMatches,
+        legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+        error: null,
+      };
+    } catch (error) {
+      this.#safeLog('conversation_round_search_failed', {
+        code: error.code ?? error.name ?? 'unknown',
+      });
+      return {
+        items: [],
+        nextBeforeId: null,
+        nextBeforeActivityMs: null,
+        totalMatches: null,
+        legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+        error: 'search_unavailable',
+      };
+    }
+  }
+
+  searchConversationRoundSessions(options = {}) {
+    try {
+      this.#assertOpen();
+      const filters = normalizeConversationRoundFilters(options);
+      if (filters.emptyLiteralQuery) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          nextBeforeActivityMs: null,
+          totalMatches: 0,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+          error: null,
+        };
+      }
+      const plan = conversationRoundSearchPlan(filters);
+      const summaryOnly = !plan.hasText
+        && filters.fromMs === null
+        && filters.toMs === null
+        && filters.deviceId === null
+        && filters.machineId === null
+        && filters.unattributedMachine === 0
+        && filters.memberLabel === null
+        && filters.accountId === null
+        && filters.model === null
+        && filters.responseState === null;
+      if (summaryOnly) {
+        const totalMatches = Number(this.db.prepare(`
+          SELECT COUNT(*) AS total_matches
+          FROM conversation_round_session_summaries
+        `).get()?.total_matches ?? 0);
+        const rows = this.db.prepare(`
+          SELECT
+            ss.conversation_session_id AS id,
+            ss.turn_count,
+            ss.pending_count,
+            ss.complete_count,
+            ss.failed_count,
+            ss.unavailable_count,
+            ss.first_prompt_at_ms,
+            ss.last_activity_at_ms,
+            ss.device_id,
+            ss.machine_id,
+            ss.member_label,
+            ss.account_id,
+            ss.account_alias,
+            ss.model,
+            first_round.prompt_text AS first_prompt_text,
+            latest_round.prompt_text AS latest_prompt_text,
+            latest_round.response_text AS latest_response_text,
+            latest_round.response_state AS latest_response_state
+          FROM conversation_round_session_summaries ss
+          JOIN conversation_rounds first_round ON first_round.id = ss.first_round_id
+          JOIN conversation_rounds latest_round ON latest_round.id = ss.latest_round_id
+          WHERE (
+            ? IS NULL
+            OR ss.last_activity_at_ms < ?
+            OR (
+              ss.last_activity_at_ms = ?
+              AND ss.conversation_session_id < ?
+            )
+          )
+          ORDER BY ss.last_activity_at_ms DESC, ss.conversation_session_id DESC
+          LIMIT ?
+        `).all(
+          filters.beforeActivityMs,
+          filters.beforeActivityMs,
+          filters.beforeActivityMs,
+          filters.beforeId,
+          filters.limit,
+        );
+        const items = rows.map(normalizeConversationRoundSessionSummary);
+        return {
+          items,
+          nextBeforeId: items.length === filters.limit ? items.at(-1).id : null,
+          nextBeforeActivityMs: items.length === filters.limit
+            ? items.at(-1).lastActivityAtMs : null,
+          totalMatches,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+          error: null,
+        };
+      }
+      const workload = plan.useSubstring ? this.db.prepare(`
+        SELECT COUNT(*) AS count,
+          CASE WHEN COUNT(*) = 0 THEN 0 ELSE TOTAL(prompt_bytes + response_bytes) END AS bytes
+        FROM conversation_rounds
+      `).get() : null;
+      if (workload && Number(workload.count) > MAX_SHORT_HAN_SEARCH_ROWS) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          nextBeforeActivityMs: null,
+          totalMatches: null,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+          error: filters.shortHanQuery
+            ? 'search_query_too_short'
+            : 'search_query_requires_indexed_terms',
+        };
+      }
+      if (workload && Number(workload.bytes) > MAX_SHORT_HAN_SEARCH_BYTES) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          nextBeforeActivityMs: null,
+          totalMatches: null,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+          error: 'search_query_requires_indexed_terms',
+        };
+      }
+      const textJoin = plan.useFts || plan.useTrigram
+        ? `JOIN ${plan.searchTable} ON ${plan.searchTable}.rowid = r.id`
+        : '';
+      const matchingRoundsSql = `
+        SELECT DISTINCT r.id AS round_id, r.conversation_session_id
+        FROM conversation_rounds r
+        ${textJoin}
+        ${conversationRoundFilterSql(plan)}
+          AND r.conversation_session_id IS NOT NULL
+      `;
+      const matchParams = conversationRoundFilterParams(filters, plan);
+      const totalMatches = Number(this.db.prepare(`
+        WITH matching_rounds AS (${matchingRoundsSql})
+        SELECT COUNT(DISTINCT conversation_session_id) AS total_matches
+        FROM matching_rounds
+      `).get(...matchParams)?.total_matches ?? 0);
+      const sql = `
+        WITH matching_rounds AS (${matchingRoundsSql}),
+        matched_sessions AS (
+          SELECT DISTINCT conversation_session_id FROM matching_rounds
+        ),
+        ranked AS (
+          SELECT
+            r.*,
+            COALESCE(r.completed_at_ms, r.prompt_at_ms) AS activity_at_ms,
+            ROW_NUMBER() OVER (
+              PARTITION BY r.conversation_session_id
+              ORDER BY r.prompt_at_ms ASC, r.id ASC
+            ) AS first_rank,
+            ROW_NUMBER() OVER (
+              PARTITION BY r.conversation_session_id
+              ORDER BY COALESCE(r.completed_at_ms, r.prompt_at_ms) DESC, r.id DESC
+            ) AS latest_rank,
+            ROW_NUMBER() OVER (
+              PARTITION BY r.conversation_session_id
+              ORDER BY CASE WHEN mr.round_id IS NULL THEN 1 ELSE 0 END,
+                       COALESCE(r.completed_at_ms, r.prompt_at_ms) DESC,
+                       r.id DESC
+            ) AS preview_rank
+          FROM conversation_rounds r
+          JOIN matched_sessions ms ON ms.conversation_session_id = r.conversation_session_id
+          LEFT JOIN matching_rounds mr ON mr.round_id = r.id
+        ),
+        summaries AS (
+          SELECT
+            conversation_session_id AS id,
+            COUNT(*) AS turn_count,
+            MIN(prompt_at_ms) AS first_prompt_at_ms,
+            MAX(activity_at_ms) AS last_activity_at_ms,
+            SUM(CASE WHEN response_state = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+            SUM(CASE WHEN response_state = 'complete' THEN 1 ELSE 0 END) AS complete_count,
+            SUM(CASE WHEN response_state = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+            SUM(CASE WHEN response_state = 'unavailable' THEN 1 ELSE 0 END) AS unavailable_count,
+            MAX(CASE WHEN first_rank = 1 THEN prompt_text END) AS first_prompt_text,
+            MAX(CASE WHEN preview_rank = 1 THEN prompt_text END) AS latest_prompt_text,
+            MAX(CASE WHEN preview_rank = 1 THEN response_text END) AS latest_response_text,
+            MAX(CASE WHEN preview_rank = 1 THEN response_state END) AS latest_response_state,
+            MAX(CASE WHEN preview_rank = 1 THEN device_id END) AS device_id,
+            MAX(CASE WHEN preview_rank = 1 THEN machine_id END) AS machine_id,
+            MAX(CASE WHEN preview_rank = 1 THEN member_label END) AS member_label,
+            MAX(CASE WHEN preview_rank = 1 THEN account_id END) AS account_id,
+            MAX(CASE WHEN preview_rank = 1 THEN account_alias END) AS account_alias,
+            MAX(CASE WHEN preview_rank = 1 THEN model END) AS model
+          FROM ranked
+          GROUP BY conversation_session_id
+        )
+        SELECT * FROM summaries
+        WHERE (
+          ? IS NULL
+          OR last_activity_at_ms < ?
+          OR (last_activity_at_ms = ? AND id < ?)
+        )
+        ORDER BY last_activity_at_ms DESC, id DESC
+        LIMIT ?
+      `;
+      const rows = this.db.prepare(sql).all(
+        ...matchParams,
+        filters.beforeActivityMs,
+        filters.beforeActivityMs,
+        filters.beforeActivityMs,
+        filters.beforeId,
+        filters.limit,
+      );
+      const items = rows.map(normalizeConversationRoundSessionSummary);
+      return {
+        items,
+        nextBeforeId: items.length === filters.limit ? items.at(-1).id : null,
+        nextBeforeActivityMs: items.length === filters.limit
+          ? items.at(-1).lastActivityAtMs : null,
+        totalMatches,
+        legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+        error: null,
+      };
+    } catch (error) {
+      this.#safeLog('conversation_round_session_search_failed', {
+        code: error.code ?? error.name ?? 'unknown',
+      });
+      return {
+        items: [],
+        nextBeforeId: null,
+        nextBeforeActivityMs: null,
+        totalMatches: null,
+        legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+        error: 'search_unavailable',
+      };
+    }
+  }
+
+  readConversationRound(id) {
+    try {
+      this.#assertOpen();
+      const normalizedId = finiteInteger(id, 'conversation round id', { minimum: 1 });
+      const row = this.db.prepare(`
+        SELECT
+          id, conversation_session_id, turn_index, prompt_key,
+          prompt_text, prompt_bytes, prompt_truncated,
+          response_text, response_bytes, response_truncated,
+          response_state, failure_code, source, prompt_at_ms, completed_at_ms,
+          device_id, machine_id, member_label, account_id, account_alias, model
+        FROM conversation_rounds
+        WHERE id = ?
+      `).get(normalizedId);
+      return {
+        round: row ? normalizeConversationRoundRecord(row) : null,
+        error: null,
+      };
+    } catch (error) {
+      this.#safeLog('conversation_round_read_failed', {
+        code: error.code ?? error.name ?? 'unknown',
+      });
+      return { round: null, error: 'round_unavailable' };
+    }
+  }
+
+  readConversationRoundSession(id) {
+    try {
+      this.#assertOpen();
+      const normalizedId = finiteInteger(id, 'conversation round session id', { minimum: 1 });
+      const session = this.db.prepare(`
+        SELECT
+          s.id,
+          COUNT(r.id) AS turn_count,
+          MIN(r.prompt_at_ms) AS first_prompt_at_ms,
+          MAX(COALESCE(r.completed_at_ms, r.prompt_at_ms)) AS last_activity_at_ms,
+          SUM(CASE WHEN r.response_state = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+          SUM(CASE WHEN r.response_state = 'complete' THEN 1 ELSE 0 END) AS complete_count,
+          SUM(CASE WHEN r.response_state = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+          SUM(CASE WHEN r.response_state = 'unavailable' THEN 1 ELSE 0 END) AS unavailable_count
+        FROM conversation_sessions s
+        LEFT JOIN conversation_rounds r ON r.conversation_session_id = s.id
+        WHERE s.id = ?
+        GROUP BY s.id
+      `).get(normalizedId);
+      if (!session || Number(session.turn_count) === 0) {
+        return {
+          session: null,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+          error: null,
+        };
+      }
+      const budgetRows = this.db.prepare(`
+        SELECT
+          id,
+          SUM(prompt_bytes + response_bytes) OVER (
+            ORDER BY turn_index ASC, prompt_at_ms ASC, id ASC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS cumulative_bytes
+        FROM conversation_rounds
+        WHERE conversation_session_id = ?
+        ORDER BY turn_index ASC, prompt_at_ms ASC, id ASC
+        LIMIT ?
+      `).all(normalizedId, MAX_CONVERSATION_ROUND_SESSION_TURNS + 1);
+      const selectedIds = [];
+      for (const row of budgetRows) {
+        if (selectedIds.length >= MAX_CONVERSATION_ROUND_SESSION_TURNS) break;
+        if (Number(row.cumulative_bytes) > MAX_CONVERSATION_ROUND_SESSION_BYTES) break;
+        selectedIds.push(Number(row.id));
+      }
+      const placeholders = selectedIds.map(() => '?').join(', ');
+      const rows = selectedIds.length === 0 ? [] : this.db.prepare(`
+        SELECT
+          id, conversation_session_id, turn_index, prompt_key,
+          prompt_text, prompt_bytes, prompt_truncated,
+          response_text, response_bytes, response_truncated,
+          response_state, failure_code, source, prompt_at_ms, completed_at_ms,
+          device_id, machine_id, member_label, account_id, account_alias, model
+        FROM conversation_rounds
+        WHERE conversation_session_id = ? AND id IN (${placeholders})
+        ORDER BY turn_index ASC, prompt_at_ms ASC, id ASC
+      `).all(normalizedId, ...selectedIds);
+      return {
+        session: {
+          id: Number(session.id),
+          turnCount: Number(session.turn_count),
+          firstPromptAtMs: Number(session.first_prompt_at_ms),
+          lastActivityAtMs: Number(session.last_activity_at_ms),
+          pendingCount: Number(session.pending_count),
+          completeCount: Number(session.complete_count),
+          failedCount: Number(session.failed_count),
+          unavailableCount: Number(session.unavailable_count),
+          stateCounts: {
+            pending: Number(session.pending_count),
+            complete: Number(session.complete_count),
+            failed: Number(session.failed_count),
+            unavailable: Number(session.unavailable_count),
+          },
+          turns: rows.map((row) => normalizeConversationRoundRecord(row)),
+          displayedTurnCount: rows.length,
+          maxDisplayedTurns: MAX_CONVERSATION_ROUND_SESSION_TURNS,
+          maxDisplayedBytes: MAX_CONVERSATION_ROUND_SESSION_BYTES,
+          truncated: Number(session.turn_count) > rows.length,
+          legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+        },
+        legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+        error: null,
+      };
+    } catch (error) {
+      this.#safeLog('conversation_round_session_read_failed', {
+        code: error.code ?? error.name ?? 'unknown',
+      });
+      return {
+        session: null,
+        legacyFragmentCount: this.#persistentLegacyConversationFragmentCount(),
+        error: 'round_session_unavailable',
       };
     }
   }

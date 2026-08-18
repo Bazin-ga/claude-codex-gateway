@@ -19,17 +19,18 @@ function conversationMetrics({ unavailable = false, searchError = null } = {}) {
     facets: [],
     sessionFacets: [],
     reads: [],
+    roundReads: [],
     sessionReads: [],
   };
   return {
     calls,
-    stats: { conversation: { dropped: 2 } },
+    stats: { conversation: { dropped: 2 }, conversationRounds: { dropped: 1 } },
     flush() {},
-    searchConversationSessions(options) {
+    searchConversationRoundSessions(options) {
       calls.searches.push(options);
       if (unavailable || searchError) {
         return {
-          items: [], nextBeforeId: null, standaloneCount: 3,
+          items: [], nextBeforeId: null, legacyFragmentCount: 3,
           error: searchError ?? 'search_unavailable',
         };
       }
@@ -37,20 +38,24 @@ function conversationMetrics({ unavailable = false, searchError = null } = {}) {
         items: [{
           id: 7,
           turnCount: 2,
-          firstStartedAtMs: Date.parse('2026-08-17T12:30:00.000Z'),
-          lastStartedAtMs: Date.parse('2026-08-17T12:34:56.000Z'),
+          firstPromptAtMs: Date.parse('2026-08-17T12:30:00.000Z'),
+          lastActivityAtMs: Date.parse('2026-08-17T12:34:56.000Z'),
           deviceId: 'device-safe',
           memberLabel: '<img src=x onerror=alert(1)>',
           accountAlias: 'account-safe',
           model: 'model-safe',
-          latestPromptSnippet: 'latest prompt snippet',
-          latestPromptSource: 'captured_api_user_text',
-          latestPromptSuffixOmitted: false,
-          latestResponseSnippet: 'latest reply snippet',
+          firstPromptText: 'first exact prompt',
+          latestPromptText: 'latest exact prompt',
+          latestResponseText: 'latest final reply',
           latestResponseState: 'complete',
+          pendingCount: 0,
+          completeCount: 2,
+          failedCount: 0,
+          unavailableCount: 0,
         }],
         nextBeforeId: 17,
-        standaloneCount: 3,
+        nextBeforeActivityMs: Date.parse('2026-08-17T12:34:56.000Z'),
+        legacyFragmentCount: 3,
         totalMatches: 1,
         error: null,
       };
@@ -121,45 +126,67 @@ function conversationMetrics({ unavailable = false, searchError = null } = {}) {
         error: null,
       };
     },
-    readConversationSession(id) {
+    readConversationRoundSession(id) {
       calls.sessionReads.push(id);
       if (unavailable) {
-        return { session: null, standaloneCount: 3, error: 'conversation_unavailable' };
+        return { session: null, error: 'conversation_unavailable' };
       }
-      if (id !== 7) return { session: null, standaloneCount: 3, error: null };
+      if (id !== 7) return { session: null, error: null };
       return {
         session: {
           id,
           turnCount: 2,
-          firstStartedAtMs: Date.parse('2026-08-17T12:30:00.000Z'),
-          lastStartedAtMs: Date.parse('2026-08-17T12:34:56.000Z'),
-          standaloneCount: 3,
+          firstPromptAtMs: Date.parse('2026-08-17T12:30:00.000Z'),
+          lastActivityAtMs: Date.parse('2026-08-17T12:34:56.000Z'),
           truncated: false,
           turns: [{
             id: 41,
             turnIndex: 1,
-            startedAtMs: Date.parse('2026-08-17T12:30:00.000Z'),
+            promptAtMs: Date.parse('2026-08-17T12:30:00.000Z'),
+            completedAtMs: Date.parse('2026-08-17T12:31:00.000Z'),
             memberLabel: '<member>',
             accountAlias: 'account-safe',
             model: 'model-safe',
             promptText: 'first prompt',
-            promptSource: 'captured_api_user_text',
-            promptSuffixOmitted: false,
+            source: 'claude_hook',
             responseText: '',
             responseState: 'complete',
           }, {
             id: 42,
             turnIndex: 2,
-            startedAtMs: Date.parse('2026-08-17T12:34:56.000Z'),
+            promptAtMs: Date.parse('2026-08-17T12:34:00.000Z'),
+            completedAtMs: Date.parse('2026-08-17T12:34:56.000Z'),
             memberLabel: '<member>',
             accountAlias: 'account-safe',
             model: 'model-safe',
-            promptText: '<conversation>second prompt</conversation><tail>hidden</tail>',
+            promptText: 'second prompt',
+            source: 'claude_hook',
             responseText: '<reply>&',
-            responseState: 'incomplete',
+            responseState: 'complete',
           }],
         },
-        standaloneCount: 3,
+        error: null,
+      };
+    },
+    readConversationRound(id) {
+      calls.roundReads.push(id);
+      if (unavailable) return { round: null, error: 'round_unavailable' };
+      if (id !== 42) return { round: null, error: null };
+      return {
+        round: {
+          id,
+          conversationSessionId: 7,
+          turnIndex: 2,
+          promptAtMs: Date.parse('2026-08-17T12:34:00.000Z'),
+          completedAtMs: Date.parse('2026-08-17T12:34:56.000Z'),
+          memberLabel: '<member>',
+          deviceId: 'device-safe',
+          accountAlias: 'account-safe',
+          promptText: 'second prompt',
+          source: 'claude_hook',
+          responseText: '<reply>&',
+          responseState: 'complete',
+        },
         error: null,
       };
     },
@@ -212,12 +239,12 @@ test('open conversation routes use a default GET and POST-only filter/search sta
     const listHtml = await list.text();
     assert.deepEqual(metrics.calls.searches[0], { q: '', beforeId: null, limit: 25 });
     assert.equal(listHtml.includes('secret-query'), false);
-    assert.match(listHtml, /data-i18n="conversation-privacy-notice"/);
+    assert.match(listHtml, /data-i18n="conversation-round-privacy-notice"/);
     assert.match(listHtml, /data-i18n="conversation-open-warning"/);
-    assert.match(listHtml, /data-i18n="conversation-queue-dropped"/);
+    assert.match(listHtml, /data-i18n="conversation-round-dropped"/);
     assert.match(listHtml, /method="post" action="\/conversations"/);
     assert.match(listHtml, /href="\/conversations\/session\/7"/);
-    assert.match(listHtml, /data-i18n="conversation-standalone-notice"/);
+    assert.match(listHtml, /data-i18n="conversation-legacy-fragments-notice"/);
     assert.match(listHtml, /href="\/conversation-turns"/);
     assert.equal(listHtml.includes('<img src=x'), false);
     assert.equal(listHtml.includes('threadKey'), false);
@@ -227,7 +254,7 @@ test('open conversation routes use a default GET and POST-only filter/search sta
       method: 'POST',
       headers: { Cookie: cookie, 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
-        q: 'needle', before_id: '12', limit: '1', period: '168',
+        q: 'needle', before_id: '12', before_activity_ms: '1777777777000', limit: '1', period: '168',
         member_label: 'member-safe', device_id: 'device-safe',
         account_id: 'account-safe', model: 'model-safe', response_state: 'complete',
       }),
@@ -238,6 +265,7 @@ test('open conversation routes use a default GET and POST-only filter/search sta
     assert.deepEqual({
       q: sessionSearch.q,
       beforeId: sessionSearch.beforeId,
+      beforeActivityMs: sessionSearch.beforeActivityMs,
       limit: sessionSearch.limit,
       memberLabel: sessionSearch.memberLabel,
       deviceId: sessionSearch.deviceId,
@@ -245,15 +273,13 @@ test('open conversation routes use a default GET and POST-only filter/search sta
       model: sessionSearch.model,
       responseState: sessionSearch.responseState,
     }, {
-      q: 'needle', beforeId: 12, limit: 1,
+      q: 'needle', beforeId: 12, beforeActivityMs: 1777777777000, limit: 1,
       memberLabel: 'member-safe', deviceId: 'device-safe',
       accountId: 'account-safe', model: 'model-safe', responseState: 'complete',
     });
     assert.equal(sessionSearch.toMs - sessionSearch.fromMs, 168 * 60 * 60 * 1000);
-    assert.equal(metrics.calls.sessionFacets[1].memberLabel, 'member-safe');
-    assert.equal(metrics.calls.sessionFacets[1].responseState, 'complete');
-    assert.match(filteredHtml, /data-facet-count="1"/);
     assert.match(filteredHtml, /name="before_id" value="17"/);
+    assert.match(filteredHtml, /name="before_activity_ms" value="1786970096000"/);
     assert.match(filteredHtml, /conversation-next-page/);
 
     const turnList = await fetch(`${app.baseUrl}/conversation-turns`);
@@ -275,6 +301,7 @@ test('open conversation routes use a default GET and POST-only filter/search sta
     assert.equal(translations.status, 200);
     const translationsText = await translations.text();
     assert.match(translationsText, /'conversation-privacy-notice':/);
+    assert.match(translationsText, /'conversation-round-privacy-notice':/);
     assert.match(translationsText, /永久保存/);
     assert.match(translationsText, /'conversation-open-warning':/);
 
@@ -295,10 +322,16 @@ test('open conversation routes use a default GET and POST-only filter/search sta
     const sessionHtml = await sessionDetail.text();
     assert.deepEqual(metrics.calls.sessionReads, [7]);
     assert.ok(sessionHtml.indexOf('first prompt') < sessionHtml.indexOf('second prompt'));
-    assert.match(sessionHtml, /data-i18n="conversation-session-empty-assistant"/);
-    assert.match(sessionHtml, /data-i18n="conversation-session-incomplete-turn"/);
-    assert.equal(sessionHtml.includes('<tail>hidden</tail>'), false);
+    assert.match(sessionHtml, /data-i18n="conversation-round-empty-response"/);
+    assert.match(sessionHtml, /data-prompt-source="claude_hook"/);
     assert.equal(sessionHtml.includes('threadKey'), false);
+
+    const roundDetail = await fetch(`${app.baseUrl}/conversation-rounds/42`);
+    assert.equal(roundDetail.status, 200);
+    const roundHtml = await roundDetail.text();
+    assert.deepEqual(metrics.calls.roundReads, [42]);
+    assert.match(roundHtml, /data-conversation-round-id="42"/);
+    assert.match(roundHtml, /&lt;reply&gt;&amp;/);
 
     const missing = await fetch(`${app.baseUrl}/conversations/999`);
     assert.equal(missing.status, 404);
@@ -310,6 +343,7 @@ test('open conversation routes use a default GET and POST-only filter/search sta
     assert.match(await missingSession.text(), /data-i18n="conversation-session-not-found"/);
     const malformedSession = await fetch(`${app.baseUrl}/conversations/session/not-a-number`);
     assert.equal(malformedSession.status, 404);
+    assert.equal((await fetch(`${app.baseUrl}/conversation-rounds/999`)).status, 404);
 
     const posted = await fetch(`${app.baseUrl}/conversations`, {
       method: 'POST',
@@ -329,6 +363,9 @@ test('open conversation routes use a default GET and POST-only filter/search sta
     const sessionPosted = await fetch(`${app.baseUrl}/conversations/session/7`, { method: 'POST' });
     assert.equal(sessionPosted.status, 405);
     assert.equal(sessionPosted.headers.get('allow'), 'GET');
+    const roundPosted = await fetch(`${app.baseUrl}/conversation-rounds/42`, { method: 'POST' });
+    assert.equal(roundPosted.status, 405);
+    assert.equal(roundPosted.headers.get('allow'), 'GET');
 
     const notArchive = await fetch(`${app.baseUrl}/claude/conversations/42`);
     assert.notEqual(notArchive.status, 200);
@@ -349,6 +386,7 @@ test('tailscale conversation routes require identity and bind a session to it', 
     assert.equal((await fetch(`${app.baseUrl}/conversation-turns`)).status, 403);
     assert.equal((await fetch(`${app.baseUrl}/conversations/session/7`)).status, 403);
     assert.equal((await fetch(`${app.baseUrl}/conversation-turns/42`)).status, 403);
+    assert.equal((await fetch(`${app.baseUrl}/conversation-rounds/42`)).status, 403);
     assert.equal((await fetch(`${app.baseUrl}/conversations/42`)).status, 403);
 
     const first = await fetch(`${app.baseUrl}/conversations`, {
@@ -359,7 +397,7 @@ test('tailscale conversation routes require identity and bind a session to it', 
     const html = await first.text();
     assert.notEqual(cookie, '');
     assert.equal(html.includes('data-i18n="conversation-open-warning"'), false);
-    assert.match(html, /data-i18n="conversation-privacy-notice"/);
+    assert.match(html, /data-i18n="conversation-round-privacy-notice"/);
     assert.equal((await fetch(`${app.baseUrl}/conversation-turns`, {
       headers: { 'Tailscale-User-Login': 'member@example.test', Cookie: cookie },
     })).status, 200);
@@ -367,6 +405,9 @@ test('tailscale conversation routes require identity and bind a session to it', 
       headers: { 'Tailscale-User-Login': 'member@example.test', Cookie: cookie },
     })).status, 200);
     assert.equal((await fetch(`${app.baseUrl}/conversation-turns/42`, {
+      headers: { 'Tailscale-User-Login': 'member@example.test', Cookie: cookie },
+    })).status, 200);
+    assert.equal((await fetch(`${app.baseUrl}/conversation-rounds/42`, {
       headers: { 'Tailscale-User-Login': 'member@example.test', Cookie: cookie },
     })).status, 200);
     assert.equal((await fetch(`${app.baseUrl}/conversations/42`, {
@@ -397,6 +438,9 @@ test('conversation sessions and legacy turn detail return 503 when metrics stora
     const sessionDetail = await fetch(`${app.baseUrl}/conversations/session/42`);
     assert.equal(sessionDetail.status, 503);
     assert.match(await sessionDetail.text(), /data-i18n="conversation-session-read-error"/);
+    const roundDetail = await fetch(`${app.baseUrl}/conversation-rounds/42`);
+    assert.equal(roundDetail.status, 503);
+    assert.match(await roundDetail.text(), /data-i18n="conversation-round-read-error"/);
     const detail = await fetch(`${app.baseUrl}/conversations/42`);
     assert.equal(detail.status, 503);
     assert.match(await detail.text(), /data-i18n="conversation-read-error"/);
@@ -457,6 +501,9 @@ test('conversation filters reject malformed and oversized UTF-8 values before me
       { q: '中'.repeat(100) },
       { device_id: 'd'.repeat(129) },
       { before_id: '-2' },
+      { before_id: '2' },
+      { before_activity_ms: '1777777777000' },
+      { before_id: '2', before_activity_ms: '-1' },
       { period: 'yesterday' },
     ]) {
       const response = await fetch(`${app.baseUrl}/conversations`, {
