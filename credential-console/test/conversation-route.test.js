@@ -257,7 +257,7 @@ test('bounded search errors return actionable 400 guidance while unknown errors 
     assert.equal(response.status, 503);
     const html = await response.text();
     assert.match(html, /data-i18n="conversation-search-error"/);
-    assert.match(html, /Conversation search could not be completed/);
+    assert.match(html, /API-turn search could not be completed/);
     assert.equal(html.includes('private_search_failure'), false);
   } finally {
     await app.close();

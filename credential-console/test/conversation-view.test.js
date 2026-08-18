@@ -92,12 +92,64 @@ test('conversation detail strictly escapes full text and preserves pre whitespac
   }
 });
 
+test('conversation prompt display unwraps known client wrappers, falls back safely, and exposes omission state', () => {
+  const wrapperHtml = conversationsView({
+    result: {
+      items: [baseItem({
+        promptText: '<conversation>\nsafe user text\n</conversation>\n\n<img src=x onerror=alert(1)>',
+        promptSnippet: '<img src=x onerror=alert(1)>',
+        promptBytes: 96,
+      })],
+      nextBeforeId: null,
+      error: null,
+    },
+  });
+  assert.match(wrapperHtml, /Captured API user text/);
+  assert.match(wrapperHtml, /safe user text/);
+  assert.match(wrapperHtml, /data-prompt-source="wrapper_removed"/);
+  assert.match(wrapperHtml, /data-prompt-suffix-omitted="true"/);
+  assert.match(wrapperHtml, /conversation-prompt-suffix-omitted/);
+  assert.match(wrapperHtml, /conversation-prompt-disclaimer/);
+  assert.equal(wrapperHtml.includes('<img src=x'), false);
+
+  const fallbackHtml = conversationsView({
+    result: {
+      items: [baseItem({ promptSnippet: '<unknown-wrapper><img src=x onerror=alert(1)></unknown-wrapper>' })],
+      nextBeforeId: null,
+      error: null,
+    },
+  });
+  assert.match(fallbackHtml, /data-prompt-source="fallback_raw"/);
+  assert.match(fallbackHtml, /conversation-prompt-source-fallback/);
+  assert.equal(fallbackHtml.includes('<img src=x'), false);
+});
+
+test('conversation detail trusts persisted prompt provenance and keeps long text wrapped on mobile', () => {
+  const html = conversationDetailView({
+    result: {
+      turn: baseItem({
+        promptText: 'already displayed API text',
+        promptSource: 'wrapper_removed',
+        promptSuffixOmitted: true,
+        responseText: 'reply',
+      }),
+      error: null,
+    },
+  });
+  assert.match(html, /already displayed API text/);
+  assert.match(html, /data-prompt-source="wrapper_removed"/);
+  assert.match(html, /data-prompt-suffix-omitted="true"/);
+  assert.match(html, /conversation-prompt-disclaimer/);
+  assert.match(html, /word-break: break-word/);
+  assert.match(html, /overflow-wrap: anywhere/);
+});
+
 test('null and read/search errors fail closed without undefined content', () => {
   const list = conversationsView({
     result: { items: null, nextBeforeId: null, error: 'search_unavailable' },
   });
   assert.match(list, /data-i18n="conversation-search-error"/);
-  assert.match(list, /Conversation search could not be completed/);
+  assert.match(list, /API-turn search could not be completed/);
   assert.equal(list.includes('search_unavailable'), false);
   assert.match(list, /data-i18n="conversation-no-results"/);
   assert.equal(list.includes('undefined'), false);
@@ -189,7 +241,7 @@ test('bounded search errors give actionable guidance while unknown errors stay f
     result: { items: [], nextBeforeId: null, error: 'database_internal_detail_should_not_render' },
   });
   assert.match(unknown, /data-i18n="conversation-search-error"/);
-  assert.match(unknown, /Conversation search could not be completed/);
+  assert.match(unknown, /API-turn search could not be completed/);
   assert.equal(unknown.includes('database_internal_detail_should_not_render'), false);
 });
 
@@ -206,7 +258,7 @@ test('persistent tabs link to captured conversations and mark the active page', 
   assert.match(list, /href="\/conversations" data-i18n="tab-conversations" aria-current="page"/);
 });
 
-test('Chinese translations and operator documentation cover permanent conversation exposure', async () => {
+test('Chinese translations and operator documentation cover permanent captured-turn exposure', async () => {
   const [server, rootReadme, rootReadmeZh, consoleReadme, deploy] = await Promise.all([
     readFile(new URL('../server.js', import.meta.url), 'utf8'),
     readFile(new URL('../../README.md', import.meta.url), 'utf8'),
@@ -234,6 +286,12 @@ test('Chinese translations and operator documentation cover permanent conversati
     'conversation-response-incomplete',
     'conversation-response-truncated',
     'conversation-response-unavailable',
+    'conversation-prompt-disclaimer',
+    'conversation-prompt-source-captured',
+    'conversation-prompt-source-wrapper',
+    'conversation-prompt-source-fallback',
+    'conversation-prompt-source-empty',
+    'conversation-prompt-suffix-omitted',
   ]) {
     assert.match(server, new RegExp(`'${key}':`), `missing translation key ${key}`);
   }
@@ -241,8 +299,9 @@ test('Chinese translations and operator documentation cover permanent conversati
   assert.match(deploy, /three consecutive Chinese characters/i);
   for (const document of [rootReadme, rootReadmeZh, consoleReadme, deploy]) {
     assert.match(document, /permanently (?:stores|retain)|永久(?:保存|保留)/i);
-    assert.match(document, /captured[\s\S]{0,40}conversation|已捕获[\s\S]{0,40}对话/i);
+    assert.match(document, /captured[\s\S]{0,40}(?:API )?turn|已捕获[\s\S]{0,40}(?:API )?轮次/i);
     assert.match(document, /Codex[^\n]{0,80}(?:not covered|outside|不在|范围)/i);
     assert.match(document, /open[^\n]{0,180}(?:anyone|tailnet|没有身份|无身份|阅读审计|read)/i);
+    assert.match(document, /(?:not guaranteed|rather than)[\s\S]{0,120}original|不保证[\s\S]{0,60}原话/i);
   }
 });

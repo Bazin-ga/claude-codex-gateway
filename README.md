@@ -4,10 +4,11 @@
 
 > **Telemetry notice / conversation notice:** `credential-console` records metadata for every proxied
 > Claude gateway request, including four provider-reported token counts, and makes those metrics
-> visible to every member who can reach the console. P6 permanently stores every captured
-> conversation turn from Claude and makes its prompt/reply text visible to everyone who can reach the console;
+> visible to every member who can reach the console. P6 permanently stores eligible captured
+> Claude API turns and makes their captured API-user/assistant text visible to everyone who can reach the console;
 > in `open` mode that means anyone on the tailnet, with no identity and no reading audit. Member
-> labels are self-entered and unverified. Codex traffic is not covered by conversation capture.
+> labels are self-entered and unverified. Captured API-user text may contain client wrappers and is
+> not guaranteed to be the human's original words. Codex traffic is not covered by turn capture.
 
 A self-hostable credential distribution centre for **Codex** (ChatGPT subscription) and
 **Claude Code** subscriptions.
@@ -147,10 +148,11 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
   Claude gateway allowlists paths, strips the device authorization header before attaching the
   provider credential, rate-limits failed authentication by source IP, and applies per-device
   request and concurrency budgets.
-- **Separated request telemetry and conversations.** The Claude gateway persists request metadata
+- **Separated request telemetry and captured API turns.** The Claude gateway persists request metadata
   and separate input, cache-creation input, cache-read input, and output token counts for shared
   metrics. The metrics page remains body-free; P6 separately and permanently stores eligible captured
-  Claude conversation turns for console-wide browsing. Codex traffic is outside that capture boundary.
+  Claude API turns for console-wide browsing. A turn is one provider request, not a reconstructed
+  session, and its API-user text may include client-added wrappers. Codex traffic is outside that boundary.
 - **The centre is a high-value host by design.** A root compromise of the centre can recover
   all active provider credentials. Keep OS access narrow, patch it, and keep an emergency
   service-stop and provider-token revocation procedure.

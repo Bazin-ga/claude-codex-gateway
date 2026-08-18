@@ -62,18 +62,20 @@ test('P6 disclosure is prominent, permanent, and explicit about the open audienc
   assert.match(englishNotice, /records metadata for every proxied\s+Claude gateway\s+request/i);
   assert.match(englishNotice, /four provider-reported token counts/i);
   assert.match(englishNotice, /makes those metrics\s+visible to every\s+member who can reach the console/i);
-  assert.match(englishNotice, /P6 permanently stores every captured\s+conversation turn from Claude/i);
-  assert.match(englishNotice, /prompt\/reply text visible to everyone who can reach the console/i);
+  assert.match(englishNotice, /P6 permanently stores eligible captured\s+Claude API turns/i);
+  assert.match(englishNotice, /API-user\/assistant text visible to everyone who can reach the console/i);
   assert.match(englishNotice, /open.*anyone on the tailnet.*no identity and no reading audit/is);
-  assert.match(englishNotice, /Codex traffic is not covered by conversation capture/i);
+  assert.match(englishNotice, /not guaranteed to be the human's original words/i);
+  assert.match(englishNotice, /Codex traffic is not covered by turn capture/i);
 
   assert.match(chineseNotice, /遥测告知/);
   assert.match(chineseNotice, /记录每个经代理转发的 Claude 网关请求元数据/);
   assert.match(chineseNotice, /服务商报告的四类 token 数/);
   assert.match(chineseNotice, /这些指标向所有能够访问控制台的成员公开/);
-  assert.match(chineseNotice, /P6[\s\S]*永久保存[\s\S]*已捕获[\s\S]*Claude 对话/);
+  assert.match(chineseNotice, /P6[\s\S]*永久保存[\s\S]*Claude API 轮次/);
   assert.match(chineseNotice, /open[\s\S]*tailnet[\s\S]*没有身份识别[\s\S]*阅读审计/i);
-  assert.match(chineseNotice, /Codex 流量不在对话采集范围内/);
+  assert.match(chineseNotice, /不保证是用户原话/);
+  assert.match(chineseNotice, /Codex 流量不在轮次采集范围内/);
 
   assert.match(consoleNotice, /every proxied\s+Claude gateway request produces a persistent\s+metadata row/i);
   assert.match(consoleNotice, /four provider-reported token-count fields/i);
@@ -81,13 +83,13 @@ test('P6 disclosure is prominent, permanent, and explicit about the open audienc
   assert.match(consoleNotice, /must not be used for accountability or billing/i);
 
   for (const english of [files.readmeEn, files.consoleReadme, files.deploy]) {
-    assert.match(english, /permanently\s+(?:stores|retains)[\s\S]{0,120}captured[\s\S]{0,80}conversation/i);
+    assert.match(english, /permanently\s+(?:stores|retains)[\s\S]{0,160}captured[\s\S]{0,80}(?:API )?turn/i);
     assert.match(english, /open[\s\S]{0,220}(?:anyone|tailnet)[\s\S]{0,180}(?:no identity|no reading audit)/i);
     assert.match(english, /Codex[\s\S]{0,100}(?:not covered|outside|not captured)/i);
   }
-  assert.match(files.readmeZh, /永久保存[\s\S]{0,100}已捕获[\s\S]{0,80}Claude 对话/);
+  assert.match(files.readmeZh, /永久保存[\s\S]{0,120}(?:已捕获[\s\S]{0,40})?Claude API 轮次/);
   assert.match(files.readmeZh, /tailnet[\s\S]{0,120}(?:没有身份识别|无身份)[\s\S]{0,80}(?:阅读审计|审计)/i);
-  assert.match(files.readmeZh, /Codex 流量不在对话采集范围内/);
+  assert.match(files.readmeZh, /Codex 流量不在轮次采集范围内/);
 });
 
 test('console runtime and deployment docs pin Node, warning suppression, and metrics backup recovery', async () => {
@@ -216,9 +218,10 @@ test('real server announces metadata and conversation disclosure before listenin
     assert.match(privacy.detail, /visible to every console member/i);
     assert.match(privacy.detail, /member labels are self-entered and unverified/i);
     assert.match(privacy.detail, /must not be used for accountability or billing/i);
-    assert.match(privacy.detail, /eligible Claude human prompts and assistant replies are permanently stored/i);
+    assert.match(privacy.detail, /eligible final API user text and assistant text are permanently stored as per-request turns/i);
+    assert.match(privacy.detail, /not guaranteed to be the human original words/i);
     assert.match(privacy.detail, /visible to every console member/i);
-    assert.match(privacy.detail, /open mode anyone (?:on the tailnet )?who can reach the console can read them/i);
+    assert.match(privacy.detail, /open mode anyone (?:on the tailnet )?who can reach the console can read the turns/i);
     assert.match(privacy.detail, /no identity and no reading audit/i);
     assert.match(privacy.detail, /Codex traffic is not captured/i);
     assert.equal(output.nonJson.length, 0, `unexpected non-JSON startup output: ${output.nonJson.join('\n')}`);

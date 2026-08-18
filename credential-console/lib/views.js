@@ -1,5 +1,6 @@
 import { escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
+import { derivePromptDisplay } from './prompt-display.js';
 import {
   CLAUDE_CLIENT_CONFIG_VERSION_KEY,
   CLIENT_CONFIG_VERSION,
@@ -314,8 +315,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-snippet, .conversation-result-snippet { min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: white; }
 .conversation-snippet strong, .conversation-result-snippet strong { display: block; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
 .conversation-result-snippet p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin: 0; min-height: 2.7em; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.35; font-size: 13px; }
+.conversation-prompt-meta { display: flex; gap: 6px 10px; flex-wrap: wrap; margin-top: 8px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.conversation-prompt-meta span { min-width: 0; overflow-wrap: anywhere; }
 .conversation-snippet pre, .conversation-text pre { margin: 0; max-height: 260px; font-size: 12px; }
-.conversation-text pre { max-height: none; white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversation-text pre { max-height: none; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .conversation-pagination { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; }
 .conversation-pagination form { margin: 0; }
 .conversation-filters { display: grid; gap: 12px; align-items: end; }
@@ -379,7 +382,7 @@ function layout(title, content, { openMode = false, activeTab = null } = {}) {
     ${activeTab ? `<nav class="page-tabs" aria-label="Primary navigation">
       <a href="/" data-i18n="tab-overview"${activeTab === 'overview' ? ' aria-current="page"' : ''}>Overview</a>
       <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
-      <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
+      <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>API turns</a>
     </nav>` : ''}
     ${openMode ? openBanner : ''}
     ${content}
@@ -1676,12 +1679,12 @@ export function metricsView({
         <div>
           <span class="badge stored" data-i18n="metrics-label">Request metrics</span>
           <h1 data-i18n="metrics-heading">Claude gateway request metrics</h1>
-          <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not rendered here; eligible captured conversations appear in the conversation archive.</p>
+          <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not rendered here; eligible captured API turns appear in the API-turn archive.</p>
           <p class="muted tiny" data-i18n="metrics-claude-only">Token accounting covers Claude gateway traffic only. Codex clients connect directly to their provider and are not included.</p>
         </div>
         <div class="actions">
           <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
-          <a class="button secondary" href="/conversations" data-i18n="metrics-conversations-link">View conversations</a>
+          <a class="button secondary" href="/conversations" data-i18n="metrics-conversations-link">View captured API turns</a>
         </div>
       </div>
       <div class="notice error metrics-attribution-notice" role="note">
@@ -1802,9 +1805,9 @@ function conversationStatusView(state) {
 
 function conversationPrivacyView(openMode) {
   return `<div class="notice error conversation-disclosure" role="note">
-    <h2 data-i18n="conversation-privacy-heading">Conversation privacy</h2>
-    <p data-i18n="conversation-privacy-notice">This feature permanently stores every captured conversation and makes captured conversation text visible to everyone who can reach this console. Member labels are self-entered and unverified. Codex traffic is not covered.</p>
-    ${openMode ? '<p data-i18n="conversation-open-warning"><strong>Open mode:</strong> anyone on the tailnet who can reach this console can read every captured conversation; there is no identity and no reading audit. A member label is not an actor identity.</p>' : ''}
+    <h2 data-i18n="conversation-privacy-heading">Captured API turn privacy</h2>
+    <p data-i18n="conversation-privacy-notice">This feature permanently stores every captured Claude API turn and makes captured turn text visible to everyone who can reach this console. Member labels are self-entered and unverified. Codex traffic is not covered.</p>
+    ${openMode ? '<p data-i18n="conversation-open-warning"><strong>Open mode:</strong> anyone on the tailnet who can reach this console can read every captured API turn; there is no identity and no reading audit. A member label is not an actor identity.</p>' : ''}
   </div>`;
 }
 
@@ -1830,6 +1833,39 @@ function conversationSnippetText(value) {
   const text = conversationText(value);
   if (text.length <= MAX_CONVERSATION_SNIPPET_CHARS) return text;
   return `${Array.from(text).slice(0, MAX_CONVERSATION_SNIPPET_CHARS).join('')}…`;
+}
+
+function promptSourceI18n(source) {
+  if (source === 'wrapper_removed') {
+    return ['conversation-prompt-source-wrapper', 'Source: recognized client wrapper removed'];
+  }
+  if (source === 'fallback_raw') {
+    return ['conversation-prompt-source-fallback', 'Source: raw captured text (wrapper not recognized)'];
+  }
+  if (source === 'empty') {
+    return ['conversation-prompt-source-empty', 'Source: unavailable'];
+  }
+  return ['conversation-prompt-source-captured', 'Source: captured API user text'];
+}
+
+function promptDisplayMetaView(display) {
+  const [sourceI18n, sourceLabel] = promptSourceI18n(display?.source);
+  return `<div class="conversation-prompt-meta" data-prompt-source="${escapeHtml(display?.source ?? 'empty')}" data-prompt-suffix-omitted="${display?.suffixOmitted === true ? 'true' : 'false'}" role="note">
+    <span data-i18n="${sourceI18n}">${sourceLabel}</span>
+    ${display?.suffixOmitted === true
+      ? '<span data-i18n="conversation-prompt-suffix-omitted">A bounded suffix is omitted from this display; the omitted text is not shown.</span>'
+      : ''}
+  </div>`;
+}
+
+function promptDisplayInput(item, value) {
+  return {
+    text: value,
+    promptBytes: item?.promptBytes,
+    promptSource: item?.promptSource ?? item?.promptDisplay?.source,
+    promptSuffixOmitted: item?.promptSuffixOmitted === true
+      || item?.promptDisplay?.suffixOmitted === true,
+  };
 }
 
 function conversationFacetOptions(values, selected, allLabel, allI18n) {
@@ -1896,10 +1932,27 @@ function conversationSnippetView(labelI18n, label, value, emptyI18n) {
   </div>`;
 }
 
+function conversationPromptSnippetView(item) {
+  // Schema v4 returns the bounded complete prompt alongside any FTS snippet so
+  // legacy wrapper suffixes can be removed before display. Older callers only
+  // have promptSnippet and keep the previous bounded fallback.
+  const raw = item?.promptText ?? item?.promptSnippet;
+  const display = derivePromptDisplay(promptDisplayInput(item, raw), {
+    maxChars: MAX_CONVERSATION_SNIPPET_CHARS,
+  });
+  return `<div class="conversation-result-snippet">
+    <strong data-i18n="conversation-prompt">Captured API user text</strong>
+    ${display.text
+      ? `<p>${escapeHtml(display.text)}</p>`
+      : '<div class="empty tiny" data-i18n="conversation-empty-prompt">Not captured</div>'}
+    <p class="conversation-prompt-disclaimer" data-i18n="conversation-prompt-disclaimer">Captured from the final API user message; it may include client wrappers and is not guaranteed to be the user's original words.</p>
+    ${promptDisplayMetaView(display)}
+  </div>`;
+}
+
 function conversationItemView(item) {
   const id = item?.id === null || item?.id === undefined ? '' : String(item.id);
   const state = conversationState(item);
-  const promptSnippet = item?.promptSnippet ?? item?.promptText;
   const responseSnippet = item?.responseSnippet ?? item?.responseText;
   const dropped = item?.conversationCaptureState === 'dropped'
     || item?.captureState === 'dropped'
@@ -1911,7 +1964,7 @@ function conversationItemView(item) {
   return `<article class="conversation-result-row" data-conversation-id="${escapeHtml(id)}">
     <div class="conversation-result-head">
       <div>
-        <h2>${id ? `#${escapeHtml(id)}` : '<span data-i18n="conversation-unknown-id">Conversation</span>'}</h2>
+        <h2>${id ? `#${escapeHtml(id)}` : '<span data-i18n="conversation-unknown-id">Captured turn</span>'}</h2>
         <div class="conversation-result-meta">
           <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(item?.startedAtMs))}</span>
           <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(item?.memberLabel ?? '—')}</span>
@@ -1922,9 +1975,9 @@ function conversationItemView(item) {
       </div>
       <div class="conversation-result-actions">${conversationStatusView(state)}${detailLink}</div>
     </div>
-    ${dropped ? '<div class="notice error tiny conversation-queue-dropped" role="status" data-i18n="conversation-queue-dropped">Conversation capture was dropped by the bounded queue.</div>' : ''}
+    ${dropped ? '<div class="notice error tiny conversation-queue-dropped" role="status" data-i18n="conversation-queue-dropped">API-turn capture was dropped by the bounded queue.</div>' : ''}
     <div class="conversation-result-snippets">
-      ${conversationSnippetView('conversation-prompt', 'Prompt', promptSnippet, 'conversation-empty-prompt')}
+      ${conversationPromptSnippetView(item)}
       ${conversationSnippetView('conversation-response', 'Response', responseSnippet, 'conversation-empty-response')}
     </div>
   </article>`;
@@ -1947,15 +2000,15 @@ function conversationEnvelope({ result, searchResult, search, items, nextBeforeI
 function conversationSearchErrorView(error) {
   const code = typeof error === 'string' ? error : error?.code;
   if (code === 'conversation_filter_invalid') {
-    return '<div class="notice error" role="alert" data-i18n="conversation-filter-invalid">One or more conversation filters are invalid or too long. Clear the filters and try again.</div>';
+    return '<div class="notice error" role="alert" data-i18n="conversation-filter-invalid">One or more API-turn filters are invalid or too long. Clear the filters and try again.</div>';
   }
   if (code === 'search_query_too_short') {
-    return '<div class="notice error" role="alert" data-i18n="conversation-search-query-too-short">Search query is too short for this archive. For large archives, enter at least three consecutive Chinese characters or more searchable text; remove standalone punctuation and split the query into simpler terms.</div>';
+    return '<div class="notice error" role="alert" data-i18n="conversation-search-query-too-short">Search query is too short for this API-turn archive. For large archives, enter at least three consecutive Chinese characters or more searchable text; remove standalone punctuation and split the query into simpler terms.</div>';
   }
   if (code === 'search_query_requires_indexed_terms') {
-    return '<div class="notice error" role="alert" data-i18n="conversation-search-requires-indexed-terms">Search needs indexed terms. For large archives, enter at least three consecutive Chinese characters, remove special punctuation, or split the query into simpler terms.</div>';
+    return '<div class="notice error" role="alert" data-i18n="conversation-search-requires-indexed-terms">API-turn search needs indexed terms. For large archives, enter at least three consecutive Chinese characters, remove special punctuation, or split the query into simpler terms.</div>';
   }
-  return '<div class="notice error" role="alert" data-i18n="conversation-search-error">Conversation search could not be completed.</div>';
+  return '<div class="notice error" role="alert" data-i18n="conversation-search-error">API-turn search could not be completed.</div>';
 }
 
 export function conversationsView({
@@ -2010,7 +2063,7 @@ export function conversationsView({
     ? ''
     : conversationSearchErrorView(envelope.error);
   const droppedNotice = droppedCount > 0
-    ? `<div class="notice error conversation-queue-dropped" role="alert"><span data-i18n="conversation-queue-dropped">Conversation capture was dropped by the bounded queue.</span> <strong>${escapeHtml(String(droppedCount))}</strong></div>`
+    ? `<div class="notice error conversation-queue-dropped" role="alert"><span data-i18n="conversation-queue-dropped">API-turn capture was dropped by the bounded queue.</span> <strong>${escapeHtml(String(droppedCount))}</strong></div>`
     : '';
   const facetNotice = facets.truncated === true
     ? '<div class="notice" role="note" data-i18n="conversation-facets-truncated">Some filter values are omitted from the list; a selected value remains available.</div>'
@@ -2031,7 +2084,7 @@ export function conversationsView({
         ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
-  return layout('Captured conversations', `
+  return layout('Captured API turns', `
     <section class="stack">
       ${conversationPrivacyView(openMode)}
       <div class="conversation-layout">
@@ -2040,8 +2093,8 @@ export function conversationsView({
           <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters">
           <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
           <p class="muted tiny conversation-filter-hint" data-i18n="conversation-filter-hint">Type to search member suggestions; leave the field blank for everyone.</p>
-          <label><span data-i18n="conversation-search">Search conversations</span>
-            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Prompt or response" data-placeholder-en="Prompt or response" data-placeholder-zh="提示词或回复">
+          <label><span data-i18n="conversation-search">Search captured API turns</span>
+            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Captured API user text or response" data-placeholder-en="Captured API user text or response" data-placeholder-zh="已捕获 API 用户文本或回复">
           </label>
           <label><span data-i18n="conversation-filter-period-label">Period</span>
             <select name="period">${periodOptions}</select>
@@ -2074,9 +2127,9 @@ export function conversationsView({
         <section class="conversation-results" aria-labelledby="conversation-results-heading">
           <div class="conversation-results-head">
             <div>
-              <span class="badge stored" data-i18n="conversations-label">Captured conversations</span>
-              <h1 id="conversation-results-heading" data-i18n="conversations-heading">Conversation archive</h1>
-              <p class="muted" data-i18n="conversations-intro">Search permanently retained Claude conversations captured from eligible turns.</p>
+              <span class="badge stored" data-i18n="conversations-label">Captured API turns</span>
+              <h1 id="conversation-results-heading" data-i18n="conversations-heading">Captured API turns</h1>
+              <p class="muted" data-i18n="conversations-intro">Search permanently retained Claude API turns captured from eligible requests. These are per-request captures, not reconstructed threads.</p>
               ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
             </div>
             <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
@@ -2085,7 +2138,7 @@ export function conversationsView({
           ${droppedNotice}
           ${facetNotice}
           <div class="conversation-list" aria-live="polite">
-            ${itemsView || '<p class="empty" data-i18n="conversation-no-results">No captured conversations match this search.</p>'}
+            ${itemsView || '<p class="empty" data-i18n="conversation-no-results">No captured API turns match this search.</p>'}
           </div>
           ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-pagination-hint">Results are ordered newest first.</span>${nextForm}</div>` : ''}
         </section>
@@ -2109,29 +2162,30 @@ export function conversationDetailView({
   const record = supplied;
   const errorText = error ?? envelope.error ?? conversation?.error ?? null;
   const errorNotice = errorText
-    ? `<div class="notice error" role="alert"><span data-i18n="conversation-read-error">Conversation could not be loaded.</span><br><span class="tiny">${escapeHtml(String(errorText))}</span></div>`
+    ? `<div class="notice error" role="alert"><span data-i18n="conversation-read-error">Captured API turn could not be loaded.</span><br><span class="tiny">${escapeHtml(String(errorText))}</span></div>`
     : '';
   if (!record || typeof record !== 'object' || Array.isArray(record)) {
-    return layout('Conversation unavailable', `
+    return layout('Captured turn unavailable', `
       <section class="stack conversation-detail-shell">
         ${conversationPrivacyView(openMode)}
-        ${errorNotice || '<div class="notice error" role="alert" data-i18n="conversation-not-found">Conversation not found.</div>'}
-        <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to conversations</a>
+        ${errorNotice || '<div class="notice error" role="alert" data-i18n="conversation-not-found">Captured API turn not found.</div>'}
+        <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to API turns</a>
       </section>
     `, { openMode, activeTab: 'conversations' });
   }
   const conversationId = record.id ?? id ?? '—';
   const state = conversationState(record);
-  const prompt = conversationText(record.promptText ?? record.prompt);
+  const promptDisplay = derivePromptDisplay(promptDisplayInput(record, record.promptText ?? record.prompt));
+  const prompt = promptDisplay.text;
   const response = conversationText(record.responseText ?? record.response);
-  return layout('Conversation', `
+  return layout('Captured turn', `
     <section class="stack conversation-detail-shell">
       ${conversationPrivacyView(openMode)}
       ${errorNotice}
       <div class="topbar">
         <div>
-          <span class="badge stored" data-i18n="conversations-label">Captured conversations</span>
-          <h1><span data-i18n="conversation-detail-heading">Conversation</span> #${escapeHtml(String(conversationId))}</h1>
+          <span class="badge stored" data-i18n="conversations-label">Captured API turns</span>
+          <h1><span data-i18n="conversation-detail-heading">Captured turn</span> #${escapeHtml(String(conversationId))}</h1>
           <div class="conversation-detail-meta">
             <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(record.startedAtMs))}</span>
             <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(record.memberLabel ?? '—')}</span>
@@ -2142,14 +2196,16 @@ export function conversationDetailView({
         ${conversationStatusView(state)}
       </div>
       <article class="card conversation-text">
-        <h2 data-i18n="conversation-prompt">Prompt</h2>
+        <h2 data-i18n="conversation-prompt">Captured API user text</h2>
+        <p class="conversation-prompt-disclaimer muted tiny" data-i18n="conversation-prompt-disclaimer">Captured from the final API user message; it may include client wrappers and is not guaranteed to be the user's original words.</p>
         ${prompt ? `<pre>${escapeHtml(prompt)}</pre>` : '<p class="empty" data-i18n="conversation-empty-prompt">Not captured</p>'}
+        ${promptDisplayMetaView(promptDisplay)}
       </article>
       <article class="card conversation-text">
         <h2 data-i18n="conversation-response">Response</h2>
         ${response ? `<pre>${escapeHtml(response)}</pre>` : '<p class="empty" data-i18n="conversation-empty-response">Not captured</p>'}
       </article>
-      <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to conversations</a>
+      <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to API turns</a>
     </section>
   `, { openMode, activeTab: 'conversations' });
 }

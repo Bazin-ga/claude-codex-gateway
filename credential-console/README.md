@@ -5,10 +5,11 @@ Multi-account control plane for subscription-backed Codex and Claude Code access
 > **Telemetry and conversation notice:** every proxied Claude gateway request produces a persistent
 > metadata row that is visible to every member who can reach the console. It includes routing, model,
 > status, timing, byte-count, and four provider-reported token-count fields. P6 permanently stores
-> every captured conversation turn from Claude and makes its prompt/reply text visible to everyone who can
+> eligible captured Claude API turns and makes their API-user/assistant text visible to everyone who can
 > reach the console; in `open` mode that means anyone on the tailnet, with no identity and no reading
 > audit. Member labels are self-entered and unverified, so metrics must not be used for accountability
-> or billing. Codex traffic is not covered by conversation capture.
+> or billing. Captured API-user text may contain client wrappers and is not guaranteed to be the
+> human's original words. Codex traffic is not covered by turn capture.
 
 It solves two related operational problems:
 
@@ -323,10 +324,10 @@ the page reports that overflow instead of rounding it or failing the entire metr
 per-request integer rows remain stored.
 
 The metrics page remains body-free: request and response bodies are not rendered there. P6 separately
-permanently stores eligible captured Claude conversation turns and exposes them through the captured
-conversation archive to every member who can reach the console; in `open` mode that means anyone on
+permanently stores eligible captured Claude API turns and exposes them through the captured-turn
+archive to every member who can reach the console; in `open` mode that means anyone on
 the tailnet, with no identity and no reading audit. Self-entered member labels remain unverified and
-must not be used for accountability or billing. Codex traffic is not covered by conversation capture.
+must not be used for accountability or billing. Codex traffic is not covered by API-turn capture.
 
 The first P5 start migrates `metrics.sqlite` from schema 1 to schema 2 in one transaction; old rows
 remain readable with unknown token values. The first P6 start then migrates schema 2 to schema 3 in
@@ -336,22 +337,24 @@ the newer metrics schema. To roll code back, stop the console and restore only `
 the matching checkpointed backup (removing its `-wal`/`-shm` sidecars); do not replace `master.key`
 or `state.json` merely to roll back metrics code or conversation UI.
 
-## Captured conversations
+## Captured API turns
 
-P6 permanently retains the prompt and reply text for eligible Claude turns and makes the archive
+P6 permanently retains the captured API-user and assistant text for eligible Claude requests and makes the archive
 available to every member who can reach the console. The list supports full-text search,
 period/member/device/account/model/state filters, facet counts, and keyset pagination. Filter and
 pagination forms use bounded read-only POST bodies so prompt text and labels do not enter URLs; a
-plain GET is only the default landing page. Opening a row shows the complete stored text with its
+plain GET is only the default landing page. Each row is one API request, not a reconstructed session.
+The final API `user` message can contain client-generated wrappers and is not proof of a human's
+original terminal text. Opening a row shows the complete stored display text with its
 `complete`, `incomplete`, `truncated`, or `unavailable` response state. Result previews are capped
 server-side at 600 characters and two visual lines. A bounded capture queue can drop a conversation
 before it is stored; the archive reports that condition prominently rather than implying that the
-turn was saved. Codex traffic does not pass through this gateway and is not covered.
+API turn was saved. Codex traffic does not pass through this gateway and is not covered.
 
 This is a deliberate disclosure, not an access-control boundary. In `open` mode, anyone on the
-tailnet who can reach the console can read every captured conversation; there is no identity and no
+tailnet who can reach the console can read every captured API turn; there is no identity and no
 reading audit. Member labels are self-entered and unverified and do not identify an actor. Treat the
-conversation archive and its backups as permanent sensitive content.
+captured-turn archive and its backups as permanent sensitive content.
 
 Search validation is intentionally bounded for large archives: if a query is too short or has no
 indexed terms, enter at least three consecutive Chinese characters, remove standalone punctuation,
@@ -510,8 +513,8 @@ its first device token through the existing console self-service page.
   returns a fixed response; every other path requires a valid device token.
 - The public gateway rate-limits failed authentication by source IP and applies per-device
   request and concurrency budgets after authentication.
-- Prompt and response bodies are streamed; eligible Claude turns are permanently retained in the
-  conversation archive and visible to every console-reachable member, while routing, model, status,
+- Prompt and response bodies are streamed; eligible Claude API turns are permanently retained in the
+  captured-turn archive and visible to every console-reachable member, while routing, model, status,
   timing, and byte-count metadata remains visible on `/metrics`. Codex traffic is outside capture.
 - TTFB is measured when the upstream response headers arrive (the first HTTP response bytes).
   Request and response byte counts are raw body bytes observed by the gateway; an interrupted row

@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import { access, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { createHmac } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { CredentialStore } from '../lib/store.js';
+import {
+  CLAUDE_SESSION_ID_PATTERN,
+  CredentialStore,
+  THREAD_KEY_VERSION,
+} from '../lib/store.js';
 import { sha256 } from '../lib/security.js';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
@@ -48,6 +53,64 @@ test('explicit key initialization creates a usable store', async () => {
     credential: { oauth_token: 'explicit-key-token' },
   });
   assert.deepEqual(store.accountCredential(account.id), { oauth_token: 'explicit-key-token' });
+});
+
+test('derives stable per-device thread keys without retaining the Claude session id', async () => {
+  const { home, store } = await newStore();
+  const sessionId = 'session-0123456789abcdef';
+  assert.equal(CLAUDE_SESSION_ID_PATTERN.test(sessionId), true);
+
+  const first = store.threadKeyForSession({
+    version: THREAD_KEY_VERSION,
+    deviceId: 'device-alpha',
+    sessionId,
+  });
+  const repeat = store.threadKeyForSession({ deviceId: 'device-alpha', sessionId });
+  const otherDevice = store.threadKeyForSession({ deviceId: 'device-beta', sessionId });
+  const otherSession = store.threadKeyForSession({
+    deviceId: 'device-alpha',
+    sessionId: 'session-0123456789abcde0',
+  });
+  assert.match(first, /^[0-9a-f]{64}$/);
+  assert.equal(repeat, first);
+  assert.notEqual(otherDevice, first);
+  assert.notEqual(otherSession, first);
+  assert.equal(store.conversationThreadKey({ deviceId: 'device-alpha', sessionId }), first);
+
+  const expected = createHmac('sha256', store.masterKey)
+    .update(`${THREAD_KEY_VERSION}\u0000device-alpha\u0000${sessionId}`, 'utf8')
+    .digest('hex');
+  assert.equal(first, expected);
+  assert.equal((await readFile(join(home, 'state.json'), 'utf8')).includes(sessionId), false);
+  assert.equal((await readFile(join(home, 'master.key'), 'utf8')).includes(sessionId), false);
+
+  const reopened = await new CredentialStore(home).init();
+  assert.equal(reopened.threadKeyForSession({ deviceId: 'device-alpha', sessionId }), first);
+});
+
+test('thread key input rejects malformed ids without echoing them', async () => {
+  const { store } = await newStore();
+  for (const sessionId of [
+    'short',
+    'session with spaces',
+    'session/unsafe',
+    'session-\u0000unsafe',
+    's'.repeat(129),
+  ]) {
+    assert.throws(
+      () => store.threadKeyForSession({ deviceId: 'device-alpha', sessionId }),
+      (error) => error.message === 'thread key session id is invalid'
+        && !error.message.includes(sessionId),
+    );
+  }
+  assert.throws(
+    () => store.threadKeyForSession({ deviceId: 'device with spaces', sessionId: 'session-0123456789abcdef' }),
+    /thread key device id is invalid/,
+  );
+  assert.throws(
+    () => store.threadKeyForSession({ version: 2 ** 32, deviceId: 'device-alpha', sessionId: 'session-0123456789abcdef' }),
+    /thread key version is invalid/,
+  );
 });
 
 test('init-key refuses to replace an existing master key', async () => {

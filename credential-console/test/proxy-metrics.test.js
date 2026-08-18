@@ -81,10 +81,11 @@ async function startHarness(t, { upstreamHandler, requestMetrics, store = storeF
   return { proxyUrl, upstream };
 }
 
-function requestHeaders() {
+function requestHeaders(extra = {}) {
   return {
     'X-Api-Key': DEVICE_TOKEN,
     'Content-Type': 'application/json',
+    ...extra,
   };
 }
 
@@ -104,10 +105,10 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
-async function fetchMetricResponse(url, body) {
+async function fetchMetricResponse(url, body, extraHeaders = {}) {
   const response = await fetch(url, {
     method: 'POST',
-    headers: requestHeaders(),
+    headers: requestHeaders(extraHeaders),
     body,
   });
   return {
@@ -508,16 +509,120 @@ test('P6 records only final human text prompts and pairs them with text-only rep
     assert.equal(conversation.responseBytes, Buffer.byteLength('assistant answer'));
     assert.deepEqual(Object.keys(conversation).sort(), [
       'promptBytes',
+      'promptSource',
+      'promptSuffixOmitted',
       'promptText',
       'responseBytes',
       'responseState',
       'responseText',
+      'threadKey',
     ]);
+    assert.equal(conversation.promptSource, 'captured_api_user_text');
+    assert.equal(conversation.promptSuffixOmitted, false);
+    assert.equal(conversation.threadKey, null);
     assert.equal(JSON.stringify(conversation).includes('DO_NOT_STORE'), false);
     assert.equal(JSON.stringify(conversation).includes(DEVICE_TOKEN), false);
     assert.equal(JSON.stringify(conversation).includes(ACCOUNT_CREDENTIAL), false);
     assert.equal(conversation.promptText.includes('secret tool output'), false);
   }
+});
+
+test('P6 unwraps only exact client session wrappers and derives an opaque thread key', async (t) => {
+  const sink = { completions: [], enqueueCompletion(value) { this.completions.push(value); } };
+  const sessionId = 'session-0123456789abcdef';
+  const threadKey = 'a'.repeat(64);
+  const store = {
+    ...storeFixture(),
+    threadKeyForSession(input) {
+      assert.deepEqual(input, {
+        version: 1,
+        deviceId: DEVICE.id,
+        sessionId,
+      });
+      return threadKey;
+    },
+  };
+  const { proxyUrl } = await startHarness(t, {
+    store,
+    requestMetrics: sink,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: 'reply' }] }));
+    },
+  });
+  const response = await fetchMetricResponse(
+    `${proxyUrl}/claude/v1/messages`,
+    Buffer.from(JSON.stringify({
+      model: 'display-wrapper',
+      stream: false,
+      messages: [{ role: 'user', content: [{
+        type: 'text',
+        text: '<session>\nreal API user text\n</session>\n\nclient note omitted',
+      }] }],
+    })),
+    { 'X-Claude-Code-Session-Id': sessionId },
+  );
+  assert.equal(response.status, 200);
+  await waitFor(() => sink.completions[0]);
+  const { conversation } = sink.completions[0];
+  assert.equal(conversation.promptText, 'real API user text');
+  assert.equal(conversation.promptBytes, Buffer.byteLength('real API user text'));
+  assert.equal(conversation.promptSource, 'wrapper_removed');
+  assert.equal(conversation.promptSuffixOmitted, true);
+  assert.equal(conversation.threadKey, threadKey);
+  assert.equal(JSON.stringify(conversation).includes(sessionId), false);
+  assert.equal(JSON.stringify(conversation).includes('client note omitted'), false);
+});
+
+test('invalid or absent Claude session headers leave a turn ungrouped without leaking the id', async (t) => {
+  const sink = { completions: [], enqueueCompletion(value) { this.completions.push(value); } };
+  const sessionIds = ['short', 'session/unsafe', 'session@unsafe'];
+  let calls = 0;
+  const store = {
+    ...storeFixture(),
+    threadKeyForSession() {
+      calls += 1;
+      return 'b'.repeat(64);
+    },
+  };
+  const { proxyUrl } = await startHarness(t, {
+    store,
+    requestMetrics: sink,
+    upstreamHandler: async (req, res) => {
+      await readBody(req);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: 'reply' }] }));
+    },
+  });
+  for (const sessionId of [null, ...sessionIds]) {
+    const promptText = sessionId === null
+      ? '<session>\nliteral user markup\n</session>\n\nuntrusted suffix'
+      : 'api user text';
+    const response = await fetchMetricResponse(
+      `${proxyUrl}/claude/v1/messages`,
+      Buffer.from(JSON.stringify({
+        model: 'invalid-session',
+        stream: false,
+        messages: [{ role: 'user', content: [{ type: 'text', text: promptText }] }],
+      })),
+      sessionId === null ? {} : { 'X-Claude-Code-Session-Id': sessionId },
+    );
+    assert.equal(response.status, 200);
+  }
+  await waitFor(() => sink.completions.length === sessionIds.length + 1);
+  assert.equal(calls, 0);
+  assert.equal(
+    sink.completions[0].conversation.promptText,
+    '<session>\nliteral user markup\n</session>\n\nuntrusted suffix',
+  );
+  assert.ok(sink.completions.every(({ conversation }) => (
+    conversation.threadKey === null
+      && conversation.promptSource === 'captured_api_user_text'
+      && conversation.promptSuffixOmitted === false
+  )));
+  assert.equal(JSON.stringify(sink.completions).includes('session/unsafe'), false);
+  assert.equal(JSON.stringify(sink.completions).includes('session@unsafe'), false);
 });
 
 test('P6 non-streaming reply capture shares the compressed observation tee', async (t) => {

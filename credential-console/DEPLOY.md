@@ -9,10 +9,12 @@ simply unavailable when the Codex credential home is on a different machine.
 built-in `node:sqlite` module. The shipped service suppresses Node 22's known experimental-module
 warning; it does not suppress application errors.
 
-P6 permanently stores the prompt and reply text for eligible captured conversation turns from Claude in the
-conversation archive. Everyone who can reach the console can read those captured conversations; in
+P6 permanently stores captured API-user and assistant text for eligible Claude API turns in the
+captured-turn archive. Each row is one provider request, not a reconstructed session, and API-user
+text may contain client wrappers rather than the human's original terminal words. Everyone who can
+reach the console can read those captured turns; in
 `open` mode that means anyone on the tailnet, with no identity and no reading audit. Member labels
-are self-entered and unverified, and Codex traffic is not covered by conversation capture.
+are self-entered and unverified, and Codex traffic is not covered by API-turn capture.
 
 ## Network
 

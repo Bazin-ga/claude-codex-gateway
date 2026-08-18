@@ -5,6 +5,8 @@ import { Transform } from 'node:stream';
 import { sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
 import { createRequestMetadataTee } from './request-metadata.js';
+import { displayPromptText } from './prompt-display.js';
+import { CLAUDE_SESSION_ID_PATTERN } from './store.js';
 import {
   createCompositeResponseObserver,
   createResponseObservationTee,
@@ -140,6 +142,31 @@ function safeConversationResponse(observation) {
   else if (unavailableReasons.has(snapshot.reason)) responseState = 'unavailable';
   else if (snapshot.status === 'complete') responseState = 'complete';
   return { responseText: snapshot.text, responseState, responseBytes };
+}
+
+function claudeSessionId(headers) {
+  const value = headers?.['x-claude-code-session-id'];
+  return typeof value === 'string' && CLAUDE_SESSION_ID_PATTERN.test(value)
+    ? value
+    : null;
+}
+
+function threadKeyForRequest(store, deviceId, sessionId) {
+  if (!sessionId) return null;
+  const derive = typeof store?.threadKeyForSession === 'function'
+    ? store.threadKeyForSession
+    : store?.conversationThreadKey;
+  if (typeof derive !== 'function') return null;
+  try {
+    const threadKey = derive.call(store, { version: 1, deviceId, sessionId });
+    return typeof threadKey === 'string' && /^[0-9a-f]{64}$/.test(threadKey)
+      ? threadKey
+      : null;
+  } catch {
+    // Invalid client correlation input must degrade to an ungrouped turn.  In
+    // particular, never put the rejected session id into a log line.
+    return null;
+  }
 }
 
 function log(event, detail = {}) {
@@ -478,9 +505,19 @@ export async function handleClaudeProxy(req, res, {
       try {
         const prompt = requestMetadata.conversationCandidate?.();
         if (prompt?.promptText) {
+          const sessionId = claudeSessionId(req.headers);
+          const display = displayPromptText(prompt.promptText, {
+            // Only a validated Claude Code correlation header establishes that
+            // the line-based root is a client envelope on new traffic. Legacy
+            // rows use the same strict structural rule at presentation time.
+            allowWrapperRemoval: sessionId !== null,
+          });
           conversation = {
-            promptText: prompt.promptText,
-            promptBytes: Buffer.byteLength(prompt.promptText, 'utf8'),
+            promptText: display.text,
+            promptBytes: Buffer.byteLength(display.text, 'utf8'),
+            promptSource: display.source,
+            promptSuffixOmitted: display.suffixOmitted,
+            threadKey: threadKeyForRequest(store, device.id, sessionId),
             ...safeConversationResponse(responseObservation),
           };
         }

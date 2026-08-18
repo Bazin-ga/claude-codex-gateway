@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import {
   chmod,
   link,
@@ -33,6 +33,12 @@ const MAX_AUDIT_EVENTS = 2_000;
  * who that user is.
  */
 export const MACHINE_ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
+
+// Claude Code reports this value as a transport correlation handle.  It is
+// accepted only as a strict ASCII token and is never persisted or emitted.
+export const CLAUDE_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+export const THREAD_KEY_VERSION = 1;
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 function nowIso() {
   return new Date().toISOString();
@@ -258,6 +264,39 @@ export class CredentialStore {
     const account = this.accountById(id);
     if (!account?.credential) return null;
     return decryptJson(this.masterKey, account.credential, `account:${id}:credential:v1`);
+  }
+
+  /**
+   * Derive a stable, non-reversible conversation thread handle.  The raw
+   * Claude Code session id is deliberately never stored, audited, returned,
+   * or included in an error message.  NUL separators are safe here because
+   * both identifiers are restricted to the ASCII patterns above.
+   */
+  threadKeyForSession({
+    version = THREAD_KEY_VERSION,
+    deviceId,
+    sessionId,
+  } = {}) {
+    if (!this.masterKey || this.masterKey.length !== 32) {
+      throw new Error('master key is unavailable');
+    }
+    if (!Number.isSafeInteger(version) || version < 1 || version > 255) {
+      throw new Error('thread key version is invalid');
+    }
+    if (typeof deviceId !== 'string' || !DEVICE_ID_PATTERN.test(deviceId)) {
+      throw new Error('thread key device id is invalid');
+    }
+    if (typeof sessionId !== 'string' || !CLAUDE_SESSION_ID_PATTERN.test(sessionId)) {
+      throw new Error('thread key session id is invalid');
+    }
+    return createHmac('sha256', this.masterKey)
+      .update(`${version}\u0000${deviceId}\u0000${sessionId}`, 'utf8')
+      .digest('hex');
+  }
+
+  // Descriptive alias for callers that use the conversation terminology.
+  conversationThreadKey(input) {
+    return this.threadKeyForSession(input);
   }
 
   #deviceRecord(deviceOrId) {
