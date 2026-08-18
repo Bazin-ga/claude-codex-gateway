@@ -118,7 +118,7 @@ test('metrics view renders exact filter echo, totals, and dashboard-safe values'
 test('metrics view has accessible request, latency, and token SVG charts plus a textual data table', () => {
   const html = render();
 
-  assert.equal((html.match(/<svg role="img"/g) ?? []).length, 5);
+  assert.equal((html.match(/<svg role="img"/g) ?? []).length, 3);
   assert.match(html, /aria-labelledby="metrics-requests-chart-title metrics-requests-chart-description"/);
   assert.match(html, /aria-labelledby="metrics-latency-chart-title metrics-latency-chart-description"/);
   assert.match(html, /<title id="metrics-requests-chart-title"[^>]*>/);
@@ -156,7 +156,7 @@ test('metrics view renders safe empty and unavailable states without invalid SVG
   assert.match(html, /data-i18n="metrics-unavailable"/);
   assert.match(html, /data-i18n="metrics-error"/);
   assert.match(html, /&lt;database unavailable&gt;/);
-  assert.equal((html.match(/<svg role="img"/g) ?? []).length, 5);
+  assert.equal((html.match(/<svg role="img"/g) ?? []).length, 3);
   assert.match(html, /data-i18n="metrics-no-data"/);
   assert.match(html, /No matching request data for this period/);
   assert.match(html, /colspan="13"/);
@@ -203,7 +203,7 @@ test('unknown token totals render as unknown, not zero, and token SVG leaves mis
   });
   assert.match(html, /data-i18n="metrics-token-coverage-unavailable"/);
   assert.match(html, /Token usage is unavailable for this selection/);
-  assert.match(html, /<strong>—<\/strong>/);
+  assert.match(html, /<strong[^>]*>—<\/strong>/);
   assert.equal(html.includes('>0<\/strong>'), false, 'unknown token totals must not render as zero');
   assert.equal(html.includes('NaN'), false);
   assert.equal(html.includes('Infinity'), false);
@@ -227,7 +227,7 @@ test('known zero token totals remain exact zeros rather than unavailable', () =>
     tokenHourly: [],
   });
   assert.match(html, /data-i18n="metrics-token-coverage-complete"/);
-  assert.equal((html.match(/<strong>0<\/strong>/g) ?? []).length >= 4, true);
+  assert.equal((html.match(/<strong[^>]*>0<\/strong>/g) ?? []).length >= 4, true);
   assert.equal(html.includes('data-i18n="metrics-token-coverage-unavailable"'), false);
 });
 

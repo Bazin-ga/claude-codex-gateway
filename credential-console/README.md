@@ -317,8 +317,11 @@ total is unknown, never zero. Complete, partial, and unavailable usage-record co
 to the totals. If any usage record is partial or unavailable, the displayed token sum is explicitly
 a lower bound and unknown values are not silently filled in. A complete record may still have
 provider-null cache categories; those are labelled complete with category values unknown, not as a
-transport/parser failure. The hourly table repeats the four token columns and coverage state, while
-the separate token SVG leaves unknown hourly points blank instead of drawing them at zero. If a
+transport/parser failure. The hourly table repeats the four token columns and coverage state. The
+interactive chart layer uses a locally bundled, tree-shaken Apache ECharts 6.1 asset with a real UTC
+time axis, stacked token composition, request/latency charts, account/model rankings, and device
+ranking/trend views. Unknown values remain `null` gaps rather than becoming zero. The original
+server-rendered SVGs and tables remain the no-JavaScript or load-failure fallback. If a
 synthetic/lifetime aggregate exceeds JavaScript's exact-integer range,
 the page reports that overflow instead of rounding it or failing the entire metrics query; the
 per-request integer rows remain stored.
@@ -328,6 +331,24 @@ permanently stores eligible captured Claude API turns and exposes them through t
 archive to every member who can reach the console; in `open` mode that means anyone on
 the tailnet, with no identity and no reading audit. Self-entered member labels remain unverified and
 must not be used for accountability or billing. Codex traffic is not covered by API-turn capture.
+
+Chart data is fetched from the session-protected, same-origin `/metrics/chart-data` endpoint. Its
+bounded columnar payload contains only aggregate counts, timestamps, and already-visible labels; it
+never includes prompt/response text, provider credentials, device bearer tokens, or conversation
+content. HTML and its immediate chart-data fetch share a five-second LRU query cache bounded by both
+eight entries and 12 MiB; all metrics reads are additionally bounded to 120 requests per minute per
+tailnet identity (or globally in open mode). The ECharts bundle is content-hashed, SRI-pinned, served with an immutable cache policy, and
+does not use a CDN. Rebuild and verify it with:
+
+```bash
+cd credential-console
+npm ci
+npm run build:metrics-assets
+npm run check:metrics-assets
+```
+
+The generated asset and third-party Apache/BSD/0BSD notices are committed so production remains a
+zero-runtime-npm-dependency deployment.
 
 The first P5 start migrates `metrics.sqlite` from schema 1 to schema 2 in one transaction; old rows
 remain readable with unknown token values. The first P6 start migrates schema 2 to schema 3, adding
@@ -370,8 +391,8 @@ Search validation is intentionally bounded for large archives: if a query is too
 indexed terms, enter at least three consecutive Chinese characters, remove standalone punctuation,
 or split the query into simpler terms. Other search failures use a fixed generic error message.
 
-The Usage & metrics page also offers a capped cross-device trend comparison: one synchronized
-input-side chart and one output-token chart for up to eight devices. Input-side points require all
+The Usage & metrics page also offers a capped cross-device comparison: a known-token device ranking
+and a toggleable hourly input-side/output trend for up to eight devices. Input-side points require all
 three input categories to be known; unknown values remain gaps. The comparison follows time, member,
 account, and model filters but intentionally ignores the single-device selector.
 

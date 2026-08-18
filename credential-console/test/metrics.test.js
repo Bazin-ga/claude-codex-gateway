@@ -1911,6 +1911,33 @@ test('breakdowns are bounded before untrusted model cardinality reaches the page
   assert.equal(store.queryBreakdown({ by: 'model', scope: 'all' }).length, 500);
 });
 
+test('token breakdown ranks the true top eight beyond the request-count candidate cap', async (t) => {
+  const { store } = await newStore(t, { batchSize: 700, maxQueue: 700 });
+  for (let index = 0; index < 501; index += 1) {
+    assert.equal(store.enqueueRequest(row({
+      startedAtMs: BASE_MS + index,
+      accountId: `account-${String(index).padStart(3, '0')}`,
+      inputTokens: index === 500 ? 1_000_000 : index,
+      outputTokens: 0,
+      usageState: 'complete',
+    })), true);
+  }
+  assert.equal(store.enqueueRequest(row({
+    startedAtMs: BASE_MS + 1000,
+    accountId: 'non-consumption-helper',
+    path: '/v1/messages/count_tokens',
+    inputTokens: 9_000_000,
+    outputTokens: 0,
+    usageState: 'complete',
+  })), true);
+  assert.equal(store.flush().written, 502);
+  const result = store.queryTokenBreakdown({ by: 'account' });
+  assert.equal(result.length, 8);
+  assert.equal(result[0].groupValue, 'account-500');
+  assert.equal(result[0].totalInputTokens, 1_000_000);
+  assert.equal(result.some((entry) => entry.groupValue === 'non-consumption-helper'), false);
+});
+
 test('row normalization bounds strings, preserves nulls, and ignores body-like fields', async (t) => {
   const { store, dbPath } = await newStore(t);
   const longModel = 'm'.repeat(1000);

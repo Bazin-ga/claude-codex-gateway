@@ -152,7 +152,9 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
   request and concurrency budgets.
 - **Separated request telemetry and captured API turns.** The Claude gateway persists request metadata
   and separate input, cache-creation input, cache-read input, and output token counts for shared
-  metrics. The metrics page remains body-free; P6 separately and permanently stores eligible captured
+  metrics. The body-free metrics page progressively enhances its server-rendered fallback with a
+  locally bundled, SRI-pinned Apache ECharts dashboard for token composition, account/model rankings,
+  and cross-device hourly trends; it makes no CDN request. P6 separately and permanently stores eligible captured
   Claude API turns for console-wide browsing. Validated client session identifiers are HMAC-hidden
   and group future turns into conversation timelines; legacy/unidentified turns remain standalone
   rather than being guessed together by time. API-user text may include client-added wrappers.

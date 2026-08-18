@@ -795,14 +795,19 @@ Browser checks:
 15. in a deliberately private `open` test deployment, confirm the dashboard visibly warns that
     anyone reachable can read the live guide and its deployment/account metadata.
 16. open `/metrics` and confirm it displays separate input, cache-creation input, cache-read input,
-    and output token totals plus known-value counts, a dedicated hourly token SVG, and matching
-    hourly table columns;
+    and output token totals plus known-value counts; confirm the content-hashed same-origin ECharts
+    asset passes SRI, renders the stacked hourly token chart, and leaves the server SVG/table fallback
+    intact when JavaScript is disabled;
 17. feed a fixture with complete, partial, unavailable, null, and known-zero usage values and
     confirm the page labels partial totals as a lower bound, renders unknown as `—` rather than
-    zero, and leaves unknown hourly SVG points blank;
-17a. confirm the Usage & metrics page shows synchronized input-side and output-token device charts,
-    uses distinct colors and line patterns for up to eight devices, keeps unknown points as gaps,
-    and ignores only the single-device selector while retaining the other filters;
+    zero, and leaves unknown ECharts and fallback SVG points blank;
+17a. confirm the Usage & metrics page shows a device ranking plus a toggleable input-side/output
+    hourly device chart, uses distinct colors and line patterns for up to eight devices, keeps unknown
+    points as gaps, and ignores only the single-device selector while retaining the other filters;
+17b. at 320, 390, 768, and 1440 CSS pixels, confirm the ECharts SVG renderer has no horizontal page
+    overflow, filters collapse only on narrow screens, `ResizeObserver` resizes every chart, raw tables
+    remain horizontally scrollable, and `/metrics/chart-data` contains aggregates but no prompt,
+    response, provider credential, or device bearer value;
 18. confirm the token page states that it covers Claude gateway traffic only, excludes Codex, and
     keeps the metrics-page body-free and open-mode visibility notices.
 19. open `/conversations` and confirm a client session with several turns renders one bounded,

@@ -68,6 +68,7 @@ export function baseHeaders({ nonce = null } = {}) {
       "default-src 'none'",
       `style-src 'self' 'unsafe-inline'${nonce ? ` 'nonce-${nonce}'` : ''}`,
       `script-src 'self'${nonce ? ` 'nonce-${nonce}'` : ''}`,
+      "connect-src 'self'",
       "img-src 'self' data:",
       "form-action 'self'",
       "base-uri 'none'",

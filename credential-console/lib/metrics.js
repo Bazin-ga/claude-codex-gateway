@@ -13,6 +13,7 @@ const DEFAULT_FLUSH_INTERVAL_MS = 250;
 const DEFAULT_MAX_QUEUE = 4096;
 const SQLITE_TIMEOUT_MS = 1000;
 const MAX_BREAKDOWN_ROWS = 500;
+const MAX_TOKEN_BREAKDOWN_ROWS = 8;
 const MAX_DEVICE_TOKEN_DEVICES = 8;
 const MAX_DEVICE_TOKEN_HOURS_PER_DEVICE = 720;
 const QUEUE_DROP_LOG_INTERVAL_MS = 60_000;
@@ -307,6 +308,19 @@ const AGGREGATE_SELECT = `
 
 const AGGREGATE_ORDER = `
   ORDER BY request_count DESC, group_value IS NULL ASC, group_value ASC
+`;
+
+// Ranking is intentionally a lower-bound known-token ranking. NULL categories
+// contribute nothing to ordering, but remain NULL with their known counts in
+// the returned aggregate so a view cannot mistake the ranking score for a
+// complete billable total.
+const TOKEN_BREAKDOWN_ORDER = `
+  ORDER BY (
+    COALESCE(TOTAL(input_tokens), 0.0)
+    + COALESCE(TOTAL(cache_creation_input_tokens), 0.0)
+    + COALESCE(TOTAL(cache_read_input_tokens), 0.0)
+    + COALESCE(TOTAL(output_tokens), 0.0)
+  ) DESC, group_value IS NULL ASC, group_value ASC
 `;
 
 const BREAKDOWN_COLUMNS = Object.freeze({
@@ -2145,6 +2159,25 @@ export class MetricsStore {
        GROUP BY ${column}
        ${AGGREGATE_ORDER}
        LIMIT ${MAX_BREAKDOWN_ROWS}`,
+      filterParams(normalized),
+    );
+    return rows.map((row) => ({
+      groupValue: row.group_value ?? null,
+      ...normalizeAggregateRow(row),
+    }));
+  }
+
+  queryTokenBreakdown({ by, ...filters } = {}) {
+    const column = BREAKDOWN_COLUMNS[by];
+    if (!column) throw new TypeError('breakdown must be machine, device, member, account, or model');
+    const normalized = normalizeFilters({ ...filters, scope: 'consumption' });
+    const rows = this.#queryRows(
+      `SELECT ${column} AS group_value, ${AGGREGATE_SELECT}
+       FROM request_metrics
+       ${filterSql(normalized)}
+       GROUP BY ${column}
+       ${TOKEN_BREAKDOWN_ORDER}
+       LIMIT ${MAX_TOKEN_BREAKDOWN_ROWS}`,
       filterParams(normalized),
     );
     return rows.map((row) => ({

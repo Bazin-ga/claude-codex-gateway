@@ -23,6 +23,7 @@ import { CLIENT_CONFIG_VERSION } from './lib/client-config-version.js';
 import { buildOnboardingGuideUrl, buildOnboardingMarkdown } from './lib/onboarding.js';
 import { UsageMonitor } from './lib/usage.js';
 import { safeTimestamp } from './lib/credential-alerts.js';
+import { buildMetricsChartPayload } from './lib/metrics-chart-data.js';
 import {
   createClaudeAuthorizationRequest,
   exchangeClaudeAuthorization,
@@ -80,6 +81,12 @@ const SESSION_TTL_MS = 12 * 60 * 60_000;
 // not depend on someone authenticating first. The process is capped at 96 MB of
 // heap by the shipped unit; an unbounded map is an OOM plus a restart loop.
 const MAX_SESSIONS = 4_096;
+const METRICS_PAGE_CACHE_TTL_MS = 5_000;
+const MAX_METRICS_PAGE_CACHE_ENTRIES = 8;
+const MAX_METRICS_PAGE_CACHE_BYTES = 12 * 1024 * 1024;
+const METRICS_CHART_RATE_WINDOW_MS = 60_000;
+const METRICS_CHART_RATE_LIMIT = 120;
+const MAX_METRICS_CHART_RATE_KEYS = 1_024;
 const DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const BOUNDED_CONVERSATION_SEARCH_ERRORS = new Set([
   'search_query_too_short',
@@ -99,6 +106,8 @@ const CONVERSATION_IDENTIFIER_MAX_BYTES = 128;
 const CONVERSATION_MODEL_MAX_BYTES = 256;
 export const SHUTDOWN_DEADLINE_MS = 1_000;
 const CODEX_AGENT_ROOT = fileURLToPath(new URL('../codex-credential/client-agent/', import.meta.url));
+const METRICS_ASSET_ROOT = fileURLToPath(new URL('./assets/', import.meta.url));
+const METRICS_ASSET_MANIFEST = `${METRICS_ASSET_ROOT}metrics-echarts-manifest.json`;
 export const CODEX_AGENT_ASSETS = new Map([
   ['pull.js', 'pull.js'],
   ['profiles.js', 'profiles.js'],
@@ -299,6 +308,30 @@ async function readPublicJson(path) {
   }
 }
 
+async function loadMetricsAsset() {
+  const manifest = JSON.parse(await readFile(METRICS_ASSET_MANIFEST, 'utf8'));
+  if (manifest?.version !== 1
+    || typeof manifest.file !== 'string'
+    || !/^metrics-echarts\.[0-9a-f]{12}\.js$/.test(manifest.file)
+    || manifest.url !== `/assets/${manifest.file}`
+    || typeof manifest.sha256 !== 'string'
+    || !/^[0-9a-f]{64}$/.test(manifest.sha256)
+    || typeof manifest.integrity !== 'string'
+    || !/^sha384-[A-Za-z0-9+/]+={0,2}$/.test(manifest.integrity)
+    || !Number.isSafeInteger(manifest.bytes)
+    || manifest.bytes < 1
+    || manifest.bytes > 700 * 1024) {
+    throw new Error('metrics asset manifest is invalid');
+  }
+  const body = await readFile(`${METRICS_ASSET_ROOT}${manifest.file}`);
+  const sha256 = createHash('sha256').update(body).digest('hex');
+  const integrity = `sha384-${createHash('sha384').update(body).digest('base64')}`;
+  if (body.length !== manifest.bytes || sha256 !== manifest.sha256 || integrity !== manifest.integrity) {
+    throw new Error('metrics asset digest does not match its manifest');
+  }
+  return { ...manifest, body };
+}
+
 /**
  * Read the two public Codex metadata files without ever returning their
  * credential values. current.json is authoritative for expiry; health.json is
@@ -450,6 +483,9 @@ export async function createCredentialConsole(options = {}) {
     log,
   }).init();
   const sessions = new Map();
+  const metricsPageCache = new Map();
+  let metricsPageCacheBytes = 0;
+  const metricsChartRate = new Map();
   const publicBaseUrl = options.publicBaseUrl ?? PUBLIC_BASE_URL;
   const onboardingUrl = buildOnboardingGuideUrl(publicBaseUrl);
   const claudeGatewayUrl = options.claudeGatewayUrl
@@ -460,6 +496,10 @@ export async function createCredentialConsole(options = {}) {
   // Overridable only so a test can drive the eviction path without minting the real
   // ceiling's worth of sessions.
   const maxSessions = options.maxSessions ?? MAX_SESSIONS;
+  const metricsChartRateLimit = Number.isSafeInteger(options.metricsChartRateLimit)
+    && options.metricsChartRateLimit > 0
+    ? options.metricsChartRateLimit
+    : METRICS_CHART_RATE_LIMIT;
   const codexEndpoint = options.codexEndpoint ?? CODEX_ENDPOINT;
   const codexCertPin = options.codexCertPin ?? CODEX_CERT_PIN;
   let codexEnrollmentKey = options.codexEnrollmentKey;
@@ -480,15 +520,37 @@ export async function createCredentialConsole(options = {}) {
       await readFile(`${CODEX_AGENT_ROOT}${relativePath}`, 'utf8'),
     ]),
   ));
+  let metricsAsset = options.metricsAsset;
+  if (metricsAsset === undefined) {
+    try {
+      metricsAsset = await loadMetricsAsset();
+    } catch (error) {
+      metricsAsset = null;
+      log('metrics_asset_unavailable', { code: error?.code ?? error?.name ?? 'invalid' });
+    }
+  }
   if (!['tailscale', 'open'].includes(adminAuth)) {
     throw new Error('CREDENTIAL_CONSOLE_ADMIN_AUTH must be tailscale or open');
   }
   // Open mode has no login, so every rendered page has to say so.
   const openMode = adminAuth === 'open';
+  const deleteMetricsPageCache = (key) => {
+    const entry = metricsPageCache.get(key);
+    if (!entry) return false;
+    metricsPageCache.delete(key);
+    metricsPageCacheBytes = Math.max(0, metricsPageCacheBytes - entry.bytes);
+    return true;
+  };
   const cleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [token, session] of sessions) {
       if (session.expires_at <= now) sessions.delete(token);
+    }
+    for (const [key, entry] of metricsPageCache) {
+      if (now - entry.createdAtMs > METRICS_PAGE_CACHE_TTL_MS) deleteMetricsPageCache(key);
+    }
+    for (const [key, entry] of metricsChartRate) {
+      if (now - entry.sinceMs > METRICS_CHART_RATE_WINDOW_MS) metricsChartRate.delete(key);
     }
   }, 15 * 60_000);
   cleanupTimer.unref();
@@ -565,6 +627,25 @@ export async function createCredentialConsole(options = {}) {
       return null;
     }
     return session;
+  }
+
+  function metricsReadRateLimited(session) {
+    const now = Date.now();
+    const key = adminAuth === 'tailscale'
+      ? `identity:${createHash('sha256').update(String(session.admin_identity ?? 'unknown')).digest('hex')}`
+      : 'open-console-global';
+    const previous = metricsChartRate.get(key);
+    const next = !previous || now - previous.sinceMs >= METRICS_CHART_RATE_WINDOW_MS
+      ? { sinceMs: now, count: 1 }
+      : { sinceMs: previous.sinceMs, count: previous.count + 1 };
+    metricsChartRate.delete(key);
+    metricsChartRate.set(key, next);
+    while (metricsChartRate.size > MAX_METRICS_CHART_RATE_KEYS) {
+      const oldest = metricsChartRate.keys().next().value;
+      if (oldest === undefined) break;
+      metricsChartRate.delete(oldest);
+    }
+    return next.count > metricsChartRateLimit;
   }
 
   function checkCsrf(session, form) {
@@ -650,7 +731,7 @@ export async function createCredentialConsole(options = {}) {
     return known;
   }
 
-  function metricsPage(url) {
+  function queryMetricsPage(url) {
     const allowedHours = new Set([24, 168, 720]);
     const requestedHours = Number(url.searchParams.get('hours'));
     const hours = allowedHours.has(requestedHours) ? requestedHours : 24;
@@ -687,12 +768,15 @@ export async function createCredentialConsole(options = {}) {
       model,
     };
     const empty = {
+      range: { fromMs, toMs: now + 1, hours, timezone: 'UTC' },
       filters: viewFilters,
       options: { machines: [], members: [], accounts: [], models: [] },
-      totals: { all: 0, consumption: 0 },
+      totals: { all: 0, consumption: 0, success: 0, errors: 0 },
       hourly: [],
       tokenTotals: {},
       tokenHourly: [],
+      accountTokenBreakdown: [],
+      modelTokenBreakdown: [],
       deviceTokenComparison: {
         devices: [], rows: [], truncated: false, devicesTruncated: false, hoursTruncated: false,
         unavailableDeviceCount: 0,
@@ -723,6 +807,25 @@ export async function createCredentialConsole(options = {}) {
       const memberRows = requestMetrics.queryBreakdown({ by: 'member', ...dimensions });
       const accountRows = requestMetrics.queryBreakdown({ by: 'account', ...dimensions });
       const modelRows = requestMetrics.queryBreakdown({ by: 'model', ...dimensions });
+      const tokenBreakdown = typeof requestMetrics.queryTokenBreakdown === 'function'
+        ? requestMetrics.queryTokenBreakdown.bind(requestMetrics)
+        : requestMetrics.queryBreakdown.bind(requestMetrics);
+      const accountTokenBreakdown = tokenBreakdown({
+        by: 'account',
+        ...filters,
+        scope: 'consumption',
+      }).map((row) => ({
+        ...row,
+        label: accountById.get(row.groupValue)?.alias ?? row.groupValue ?? 'Unattributed',
+      }));
+      const modelTokenBreakdown = tokenBreakdown({
+        by: 'model',
+        ...filters,
+        scope: 'consumption',
+      }).map((row) => ({
+        ...row,
+        label: row.groupValue ?? 'Unattributed',
+      }));
       let deviceTokenComparison = {
         devices: [], rows: [], truncated: false, devicesTruncated: false, hoursTruncated: false,
         unavailableDeviceCount: 0,
@@ -764,6 +867,7 @@ export async function createCredentialConsole(options = {}) {
         }
       }
       return {
+        range: { fromMs, toMs: now + 1, hours, timezone: 'UTC' },
         filters: viewFilters,
         options: {
           machines: [
@@ -797,10 +901,14 @@ export async function createCredentialConsole(options = {}) {
         totals: {
           all: allTotals.requestCount,
           consumption: consumptionTotals.requestCount,
+          success: allTotals.successCount,
+          errors: allTotals.errorCount,
         },
         hourly,
         tokenTotals: consumptionTotals,
         tokenHourly,
+        accountTokenBreakdown,
+        modelTokenBreakdown,
         deviceTokenComparison,
         metricsAvailable: true,
         droppedMetrics: requestMetrics.stats?.dropped ?? 0,
@@ -813,6 +921,45 @@ export async function createCredentialConsole(options = {}) {
         error: 'Request metrics could not be read.',
       };
     }
+  }
+
+  function metricsPage(url) {
+    const requestedHours = Number(url.searchParams.get('hours'));
+    const hours = new Set([24, 168, 720]).has(requestedHours) ? requestedHours : 24;
+    const cacheKey = JSON.stringify([
+      hours,
+      String(url.searchParams.get('machine_id') ?? '').slice(0, 256),
+      String(url.searchParams.get('member_label') ?? '').slice(0, 160),
+      String(url.searchParams.get('account_id') ?? '').slice(0, 128),
+      String(url.searchParams.get('model') ?? '').slice(0, 256),
+    ]);
+    const now = Date.now();
+    const cached = metricsPageCache.get(cacheKey);
+    if (cached && now - cached.createdAtMs <= METRICS_PAGE_CACHE_TTL_MS) {
+      metricsPageCache.delete(cacheKey);
+      metricsPageCache.set(cacheKey, cached);
+      return cached.page;
+    }
+    if (cached) deleteMetricsPageCache(cacheKey);
+    const page = queryMetricsPage(url);
+    let bytes = MAX_METRICS_PAGE_CACHE_BYTES + 1;
+    try {
+      bytes = Buffer.byteLength(JSON.stringify(page), 'utf8');
+    } catch {
+      // A query result that cannot be measured is still safe to render once,
+      // but it must never enter a memory cache with an unknown cost.
+    }
+    while (metricsPageCache.size >= MAX_METRICS_PAGE_CACHE_ENTRIES
+      || (metricsPageCache.size > 0 && metricsPageCacheBytes + bytes > MAX_METRICS_PAGE_CACHE_BYTES)) {
+      const oldest = metricsPageCache.keys().next().value;
+      if (oldest === undefined) break;
+      deleteMetricsPageCache(oldest);
+    }
+    if (bytes <= MAX_METRICS_PAGE_CACHE_BYTES) {
+      metricsPageCache.set(cacheKey, { createdAtMs: now, page, bytes });
+      metricsPageCacheBytes += bytes;
+    }
+    return page;
   }
 
   function conversationSearchPage(url, { mode = 'sessions' } = {}) {
@@ -1093,12 +1240,36 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    if (req.method === 'GET' && path === '/metrics/chart-data') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      if (metricsReadRateLimited(session)) {
+        sendJson(res, 429, { error: 'metrics_chart_rate_limited' }, { 'Retry-After': '60' });
+        return;
+      }
+      const page = metricsPage(url);
+      sendJson(res, page.error || !page.metricsAvailable ? 503 : 200, buildMetricsChartPayload(page));
+      return;
+    }
+
     if (req.method === 'GET' && path === '/metrics') {
       const session = requireSession(req, res);
       if (!session) return;
+      if (metricsReadRateLimited(session)) {
+        sendHtml(res, 429, messageView(
+          'Metrics temporarily rate limited',
+          'Too many metrics reads were requested. Wait one minute and try again.',
+          { error: true, openMode },
+        ), { 'Retry-After': '60' });
+        return;
+      }
       sendHtml(res, 200, metricsView({
         ...metricsPage(url),
         openMode,
+        metricsAsset: metricsAsset ? {
+          url: metricsAsset.url,
+          integrity: metricsAsset.integrity,
+        } : null,
       }));
       return;
     }
@@ -1211,6 +1382,19 @@ export async function createCredentialConsole(options = {}) {
         id: conversationParams.id,
         openMode,
       }));
+      return;
+    }
+
+    if (req.method === 'GET' && metricsAsset && path === metricsAsset.url) {
+      sendText(res, 200, metricsAsset.body, 'text/javascript; charset=utf-8', {
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        ETag: `"${metricsAsset.sha256}"`,
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && path.startsWith('/assets/metrics-echarts.')) {
+      sendText(res, 404, 'not found\n');
       return;
     }
 
@@ -1353,12 +1537,16 @@ const translations = {
   'copy-onboarding-link': '复制指引链接',
   'open-onboarding-guide': '打开指引',
   'metrics-dashboard-link': '查看请求指标',
-  'metrics-label': '请求指标',
-  'metrics-heading': 'Claude 网关请求指标',
-  'metrics-intro': '本页只展示请求元数据；本页不展示请求正文或回复正文，符合条件的已捕获 API 轮次会在「对话」与单轮归档中展示。',
+  'metrics-label': '用量洞察',
+  'metrics-heading': 'Token 使用量',
+  'metrics-intro': '按小时查看 Claude 网关的 Token 消耗、请求健康和设备趋势，并严格区分未知值与零。',
+  'metrics-intro-long': '本页只渲染请求元数据，不展示请求正文或回复正文；符合条件的已捕获 API 轮次会在「对话」中展示。',
   'metrics-claude-only': 'Token 核算只覆盖 Claude 网关流量。Codex 客户端直接连接服务商，不在此统计范围内。',
   'metrics-attribution-disclaimer': '使用者标签由本人填写，未经验证；只能用于观察用量趋势，不得作为追责或计费依据。',
-  'metrics-filter-heading': '筛选请求指标',
+  'metrics-status-coverage': '完整覆盖率',
+  'metrics-unknown-zero': '— 表示未知，绝不表示零',
+  'metrics-filter-toggle': '筛选条件',
+  'metrics-filter-heading': '筛选用量',
   'metrics-filter-machine': '机器',
   'metrics-filter-member': '使用者标签',
   'metrics-filter-account': '账号',
@@ -1379,9 +1567,13 @@ const translations = {
   'metrics-error': '指标页面无法载入数据。',
   'metrics-total-requests': '全部请求',
   'metrics-consumption-requests': '消耗请求',
-  'metrics-request-volume': '每小时请求量',
+  'metrics-known-total': '已知 Token 总量',
+  'metrics-known-total-lower-bound': '所选时间范围的下界',
+  'metrics-known-total-exact': '完整上报类别的精确总和',
+  'metrics-request-outcomes': '成功 / 错误',
+  'metrics-request-volume': '请求健康',
   'metrics-request-volume-description': '每小时全部请求、成功请求与错误请求的数量。',
-  'metrics-latency': '每小时请求延迟',
+  'metrics-latency': '延迟',
   'metrics-latency-description': '每小时平均首字节时间与请求总耗时，单位为毫秒。',
   'metrics-no-data': '所选时间范围内没有匹配的请求数据。',
   'metrics-series-total': '全部请求',
@@ -1407,8 +1599,8 @@ const translations = {
   'metrics-token-complete-count': '完整',
   'metrics-token-partial-count': '部分',
   'metrics-token-unavailable-count': '不可用',
-  'metrics-token-trend': '每小时 token 用量',
-  'metrics-token-trend-description': '每小时输入、缓存创建、缓存读取和输出 token 总量；未知值会留空，不会当作零。',
+  'metrics-token-trend': '每小时 Token 构成',
+  'metrics-token-trend-description': '在真实 UTC 时间轴上堆叠四类已知 Token；未知值保留为空档。',
   'metrics-token-no-data': '所选范围没有可用的 token 用量。',
   'metrics-total-input-tokens': '输入 token',
   'metrics-total-cache-creation-input-tokens': '缓存创建输入 token',
@@ -1434,13 +1626,25 @@ const translations = {
   'tab-metrics': '用量与指标',
   'tab-conversations': '对话',
   'metrics-conversations-link': '查看对话',
-  'metrics-device-comparison-heading': '跨设备 token 趋势比较',
-  'metrics-device-comparison-description': '两张同步图分别比较各设备的输入侧已知 token 与 output_tokens；未知值留空，不当作零，也不是计费视图。',
+  'metrics-account-breakdown-heading': '按账号查看用量',
+  'metrics-account-breakdown-description': '按已知 Token 总量排列用量最高的账号。',
+  'metrics-model-breakdown-heading': '按模型查看用量',
+  'metrics-model-breakdown-description': '按已知 Token 总量排列用量最高的模型。',
+  'metrics-breakdown-no-data': '当前没有可用的 Token 分布数据。',
+  'metrics-device-comparison-heading': '设备用量洞察',
+  'metrics-device-comparison-description': '比较最活跃设备的已知 Token 总量与每小时趋势；未知值保留为空档，绝不补零。',
   'metrics-device-comparison-scope': '此比较沿用成员、账号、模型和时间筛选；有意忽略单设备机器选择器。',
   'metrics-device-input-comparison-heading': '每小时按设备的输入侧已知 token',
   'metrics-device-input-comparison-description': '仅当 input、缓存创建 input、缓存读取 input 三类都已知时绘制；缺一类就留出空档。',
   'metrics-device-output-comparison-heading': '每小时按设备的输出 token',
   'metrics-device-output-comparison-description': '每条线是 output_tokens；未知输出留空，不当作零。',
+  'metrics-device-ranking-heading': '按设备的已知 Token',
+  'metrics-device-ranking-description': '所选范围内的输入侧已知 Token 与输出 Token。',
+  'metrics-device-trend-heading': '每小时设备趋势',
+  'metrics-device-trend-description': '在完整输入侧已知 Token 与输出 Token 之间切换。',
+  'metrics-device-toggle-input': '输入侧',
+  'metrics-device-toggle-output': '输出',
+  'metrics-static-fallback-toggle': '显示静态图表备用视图',
   'metrics-device-comparison-known-sum': '设备趋势线',
   'metrics-device-comparison-known-points': '已知点',
   'metrics-device-comparison-unknown-points': '未知点',
@@ -1460,6 +1664,8 @@ const translations = {
   'metrics-hourly-table-caption': '每小时请求与 token 明细',
   'metrics-hourly-table-toggle': '显示每小时明细',
   'metrics-hourly-table-truncated': '每小时表只显示最新 200 行；更早的行已省略。',
+  'metrics-scroll-table-hint': '可横向滑动查看全部列。',
+  'metrics-methodology-toggle': '统计范围、隐私与归因说明',
   'conversations-dashboard-link': '查看对话',
   'conversations-label': '已捕获 API 轮次',
   'conversations-heading': '已捕获 API 轮次',
@@ -1678,6 +1884,7 @@ function applyLanguage(language) {
     button.setAttribute('aria-pressed', button.dataset.language === selected ? 'true' : 'false');
   });
   localStorage.setItem('credential_console_language', selected);
+  window.dispatchEvent(new CustomEvent('credential-console-language', { detail: { language: selected } }));
 }
 
 applyLanguage(localStorage.getItem('credential_console_language') ?? 'en');
@@ -1695,6 +1902,17 @@ const syncConversationFilters = (media) => {
 if (conversationFilterMedia) {
   syncConversationFilters(conversationFilterMedia);
   conversationFilterMedia.addEventListener?.('change', syncConversationFilters);
+}
+
+const metricsFilterMedia = window.matchMedia?.('(max-width: 640px)');
+const syncMetricsFilters = (media) => {
+  document.querySelectorAll('.metrics-filter-details').forEach((details) => {
+    details.open = !media.matches;
+  });
+};
+if (metricsFilterMedia) {
+  syncMetricsFilters(metricsFilterMedia);
+  metricsFilterMedia.addEventListener?.('change', syncMetricsFilters);
 }
 
 async function copyText(text) {

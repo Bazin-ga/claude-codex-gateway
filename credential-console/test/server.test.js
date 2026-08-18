@@ -27,6 +27,7 @@ async function fixture({
   claudeOauthExchange,
   cookieSecure = false,
   maxSessions,
+  metricsChartRateLimit,
   usageSnapshot = () => null,
 } = {}) {
   const upstreamRequests = [];
@@ -67,6 +68,7 @@ async function fixture({
     adminAuth,
     cookieSecure,
     ...(maxSessions === undefined ? {} : { maxSessions }),
+    ...(metricsChartRateLimit === undefined ? {} : { metricsChartRateLimit }),
     publicBaseUrl: 'http://credential-console.test',
     claudeUpstreamBaseUrl: upstreamUrl,
     ...(claudeOauthExchange ? { claudeOauthExchange } : {}),
@@ -1775,13 +1777,19 @@ test('request metrics page attributes the device label and excludes count_tokens
       [{ groupValue: 'self-asserted-member', requestCount: 2 }],
     );
 
+    let queryTotalsCalls = 0;
+    const queryTotals = app.requestMetrics.queryTotals.bind(app.requestMetrics);
+    app.requestMetrics.queryTotals = (...args) => {
+      queryTotalsCalls += 1;
+      return queryTotals(...args);
+    };
     const metrics = await fetch(
       `${app.baseUrl}/metrics?machine_id=device:${encodeURIComponent(issued.device.id)}&member_label=self-asserted-member&account_id=${encodeURIComponent(account.id)}&model=claude-metrics-model&hours=24`,
     );
     assert.equal(metrics.status, 200);
     const html = await metrics.text();
-    assert.match(html, /data-i18n="metrics-total-requests">All requests<\/span><strong>2<\/strong>/);
-    assert.match(html, /data-i18n="metrics-consumption-requests">Consumption requests<\/span><strong>1<\/strong>/);
+    assert.match(html, /data-i18n="metrics-total-requests">All requests<\/span>:\s*<strong>2<\/strong>/);
+    assert.match(html, /data-i18n="metrics-consumption-requests">Consumption requests<\/span>:\s*<strong>1<\/strong>/);
     assert.match(html, /value="self-asserted-member" selected/);
     assert.match(html, /value="claude-metrics-model" selected/);
     assert.match(html, /self-entered and unverified/);
@@ -1792,10 +1800,43 @@ test('request metrics page attributes the device label and excludes count_tokens
     assert.match(html, /id="metrics-device-input-comparison-chart-title"/);
     assert.match(html, /id="metrics-device-output-comparison-chart-title"/);
     assert.match(html, /data-i18n="metrics-device-comparison-scope"/);
-    assert.match(html, /data-i18n="metrics-token-input">Input tokens<\/span>\s*<strong>7<\/strong>/);
-    assert.match(html, /data-i18n="metrics-token-output">Output tokens<\/span>\s*<strong>5<\/strong>/);
+    assert.match(html, /data-metrics-dashboard/);
+    assert.match(html, /data-metrics-chart="tokens"/);
+    assert.match(html, /data-metrics-chart="device-trend"/);
+    assert.match(html, /src="\/assets\/metrics-echarts\.[0-9a-f]{12}\.js" integrity="sha384-/);
+    assert.match(html, /data-i18n="metrics-token-input">Input tokens<\/span>\s*<strong[^>]*>7<\/strong>/);
+    assert.match(html, /data-i18n="metrics-token-output">Output tokens<\/span>\s*<strong[^>]*>5<\/strong>/);
     assert.equal(html.includes(promptMarker), false);
     assert.equal(html.includes(issued.token), false);
+    assert.match(metrics.headers.get('content-security-policy'), /connect-src 'self'/);
+
+    const assetPath = html.match(/src="(\/assets\/metrics-echarts\.[0-9a-f]{12}\.js)"/)?.[1];
+    assert.ok(assetPath);
+    const chartAsset = await fetch(`${app.baseUrl}${assetPath}`);
+    assert.equal(chartAsset.status, 200);
+    assert.match(chartAsset.headers.get('content-type'), /^text\/javascript/);
+    assert.equal(chartAsset.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+    assert.ok((await chartAsset.arrayBuffer()).byteLength > 100_000);
+    const staleAsset = await fetch(`${app.baseUrl}/assets/metrics-echarts.000000000000.js`);
+    assert.equal(staleAsset.status, 404);
+
+    const chartData = await fetch(
+      `${app.baseUrl}/metrics/chart-data?machine_id=device:${encodeURIComponent(issued.device.id)}&member_label=self-asserted-member&account_id=${encodeURIComponent(account.id)}&model=claude-metrics-model&hours=24`,
+    );
+    assert.equal(chartData.status, 200);
+    const chartPayload = await chartData.json();
+    assert.equal(chartPayload.version, 1);
+    assert.equal(chartPayload.totals.requests.all, 2);
+    assert.equal(chartPayload.totals.requests.consumption, 1);
+    assert.equal(chartPayload.totals.tokens.input, 7);
+    assert.equal(chartPayload.totals.tokens.output, 5);
+    assert.equal(chartPayload.breakdowns.accounts[0].label, 'metrics-account');
+    assert.equal(chartPayload.breakdowns.models[0].label, 'claude-metrics-model');
+    const serializedChartPayload = JSON.stringify(chartPayload);
+    assert.equal(serializedChartPayload.includes(promptMarker), false);
+    assert.equal(serializedChartPayload.includes(issued.token), false);
+    assert.equal(serializedChartPayload.includes('metrics-provider-token'), false);
+    assert.equal(queryTotalsCalls, 2, 'HTML and immediate chart-data read should share one short-lived query result');
     const appScript = await (await fetch(`${app.baseUrl}/assets/app.js`)).text();
     const metricsTranslationKeys = new Set(
       [...html.matchAll(/data-i18n="(metrics-[a-z0-9-]+)"/g)].map((match) => match[1]),
@@ -1819,6 +1860,33 @@ test('request metrics page attributes the device label and excludes count_tokens
     assert.equal(persisted.includes(promptMarker), false);
     assert.equal(persisted.includes(issued.token), false);
     assert.equal(persisted.includes('metrics-provider-token'), false);
+  } finally {
+    await app.close();
+  }
+});
+
+test('metrics chart data keeps the same console-session boundary as the HTML page', async () => {
+  const app = await fixture({ metricsChartRateLimit: 1 });
+  try {
+    const withoutIdentity = await fetch(`${app.baseUrl}/metrics/chart-data?hours=24`);
+    assert.equal(withoutIdentity.status, 403);
+
+    const withIdentity = await fetch(`${app.baseUrl}/metrics/chart-data?hours=24`, {
+      headers: { 'Tailscale-User-Login': 'member@example.com' },
+    });
+    assert.equal(withIdentity.status, 200);
+    const payload = await withIdentity.json();
+    assert.equal(payload.version, 1);
+    assert.equal(payload.range.hours, 24);
+    assert.equal(JSON.stringify(payload).includes('access_token'), false);
+    assert.equal(JSON.stringify(payload).includes('refresh_token'), false);
+
+    const limited = await fetch(`${app.baseUrl}/metrics/chart-data?hours=24`, {
+      headers: { 'Tailscale-User-Login': 'member@example.com' },
+    });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.headers.get('retry-after'), '60');
+    assert.deepEqual(await limited.json(), { error: 'metrics_chart_rate_limited' });
   } finally {
     await app.close();
   }
@@ -1848,6 +1916,9 @@ test('metrics initialization failure is visible but does not prevent the console
     const page = await fetch(`${baseUrl}/metrics`);
     assert.equal(page.status, 200);
     assert.match(await page.text(), /data-i18n="metrics-unavailable"/);
+    const chartData = await fetch(`${baseUrl}/metrics/chart-data?hours=24`);
+    assert.equal(chartData.status, 503);
+    assert.equal((await chartData.json()).available, false);
   } finally {
     await new Promise((resolve) => created.server.close(resolve));
   }

@@ -259,6 +259,106 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-hourly-details[open] > summary, .metrics-comparison-raw[open] > summary { margin-bottom: 8px; }
 .metrics-attribution-notice { margin: 0; }
 .metrics-attribution-notice p { margin: 0; }
+.metrics-dashboard { gap: 18px; }
+.metrics-page-hero { position: relative; overflow: hidden; display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; padding: 26px; border: 1px solid #cfd9d1; border-radius: 22px; background: linear-gradient(135deg, #fdfefa 0%, #edf5ef 56%, #e7eff4 100%); box-shadow: var(--shadow-soft); }
+.metrics-page-hero::after { content: ''; position: absolute; width: 260px; height: 260px; right: -110px; top: -150px; border-radius: 50%; background: rgba(0,114,178,.09); pointer-events: none; }
+.metrics-page-hero > * { position: relative; z-index: 1; min-width: 0; }
+.metrics-page-hero h1 { font-size: clamp(30px, 4vw, 46px); }
+.metrics-page-hero p { max-width: 760px; margin: 8px 0 0; }
+.metrics-eyebrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; color: var(--green); font-size: 12px; font-weight: 850; letter-spacing: .08em; text-transform: uppercase; }
+.metrics-status-strip { display: flex; align-items: center; gap: 8px 18px; flex-wrap: wrap; padding: 11px 14px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.78); color: var(--muted); font-size: 12px; }
+.metrics-status-strip strong { color: var(--ink); }
+.metrics-status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(31,107,79,.1); }
+.metrics-status-dot.partial { background: var(--amber); box-shadow: 0 0 0 4px rgba(154,93,22,.1); }
+.metrics-token-coverage { margin: 0; padding: 10px 13px; }
+.metrics-token-coverage p { margin: 0; }
+.metrics-token-coverage p + p { margin-top: 4px; }
+.metrics-filter-details { min-width: 0; }
+.metrics-filter-details > summary { display: none; }
+.metrics-filter-details .metrics-filters { border-radius: 16px; padding: 16px; box-shadow: none; }
+.metrics-filters { grid-template-columns: repeat(5, minmax(0, 1fr)) auto; }
+.metrics-filters .filter-actions { justify-content: flex-end; }
+.metrics-filters .filter-actions > * { min-height: 44px; display: inline-flex; align-items: center; justify-content: center; }
+.metrics-kpi-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }
+.metrics-kpi { position: relative; overflow: hidden; min-width: 0; border: 1px solid var(--line); border-radius: 16px; padding: 16px; background: var(--card); box-shadow: 0 8px 22px rgba(22,33,29,.045); }
+.metrics-kpi::before { content: ''; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--kpi-color, var(--green)); }
+.metrics-kpi-primary { background: linear-gradient(145deg, #173c31 0%, #235e4b 100%); color: white; border-color: transparent; }
+.metrics-kpi-primary .muted, .metrics-kpi-primary small { color: #cfe3da; }
+.metrics-kpi > span { display: block; color: var(--muted); font-size: 12px; font-weight: 750; }
+.metrics-kpi strong { display: block; margin: 7px 0 4px; font-size: clamp(22px, 2vw, 28px); line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.metrics-kpi small { display: block; color: var(--muted); font-size: 11px; }
+.metrics-kpi-input { --kpi-color: #0072b2; }
+.metrics-kpi-cache-create { --kpi-color: #e69f00; }
+.metrics-kpi-cache-read { --kpi-color: #009e73; }
+.metrics-kpi-output { --kpi-color: #cc79a7; }
+.metrics-analytics-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
+.metrics-chart-panel { min-width: 0; grid-column: span 6; border: 1px solid var(--line); border-radius: 18px; padding: 18px; background: var(--card); box-shadow: var(--shadow-soft); }
+.metrics-chart-panel-wide { grid-column: 1 / -1; }
+.metrics-chart-panel h2 { margin-bottom: 5px; font-size: 18px; }
+.metrics-chart-panel h3 { margin: 0; font-size: 15px; }
+.metrics-chart-copy { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+.metrics-chart-heading { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 4px; }
+.metrics-chart-host { width: 100%; height: clamp(260px, 28vw, 370px); min-height: 260px; }
+.metrics-chart-host-compact { height: clamp(240px, 24vw, 320px); min-height: 240px; }
+.metrics-chart-host[hidden] { display: none; }
+.metrics-chart-panel.metrics-chart-empty .metrics-chart-host { height: 170px; min-height: 170px; }
+.metrics-echarts-ready > .metrics-chart-fallback { display: none; }
+.metrics-chart-fallback { min-width: 0; }
+.metrics-chart-fallback svg { width: 100%; height: auto; display: block; overflow: visible; }
+.metrics-chart-fallback summary { cursor: pointer; color: var(--green); font-size: 12px; font-weight: 800; }
+.metrics-chart-fallback-list { display: grid; gap: 8px; margin: 14px 0 0; padding: 0; list-style: none; }
+.metrics-chart-fallback-list li { display: flex; justify-content: space-between; gap: 12px; padding: 9px 10px; border-radius: 9px; background: #f3f6f2; font-size: 12px; }
+.metrics-chart-fallback-list span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.metrics-chart-fallback-list strong { flex: 0 0 auto; }
+.metrics-device-section { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.metrics-device-section > .metrics-section-heading, .metrics-device-section > .metrics-device-notes, .metrics-device-section > .metrics-comparison-raw { grid-column: 1 / -1; }
+.metrics-section-heading { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.metrics-section-heading h2 { margin-bottom: 5px; }
+.metrics-section-heading p { margin: 0; max-width: 780px; }
+.metrics-segmented { display: inline-flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: #f3f6f2; }
+.metrics-segmented button { min-height: 36px; padding: 7px 11px; border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; }
+.metrics-segmented button.active { background: var(--ink); color: white; }
+.metrics-device-chips { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0 2px; scrollbar-width: thin; }
+.metrics-device-chip { flex: 0 0 auto; max-width: 220px; padding: 5px 9px; border: 1px solid var(--line); border-radius: 999px; background: #f5f7f3; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.metrics-device-notes { display: grid; gap: 8px; }
+.metrics-device-notes .notice { margin: 0; }
+.metrics-table-card { min-width: 0; border: 1px solid var(--line); border-radius: 18px; padding: 18px; background: var(--card); box-shadow: var(--shadow-soft); }
+.metrics-table-card > summary { cursor: pointer; color: var(--green); font-weight: 850; }
+.metrics-table-card[open] > summary { margin-bottom: 12px; }
+.metrics-scroll-hint { display: none; margin: 8px 0; color: var(--muted); font-size: 11px; }
+.metrics-table-wrap, .metrics-comparison-table-wrap { overscroll-behavior-inline: contain; -webkit-overflow-scrolling: touch; }
+.metrics-privacy-details > summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 750; }
+.metrics-privacy-details p { margin: 8px 0 0; }
+@media (max-width: 1100px) {
+  .metrics-kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .metrics-page-hero { align-items: flex-start; padding: 20px; }
+  .metrics-page-hero, .metrics-section-heading { display: grid; }
+  .metrics-page-hero .actions > * { flex: 1; text-align: center; }
+  .metrics-chart-panel { grid-column: 1 / -1; padding: 15px; }
+  .metrics-device-section { grid-template-columns: 1fr; }
+  .metrics-device-section > * { grid-column: 1 / -1; }
+}
+@media (max-width: 640px) {
+  .metrics-dashboard { gap: 14px; }
+  .metrics-page-hero { padding: 17px; border-radius: 18px; }
+  .metrics-page-hero h1 { font-size: 31px; }
+  .metrics-page-hero .actions { display: grid; grid-template-columns: 1fr; width: 100%; }
+  .metrics-filter-details > summary { display: block; cursor: pointer; padding: 12px 14px; border: 1px solid var(--line); border-radius: 13px; background: white; color: var(--green); font-weight: 850; }
+  .metrics-filter-details[open] > summary { margin-bottom: 8px; }
+  .metrics-filter-details .metrics-filters { padding: 13px; }
+  .metrics-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+  .metrics-kpi { padding: 13px; border-radius: 14px; }
+  .metrics-kpi-primary { grid-column: 1 / -1; }
+  .metrics-kpi strong { font-size: 23px; }
+  .metrics-chart-host, .metrics-chart-host-compact { height: 240px; min-height: 240px; }
+  .metrics-chart-panel { padding: 13px; border-radius: 15px; }
+  .metrics-chart-panel h2 { font-size: 16px; }
+  .metrics-status-strip { gap: 8px 12px; }
+  .metrics-scroll-hint { display: block; }
+  .metrics-table-card { padding: 14px; border-radius: 15px; }
+}
 .account-switch-form { min-width: 190px; }
 .account-selection-details { display: grid; gap: 3px; margin-top: 5px; }
 .accounts-table { width: 100%; min-width: 1000px; table-layout: fixed; }
@@ -382,7 +482,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 // look like something is guarding it.
 const openBanner = '<div class="notice error open-banner" role="status" data-i18n="open-banner">No authentication: anyone who can reach this console can issue and revoke credentials.</div>';
 
-function layout(title, content, { openMode = false, activeTab = null } = {}) {
+function layout(title, content, { openMode = false, activeTab = null, metricsAsset = null } = {}) {
+  const metricsScript = metricsAsset?.url && metricsAsset?.integrity
+    ? `<script src="${escapeHtml(metricsAsset.url)}" integrity="${escapeHtml(metricsAsset.integrity)}" crossorigin="anonymous" defer></script>`
+    : '';
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -392,6 +495,7 @@ function layout(title, content, { openMode = false, activeTab = null } = {}) {
   <title>${escapeHtml(title)} · Credential Console</title>
   <style>${styles}</style>
   <script src="/assets/app.js" defer></script>
+  ${metricsScript}
 </head>
 <body>
   <main class="shell">
@@ -1316,7 +1420,7 @@ function metricUsageCoverage(row) {
   return '<span data-i18n="metrics-usage-unavailable">Unavailable</span>';
 }
 
-function metricsTable(rows) {
+function metricsTable(rows, { wrapped = true } = {}) {
   const sourceRows = Array.isArray(rows) ? rows : [];
   const tableRows = sourceRows.slice(-200);
   const truncated = sourceRows.length > tableRows.length;
@@ -1337,9 +1441,7 @@ function metricsTable(rows) {
         <td>${metricUsageCoverage(row)}</td>
       </tr>`).join('')
     : '<tr><td colspan="13" class="empty" data-i18n="metrics-no-data">No matching request data for this period.</td></tr>';
-  return `<details class="metrics-hourly-details"${truncated ? '' : ' open'}>
-    <summary data-i18n="metrics-hourly-table-toggle">Show hourly details</summary>
-    ${truncated ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-hourly-table-truncated">The hourly table shows the latest 200 rows; older rows are omitted.</p>' : ''}
+  const contents = `${truncated ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-hourly-table-truncated">The hourly table shows the latest 200 rows; older rows are omitted.</p>' : ''}
     <div class="metrics-table-wrap">
       <table class="metrics-table">
         <caption class="muted tiny" data-i18n="metrics-hourly-table-caption">Hourly request and token details</caption>
@@ -1360,8 +1462,13 @@ function metricsTable(rows) {
         </tr></thead>
         <tbody>${body}</tbody>
       </table>
-    </div>
-  </details>`;
+    </div>`;
+  return wrapped
+    ? `<details class="metrics-hourly-details"${truncated ? '' : ' open'}>
+      <summary data-i18n="metrics-hourly-table-toggle">Show hourly details</summary>
+      ${contents}
+    </details>`
+    : contents;
 }
 
 const DEVICE_COMPARISON_INPUT_FIELDS = Object.freeze([
@@ -1502,6 +1609,17 @@ function deviceComparisonCoverageView(coverage) {
 
 function deviceComparisonView(input) {
   const comparison = normalizeDeviceComparison(input);
+  if (!comparison.devices.length) {
+    return `<section class="metrics-device-section metrics-device-section-empty">
+      <div class="metrics-section-heading">
+        <div><h2 data-i18n="metrics-device-comparison-heading">Device intelligence</h2>
+        <p class="muted tiny" data-i18n="metrics-device-comparison-description">Compare known token volume and hourly trends across the busiest devices. Unknown values stay as gaps, never zero.</p></div>
+      </div>
+      <article class="metrics-chart-panel metrics-chart-panel-wide metrics-chart-empty">
+        <p class="metrics-empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</p>
+      </article>
+    </section>`;
+  }
   const comparisonTableSource = [...comparison.sourceRows]
     .sort((left, right) => Number(right.hourBucketMs ?? right.hour_bucket_ms) - Number(left.hourBucketMs ?? left.hour_bucket_ms))
     .slice(0, 200);
@@ -1578,28 +1696,112 @@ function deviceComparisonView(input) {
       ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-device-comparison-truncated">Comparison data is bounded; some devices or hours may be omitted.</p>'
       : '',
   ].join('');
-  return `<article class="metrics-chart metrics-chart-wide metrics-comparison">
-    <h2 data-i18n="metrics-device-comparison-heading">Cross-device token comparison</h2>
-    <p class="muted tiny" data-i18n="metrics-device-comparison-description">Two synchronized charts compare input-side known tokens and output_tokens by device. Unknown values are gaps, not zeros; this is a trend view, not billing.</p>
-    <p class="muted tiny" data-i18n="metrics-device-comparison-scope">This comparison follows the member, account, model, and time filters; it intentionally ignores the single-device machine selector.</p>
-    ${truncatedNotice}
-    <h3 data-i18n="metrics-device-input-comparison-heading">Hourly input-side known tokens by device</h3>
-    ${inputChart}
-    <h3 data-i18n="metrics-device-output-comparison-heading">Hourly output tokens by device</h3>
-    ${outputChart}
-    <div class="metrics-legend">${legend || '<span class="metrics-empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</span>'}</div>
-    <details class="metrics-comparison-raw">
+  const chips = comparison.devices.map((device) => (
+    `<span class="metrics-device-chip" title="${escapeHtml(device.label)}">${escapeHtml(device.label)}</span>`
+  )).join('');
+  return `<section class="metrics-device-section">
+    <div class="metrics-section-heading">
+      <div>
+        <h2 data-i18n="metrics-device-comparison-heading">Device intelligence</h2>
+        <p class="muted tiny" data-i18n="metrics-device-comparison-description">Compare known token volume and hourly trends across the busiest devices. Unknown values stay as gaps, never zero.</p>
+        <p class="muted tiny" data-i18n="metrics-device-comparison-scope">This comparison follows the member, account, model, and time filters; it intentionally ignores the single-device machine selector.</p>
+      </div>
+      <div class="metrics-device-chips" aria-label="Compared devices">${chips}</div>
+    </div>
+    <article class="metrics-chart-panel metrics-chart-panel-compact">
+      <h3 data-i18n="metrics-device-ranking-heading">Known tokens by device</h3>
+      <p class="metrics-chart-copy" data-i18n="metrics-device-ranking-description">Input-side known tokens and output tokens for this period.</p>
+      <div class="metrics-chart-host metrics-chart-host-compact" data-metrics-chart="device-ranking" hidden></div>
+      <div class="metrics-chart-fallback">
+        <div class="metrics-legend">${legend || '<span class="metrics-empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</span>'}</div>
+      </div>
+    </article>
+    <article class="metrics-chart-panel metrics-chart-panel-compact">
+      <div class="metrics-chart-heading">
+        <div>
+          <h3 data-i18n="metrics-device-trend-heading">Hourly device trend</h3>
+          <p class="metrics-chart-copy" data-i18n="metrics-device-trend-description">Toggle between complete input-side known tokens and output tokens.</p>
+        </div>
+        <div class="metrics-segmented" aria-label="Device token metric">
+          <button type="button" class="active" data-device-metric="input" aria-pressed="true" data-i18n="metrics-device-toggle-input">Input side</button>
+          <button type="button" data-device-metric="output" aria-pressed="false" data-i18n="metrics-device-toggle-output">Output</button>
+        </div>
+      </div>
+      <div class="metrics-chart-host metrics-chart-host-compact" data-metrics-chart="device-trend" hidden></div>
+      <details class="metrics-chart-fallback">
+        <summary data-i18n="metrics-static-fallback-toggle">Show static chart fallback</summary>
+        <h3 data-i18n="metrics-device-input-comparison-heading">Hourly input-side known tokens by device</h3>
+        ${inputChart}
+        <h3 data-i18n="metrics-device-output-comparison-heading">Hourly output tokens by device</h3>
+        ${outputChart}
+      </details>
+    </article>
+    <div class="metrics-device-notes">${truncatedNotice}</div>
+    <details class="metrics-comparison-raw metrics-table-card">
       <summary data-i18n="metrics-device-comparison-table-toggle">Show raw comparison table</summary>
+      <p class="metrics-scroll-hint" data-i18n="metrics-scroll-table-hint">Swipe horizontally to inspect every column.</p>
       <div class="metrics-comparison-table-wrap"><table class="metrics-table metrics-comparison-table">
         <caption class="muted tiny" data-i18n="metrics-device-comparison-table-caption">Raw four-category values and coverage fallback</caption>
         <thead><tr><th scope="col" data-i18n="metrics-hour">Hour (UTC)</th><th scope="col" data-i18n="metrics-device-comparison-device">Device</th><th scope="col" data-i18n="metrics-total-input-tokens">Input tokens</th><th scope="col" data-i18n="metrics-total-cache-creation-input-tokens">Cache creation input tokens</th><th scope="col" data-i18n="metrics-total-cache-read-input-tokens">Cache read input tokens</th><th scope="col" data-i18n="metrics-total-output-tokens">Output tokens</th><th scope="col" data-i18n="metrics-device-comparison-coverage">Coverage</th></tr></thead>
         <tbody>${tableRows || '<tr><td colspan="7" class="empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</td></tr>'}</tbody>
       </table></div>
     </details>
+  </section>`;
+}
+
+function metricKnownTokenTotal(totals) {
+  if (totals?.tokenTotalsOverflow === true) return null;
+  const values = [
+    totals?.totalInputTokens,
+    totals?.totalCacheCreationInputTokens,
+    totals?.totalCacheReadInputTokens,
+    totals?.totalOutputTokens,
+  ].map(metricTokenNumber).filter((value) => value !== null);
+  if (!values.length) return null;
+  let sum = 0;
+  for (const value of values) {
+    sum += value;
+    if (!Number.isSafeInteger(sum)) return null;
+  }
+  return sum;
+}
+
+function metricsBreakdownFallback(rows, emptyKey, emptyText) {
+  const normalized = (Array.isArray(rows) ? rows : []).map((row) => ({
+    label: String(row?.label ?? row?.groupValue ?? '—'),
+    value: metricKnownTokenTotal(row),
+  })).filter((row) => row.value !== null)
+    .sort((left, right) => right.value - left.value || left.label.localeCompare(right.label))
+    .slice(0, 8);
+  if (!normalized.length) {
+    return `<p class="metrics-empty" data-i18n="${escapeHtml(emptyKey)}">${escapeHtml(emptyText)}</p>`;
+  }
+  return `<ol class="metrics-chart-fallback-list">${normalized.map((row) => `<li>
+    <span title="${escapeHtml(row.label)}">${escapeHtml(row.label)}</span>
+    <strong>${escapeHtml(metricDisplayNumber(row.value))}</strong>
+  </li>`).join('')}</ol>`;
+}
+
+function metricsChartPanel({
+  kind,
+  title,
+  titleI18n,
+  description,
+  descriptionI18n,
+  fallback,
+  wide = false,
+  compact = false,
+}) {
+  return `<article class="metrics-chart-panel${wide ? ' metrics-chart-panel-wide' : ''}">
+    <h2 data-i18n="${escapeHtml(titleI18n)}">${escapeHtml(title)}</h2>
+    <p class="metrics-chart-copy" data-i18n="${escapeHtml(descriptionI18n)}">${escapeHtml(description)}</p>
+    <div class="metrics-chart-host${compact ? ' metrics-chart-host-compact' : ''}" data-metrics-chart="${escapeHtml(kind)}" hidden></div>
+    <div class="metrics-chart-fallback">${fallback}</div>
   </article>`;
 }
 
 export function metricsView({
+  range = {},
   filters = {},
   options = {},
   totals = {},
@@ -1607,10 +1809,13 @@ export function metricsView({
   tokenTotals = {},
   tokenHourly = [],
   deviceTokenComparison = {},
+  accountTokenBreakdown = [],
+  modelTokenBreakdown = [],
   openMode = false,
   metricsAvailable = true,
   droppedMetrics = 0,
   error = null,
+  metricsAsset = null,
 }) {
   const selectedHours = Number(filters.hours);
   const hours = METRICS_HOUR_OPTIONS.some((option) => option.value === selectedHours)
@@ -1695,83 +1900,177 @@ export function metricsView({
     String(hours),
     { i18n: option.i18n },
   )).join('');
-  return layout('Request metrics', `
-    <section class="stack">
+  const knownTokenTotal = metricKnownTokenTotal(normalizedTokenTotals);
+  const coverageCount = normalizedTokenTotals.usageCompleteCount
+    + normalizedTokenTotals.usagePartialCount
+    + normalizedTokenTotals.usageUnavailableCount;
+  const coveragePercent = coverageCount > 0
+    ? Math.round((normalizedTokenTotals.usageCompleteCount / coverageCount) * 1000) / 10
+    : null;
+  const coveragePartial = normalizedTokenTotals.usagePartialCount > 0
+    || normalizedTokenTotals.usageUnavailableCount > 0
+    || normalizedTokenTotals.tokenTotalsOverflow;
+  const chartParams = new URLSearchParams();
+  chartParams.set('hours', String(hours));
+  const effectiveMachine = unattributedMachine ? UNATTRIBUTED_MACHINE_VALUE : selectedMachine;
+  if (effectiveMachine) chartParams.set('machine_id', effectiveMachine);
+  if (selectedMember) chartParams.set('member_label', selectedMember);
+  if (selectedAccount) chartParams.set('account_id', selectedAccount);
+  if (selectedModel) chartParams.set('model', selectedModel);
+  const metricsEndpoint = `/metrics/chart-data?${chartParams.toString()}`;
+  const rangeLabel = METRICS_HOUR_OPTIONS.find((option) => option.value === hours)?.label ?? `${hours} hours`;
+  const accountFallback = metricsBreakdownFallback(
+    accountTokenBreakdown,
+    'metrics-breakdown-no-data',
+    'No account token totals are available.',
+  );
+  const modelFallback = metricsBreakdownFallback(
+    modelTokenBreakdown,
+    'metrics-breakdown-no-data',
+    'No model token totals are available.',
+  );
+  const accountBreakdownAvailable = accountTokenBreakdown.some((row) => metricKnownTokenTotal(row) !== null);
+  const modelBreakdownAvailable = modelTokenBreakdown.some((row) => metricKnownTokenTotal(row) !== null);
+  const breakdownPanels = [
+    accountBreakdownAvailable ? metricsChartPanel({
+      kind: 'accounts',
+      title: 'Usage by account',
+      titleI18n: 'metrics-account-breakdown-heading',
+      description: 'Top accounts ranked by known token total.',
+      descriptionI18n: 'metrics-account-breakdown-description',
+      fallback: accountFallback,
+      compact: true,
+    }) : '',
+    modelBreakdownAvailable ? metricsChartPanel({
+      kind: 'models',
+      title: 'Usage by model',
+      titleI18n: 'metrics-model-breakdown-heading',
+      description: 'Top models ranked by known token total.',
+      descriptionI18n: 'metrics-model-breakdown-description',
+      fallback: modelFallback,
+      compact: true,
+    }) : '',
+  ].join('');
+  return layout('Token usage', `
+    <section class="stack metrics-dashboard" data-metrics-dashboard data-metrics-endpoint="${escapeHtml(metricsEndpoint)}">
       ${availabilityNotice}
       ${droppedNotice}
       ${errorNotice}
-      <div class="metrics-heading">
+      <header class="metrics-page-hero">
         <div>
-          <span class="badge stored" data-i18n="metrics-label">Request metrics</span>
-          <h1 data-i18n="metrics-heading">Claude gateway request metrics</h1>
-          <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not rendered here; eligible captured API turns appear under Conversations and the captured-turn archive.</p>
-          <p class="muted tiny" data-i18n="metrics-claude-only">Token accounting covers Claude gateway traffic only. Codex clients connect directly to their provider and are not included.</p>
+          <div class="metrics-eyebrow"><span class="metrics-status-dot${coveragePartial ? ' partial' : ''}" aria-hidden="true"></span><span data-i18n="metrics-label">Usage intelligence</span></div>
+          <h1 data-i18n="metrics-heading">Token usage</h1>
+          <p class="muted" data-i18n="metrics-intro">Explore hourly Claude gateway token consumption, request health, and device trends with exact unknown-value handling.</p>
         </div>
         <div class="actions">
           <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
           <a class="button secondary" href="/conversations" data-i18n="metrics-conversations-link">View conversations</a>
         </div>
+      </header>
+      <div class="metrics-status-strip" role="status">
+        <span><strong>${escapeHtml(rangeLabel)}</strong> · UTC</span>
+        <span><span data-i18n="metrics-total-requests">All requests</span>: <strong>${escapeHtml(metricDisplayNumber(allTotal))}</strong></span>
+        <span><span data-i18n="metrics-consumption-requests">Consumption requests</span>: <strong>${escapeHtml(metricDisplayNumber(consumptionTotal))}</strong></span>
+        <span><span data-i18n="metrics-status-coverage">Complete coverage</span>: <strong>${coveragePercent === null ? '—' : `${escapeHtml(metricDisplayNumber(coveragePercent, { decimals: 1 }))}%`}</strong></span>
+        <span data-i18n="metrics-unknown-zero">— means unknown, never zero</span>
       </div>
-      <div class="notice error metrics-attribution-notice" role="note">
-        <p data-i18n="metrics-attribution-disclaimer">Member labels are self-entered and unverified. Use them only to observe usage trends; never use them for accountability or billing.</p>
-      </div>
-      <form method="get" action="/metrics" class="card metrics-filters">
-        <h2 class="metrics-filter-heading" data-i18n="metrics-filter-heading">Filter request metrics</h2>
-        <label><span data-i18n="metrics-filter-machine">Machine</span>
-          <select name="machine_id">${metricMachineOptions(options.machines, selectedMachine, unattributedMachine)}</select>
-        </label>
-        <label><span data-i18n="metrics-filter-member">Member label</span>
-          <select name="member_label">${metricOptions(options.members, selectedMember, 'All members', 'metrics-all-members')}</select>
-        </label>
-        <label><span data-i18n="metrics-filter-account">Account</span>
-          <select name="account_id">${metricOptions(options.accounts, selectedAccount, 'All accounts', 'metrics-all-accounts')}</select>
-        </label>
-        <label><span data-i18n="metrics-filter-model">Model</span>
-          <select name="model">${metricOptions(options.models, selectedModel, 'All models', 'metrics-all-models')}</select>
-        </label>
-        <label><span data-i18n="metrics-filter-hours">Period</span>
-          <select name="hours">${hourOptions}</select>
-        </label>
-        <div class="filter-actions">
-          <button type="submit" data-i18n="metrics-apply-filters">Apply filters</button>
-          <a class="button secondary" href="/metrics" data-i18n="metrics-reset-filters">Reset filters</a>
-        </div>
-      </form>
-      <div class="metrics-summary">
-        <article class="card summary"><span class="muted" data-i18n="metrics-total-requests">All requests</span><strong>${escapeHtml(metricDisplayNumber(allTotal))}</strong></article>
-        <article class="card summary"><span class="muted" data-i18n="metrics-consumption-requests">Consumption requests</span><strong>${escapeHtml(metricDisplayNumber(consumptionTotal))}</strong></article>
+      <details class="metrics-filter-details" open>
+        <summary data-i18n="metrics-filter-toggle">Filters</summary>
+        <form method="get" action="/metrics" class="card metrics-filters">
+          <h2 class="metrics-filter-heading" data-i18n="metrics-filter-heading">Filter usage</h2>
+          <label><span data-i18n="metrics-filter-hours">Period</span>
+            <select name="hours">${hourOptions}</select>
+          </label>
+          <label><span data-i18n="metrics-filter-machine">Machine</span>
+            <select name="machine_id">${metricMachineOptions(options.machines, selectedMachine, unattributedMachine)}</select>
+          </label>
+          <label><span data-i18n="metrics-filter-member">Member label</span>
+            <select name="member_label">${metricOptions(options.members, selectedMember, 'All members', 'metrics-all-members')}</select>
+          </label>
+          <label><span data-i18n="metrics-filter-account">Account</span>
+            <select name="account_id">${metricOptions(options.accounts, selectedAccount, 'All accounts', 'metrics-all-accounts')}</select>
+          </label>
+          <label><span data-i18n="metrics-filter-model">Model</span>
+            <select name="model">${metricOptions(options.models, selectedModel, 'All models', 'metrics-all-models')}</select>
+          </label>
+          <div class="filter-actions">
+            <button type="submit" data-i18n="metrics-apply-filters">Apply</button>
+            <a class="button secondary" href="/metrics" data-i18n="metrics-reset-filters">Reset</a>
+          </div>
+        </form>
+      </details>
+      <div class="metrics-kpi-grid">
+        <article class="metrics-kpi metrics-kpi-primary">
+          <span data-i18n="metrics-known-total">Known token total</span>
+          <strong title="${escapeHtml(metricTokenText(knownTokenTotal))}">${escapeHtml(metricTokenText(knownTokenTotal))}</strong>
+          <small data-i18n="${coveragePartial ? 'metrics-known-total-lower-bound' : 'metrics-known-total-exact'}">${coveragePartial ? 'Lower bound for the selected period' : 'Exact across complete reported categories'}</small>
+        </article>
+        <article class="metrics-kpi metrics-kpi-input"><span data-i18n="metrics-token-input">Input tokens</span>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalInputTokens))}</strong>
+          <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalInputTokensKnownCount))}</small>
+        </article>
+        <article class="metrics-kpi metrics-kpi-output"><span data-i18n="metrics-token-output">Output tokens</span>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalOutputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalOutputTokens))}</strong>
+          <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalOutputTokensKnownCount))}</small>
+        </article>
+        <article class="metrics-kpi metrics-kpi-cache-read"><span data-i18n="metrics-token-cache-read">Cache read input tokens</span>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheReadInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheReadInputTokens))}</strong>
+          <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalCacheReadInputTokensKnownCount))}</small>
+        </article>
+        <article class="metrics-kpi metrics-kpi-cache-create"><span data-i18n="metrics-token-cache-creation">Cache creation input tokens</span>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheCreationInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheCreationInputTokens))}</strong>
+          <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalCacheCreationInputTokensKnownCount))}</small>
+        </article>
+        <article class="metrics-kpi"><span data-i18n="metrics-consumption-requests">Consumption requests</span>
+          <strong title="${escapeHtml(metricDisplayNumber(consumptionTotal))}">${escapeHtml(metricDisplayNumber(consumptionTotal))}</strong>
+          <small><span data-i18n="metrics-request-outcomes">Successful / errors</span>: ${escapeHtml(metricDisplayNumber(metricCount(totals.success)))} / ${escapeHtml(metricDisplayNumber(metricCount(totals.errors)))}</small>
+        </article>
       </div>
       ${tokenCoverageNotice(normalizedTokenTotals)}
-      <div class="metrics-token-summary">
-        ${tokenSummaryCard({ label: 'Input tokens', i18n: 'metrics-token-input', value: normalizedTokenTotals.totalInputTokens, knownCount: normalizedTokenTotals.totalInputTokensKnownCount })}
-        ${tokenSummaryCard({ label: 'Cache creation input tokens', i18n: 'metrics-token-cache-creation', value: normalizedTokenTotals.totalCacheCreationInputTokens, knownCount: normalizedTokenTotals.totalCacheCreationInputTokensKnownCount })}
-        ${tokenSummaryCard({ label: 'Cache read input tokens', i18n: 'metrics-token-cache-read', value: normalizedTokenTotals.totalCacheReadInputTokens, knownCount: normalizedTokenTotals.totalCacheReadInputTokensKnownCount })}
-        ${tokenSummaryCard({ label: 'Output tokens', i18n: 'metrics-token-output', value: normalizedTokenTotals.totalOutputTokens, knownCount: normalizedTokenTotals.totalOutputTokensKnownCount })}
-      </div>
-      <div class="metrics-chart-grid">
-        <article class="metrics-chart">
-          <h2 data-i18n="metrics-request-volume">Hourly request volume</h2>
-          ${requestChart}
-          ${metricLegend(requestSeries)}
-        </article>
-        <article class="metrics-chart">
-          <h2 data-i18n="metrics-latency">Hourly request latency</h2>
-          ${latencyChart}
-          ${metricLegend(latencySeries)}
-        </article>
-        <article class="metrics-chart metrics-chart-wide">
-          <h2 data-i18n="metrics-token-trend">Hourly token usage</h2>
-          ${tokenChart}
-          ${metricLegend(tokenSeries)}
-        </article>
+      <div class="metrics-analytics-grid">
+        ${metricsChartPanel({
+          kind: 'tokens',
+          title: 'Hourly token composition',
+          titleI18n: 'metrics-token-trend',
+          description: 'Stacked known token categories on a real UTC time axis; gaps stay unknown.',
+          descriptionI18n: 'metrics-token-trend-description',
+          fallback: `${tokenChart}${metricLegend(tokenSeries)}`,
+          wide: true,
+        })}
+        ${metricsChartPanel({
+          kind: 'requests',
+          title: 'Request health',
+          titleI18n: 'metrics-request-volume',
+          description: 'Hourly total, successful, and error requests.',
+          descriptionI18n: 'metrics-request-volume-description',
+          fallback: `${requestChart}${metricLegend(requestSeries)}`,
+          compact: true,
+        })}
+        ${metricsChartPanel({
+          kind: 'latency',
+          title: 'Latency',
+          titleI18n: 'metrics-latency',
+          description: 'Average time to first byte and total duration.',
+          descriptionI18n: 'metrics-latency-description',
+          fallback: `${latencyChart}${metricLegend(latencySeries)}`,
+          compact: true,
+        })}
+        ${breakdownPanels}
         ${deviceComparison}
       </div>
-      <article class="card">
-        <h2 data-i18n="metrics-hourly-table">Hourly details</h2>
-        ${metricsTable(rows)}
-      </article>
+      <details class="metrics-table-card metrics-hourly-details">
+        <summary data-i18n="metrics-hourly-table-toggle">Show hourly details</summary>
+        <p class="metrics-scroll-hint" data-i18n="metrics-scroll-table-hint">Swipe horizontally to inspect every column.</p>
+        ${metricsTable(rows, { wrapped: false })}
+      </details>
+      <details class="metrics-privacy-details">
+        <summary data-i18n="metrics-methodology-toggle">Scope, privacy, and attribution</summary>
+        <p class="muted tiny" data-i18n="metrics-claude-only">Token accounting covers Claude gateway traffic only. Codex clients connect directly to their provider and are not included.</p>
+        <p class="muted tiny" data-i18n="metrics-intro-long">This page renders request metadata only. Request and response bodies are not shown here; eligible captured API turns appear under Conversations.</p>
+        <p class="muted tiny" data-i18n="metrics-attribution-disclaimer">Member labels are self-entered and unverified. Use them only to observe usage trends; never use them for accountability or billing.</p>
+      </details>
     </section>
-  `, { openMode, activeTab: 'metrics' });
+  `, { openMode, activeTab: 'metrics', metricsAsset });
 }
 
 const CONVERSATION_RESPONSE_STATES = Object.freeze([
