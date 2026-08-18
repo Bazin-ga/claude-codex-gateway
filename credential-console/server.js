@@ -49,6 +49,8 @@ import {
   metricsView,
   conversationsView,
   conversationDetailView,
+  conversationSessionsView,
+  conversationSessionDetailView,
 } from './lib/views.js';
 import { requestEnrollment as requestCodexEnrollment } from '../codex-credential/client-agent/enroll.js';
 
@@ -813,7 +815,13 @@ export async function createCredentialConsole(options = {}) {
     }
   }
 
-  function conversationSearchPage(url) {
+  function conversationSearchPage(url, { mode = 'sessions' } = {}) {
+    const searchMethod = mode === 'turns'
+      ? 'searchConversations'
+      : 'searchConversationSessions';
+    const facetMethod = mode === 'turns'
+      ? 'queryConversationFacets'
+      : 'queryConversationSessionFacets';
     const q = String(url.searchParams.get('q') ?? '');
     const beforeValue = url.searchParams.get('before_id');
     const limitValue = Number(url.searchParams.get('limit') ?? 25);
@@ -884,6 +892,7 @@ export async function createCredentialConsole(options = {}) {
           nextBeforeId: null,
           error: 'conversation_filter_invalid',
           totalMatches: null,
+          standaloneCount: null,
           facets: fallbackFacets,
         },
         q: '',
@@ -921,6 +930,7 @@ export async function createCredentialConsole(options = {}) {
         nextBeforeId: null,
         error: 'conversation_archive_unavailable',
         totalMatches: null,
+        standaloneCount: null,
         facets: fallbackFacets,
       },
       q,
@@ -934,7 +944,7 @@ export async function createCredentialConsole(options = {}) {
       responseState,
       queueDropped: requestMetrics?.stats?.conversation?.dropped ?? 0,
     };
-    if (typeof requestMetrics?.searchConversations !== 'function') return empty;
+    if (typeof requestMetrics?.[searchMethod] !== 'function') return empty;
     try {
       // Like the metrics dashboard, a read is allowed to flush a bounded batch.
       // The proxy completion path itself never waits on SQLite.
@@ -951,12 +961,12 @@ export async function createCredentialConsole(options = {}) {
         if (model !== null) searchOptions.model = model;
         if (responseState !== null) searchOptions.responseState = responseState;
       }
-      const rawResult = requestMetrics.searchConversations(searchOptions);
+      const rawResult = requestMetrics[searchMethod](searchOptions);
       const source = rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
         ? rawResult
         : { items: [], nextBeforeId: null, error: 'conversation_archive_unavailable' };
       let facetSource = null;
-      if (typeof requestMetrics.queryConversationFacets === 'function') {
+      if (typeof requestMetrics?.[facetMethod] === 'function') {
         const facetOptions = { q };
         if (fromMs !== null) {
           facetOptions.fromMs = fromMs;
@@ -968,7 +978,7 @@ export async function createCredentialConsole(options = {}) {
         if (model !== null) facetOptions.model = model;
         if (responseState !== null) facetOptions.responseState = responseState;
         try {
-          const queried = requestMetrics.queryConversationFacets(facetOptions);
+          const queried = requestMetrics[facetMethod](facetOptions);
           if (queried && typeof queried === 'object' && !Array.isArray(queried)) facetSource = queried;
         } catch {
           // Facets are an enhancement. A search result remains useful when a
@@ -1004,9 +1014,14 @@ export async function createCredentialConsole(options = {}) {
         nextBeforeId: source.nextBeforeId ?? null,
         error: source.error ?? null,
         droppedConversations: source.droppedConversations ?? null,
+        standaloneCount: Number.isSafeInteger(source.standaloneCount)
+          ? source.standaloneCount
+          : null,
         totalMatches: Number.isSafeInteger(source.totalMatches)
           ? source.totalMatches
-          : (Number.isSafeInteger(facetSource?.totalStored) ? facetSource.totalStored : null),
+          : (mode === 'turns' && Number.isSafeInteger(facetSource?.totalStored)
+            ? facetSource.totalStored
+            : null),
         facets: mappedFacets,
       };
       const statusCode = result?.error
@@ -1088,47 +1103,82 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
-    if (path === '/conversations' && !['GET', 'POST'].includes(req.method)) {
+    const conversationCollection = path === '/conversations'
+      ? { mode: 'sessions', view: conversationSessionsView }
+      : path === '/conversation-turns'
+        ? { mode: 'turns', view: conversationsView }
+        : null;
+    if (conversationCollection && !['GET', 'POST'].includes(req.method)) {
       sendText(res, 405, 'method not allowed\n', 'text/plain; charset=utf-8', { Allow: 'GET, POST' });
       return;
     }
 
-    if (req.method === 'GET' && path === '/conversations') {
+    if (conversationCollection && ['GET', 'POST'].includes(req.method)) {
       const session = requireSession(req, res);
       if (!session) return;
       // Search state stays out of URLs: GET is the default landing page, while
-      // the read-only filter form submits a bounded POST below.
-      const page = conversationSearchPage(new URL('/conversations', url));
-      sendHtml(res, page.statusCode ?? 200, conversationsView({
+      // the read-only filter form submits a bounded POST.
+      const formUrl = new URL(path, url);
+      if (req.method === 'POST') {
+        let form;
+        try {
+          form = await readForm(req, 8 * 1024);
+        } catch {
+          sendText(res, 413, 'conversation filter form too large\n');
+          return;
+        }
+        for (const [key, value] of Object.entries(form)) {
+          if (typeof value === 'string') formUrl.searchParams.set(key, value);
+        }
+      }
+      const page = conversationSearchPage(formUrl, { mode: conversationCollection.mode });
+      sendHtml(res, page.statusCode ?? 200, conversationCollection.view({
         ...page,
         openMode,
       }));
       return;
     }
 
-    if (req.method === 'POST' && path === '/conversations') {
-      const session = requireSession(req, res);
-      if (!session) return;
-      let form;
-      try {
-        form = await readForm(req, 8 * 1024);
-      } catch {
-        sendText(res, 413, 'conversation filter form too large\n');
-        return;
+    const sessionParams = routeMatch(path, '/conversations/session/:id');
+    if (sessionParams && req.method !== 'GET') {
+      sendText(res, 405, 'method not allowed\n', 'text/plain; charset=utf-8', { Allow: 'GET' });
+      return;
+    }
+    if (req.method === 'GET' && sessionParams) {
+      const adminSession = requireSession(req, res);
+      if (!adminSession) return;
+      const sessionId = Number(sessionParams.id);
+      let result = { session: null, standaloneCount: null, error: null };
+      if (Number.isSafeInteger(sessionId) && sessionId > 0
+        && typeof requestMetrics?.readConversationSession === 'function') {
+        try {
+          requestMetrics.flush?.();
+          const rawResult = requestMetrics.readConversationSession(sessionId);
+          result = rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+            ? rawResult
+            : { session: null, standaloneCount: null, error: 'conversation_unavailable' };
+        } catch (error) {
+          log('conversation_session_read_route_failed', {
+            code: error?.code ?? error?.name ?? 'unknown',
+          });
+          result = { session: null, standaloneCount: null, error: 'conversation_unavailable' };
+        }
+      } else if (typeof requestMetrics?.readConversationSession !== 'function') {
+        result = { session: null, standaloneCount: null, error: 'conversation_archive_unavailable' };
       }
-      const formUrl = new URL('/conversations', url);
-      for (const [key, value] of Object.entries(form)) {
-        if (typeof value === 'string') formUrl.searchParams.set(key, value);
-      }
-      const page = conversationSearchPage(formUrl, { fromForm: true });
-      sendHtml(res, page.statusCode ?? 200, conversationsView({
-        ...page,
+      const statusCode = result?.error ? 503 : (result?.session ? 200 : 404);
+      sendHtml(res, statusCode, conversationSessionDetailView({
+        result,
+        id: sessionParams.id,
         openMode,
       }));
       return;
     }
 
-    const conversationParams = routeMatch(path, '/conversations/:id');
+    // `/conversations/:id` remains a compatibility alias for old bookmarks;
+    // all newly rendered turn links use the explicit `/conversation-turns/:id`.
+    const conversationParams = routeMatch(path, '/conversation-turns/:id')
+      ?? routeMatch(path, '/conversations/:id');
     if (conversationParams && req.method !== 'GET') {
       sendText(res, 405, 'method not allowed\n', 'text/plain; charset=utf-8', { Allow: 'GET' });
       return;
@@ -1305,7 +1355,7 @@ const translations = {
   'metrics-dashboard-link': '查看请求指标',
   'metrics-label': '请求指标',
   'metrics-heading': 'Claude 网关请求指标',
-  'metrics-intro': '本页只展示请求元数据；本页不展示请求正文或回复正文，符合条件的已捕获 API 轮次会在 API 轮次归档中单独展示。',
+  'metrics-intro': '本页只展示请求元数据；本页不展示请求正文或回复正文，符合条件的已捕获 API 轮次会在「对话」与单轮归档中展示。',
   'metrics-claude-only': 'Token 核算只覆盖 Claude 网关流量。Codex 客户端直接连接服务商，不在此统计范围内。',
   'metrics-attribution-disclaimer': '使用者标签由本人填写，未经验证；只能用于观察用量趋势，不得作为追责或计费依据。',
   'metrics-filter-heading': '筛选请求指标',
@@ -1382,8 +1432,8 @@ const translations = {
   'metrics-avg-duration': '平均总耗时（毫秒）',
   'tab-overview': '总览',
   'tab-metrics': '用量与指标',
-  'tab-conversations': 'API 轮次',
-  'metrics-conversations-link': '查看已捕获 API 轮次',
+  'tab-conversations': '对话',
+  'metrics-conversations-link': '查看对话',
   'metrics-device-comparison-heading': '跨设备 token 趋势比较',
   'metrics-device-comparison-description': '两张同步图分别比较各设备的输入侧已知 token 与 output_tokens；未知值留空，不当作零，也不是计费视图。',
   'metrics-device-comparison-scope': '此比较沿用成员、账号、模型和时间筛选；有意忽略单设备机器选择器。',
@@ -1410,10 +1460,45 @@ const translations = {
   'metrics-hourly-table-caption': '每小时请求与 token 明细',
   'metrics-hourly-table-toggle': '显示每小时明细',
   'metrics-hourly-table-truncated': '每小时表只显示最新 200 行；更早的行已省略。',
-  'conversations-dashboard-link': '查看已捕获 API 轮次',
+  'conversations-dashboard-link': '查看对话',
   'conversations-label': '已捕获 API 轮次',
   'conversations-heading': '已捕获 API 轮次',
   'conversations-intro': '搜索符合条件且永久保留的 Claude API 轮次。这些是按请求捕获的轮次，不是还原出的完整线程。',
+  'conversation-subnav-sessions': '对话',
+  'conversation-subnav-turns': '已捕获 API 轮次',
+  'conversation-sessions-label': '客户端会话关联',
+  'conversation-sessions-heading': '对话',
+  'conversation-sessions-intro': '只有 Claude Code 提供格式校验通过的会话标识时，已捕获轮次才会关联到同一对话；这种关联不代表用户身份认证。无会话标识的单轮绝不会按时间猜测归组。',
+  'conversation-session-heading': '对话',
+  'conversation-session-open': '打开对话',
+  'conversation-session-open-turn': '打开单轮',
+  'conversation-session-turn-count': '轮次数',
+  'conversation-session-first-at': '首次捕获',
+  'conversation-session-last-at': '最近捕获',
+  'conversation-session-latest-preview': '最近捕获的轮次',
+  'conversation-session-total-matches': '个匹配对话',
+  'conversation-session-no-results': '没有符合当前搜索条件的关联对话。',
+  'conversation-session-pagination-hint': '对话按内部会话记录编号从新到旧排列。',
+  'conversation-session-filter-hint': '筛选条件只要匹配客户端会话关联中的任一已捕获轮次，该对话就会出现；结果卡片展示最近轮次的归因与摘要。',
+  'conversation-session-search': '搜索对话',
+  'conversation-session-filter-invalid': '一个或多个对话筛选值无效或过长。请清除筛选条件后重试。',
+  'conversation-session-search-query-too-short': '搜索词对当前对话归档太短。大库中至少输入连续 3 个中文字符或更多可检索文字；请去掉单独特殊标点，并拆开查询。',
+  'conversation-session-search-requires-indexed-terms': '对话搜索需要可建立索引的词。大库中请输入至少连续 3 个中文字符，去掉特殊标点，或拆开查询。',
+  'conversation-session-search-error': '对话搜索无法完成。',
+  'conversation-session-read-error': '对话无法载入。',
+  'conversation-session-not-found': '找不到这个对话。',
+  'conversation-session-back': '返回对话列表',
+  'conversation-session-detail-intro': '以下轮次来自同一个客户端会话关联，并按从旧到新排列。标识只做格式校验与 HMAC 隐藏，不代表用户身份认证；原始值不会显示或入库。',
+  'conversation-session-turn': '轮次',
+  'conversation-session-incomplete-turn': '这个 API 轮次结束时，尚未捕获到完整的助手回复。',
+  'conversation-session-truncated-turn': '助手正文达到有界上限，当前捕获内容并不完整。',
+  'conversation-session-empty-assistant': '未捕获助手正文。这个轮次可能包含工具活动，或者回复正文当时不可用。',
+  'conversation-session-timeline-clipped': '时间线会缩短过长的助手正文；请打开对应单轮查看完整的已捕获文本。',
+  'conversation-session-truncated': '此对话超过时间线的有界预算；仅显示最早的连续前缀（最多 200 轮、8 MiB 已存文本），完整正文可逐轮打开查看。',
+  'conversation-session-empty': '这个对话中没有可显示的已捕获轮次。',
+  'conversation-standalone-heading': '未归组的已捕获轮次',
+  'conversation-standalone-notice': '这些旧轮次或无法关联的 API 轮次没有格式校验通过的会话标识，系统绝不会按时间猜测归组。',
+  'conversation-standalone-link': '查看未归组轮次和全部已捕获 API 轮次',
   'conversation-privacy-heading': '已捕获 API 轮次隐私告知',
   'conversation-privacy-notice': '此功能会永久保存每一条已捕获的 Claude API 轮次，并把轮次正文公开给所有能访问本控制台的人。成员标签由本人填写且未经验证。Codex 流量不在采集范围内。',
   'conversation-open-warning': 'Open 模式：tailnet 中任何能访问本控制台的人都可以读取所有已捕获 API 轮次；没有身份识别，也没有阅读审计。成员标签不代表操作人身份。',

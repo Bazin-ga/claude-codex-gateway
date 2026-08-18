@@ -10,11 +10,15 @@ built-in `node:sqlite` module. The shipped service suppresses Node 22's known ex
 warning; it does not suppress application errors.
 
 P6 permanently stores captured API-user and assistant text for eligible Claude API turns in the
-captured-turn archive. Each row is one provider request, not a reconstructed session, and API-user
+captured-turn archive. Each row is one provider request, and API-user
 text may contain client wrappers rather than the human's original terminal words. Everyone who can
 reach the console can read those captured turns; in
 `open` mode that means anyone on the tailnet, with no identity and no reading audit. Member labels
 are self-entered and unverified, and Codex traffic is not covered by API-turn capture.
+Schema 4 additionally correlates future turns carrying a format-valid Claude Code session header into
+conversation timelines. Only a master-key HMAC of device + session is stored; the raw header is not,
+and correlation is not user authentication. Existing turns remain standalone rather than being
+time-guessed into a thread.
 
 ## Network
 
@@ -801,8 +805,10 @@ Browser checks:
     and ignores only the single-device selector while retaining the other filters;
 18. confirm the token page states that it covers Claude gateway traffic only, excludes Codex, and
     keeps the metrics-page body-free and open-mode visibility notices.
-19. open the captured-conversations page, submit its POST filter form with a known phrase, follow
-    the POST keyset next-page form, and open a detail row; confirm prompt text does not enter the
+19. open `/conversations` and confirm a client session with several turns renders one bounded,
+    oldest-first timeline without exposing its raw session identifier; then open
+    `/conversation-turns`, submit its POST filter form with a known phrase, follow the POST
+    keyset next-page form, and open a detail row; confirm prompt text does not enter the
     URL, the permanent-storage/open-mode disclosure is prominent, full text preserves whitespace,
     all four response states are distinguishable, and a dropped conversation queue count is shown
     as dropped rather than silently treated as stored. Verify period/member/device/account/model
@@ -811,12 +817,13 @@ Browser checks:
     split the query; an unknown search failure must remain a fixed generic message.
 
 The first start with token accounting migrates `metrics.sqlite` schema 1 to 2 transactionally.
-The first P6 start migrates schema 2 to schema 3 transactionally, adding the permanent conversation
-tables and full-text index; old request rows remain readable and simply have no conversation turn.
-Take the normal checkpointed backup immediately before either upgrade. If the code must be rolled
-back to a pre-P6 release, stop the console, restore the matching pre-upgrade `metrics.sqlite` only,
+The first P6 start migrates schema 2 to schema 3 transactionally, adding permanent turn tables and
+full-text indexes. The session/timeline release migrates schema 3 to schema 4 transactionally; old
+turns remain standalone and retain searchable text. Take the normal checkpointed backup immediately
+before every schema upgrade. If code must be rolled back to a pre-v4 release, stop the console and
+restore the matching pre-v4 `metrics.sqlite` only,
 remove `metrics.sqlite-wal` and `metrics.sqlite-shm`, then start the old code. Do not roll
-`master.key` or `state.json` back for a metrics-only or conversation-UI rollback. Because schema 3
+`master.key` or `state.json` back for a metrics-only or conversation-UI rollback. Because schema 4
 contains permanently retained conversation text, every `metrics.sqlite` snapshot and off-host copy is
 sensitive and must stay root-only/encrypted.
 

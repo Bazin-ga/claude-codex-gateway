@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
   conversationDetailView,
+  conversationSessionDetailView,
+  conversationSessionsView,
   conversationsView,
   dashboardView,
 } from '../lib/views.js';
@@ -48,12 +50,12 @@ test('conversation list renders search, escaped snippets, status, queue drop, an
     },
   });
 
-  assert.match(html, /<form method="post" action="\/conversations"/);
+  assert.match(html, /<form method="post" action="\/conversation-turns"/);
   assert.match(html, /name="q" value="&lt;img src=x onerror=alert\(1\)&gt;&amp;&quot;&#39;/);
   assert.match(html, /data-i18n="conversation-response-truncated"/);
   assert.match(html, /data-i18n="conversation-queue-dropped"/);
   assert.match(html, />3<\/strong>/);
-  assert.match(html, /href="\/conversations\/42"[^>]*data-i18n="conversation-open"/);
+  assert.match(html, /href="\/conversation-turns\/42"[^>]*data-i18n="conversation-open"/);
   assert.match(html, /name="before_id" value="17"/);
   assert.match(html, /name="period" value="all"/);
   assert.match(html, /prompt\n  whitespace/);
@@ -144,6 +146,122 @@ test('conversation detail trusts persisted prompt provenance and keeps long text
   assert.match(html, /overflow-wrap: anywhere/);
 });
 
+test('conversation session list groups only correlated sessions and links standalone turns separately', () => {
+  const html = conversationSessionsView({
+    openMode: true,
+    q: '<script>query</script>',
+    result: {
+      totalMatches: 1,
+      nextBeforeId: 6,
+      standaloneCount: 4,
+      droppedConversations: 2,
+      facets: {
+        members: [{ value: 'alice', count: 3 }],
+        devices: [], accounts: [], models: [], responseStates: [],
+      },
+      items: [{
+        id: 7,
+        threadKey: 'must-never-render-thread-key',
+        rawSessionId: 'must-never-render-session-id',
+        turnCount: 3,
+        firstStartedAtMs: Date.parse('2026-08-17T12:00:00Z'),
+        lastStartedAtMs: Date.parse('2026-08-17T12:30:00Z'),
+        deviceId: 'device-7',
+        memberLabel: HOSTILE,
+        accountAlias: 'account-safe',
+        model: 'model-safe',
+        latestPromptSnippet: 'already unwrapped prompt',
+        latestPromptSource: 'wrapper_removed',
+        latestPromptSuffixOmitted: true,
+        latestResponseSnippet: HOSTILE,
+        latestResponseState: 'complete',
+      }],
+      error: null,
+    },
+  });
+  assert.match(html, /href="\/conversations\/session\/7"/);
+  assert.match(html, /method="post" action="\/conversations"/);
+  assert.match(html, /name="before_id" value="6"/);
+  assert.match(html, /data-i18n="conversation-session-turn-count">Turns<\/span>: 3/);
+  assert.match(html, /data-i18n="conversation-standalone-notice"/);
+  assert.match(html, /href="\/conversation-turns"/);
+  assert.match(html, /data-prompt-source="wrapper_removed"/);
+  assert.match(html, /data-prompt-suffix-omitted="true"/);
+  assert.equal(html.includes('must-never-render-thread-key'), false);
+  assert.equal(html.includes('must-never-render-session-id'), false);
+  assert.equal(html.includes('<img src=x'), false);
+  assert.equal(html.includes('<script>query</script>'), false);
+});
+
+test('conversation session detail renders a bounded forward timeline with explicit empty states', () => {
+  const turns = Array.from({ length: 201 }, (_, index) => {
+    const turnIndex = index + 1;
+    return {
+      id: 1_000 + turnIndex,
+      turnIndex,
+      startedAtMs: Date.parse('2026-08-17T00:00:00Z') + turnIndex,
+      memberLabel: `member-${turnIndex}`,
+      accountAlias: 'account-safe',
+      model: 'model-safe',
+      promptText: turnIndex === 2 ? 'safe prompt' : `prompt-${String(turnIndex).padStart(3, '0')}`,
+      promptSource: turnIndex === 2 ? 'wrapper_removed' : 'captured_api_user_text',
+      promptSuffixOmitted: turnIndex === 2,
+      responseText: turnIndex === 1
+        ? ''
+        : turnIndex === 3
+          ? 'r'.repeat((16 * 1024) + 20)
+          : `response-${turnIndex}`,
+      responseState: turnIndex === 1 ? 'complete' : turnIndex === 2 ? 'incomplete' : 'complete',
+      responseDisplayTruncated: turnIndex === 3,
+      threadKey: 'must-never-render-turn-thread-key',
+    };
+  }).reverse();
+  const html = conversationSessionDetailView({
+    result: {
+      session: {
+        id: 7,
+        turnCount: 201,
+        firstStartedAtMs: Date.parse('2026-08-17T00:00:00Z') + 1,
+        lastStartedAtMs: Date.parse('2026-08-17T00:00:00Z') + 201,
+        turns,
+        truncated: true,
+        standaloneCount: 2,
+        threadKey: 'must-never-render-session-thread-key',
+        rawSessionId: 'must-never-render-raw-session-id',
+      },
+      standaloneCount: 2,
+      error: null,
+    },
+  });
+  assert.equal((html.match(/class="conversation-timeline-turn"/g) ?? []).length, 200);
+  assert.ok(html.indexOf('prompt-001') < html.indexOf('safe prompt'));
+  assert.match(html, /prompt-200/);
+  assert.equal(html.includes('prompt-201'), false);
+  assert.match(html, /data-i18n="conversation-session-truncated"/);
+  assert.match(html, /data-i18n="conversation-session-empty-assistant"/);
+  assert.match(html, /data-i18n="conversation-session-incomplete-turn"/);
+  assert.match(html, /data-i18n="conversation-session-timeline-clipped"/);
+  assert.equal(html.includes('<img src=x'), false);
+  assert.equal(html.includes('<tail>'), false);
+  assert.equal(html.includes('must-never-render-session-thread-key'), false);
+  assert.equal(html.includes('must-never-render-turn-thread-key'), false);
+  assert.equal(html.includes('must-never-render-raw-session-id'), false);
+  assert.ok(Buffer.byteLength(html, 'utf8') < 10 * 1024 * 1024);
+  assert.match(html, /\.conversation-message \{ width: min\(92%, 820px\)/);
+  assert.match(html, /\.conversation-message \{ width: 100%; \}/);
+});
+
+test('conversation session detail has safe 404 and unavailable states', () => {
+  const missing = conversationSessionDetailView({ result: { session: null, error: null } });
+  assert.match(missing, /data-i18n="conversation-session-not-found"/);
+  assert.match(missing, /href="\/conversations"/);
+  const unavailable = conversationSessionDetailView({
+    result: { session: null, error: 'private_database_detail' },
+  });
+  assert.match(unavailable, /data-i18n="conversation-session-read-error"/);
+  assert.equal(unavailable.includes('private_database_detail'), false);
+});
+
 test('null and read/search errors fail closed without undefined content', () => {
   const list = conversationsView({
     result: { items: null, nextBeforeId: null, error: 'search_unavailable' },
@@ -198,7 +316,7 @@ test('conversation filters render bounded facets, selected values, counts, chips
       nextBeforeId: 17,
     },
   });
-  assert.match(html, /method="post" action="\/conversations"/);
+  assert.match(html, /method="post" action="\/conversation-turns"/);
   assert.match(html, /name="member_label"[^>]*list="conversation-member-facets"/);
   assert.match(html, /name="period"[^>]*value="168"/);
   assert.match(html, /conversation-filter-query/);
@@ -254,8 +372,11 @@ test('persistent tabs link to captured conversations and mark the active page', 
   });
   assert.match(html, /href="\/conversations" data-i18n="tab-conversations"/);
   assert.doesNotMatch(html, /data-i18n="conversations-dashboard-link"/);
-  const list = conversationsView({ result: { items: [], nextBeforeId: null, error: null } });
-  assert.match(list, /href="\/conversations" data-i18n="tab-conversations" aria-current="page"/);
+  const turnList = conversationsView({ result: { items: [], nextBeforeId: null, error: null } });
+  assert.match(turnList, /href="\/conversations" data-i18n="tab-conversations" aria-current="page"/);
+  assert.match(turnList, /href="\/conversation-turns" data-i18n="conversation-subnav-turns" aria-current="page"/);
+  const sessions = conversationSessionsView({ result: { items: [], nextBeforeId: null, error: null } });
+  assert.match(sessions, /href="\/conversations" data-i18n="conversation-subnav-sessions" aria-current="page"/);
 });
 
 test('Chinese translations and operator documentation cover permanent captured-turn exposure', async () => {
@@ -292,6 +413,41 @@ test('Chinese translations and operator documentation cover permanent captured-t
     'conversation-prompt-source-fallback',
     'conversation-prompt-source-empty',
     'conversation-prompt-suffix-omitted',
+    'conversation-subnav-sessions',
+    'conversation-subnav-turns',
+    'conversation-sessions-label',
+    'conversation-sessions-heading',
+    'conversation-sessions-intro',
+    'conversation-session-heading',
+    'conversation-session-open',
+    'conversation-session-open-turn',
+    'conversation-session-turn-count',
+    'conversation-session-first-at',
+    'conversation-session-last-at',
+    'conversation-session-latest-preview',
+    'conversation-session-total-matches',
+    'conversation-session-no-results',
+    'conversation-session-pagination-hint',
+    'conversation-session-filter-hint',
+    'conversation-session-search',
+    'conversation-session-filter-invalid',
+    'conversation-session-search-query-too-short',
+    'conversation-session-search-requires-indexed-terms',
+    'conversation-session-search-error',
+    'conversation-session-read-error',
+    'conversation-session-not-found',
+    'conversation-session-back',
+    'conversation-session-detail-intro',
+    'conversation-session-turn',
+    'conversation-session-incomplete-turn',
+    'conversation-session-truncated-turn',
+    'conversation-session-empty-assistant',
+    'conversation-session-timeline-clipped',
+    'conversation-session-truncated',
+    'conversation-session-empty',
+    'conversation-standalone-heading',
+    'conversation-standalone-notice',
+    'conversation-standalone-link',
   ]) {
     assert.match(server, new RegExp(`'${key}':`), `missing translation key ${key}`);
   }

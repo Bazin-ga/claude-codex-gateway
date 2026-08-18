@@ -71,7 +71,7 @@ V1 implements:
 - a public generic AI onboarding document plus a live private Markdown guide with safe deployment
   metadata, exact read-only version checks, and a copyable dashboard link;
 - persistent per-request metrics in a separate SQLite database, with server-rendered charts and
-  filters, plus a permanent archive of eligible captured Claude conversation turns.
+  filters, plus permanent captured Claude API turns and HMAC-correlated conversation timelines.
 
 V1 deliberately does **not**:
 
@@ -330,26 +330,36 @@ the tailnet, with no identity and no reading audit. Self-entered member labels r
 must not be used for accountability or billing. Codex traffic is not covered by API-turn capture.
 
 The first P5 start migrates `metrics.sqlite` from schema 1 to schema 2 in one transaction; old rows
-remain readable with unknown token values. The first P6 start then migrates schema 2 to schema 3 in
-one transaction, adding the permanent conversation tables and full-text index; existing request rows
-remain readable and simply have no conversation turn. A pre-P5 or pre-P6 binary deliberately refuses
-the newer metrics schema. To roll code back, stop the console and restore only `metrics.sqlite` from
-the matching checkpointed backup (removing its `-wal`/`-shm` sidecars); do not replace `master.key`
+remain readable with unknown token values. The first P6 start migrates schema 2 to schema 3, adding
+permanent turn tables and full-text indexes. Schema 4 adds HMAC-correlated conversation sessions,
+turn ordering, and prompt provenance in another transaction. Existing schema-3 turns remain
+standalone with `legacy_unclassified` provenance; they are never guessed into sessions by time.
+Older binaries deliberately refuse newer schemas. To roll code back, stop the console and restore
+only the matching pre-upgrade `metrics.sqlite` from the checkpointed backup (removing its
+`-wal`/`-shm` sidecars); do not replace `master.key`
 or `state.json` merely to roll back metrics code or conversation UI.
 
-## Captured API turns
+## Conversations and captured API turns
 
 P6 permanently retains the captured API-user and assistant text for eligible Claude requests and makes the archive
 available to every member who can reach the console. The list supports full-text search,
 period/member/device/account/model/state filters, facet counts, and keyset pagination. Filter and
 pagination forms use bounded read-only POST bodies so prompt text and labels do not enter URLs; a
-plain GET is only the default landing page. Each row is one API request, not a reconstructed session.
+plain GET is only the default landing page. `/conversation-turns` keeps this per-request archive.
 The final API `user` message can contain client-generated wrappers and is not proof of a human's
 original terminal text. Opening a row shows the complete stored display text with its
 `complete`, `incomplete`, `truncated`, or `unavailable` response state. Result previews are capped
 server-side at 600 characters and two visual lines. A bounded capture queue can drop a conversation
 before it is stored; the archive reports that condition prominently rather than implying that the
 API turn was saved. Codex traffic does not pass through this gateway and is not covered.
+
+`/conversations` is the grouped view for future turns carrying a strictly bounded
+`x-claude-code-session-id`. The console derives an HMAC from the master key, device ID, and session
+ID; it stores only the 64-hex HMAC, never the raw header. HMAC correlation prevents raw-ID disclosure
+but does not authenticate the person using the client. A conversation detail renders turns by their
+persisted `turn_index`, oldest first. Legacy rows and requests without a valid session header remain
+standalone and link back to the API-turn archive. Timeline responses are previewed under an 8 MiB
+total budget and a 200-turn cap; each turn retains a link to its complete stored detail.
 
 This is a deliberate disclosure, not an access-control boundary. In `open` mode, anyone on the
 tailnet who can reach the console can read every captured API turn; there is no identity and no

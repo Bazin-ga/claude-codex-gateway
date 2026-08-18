@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { TextDecoder } from 'node:util';
 
 export const METRICS_FILENAME = 'metrics.sqlite';
-export const METRICS_SCHEMA_VERSION = 3;
+export const METRICS_SCHEMA_VERSION = 4;
 
 const HOUR_MS = 60 * 60 * 1000;
 const DEFAULT_BATCH_SIZE = 64;
@@ -28,6 +28,11 @@ const MAX_UPSTREAM_REQUEST_ID = 256;
 const USAGE_STATES = Object.freeze(['unavailable', 'partial', 'complete']);
 const CONVERSATION_CAPTURE_STATES = Object.freeze(['not_applicable', 'stored', 'dropped']);
 const RESPONSE_STATES = Object.freeze(['complete', 'incomplete', 'truncated', 'unavailable']);
+const PROMPT_SOURCES = Object.freeze([
+  'captured_api_user_text',
+  'wrapper_removed',
+  'fallback_raw',
+]);
 const DEFAULT_MAX_CONVERSATION_QUEUE_ITEMS = 64;
 const DEFAULT_MAX_CONVERSATION_QUEUE_BYTES = 8 * 1024 * 1024;
 const MAX_CONVERSATION_FLUSH_ITEMS = 4;
@@ -38,6 +43,9 @@ const MAX_SEARCH_LIMIT = 50;
 const MAX_SEARCH_SNIPPET_BYTES = 4 * 1024;
 const MAX_CONVERSATION_FACETS = 100;
 const MAX_READ_CONVERSATION_BYTES = 1024 * 1024;
+const MAX_CONVERSATION_SESSION_TURNS = 200;
+const MAX_CONVERSATION_SESSION_BYTES = 8 * 1024 * 1024;
+const MAX_CONVERSATION_SESSION_RESPONSE_CHARS = 16 * 1024;
 const CONVERSATION_QUEUE_OVERHEAD_BYTES = 4 * 1024;
 const MAX_SHORT_HAN_SEARCH_ROWS = 20_000;
 const MAX_SHORT_HAN_SEARCH_BYTES = 64 * 1024 * 1024;
@@ -110,12 +118,49 @@ const CREATE_CONVERSATION_TURNS = `
     id INTEGER PRIMARY KEY,
     request_metrics_id INTEGER NOT NULL UNIQUE
       REFERENCES request_metrics(id) ON DELETE RESTRICT,
+    conversation_session_id INTEGER
+      REFERENCES conversation_sessions(id) ON DELETE RESTRICT,
+    turn_index INTEGER,
+    prompt_text TEXT NOT NULL CHECK (length(prompt_text) > 0),
+    prompt_bytes INTEGER NOT NULL CHECK (prompt_bytes > 0),
+    prompt_source TEXT NOT NULL DEFAULT 'captured_api_user_text'
+      CHECK (prompt_source IN (
+        'captured_api_user_text', 'wrapper_removed', 'fallback_raw', 'legacy_unclassified'
+      )),
+    prompt_suffix_omitted INTEGER NOT NULL DEFAULT 0
+      CHECK (prompt_suffix_omitted IN (0, 1)),
+    response_text TEXT NOT NULL DEFAULT '',
+    response_state TEXT NOT NULL
+      CHECK (response_state IN ('complete', 'incomplete', 'truncated', 'unavailable')),
+    response_bytes INTEGER NOT NULL CHECK (response_bytes >= 0),
+    CHECK (
+      (conversation_session_id IS NULL AND turn_index IS NULL)
+      OR (conversation_session_id IS NOT NULL AND turn_index IS NOT NULL AND turn_index >= 1)
+    ),
+    UNIQUE (conversation_session_id, turn_index)
+  )
+`;
+
+const CREATE_CONVERSATION_TURNS_V3 = `
+  CREATE TABLE IF NOT EXISTS conversation_turns (
+    id INTEGER PRIMARY KEY,
+    request_metrics_id INTEGER NOT NULL UNIQUE
+      REFERENCES request_metrics(id) ON DELETE RESTRICT,
     prompt_text TEXT NOT NULL CHECK (length(prompt_text) > 0),
     prompt_bytes INTEGER NOT NULL CHECK (prompt_bytes > 0),
     response_text TEXT NOT NULL DEFAULT '',
     response_state TEXT NOT NULL
       CHECK (response_state IN ('complete', 'incomplete', 'truncated', 'unavailable')),
     response_bytes INTEGER NOT NULL CHECK (response_bytes >= 0)
+  )
+`;
+
+const CREATE_CONVERSATION_SESSIONS = `
+  CREATE TABLE IF NOT EXISTS conversation_sessions (
+    id INTEGER PRIMARY KEY,
+    thread_key TEXT NOT NULL UNIQUE
+      CHECK (length(thread_key) = 64 AND thread_key NOT GLOB '*[^0-9a-f]*'),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
   )
 `;
 
@@ -140,6 +185,12 @@ const CREATE_CONVERSATION_TRIGRAM_FTS = `
 `;
 
 const CREATE_CONVERSATION_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS conversation_turns_metrics_idx ON conversation_turns(request_metrics_id)',
+  'CREATE INDEX IF NOT EXISTS conversation_turns_session_idx ON conversation_turns(conversation_session_id, turn_index)',
+  'CREATE INDEX IF NOT EXISTS conversation_sessions_created_idx ON conversation_sessions(created_at_ms)',
+];
+
+const CREATE_CONVERSATION_INDEXES_V3 = [
   'CREATE INDEX IF NOT EXISTS conversation_turns_metrics_idx ON conversation_turns(request_metrics_id)',
 ];
 
@@ -210,12 +261,16 @@ const INSERT_REQUEST = `
 const INSERT_CONVERSATION = `
   INSERT INTO conversation_turns (
     request_metrics_id,
+    conversation_session_id,
+    turn_index,
     prompt_text,
     prompt_bytes,
+    prompt_source,
+    prompt_suffix_omitted,
     response_text,
     response_state,
     response_bytes
-  ) VALUES (?, ?, ?, ?, ?, ?)
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `;
 
 const AGGREGATE_SELECT = `
@@ -302,6 +357,14 @@ function boundedString(value, name, maxLength, { nullable = true, emptyAsNull = 
   if (typeof value !== 'string') throw new TypeError(`${name} must be a string`);
   if (emptyAsNull && value.length === 0) return null;
   return value.slice(0, maxLength);
+}
+
+function normalizeThreadKey(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || !/^[0-9a-f]{64}$/i.test(value)) {
+    throw new TypeError('conversation threadKey must be a nullable 64-hex string');
+  }
+  return value.toLowerCase();
 }
 
 function normalizePathFilter(value, name) {
@@ -439,6 +502,22 @@ function normalizeConversation(input) {
   if (!RESPONSE_STATES.includes(responseState)) {
     throw new TypeError('conversation responseState is invalid');
   }
+  const promptSource = input.promptSource === undefined
+    ? 'captured_api_user_text'
+    : input.promptSource;
+  if (!PROMPT_SOURCES.includes(promptSource)) {
+    throw new TypeError('conversation promptSource is invalid');
+  }
+  const promptSuffixOmitted = input.promptSuffixOmitted === undefined
+    ? 0
+    : input.promptSuffixOmitted === true
+      ? 1
+      : input.promptSuffixOmitted === false
+        ? 0
+        : null;
+  if (promptSuffixOmitted === null) {
+    throw new TypeError('conversation promptSuffixOmitted must be boolean');
+  }
   if (responseState === 'unavailable' && responseText.length > 0) {
     throw new TypeError('unavailable responseState requires an empty responseText');
   }
@@ -450,8 +529,11 @@ function normalizeConversation(input) {
   }
   const promptUtf8Bytes = Buffer.byteLength(input.promptText, 'utf8');
   return {
+    threadKey: normalizeThreadKey(input.threadKey),
     promptText: input.promptText,
     promptBytes: promptUtf8Bytes,
+    promptSource,
+    promptSuffixOmitted,
     responseText,
     responseState,
     responseBytes,
@@ -992,6 +1074,76 @@ function assertV3Schema(db) {
   }
 }
 
+function assertV4Schema(db) {
+  assertV3Schema(db);
+
+  if (!sqliteObjectExists(db, 'table', 'conversation_sessions')) {
+    throw new Error('metrics schema is missing conversation_sessions');
+  }
+  const sessionColumns = new Map(
+    db.prepare('PRAGMA table_info(conversation_sessions)').all()
+      .map((column) => [column.name, column]),
+  );
+  const threadKey = sessionColumns.get('thread_key');
+  const createdAt = sessionColumns.get('created_at_ms');
+  if (!threadKey || String(threadKey.type).toUpperCase() !== 'TEXT' || threadKey.notnull !== 1) {
+    throw new Error('conversation_sessions thread_key has an incompatible contract');
+  }
+  if (!createdAt || String(createdAt.type).toUpperCase() !== 'INTEGER' || createdAt.notnull !== 1) {
+    throw new Error('conversation_sessions created_at_ms has an incompatible contract');
+  }
+  const sessionSql = String(db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversation_sessions'
+  `).get()?.sql ?? '').replace(/\s+/g, ' ').toLowerCase();
+  if (!sessionSql.includes('thread_key text not null unique')
+    || !sessionSql.includes('check (length(thread_key) = 64')
+    || !sessionSql.includes("thread_key not glob '*[^0-9a-f]*'")) {
+    throw new Error('conversation_sessions is missing its canonical thread key contract');
+  }
+
+  const conversationColumns = new Map(
+    db.prepare('PRAGMA table_info(conversation_turns)').all()
+      .map((column) => [column.name, column]),
+  );
+  for (const name of ['conversation_session_id', 'turn_index']) {
+    const column = conversationColumns.get(name);
+    if (!column || String(column.type).toUpperCase() !== 'INTEGER' || column.notnull !== 0) {
+      throw new Error(`conversation_turns column ${name} has an incompatible contract`);
+    }
+  }
+  const promptSource = conversationColumns.get('prompt_source');
+  if (!promptSource || String(promptSource.type).toUpperCase() !== 'TEXT'
+    || promptSource.notnull !== 1 || promptSource.dflt_value !== "'captured_api_user_text'") {
+    throw new Error('conversation_turns prompt_source has an incompatible contract');
+  }
+  const promptSuffix = conversationColumns.get('prompt_suffix_omitted');
+  if (!promptSuffix || String(promptSuffix.type).toUpperCase() !== 'INTEGER'
+    || promptSuffix.notnull !== 1 || promptSuffix.dflt_value !== '0') {
+    throw new Error('conversation_turns prompt_suffix_omitted has an incompatible contract');
+  }
+  const conversationSql = String(db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversation_turns'
+  `).get()?.sql ?? '').replace(/\s+/g, ' ').toLowerCase();
+  if (!/check \(\s*\(conversation_session_id is null and turn_index is null\)\s*or\s*\(conversation_session_id is not null and turn_index is not null and turn_index >= 1\)\s*\)/.test(conversationSql)) {
+    throw new Error('conversation_turns is missing its session/index pairing constraint');
+  }
+  if (!conversationSql.includes('unique (conversation_session_id, turn_index)')) {
+    throw new Error('conversation_turns is missing its session/index uniqueness constraint');
+  }
+  if (!conversationSql.includes('check (prompt_source in (')
+    || !['captured_api_user_text', 'wrapper_removed', 'fallback_raw', 'legacy_unclassified']
+      .every((source) => conversationSql.includes(`'${source}'`))
+    || !conversationSql.includes('check (prompt_suffix_omitted in (0, 1))')) {
+    throw new Error('conversation_turns is missing its prompt provenance constraints');
+  }
+  const foreignKeys = db.prepare('PRAGMA foreign_key_list(conversation_turns)').all();
+  if (!foreignKeys.some((entry) => entry.table === 'conversation_sessions'
+    && entry.from === 'conversation_session_id' && entry.to === 'id'
+    && entry.on_delete === 'RESTRICT')) {
+    throw new Error('conversation_turns is missing its conversation session foreign key');
+  }
+}
+
 function migrateRequestMetricsToV2(db) {
   if (!requestMetricsTableExists(db)) {
     throw new Error('existing metrics database has no request_metrics table');
@@ -1029,12 +1181,72 @@ function migrateRequestMetricsToV3(db) {
   }
   const [name, definition] = Object.entries(V3_COLUMN_DEFINITIONS)[0];
   db.exec(`ALTER TABLE request_metrics ADD COLUMN ${name} ${definition}`);
-  db.exec(CREATE_CONVERSATION_TURNS);
+  db.exec(CREATE_CONVERSATION_TURNS_V3);
   db.exec(CREATE_CONVERSATION_FTS);
   db.exec(CREATE_CONVERSATION_TRIGRAM_FTS);
-  for (const sql of CREATE_CONVERSATION_INDEXES) db.exec(sql);
+  for (const sql of CREATE_CONVERSATION_INDEXES_V3) db.exec(sql);
   for (const sql of CREATE_CONVERSATION_TRIGGERS) db.exec(sql);
   assertV3Schema(db);
+}
+
+function migrateRequestMetricsToV4(db) {
+  if (!requestMetricsTableExists(db)) {
+    throw new Error('existing metrics database has no request_metrics table');
+  }
+  assertV3Schema(db);
+  const conversationColumns = new Set(
+    db.prepare('PRAGMA table_info(conversation_turns)').all().map((column) => column.name),
+  );
+  const partialNames = [
+    'conversation_sessions',
+    'conversation_turns_session_idx',
+    'conversation_sessions_created_idx',
+    'conversation_turns_v3_legacy',
+    ...['conversation_session_id', 'turn_index', 'prompt_source', 'prompt_suffix_omitted']
+      .filter((name) => conversationColumns.has(name)),
+  ].filter((name) => sqliteObjectExists(db, 'table', name)
+    || sqliteObjectExists(db, 'index', name)
+    || conversationColumns.has(name));
+  if (partialNames.length) {
+    throw new Error(`metrics schema v3 contains untrusted partial v4 objects: ${partialNames.join(', ')}`);
+  }
+
+  db.exec(CREATE_CONVERSATION_SESSIONS);
+  for (const trigger of [
+    'conversation_turns_fts_ai',
+    'conversation_turns_trigram_fts_ai',
+    'conversation_turns_no_update',
+    'conversation_turns_no_delete',
+  ]) db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+  db.exec('DROP INDEX IF EXISTS conversation_turns_metrics_idx');
+  db.exec('DROP TABLE conversation_turns_fts');
+  db.exec('DROP TABLE conversation_turns_trigram_fts');
+  db.exec('ALTER TABLE conversation_turns RENAME TO conversation_turns_v3_legacy');
+  db.exec(CREATE_CONVERSATION_TURNS);
+  db.exec(`
+    INSERT INTO conversation_turns (
+      id, request_metrics_id, prompt_text, prompt_bytes, prompt_source,
+      response_text, response_state, response_bytes
+    )
+    SELECT
+      id, request_metrics_id, prompt_text, prompt_bytes, 'legacy_unclassified',
+      response_text, response_state, response_bytes
+    FROM conversation_turns_v3_legacy
+  `);
+  db.exec('DROP TABLE conversation_turns_v3_legacy');
+  db.exec(CREATE_CONVERSATION_FTS);
+  db.exec(CREATE_CONVERSATION_TRIGRAM_FTS);
+  db.exec(`
+    INSERT INTO conversation_turns_fts(rowid, prompt_text, response_text)
+    SELECT id, prompt_text, response_text FROM conversation_turns
+  `);
+  db.exec(`
+    INSERT INTO conversation_turns_trigram_fts(rowid, prompt_text, response_text)
+    SELECT id, prompt_text, response_text FROM conversation_turns
+  `);
+  for (const sql of CREATE_CONVERSATION_INDEXES) db.exec(sql);
+  for (const sql of CREATE_CONVERSATION_TRIGGERS) db.exec(sql);
+  assertV4Schema(db);
 }
 
 function ensureConversationTrigramSearch(db) {
@@ -1195,6 +1407,20 @@ function conversationSearchFilterParams(filters, plan, { includeBefore = false }
     filters.responseState, filters.responseState,
     ...(includeBefore ? [filters.beforeId, filters.beforeId] : []),
   ];
+}
+
+function conversationSessionMatchSql(plan) {
+  const textJoin = plan.useFts || plan.useTrigram
+    ? `JOIN ${plan.searchTable} ON ${plan.searchTable}.rowid = t.id`
+    : '';
+  return `
+    SELECT DISTINCT t.conversation_session_id
+    FROM conversation_turns t
+    JOIN request_metrics m ON m.id = t.request_metrics_id
+    ${textJoin}
+    ${conversationSearchFilterSql(plan)}
+      AND t.conversation_session_id IS NOT NULL
+  `;
 }
 
 function normalizeConversationFacetFilters(filters = {}) {
@@ -1465,12 +1691,13 @@ export class MetricsStore {
         let schemaVersion = schemaMeta?.schema_version ?? null;
         if (!schemaMeta) {
           this.db.exec(CREATE_REQUEST_METRICS);
+          this.db.exec(CREATE_CONVERSATION_SESSIONS);
           this.db.exec(CREATE_CONVERSATION_TURNS);
           this.db.exec(CREATE_CONVERSATION_FTS);
           this.db.exec(CREATE_CONVERSATION_TRIGRAM_FTS);
           for (const sql of CREATE_CONVERSATION_INDEXES) this.db.exec(sql);
           for (const sql of CREATE_CONVERSATION_TRIGGERS) this.db.exec(sql);
-          assertV3Schema(this.db);
+          assertV4Schema(this.db);
           schemaVersion = METRICS_SCHEMA_VERSION;
         } else if (schemaVersion === 1) {
           migrateRequestMetricsToV2(this.db);
@@ -1479,9 +1706,13 @@ export class MetricsStore {
         if (schemaVersion === 2) {
           migrateRequestMetricsToV3(this.db);
           schemaVersion = 3;
+        }
+        if (schemaVersion === 3) {
+          migrateRequestMetricsToV4(this.db);
+          schemaVersion = 4;
         } else if (schemaVersion === METRICS_SCHEMA_VERSION) {
           ensureConversationTrigramSearch(this.db);
-          assertV3Schema(this.db);
+          assertV4Schema(this.db);
         } else if (schemaVersion !== null) {
           throw new Error(
             `metrics schema_version ${schemaVersion} cannot be migrated to ${METRICS_SCHEMA_VERSION}`,
@@ -1631,6 +1862,43 @@ export class MetricsStore {
     }
   }
 
+  #persistentStandaloneConversationCount() {
+    try {
+      return Number(this.db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM conversation_turns
+        WHERE conversation_session_id IS NULL
+      `).get().count);
+    } catch {
+      return null;
+    }
+  }
+
+  #ensureConversationSession(threadKey, startedAtMs) {
+    if (threadKey === null) return null;
+    this.db.prepare(`
+      INSERT INTO conversation_sessions (thread_key, created_at_ms)
+      VALUES (?, ?)
+      ON CONFLICT(thread_key) DO NOTHING
+    `).run(threadKey, startedAtMs);
+    const session = this.db.prepare(`
+      SELECT id
+      FROM conversation_sessions
+      WHERE thread_key = ?
+    `).get(threadKey);
+    if (!session) throw new Error('conversation session could not be created');
+    return Number(session.id);
+  }
+
+  #nextConversationTurnIndex(sessionId) {
+    const row = this.db.prepare(`
+      SELECT COALESCE(MAX(turn_index), 0) + 1 AS turn_index
+      FROM conversation_turns
+      WHERE conversation_session_id = ?
+    `).get(sessionId);
+    return Number(row.turn_index);
+  }
+
   #conversationSearchWorkload() {
     return this.db.prepare(`
       SELECT COUNT(*) AS count,
@@ -1657,10 +1925,21 @@ export class MetricsStore {
     this.db.exec('SAVEPOINT conversation_pair');
     try {
       const metricId = this.#insertMetric(pair.metrics);
+      const conversationSessionId = this.#ensureConversationSession(
+        pair.conversation.threadKey,
+        pair.metrics.startedAtMs,
+      );
+      const turnIndex = conversationSessionId === null
+        ? null
+        : this.#nextConversationTurnIndex(conversationSessionId);
       this.db.prepare(INSERT_CONVERSATION).run(
         metricId,
+        conversationSessionId,
+        turnIndex,
         pair.conversation.promptText,
         pair.conversation.promptBytes,
+        pair.conversation.promptSource,
+        pair.conversation.promptSuffixOmitted,
         pair.conversation.responseText,
         pair.conversation.responseState,
         pair.conversation.responseBytes,
@@ -1876,14 +2155,25 @@ export class MetricsStore {
 
   queryConversationFacets(filters = {}) {
     try {
-      return this.#queryConversationFacets(filters);
+      return this.#queryConversationFacets(filters, { sessionsOnly: false });
     } catch (error) {
       this.#safeLog('conversation_facets_failed', { code: error.code ?? error.name ?? 'unknown' });
       return this.#emptyConversationFacets('search_unavailable');
     }
   }
 
-  #queryConversationFacets(filters = {}) {
+  queryConversationSessionFacets(filters = {}) {
+    try {
+      return this.#queryConversationFacets(filters, { sessionsOnly: true });
+    } catch (error) {
+      this.#safeLog('conversation_session_facets_failed', {
+        code: error.code ?? error.name ?? 'unknown',
+      });
+      return this.#emptyConversationFacets('search_unavailable');
+    }
+  }
+
+  #queryConversationFacets(filters = {}, { sessionsOnly = false } = {}) {
     const normalized = normalizeConversationFacetFilters(filters);
     const plan = conversationSearchPlan(normalized);
     if (normalized.emptyLiteralQuery) {
@@ -1920,15 +2210,22 @@ export class MetricsStore {
     const textJoin = plan.useFts || plan.useTrigram
       ? `JOIN ${plan.searchTable} ON ${plan.searchTable}.rowid = t.id`
       : '';
+    const sessionConstraint = sessionsOnly
+      ? 'AND t.conversation_session_id IS NOT NULL'
+      : '';
+    const facetCount = sessionsOnly
+      ? 'COUNT(DISTINCT conversation_session_id)'
+      : 'COUNT(*)';
     const stats = this.#queryRows(`
       SELECT
-        COUNT(*) AS total_stored,
+        ${sessionsOnly ? 'COUNT(DISTINCT t.conversation_session_id)' : 'COUNT(*)'} AS total_stored,
         MIN(m.started_at_ms) AS earliest_started_at_ms,
         MAX(m.started_at_ms) AS latest_started_at_ms
       FROM conversation_turns t
       JOIN request_metrics m ON m.id = t.request_metrics_id
       ${textJoin}
       ${conversationFacetFilterSql(plan)}
+      ${sessionConstraint}
     `, params)[0];
     // Facets are disjunctive: each list applies every active constraint except
     // its own dimension. This keeps, for example, member B available while
@@ -1947,14 +2244,16 @@ export class MetricsStore {
           m.device_id,
           m.account_id,
           m.model,
+          t.conversation_session_id,
           t.response_state
         FROM conversation_turns t
         JOIN request_metrics m ON m.id = t.request_metrics_id
         ${textJoin}
         ${conversationFacetBaseFilterSql(plan)}
+        ${sessionConstraint}
       ),
       facet_values AS (
-        SELECT 'members' AS facet, member_label AS value, COUNT(*) AS facet_count
+        SELECT 'members' AS facet, member_label AS value, ${facetCount} AS facet_count
         FROM base, criteria
         WHERE member_label IS NOT NULL AND member_label <> ''
           AND (device_filter IS NULL OR device_id = device_filter)
@@ -1963,7 +2262,7 @@ export class MetricsStore {
           AND (response_filter IS NULL OR response_state = response_filter)
         GROUP BY member_label
         UNION ALL
-        SELECT 'devices' AS facet, device_id AS value, COUNT(*) AS facet_count
+        SELECT 'devices' AS facet, device_id AS value, ${facetCount} AS facet_count
         FROM base, criteria
         WHERE device_id IS NOT NULL AND device_id <> ''
           AND (member_filter IS NULL OR member_label = member_filter)
@@ -1972,7 +2271,7 @@ export class MetricsStore {
           AND (response_filter IS NULL OR response_state = response_filter)
         GROUP BY device_id
         UNION ALL
-        SELECT 'accounts' AS facet, account_id AS value, COUNT(*) AS facet_count
+        SELECT 'accounts' AS facet, account_id AS value, ${facetCount} AS facet_count
         FROM base, criteria
         WHERE account_id IS NOT NULL AND account_id <> ''
           AND (member_filter IS NULL OR member_label = member_filter)
@@ -1981,7 +2280,7 @@ export class MetricsStore {
           AND (response_filter IS NULL OR response_state = response_filter)
         GROUP BY account_id
         UNION ALL
-        SELECT 'models' AS facet, model AS value, COUNT(*) AS facet_count
+        SELECT 'models' AS facet, model AS value, ${facetCount} AS facet_count
         FROM base, criteria
         WHERE model IS NOT NULL AND model <> ''
           AND (member_filter IS NULL OR member_label = member_filter)
@@ -1990,7 +2289,7 @@ export class MetricsStore {
           AND (response_filter IS NULL OR response_state = response_filter)
         GROUP BY model
         UNION ALL
-        SELECT 'responseStates' AS facet, response_state AS value, COUNT(*) AS facet_count
+        SELECT 'responseStates' AS facet, response_state AS value, ${facetCount} AS facet_count
         FROM base, criteria
         WHERE response_state IS NOT NULL AND response_state <> ''
           AND (member_filter IS NULL OR member_label = member_filter)
@@ -2139,7 +2438,10 @@ export class MetricsStore {
           m.model,
           m.status_code,
           m.outcome,
+          substr(t.prompt_text, 1, ${MAX_PROMPT_BYTES}) AS prompt_text,
           t.prompt_bytes,
+          t.prompt_source,
+          t.prompt_suffix_omitted,
           t.response_state,
           t.response_bytes,
           ${textSelect}
@@ -2168,7 +2470,10 @@ export class MetricsStore {
         model: row.model ?? null,
         statusCode: row.status_code === null ? null : Number(row.status_code),
         outcome: row.outcome,
+        promptText: clipConversationText(row.prompt_text, MAX_PROMPT_BYTES),
         promptBytes: Number(row.prompt_bytes),
+        promptSource: row.prompt_source,
+        promptSuffixOmitted: Boolean(row.prompt_suffix_omitted),
         responseState: row.response_state,
         responseBytes: Number(row.response_bytes),
         promptSnippet: clipConversationText(row.prompt_snippet, MAX_SEARCH_SNIPPET_BYTES),
@@ -2188,6 +2493,135 @@ export class MetricsStore {
         nextBeforeId: null,
         totalMatches: null,
         droppedConversations: this.#persistentConversationDroppedCount(),
+        error: 'search_unavailable',
+      };
+    }
+  }
+
+  searchConversationSessions(options = {}) {
+    try {
+      this.#assertOpen();
+      const filters = normalizeConversationSearch(options);
+      const standaloneCount = this.#persistentStandaloneConversationCount();
+      if (filters.emptyLiteralQuery) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          totalMatches: 0,
+          droppedConversations: this.#persistentConversationDroppedCount(),
+          standaloneCount,
+          error: null,
+        };
+      }
+      const plan = conversationSearchPlan(filters);
+      const workload = plan.useSubstring ? this.#conversationSearchWorkload() : null;
+      if (workload && Number(workload.count) > MAX_SHORT_HAN_SEARCH_ROWS) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          totalMatches: null,
+          droppedConversations: this.#persistentConversationDroppedCount(),
+          standaloneCount,
+          error: filters.shortHanQuery ? 'search_query_too_short' : 'search_query_requires_indexed_terms',
+        };
+      }
+      if (workload && Number(workload.bytes) > MAX_SHORT_HAN_SEARCH_BYTES) {
+        return {
+          items: [],
+          nextBeforeId: null,
+          totalMatches: null,
+          droppedConversations: this.#persistentConversationDroppedCount(),
+          standaloneCount,
+          error: 'search_query_requires_indexed_terms',
+        };
+      }
+
+      const matchSql = conversationSessionMatchSql(plan);
+      const matchParams = conversationSearchFilterParams(filters, plan);
+      const totalMatches = Number(this.db.prepare(`
+        SELECT COUNT(*) AS total_matches
+        FROM conversation_sessions s
+        WHERE s.id IN (${matchSql})
+      `).get(...matchParams).total_matches);
+      const rows = this.db.prepare(`
+        WITH matched_sessions AS (${matchSql}),
+        ranked_turns AS (
+          SELECT
+            t.conversation_session_id AS id,
+            COUNT(*) OVER (PARTITION BY t.conversation_session_id) AS turn_count,
+            MIN(m.started_at_ms) OVER (PARTITION BY t.conversation_session_id)
+              AS first_started_at_ms,
+            MAX(m.started_at_ms) OVER (PARTITION BY t.conversation_session_id)
+              AS last_started_at_ms,
+            m.device_id AS latest_device_id,
+            m.machine_id AS latest_machine_id,
+            m.member_label AS latest_member_label,
+            m.account_id AS latest_account_id,
+            m.account_alias AS latest_account_alias,
+            m.model AS latest_model,
+            substr(t.prompt_text, 1, ${MAX_SEARCH_SNIPPET_BYTES}) AS latest_prompt_snippet,
+            t.prompt_source AS latest_prompt_source,
+            t.prompt_suffix_omitted AS latest_prompt_suffix_omitted,
+            substr(t.response_text, 1, ${MAX_SEARCH_SNIPPET_BYTES}) AS latest_response_snippet,
+            t.response_state AS latest_response_state,
+            ROW_NUMBER() OVER (
+              PARTITION BY t.conversation_session_id
+              ORDER BY t.turn_index DESC, t.id DESC
+            ) AS latest_rank
+          FROM conversation_turns t
+          JOIN request_metrics m ON m.id = t.request_metrics_id
+          WHERE t.conversation_session_id IN (
+            SELECT conversation_session_id FROM matched_sessions
+          )
+        )
+        SELECT *
+        FROM ranked_turns
+        WHERE latest_rank = 1
+          AND (? IS NULL OR id < ?)
+        ORDER BY id DESC
+        LIMIT ?
+      `).all(...matchParams, filters.beforeId, filters.beforeId, filters.limit);
+      const items = rows.map((row) => ({
+        id: Number(row.id),
+        turnCount: Number(row.turn_count),
+        firstStartedAtMs: Number(row.first_started_at_ms),
+        lastStartedAtMs: Number(row.last_started_at_ms),
+        deviceId: row.latest_device_id,
+        machineId: row.latest_machine_id ?? null,
+        memberLabel: row.latest_member_label,
+        accountId: row.latest_account_id,
+        accountAlias: row.latest_account_alias,
+        model: row.latest_model ?? null,
+        latestPromptSnippet: clipConversationText(
+          row.latest_prompt_snippet,
+          MAX_SEARCH_SNIPPET_BYTES,
+        ),
+        latestPromptSource: row.latest_prompt_source,
+        latestPromptSuffixOmitted: Boolean(row.latest_prompt_suffix_omitted),
+        latestResponseSnippet: clipConversationText(
+          row.latest_response_snippet,
+          MAX_SEARCH_SNIPPET_BYTES,
+        ),
+        latestResponseState: row.latest_response_state,
+      }));
+      return {
+        items,
+        nextBeforeId: items.length === filters.limit ? items.at(-1).id : null,
+        totalMatches,
+        droppedConversations: this.#persistentConversationDroppedCount(),
+        standaloneCount,
+        error: null,
+      };
+    } catch (error) {
+      this.#safeLog('conversation_session_search_failed', {
+        code: error.code ?? error.name ?? 'unknown',
+      });
+      return {
+        items: [],
+        nextBeforeId: null,
+        totalMatches: null,
+        droppedConversations: this.#persistentConversationDroppedCount(),
+        standaloneCount: this.#persistentStandaloneConversationCount(),
         error: 'search_unavailable',
       };
     }
@@ -2216,6 +2650,8 @@ export class MetricsStore {
           m.response_bytes,
           t.prompt_text,
           t.prompt_bytes,
+          t.prompt_source,
+          t.prompt_suffix_omitted,
           t.response_text,
           t.response_state,
           t.response_bytes AS stored_response_bytes
@@ -2243,6 +2679,8 @@ export class MetricsStore {
           responseBytes: Number(row.response_bytes),
           promptText: clipConversationText(row.prompt_text, MAX_PROMPT_BYTES),
           promptBytes: Number(row.prompt_bytes),
+          promptSource: row.prompt_source,
+          promptSuffixOmitted: Boolean(row.prompt_suffix_omitted),
           responseText: clipConversationText(row.response_text, MAX_READ_CONVERSATION_BYTES),
           responseState: row.response_state,
           responseBytesStored: Number(row.stored_response_bytes),
@@ -2252,6 +2690,140 @@ export class MetricsStore {
     } catch (error) {
       this.#safeLog('conversation_read_failed', { code: error.code ?? error.name ?? 'unknown' });
       return { turn: null, error: 'conversation_unavailable' };
+    }
+  }
+
+  readConversationSession(id) {
+    try {
+      this.#assertOpen();
+      const normalizedId = finiteInteger(id, 'conversation session id', { minimum: 1 });
+      const session = this.db.prepare(`
+        SELECT
+          s.id,
+          COUNT(t.id) AS turn_count,
+          MIN(m.started_at_ms) AS first_started_at_ms,
+          MAX(m.started_at_ms) AS last_started_at_ms
+        FROM conversation_sessions s
+        LEFT JOIN conversation_turns t ON t.conversation_session_id = s.id
+        LEFT JOIN request_metrics m ON m.id = t.request_metrics_id
+        WHERE s.id = ?
+        GROUP BY s.id
+      `).get(normalizedId);
+      if (!session) {
+        return {
+          session: null,
+          standaloneCount: this.#persistentStandaloneConversationCount(),
+          error: null,
+        };
+      }
+      const budgetRows = this.db.prepare(`
+        SELECT
+          t.id,
+          t.turn_index,
+          SUM(t.prompt_bytes + t.response_bytes) OVER (
+            ORDER BY t.turn_index ASC, t.id ASC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS cumulative_bytes
+        FROM conversation_turns t
+        WHERE t.conversation_session_id = ?
+        ORDER BY t.turn_index ASC, t.id ASC
+        LIMIT ?
+      `).all(normalizedId, MAX_CONVERSATION_SESSION_TURNS + 1);
+      const selectedIds = [];
+      for (const row of budgetRows) {
+        if (selectedIds.length >= MAX_CONVERSATION_SESSION_TURNS) break;
+        if (Number(row.cumulative_bytes) > MAX_CONVERSATION_SESSION_BYTES) break;
+        selectedIds.push(Number(row.id));
+      }
+      const placeholders = selectedIds.map(() => '?').join(', ');
+      const rows = selectedIds.length === 0 ? [] : this.db.prepare(`
+        SELECT
+          t.id,
+          t.conversation_session_id,
+          t.turn_index,
+          m.started_at_ms,
+          m.device_id,
+          m.machine_id,
+          m.member_label,
+          m.account_id,
+          m.account_alias,
+          m.model,
+          m.stream,
+          m.status_code,
+          m.outcome,
+          m.ttfb_ms,
+          m.duration_ms,
+          m.request_bytes,
+          m.response_bytes,
+          t.prompt_text,
+          t.prompt_bytes,
+          t.prompt_source,
+          t.prompt_suffix_omitted,
+          substr(t.response_text, 1, ${MAX_CONVERSATION_SESSION_RESPONSE_CHARS})
+            AS response_display_text,
+          CASE WHEN length(t.response_text) > ${MAX_CONVERSATION_SESSION_RESPONSE_CHARS}
+            THEN 1 ELSE 0 END AS response_display_truncated,
+          t.response_state,
+          t.response_bytes AS stored_response_bytes
+        FROM conversation_turns t
+        JOIN request_metrics m ON m.id = t.request_metrics_id
+        WHERE t.conversation_session_id = ?
+          AND t.id IN (${placeholders})
+        ORDER BY t.turn_index ASC, t.id ASC
+      `).all(normalizedId, ...selectedIds);
+      const standaloneCount = this.#persistentStandaloneConversationCount();
+      const turns = rows.map((row) => ({
+        id: Number(row.id),
+        conversationSessionId: Number(row.conversation_session_id),
+        turnIndex: Number(row.turn_index),
+        startedAtMs: Number(row.started_at_ms),
+        deviceId: row.device_id,
+        machineId: row.machine_id ?? null,
+        memberLabel: row.member_label,
+        accountId: row.account_id,
+        accountAlias: row.account_alias,
+        model: row.model ?? null,
+        stream: row.stream === null ? null : Boolean(row.stream),
+        statusCode: row.status_code === null ? null : Number(row.status_code),
+        outcome: row.outcome,
+        ttfbMs: row.ttfb_ms === null ? null : Number(row.ttfb_ms),
+        durationMs: row.duration_ms === null ? null : Number(row.duration_ms),
+        requestBytes: Number(row.request_bytes),
+        responseBytes: Number(row.response_bytes),
+        promptText: clipConversationText(row.prompt_text, MAX_PROMPT_BYTES),
+        promptBytes: Number(row.prompt_bytes),
+        promptSource: row.prompt_source,
+        promptSuffixOmitted: Boolean(row.prompt_suffix_omitted),
+        responseText: clipConversationText(row.response_display_text, MAX_READ_CONVERSATION_BYTES),
+        responseDisplayTruncated: Boolean(row.response_display_truncated),
+        responseState: row.response_state,
+        responseBytesStored: Number(row.stored_response_bytes),
+      }));
+      return {
+        session: {
+          id: Number(session.id),
+          turnCount: Number(session.turn_count),
+          firstStartedAtMs: Number(session.first_started_at_ms),
+          lastStartedAtMs: Number(session.last_started_at_ms),
+          turns,
+          displayedTurnCount: turns.length,
+          maxDisplayedTurns: MAX_CONVERSATION_SESSION_TURNS,
+          maxDisplayedBytes: MAX_CONVERSATION_SESSION_BYTES,
+          truncated: Number(session.turn_count) > turns.length,
+          standaloneCount,
+        },
+        standaloneCount,
+        error: null,
+      };
+    } catch (error) {
+      this.#safeLog('conversation_session_read_failed', {
+        code: error.code ?? error.name ?? 'unknown',
+      });
+      return {
+        session: null,
+        standaloneCount: this.#persistentStandaloneConversationCount(),
+        error: 'conversation_unavailable',
+      };
     }
   }
 

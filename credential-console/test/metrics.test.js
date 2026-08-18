@@ -147,9 +147,82 @@ async function createV2Database(home, options = {}) {
   return dbPath;
 }
 
+async function createV3Database(home, options = {}) {
+  const dbPath = await createV2Database(home, options);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    ALTER TABLE request_metrics ADD COLUMN conversation_capture_state TEXT NOT NULL
+      DEFAULT 'not_applicable'
+      CHECK (conversation_capture_state IN ('not_applicable', 'stored', 'dropped'));
+    CREATE TABLE conversation_turns (
+      id INTEGER PRIMARY KEY,
+      request_metrics_id INTEGER NOT NULL UNIQUE
+        REFERENCES request_metrics(id) ON DELETE RESTRICT,
+      prompt_text TEXT NOT NULL CHECK (length(prompt_text) > 0),
+      prompt_bytes INTEGER NOT NULL CHECK (prompt_bytes > 0),
+      response_text TEXT NOT NULL DEFAULT '',
+      response_state TEXT NOT NULL
+        CHECK (response_state IN ('complete', 'incomplete', 'truncated', 'unavailable')),
+      response_bytes INTEGER NOT NULL CHECK (response_bytes >= 0)
+    );
+    CREATE VIRTUAL TABLE conversation_turns_fts USING fts5(
+      prompt_text, response_text, content='conversation_turns', content_rowid='id',
+      tokenize='unicode61 remove_diacritics 2'
+    );
+    CREATE VIRTUAL TABLE conversation_turns_trigram_fts USING fts5(
+      prompt_text, response_text, content='conversation_turns', content_rowid='id',
+      tokenize='trigram'
+    );
+    CREATE INDEX conversation_turns_metrics_idx ON conversation_turns(request_metrics_id);
+    CREATE TRIGGER conversation_turns_fts_ai
+    AFTER INSERT ON conversation_turns
+    BEGIN
+      INSERT INTO conversation_turns_fts(rowid, prompt_text, response_text)
+      VALUES (new.id, new.prompt_text, new.response_text);
+    END;
+    CREATE TRIGGER conversation_turns_trigram_fts_ai
+    AFTER INSERT ON conversation_turns
+    BEGIN
+      INSERT INTO conversation_turns_trigram_fts(rowid, prompt_text, response_text)
+      VALUES (new.id, new.prompt_text, new.response_text);
+    END;
+    CREATE TRIGGER conversation_turns_no_update
+    BEFORE UPDATE ON conversation_turns
+    BEGIN
+      SELECT RAISE(ABORT, 'conversation turns are permanent');
+    END;
+    CREATE TRIGGER conversation_turns_no_delete
+    BEFORE DELETE ON conversation_turns
+    BEGIN
+      SELECT RAISE(ABORT, 'conversation turns are permanent');
+    END;
+  `);
+  const promptText = options.promptText ?? 'legacy v3 prompt';
+  const responseText = options.responseText ?? 'legacy v3 response';
+  db.prepare(`
+    INSERT INTO conversation_turns (
+      request_metrics_id, prompt_text, prompt_bytes, response_text,
+      response_state, response_bytes
+    ) VALUES (1, ?, ?, ?, 'complete', ?)
+  `).run(
+    promptText,
+    Buffer.byteLength(promptText),
+    responseText,
+    Buffer.byteLength(responseText),
+  );
+  db.prepare(`
+    UPDATE request_metrics
+    SET conversation_capture_state = 'stored'
+    WHERE id = 1
+  `).run();
+  db.prepare('UPDATE schema_meta SET schema_version = 3 WHERE singleton = 1').run();
+  db.close();
+  return dbPath;
+}
+
 test('initializes a private WAL/NORMAL database with schema version and indexes', async (t) => {
   const { store, dbPath } = await newStore(t);
-  assert.equal(METRICS_SCHEMA_VERSION, 3);
+  assert.equal(METRICS_SCHEMA_VERSION, 4);
   assert.equal((await stat(dbPath)).mode & 0o777, 0o600);
 
   const db = readOnly(dbPath);
@@ -195,7 +268,7 @@ test('migrates a v1 database in place and keeps old rows readable', async (t) =>
   t.after(() => db.close());
   assert.equal(
     db.prepare('SELECT schema_version FROM schema_meta WHERE singleton = 1').get().schema_version,
-    3,
+    4,
   );
   assert.deepEqual(store.queryTotals({ scope: 'all' }), {
     requestCount: 1,
@@ -240,7 +313,7 @@ test('migrates a v2 database to v3 with FTS in one transaction', async (t) => {
 
   const db = readOnly(dbPath);
   t.after(() => db.close());
-  assert.equal(db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 3);
+  assert.equal(db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 4);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM conversation_turns").get().count, 0);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns_fts'").get().count, 1);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_turns_trigram_fts'").get().count, 1);
@@ -502,6 +575,329 @@ test('paired completion stores conversation, FTS index, and safe metadata only',
     () => store.db.exec(`DELETE FROM conversation_turns WHERE id = ${stored.id}`),
     /conversation turns are permanent/,
   );
+});
+
+test('schema v4 groups supplied HMAC thread keys and exposes provenance', async (t) => {
+  // The proxy computes this digest with CredentialStore.master.key.  Metrics
+  // accepts only the digest and stores that exact 64-hex value.
+  const threadKey = 'a'.repeat(64);
+  const { store, dbPath } = await newStore(t, { batchSize: 8 });
+  for (const [index, [promptText, promptSource]] of [
+    ['captured user text', 'captured_api_user_text'],
+    ['wrapper removed', 'wrapper_removed'],
+    ['fallback raw', 'fallback_raw'],
+  ].entries()) {
+    assert.equal(store.enqueueCompletion({
+      metrics: row({ startedAtMs: BASE_MS + index, memberLabel: index === 1 ? 'bob' : 'alice' }),
+      conversation: {
+        threadKey,
+        headers: { 'x-claude-code-session-id': 'raw-header-must-not-reach-metrics' },
+        promptText,
+        promptSource,
+        promptSuffixOmitted: index === 1,
+        responseText: `reply-${index}`,
+        responseState: 'complete',
+        responseBytes: Buffer.byteLength(`reply-${index}`),
+      },
+    }), true);
+  }
+  assert.equal(store.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS + 10, memberLabel: 'legacy-only' }),
+    conversation: {
+      promptText: 'standalone legacy-shaped turn',
+      responseText: 'standalone reply',
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength('standalone reply'),
+    },
+  }), true);
+  assert.equal(store.flush().written, 4);
+
+  const db = readOnly(dbPath);
+  t.after(() => db.close());
+  const rows = db.prepare(`
+    SELECT conversation_session_id, turn_index, prompt_source, prompt_suffix_omitted
+    FROM conversation_turns
+    ORDER BY id ASC
+  `).all();
+  assert.deepEqual(rows.slice(0, 3).map((entry) => [
+    Number(entry.conversation_session_id), Number(entry.turn_index),
+    entry.prompt_source, Number(entry.prompt_suffix_omitted),
+  ]), [
+    [1, 1, 'captured_api_user_text', 0],
+    [1, 2, 'wrapper_removed', 1],
+    [1, 3, 'fallback_raw', 0],
+  ]);
+  assert.equal(rows[3].conversation_session_id, null);
+  assert.equal(rows[3].turn_index, null);
+  const storedThreadKey = db.prepare(
+    'SELECT thread_key FROM conversation_sessions WHERE id = 1',
+  ).get().thread_key;
+  assert.match(storedThreadKey, /^[0-9a-f]{64}$/);
+  assert.equal(storedThreadKey, threadKey);
+  assert.equal(db.prepare(
+    "SELECT COUNT(*) AS count FROM pragma_table_info('conversation_sessions') WHERE name LIKE '%header%'",
+  ).get().count, 0);
+
+  const sessions = store.searchConversationSessions({ q: 'reply', limit: 5 });
+  assert.equal(sessions.error, null);
+  assert.equal(sessions.totalMatches, 1);
+  assert.equal(sessions.items.length, 1);
+  assert.equal(sessions.items[0].turnCount, 3);
+  assert.equal(sessions.items[0].deviceId, 'device-1');
+  assert.equal(sessions.items[0].memberLabel, 'alice');
+  assert.equal(sessions.items[0].accountAlias, 'claude-team');
+  assert.equal(sessions.items[0].model, 'claude-test');
+  assert.equal(sessions.items[0].latestPromptSource, 'fallback_raw');
+  assert.equal(sessions.items[0].latestPromptSuffixOmitted, false);
+  const detail = store.readConversationSession(sessions.items[0].id);
+  assert.equal(detail.error, null);
+  assert.equal(detail.session.turnCount, 3);
+  assert.equal(detail.session.turns.length, 3);
+  assert.deepEqual(detail.session.turns.map((turn) => turn.turnIndex), [1, 2, 3]);
+  assert.deepEqual(detail.session.turns.map((turn) => [
+    turn.promptSource, turn.promptSuffixOmitted,
+  ]), [
+    ['captured_api_user_text', false],
+    ['wrapper_removed', true],
+    ['fallback_raw', false],
+  ]);
+  assert.equal(detail.session.standaloneCount, 1);
+  const sessionFacets = store.queryConversationSessionFacets({});
+  assert.equal(sessionFacets.totalStored, 1);
+  assert.deepEqual(sessionFacets.members.map((entry) => [entry.value, entry.count]), [
+    ['alice', 1],
+    ['bob', 1],
+  ]);
+  assert.equal(sessionFacets.members.some((entry) => entry.value === 'legacy-only'), false);
+  assert.equal(store.readConversationSession('not-an-id').error, 'conversation_unavailable');
+
+});
+
+test('schema v4 migrates v3 turns to standalone defaults without guessing a session', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-v3-to-v4-'));
+  const dbPath = await createV3Database(home);
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await store.init();
+  t.after(() => store.close());
+  const db = readOnly(dbPath);
+  t.after(() => db.close());
+  assert.equal(db.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 4);
+  const legacy = db.prepare(`
+    SELECT conversation_session_id, turn_index, prompt_source, prompt_suffix_omitted
+    FROM conversation_turns WHERE id = 1
+  `).get();
+  assert.equal(legacy.conversation_session_id, null);
+  assert.equal(legacy.turn_index, null);
+  assert.equal(legacy.prompt_source, 'legacy_unclassified');
+  assert.equal(legacy.prompt_suffix_omitted, 0);
+  assert.equal(store.searchConversations({ q: 'legacy v3' }).items.length, 1);
+  assert.equal(store.searchConversationSessions({}).items.length, 0);
+  assert.equal(store.searchConversationSessions({}).standaloneCount, 1);
+  assert.equal(store.integrityCheck(), true);
+});
+
+test('turn search returns the bounded complete legacy prompt when FTS hits only its suffix', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-v4-search-prompt-'));
+  const promptText = '<session>\nvisible user body\n</session>\n\nsuffix-only-marker';
+  await createV3Database(home, { promptText });
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await store.init();
+  t.after(() => store.close());
+  const result = store.searchConversations({ q: 'suffix-only-marker' });
+  assert.equal(result.error, null);
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].promptText, promptText);
+  assert.equal(result.items[0].promptSource, 'legacy_unclassified');
+  assert.equal(result.items[0].promptSuffixOmitted, false);
+  assert.equal(result.items[0].promptSnippet.includes('suffix-only-marker'), true);
+});
+
+test('schema v4 migration rollback leaves a v3 database untouched', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-v4-rollback-'));
+  const dbPath = await createV3Database(home);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TRIGGER reject_v4_promotion
+    BEFORE UPDATE OF schema_version ON schema_meta
+    BEGIN
+      SELECT RAISE(ABORT, 'v4 migration deliberately blocked');
+    END;
+  `);
+  db.close();
+  const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await assert.rejects(store.init(), /v4 migration deliberately blocked/);
+  t.after(() => store.close());
+  const verify = new DatabaseSync(dbPath, { readOnly: true });
+  t.after(() => verify.close());
+  assert.equal(verify.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 3);
+  assert.equal(verify.prepare(
+    "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'conversation_sessions'",
+  ).get().count, 0);
+  assert.equal(verify.prepare(
+    "SELECT COUNT(*) AS count FROM pragma_table_info('conversation_turns') WHERE name IN ('conversation_session_id', 'turn_index', 'prompt_source', 'prompt_suffix_omitted')",
+  ).get().count, 0);
+  assert.equal(verify.prepare('SELECT COUNT(*) AS count FROM conversation_turns').get().count, 1);
+});
+
+test('schema v4 refuses partial session or provenance objects without promotion', async (t) => {
+  const shapes = ['session_table', 'session_column', 'prompt_source_column'];
+  for (const shape of shapes) {
+    const home = await mkdtemp(join(tmpdir(), `credential-console-metrics-v4-partial-${shape}-`));
+    const dbPath = await createV3Database(home);
+    const db = new DatabaseSync(dbPath);
+    if (shape === 'session_table') {
+      db.exec(`
+        CREATE TABLE conversation_sessions (
+          id INTEGER PRIMARY KEY,
+          thread_key TEXT NOT NULL
+        )
+      `);
+    } else if (shape === 'session_column') {
+      db.exec('ALTER TABLE conversation_turns ADD COLUMN conversation_session_id INTEGER');
+    } else {
+      db.exec("ALTER TABLE conversation_turns ADD COLUMN prompt_source TEXT");
+    }
+    db.close();
+    const store = new MetricsStore({ home, flushIntervalMs: 60_000 });
+    await assert.rejects(store.init(), /untrusted partial v4 objects/);
+    t.after(() => store.close());
+    const verify = new DatabaseSync(dbPath, { readOnly: true });
+    t.after(() => verify.close());
+    assert.equal(verify.prepare('SELECT schema_version FROM schema_meta').get().schema_version, 3);
+  }
+});
+
+test('schema v4 session detail is capped at 200 turns and preserves explicit ordering', async (t) => {
+  const { store } = await newStore(t, {
+    batchSize: 64,
+    maxConversationQueueItems: 64,
+  });
+  const threadKey = 'b'.repeat(64);
+  for (let index = 0; index < 201; index += 1) {
+    assert.equal(store.enqueueCompletion({
+      metrics: row({ startedAtMs: BASE_MS + index }),
+      conversation: {
+        threadKey,
+        promptText: `bounded session prompt ${index}`,
+        responseText: `bounded session response ${index}`,
+        responseState: 'complete',
+        responseBytes: Buffer.byteLength(`bounded session response ${index}`),
+      },
+    }), true);
+    if ((index + 1) % 4 === 0) assert.equal(store.flush().written, 4);
+  }
+  assert.equal(store.flush().written, 1);
+  const list = store.searchConversationSessions({ q: 'bounded session', limit: 5 });
+  assert.equal(list.items.length, 1);
+  assert.equal(list.items[0].turnCount, 201);
+  const detail = store.readConversationSession(list.items[0].id);
+  assert.equal(detail.error, null);
+  assert.equal(detail.session.turnCount, 201);
+  assert.equal(detail.session.turns.length, 200);
+  assert.equal(detail.session.displayedTurnCount, 200);
+  assert.equal(detail.session.maxDisplayedTurns, 200);
+  assert.equal(detail.session.maxDisplayedBytes, 8 * 1024 * 1024);
+  assert.equal(detail.session.truncated, true);
+  assert.deepEqual(detail.session.turns.map((turn) => turn.turnIndex).slice(0, 3), [1, 2, 3]);
+  assert.equal(detail.session.turns.at(-1).turnIndex, 200);
+});
+
+test('schema v4 same-thread writes converge on one session under separate store flushes', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-metrics-v4-concurrent-'));
+  const first = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  const second = new MetricsStore({ home, flushIntervalMs: 60_000 });
+  await first.init();
+  await second.init();
+  t.after(() => first.close());
+  t.after(() => second.close());
+  const threadKey = 'c'.repeat(64);
+  assert.equal(first.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS + 100 }),
+    conversation: {
+      threadKey,
+      promptText: 'first concurrent prompt',
+      responseText: 'first concurrent response',
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength('first concurrent response'),
+    },
+  }), true);
+  assert.equal(second.enqueueCompletion({
+    metrics: row({ startedAtMs: BASE_MS }),
+    conversation: {
+      threadKey,
+      promptText: 'second concurrent prompt',
+      responseText: 'second concurrent response',
+      responseState: 'complete',
+      responseBytes: Buffer.byteLength('second concurrent response'),
+    },
+  }), true);
+  assert.equal(first.flush().written, 1);
+  assert.equal(second.flush().written, 1);
+  const db = readOnly(join(home, METRICS_FILENAME));
+  t.after(() => db.close());
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM conversation_sessions').get().count, 1);
+  assert.deepEqual(db.prepare(`
+    SELECT conversation_session_id, turn_index
+    FROM conversation_turns ORDER BY turn_index ASC
+  `).all().map((entry) => [Number(entry.conversation_session_id), Number(entry.turn_index)]), [
+    [1, 1],
+    [1, 2],
+  ]);
+  const sessions = first.searchConversationSessions({ limit: 5 });
+  assert.equal(sessions.items[0].latestPromptSnippet, 'second concurrent prompt');
+  const detail = first.readConversationSession(sessions.items[0].id);
+  assert.deepEqual(detail.session.turns.map((turn) => turn.turnIndex), [1, 2]);
+  assert.deepEqual(detail.session.turns.map((turn) => turn.promptText), [
+    'first concurrent prompt',
+    'second concurrent prompt',
+  ]);
+});
+
+test('schema v4 session detail applies a total byte budget and bounded response previews', async (t) => {
+  const { store } = await newStore(t, { batchSize: 4 });
+  const threadKey = 'd'.repeat(64);
+  const responseText = 'x'.repeat(1024 * 1024);
+  for (let index = 0; index < 9; index += 1) {
+    assert.equal(store.enqueueCompletion({
+      metrics: row({ startedAtMs: BASE_MS + index }),
+      conversation: {
+        threadKey,
+        promptText: `large response prompt ${index}`,
+        responseText,
+        responseState: 'complete',
+        responseBytes: Buffer.byteLength(responseText),
+      },
+    }), true);
+    assert.equal(store.flush().written, 1);
+  }
+  const session = store.searchConversationSessions({ limit: 5 }).items[0];
+  const detail = store.readConversationSession(session.id);
+  assert.equal(detail.session.turnCount, 9);
+  assert.ok(detail.session.turns.length > 0 && detail.session.turns.length < 9);
+  assert.equal(detail.session.truncated, true);
+  assert.equal(detail.session.maxDisplayedBytes, 8 * 1024 * 1024);
+  assert.ok(detail.session.turns.every((turn) => turn.responseText.length === 16 * 1024));
+  assert.ok(detail.session.turns.every((turn) => turn.responseDisplayTruncated === true));
+});
+
+test('schema v4 rejects malformed thread keys without persisting their value', async (t) => {
+  const { store } = await newStore(t);
+  assert.equal(store.enqueueCompletion({
+    metrics: row(),
+    conversation: {
+      threadKey: 'not-a-thread-key',
+      promptText: 'malformed thread key',
+      responseText: 'reply',
+      responseState: 'complete',
+      responseBytes: 5,
+    },
+  }), true);
+  assert.equal(store.flush().written, 1);
+  assert.equal(store.stats.conversation.dropped, 1);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM conversation_sessions').get().count, 0);
+  assert.equal(store.db.prepare(
+    "SELECT conversation_capture_state FROM request_metrics",
+  ).get().conversation_capture_state, 'dropped');
 });
 
 test('conversation queue enforces item/byte budgets while retaining dropped metrics', async (t) => {

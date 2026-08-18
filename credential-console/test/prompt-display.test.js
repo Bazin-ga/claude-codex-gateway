@@ -87,3 +87,15 @@ test('view adapter trusts persisted provenance from a newer capture row', () => 
     suffixOmitted: true,
   });
 });
+
+test('legacy unclassified rows use the strict wrapper heuristic instead of trusting a default', () => {
+  assert.deepEqual(derivePromptDisplay({
+    promptText: '<session>\nlegacy user body\n</session>\n\nlegacy client suffix',
+    promptSource: 'legacy_unclassified',
+    promptSuffixOmitted: false,
+  }), {
+    text: 'legacy user body',
+    source: PROMPT_DISPLAY_SOURCES.WRAPPER_REMOVED,
+    suffixOmitted: true,
+  });
+});

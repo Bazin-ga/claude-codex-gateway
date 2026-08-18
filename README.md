@@ -8,7 +8,9 @@
 > Claude API turns and makes their captured API-user/assistant text visible to everyone who can reach the console;
 > in `open` mode that means anyone on the tailnet, with no identity and no reading audit. Member
 > labels are self-entered and unverified. Captured API-user text may contain client wrappers and is
-> not guaranteed to be the human's original words. Codex traffic is not covered by turn capture.
+> not guaranteed to be the human's original words. Turns are correlated into conversations only
+> when a bounded Claude Code session identifier is present; only its HMAC is stored, and this
+> correlation does not authenticate the user. Codex traffic is not covered by turn capture.
 
 A self-hostable credential distribution centre for **Codex** (ChatGPT subscription) and
 **Claude Code** subscriptions.
@@ -151,8 +153,10 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
 - **Separated request telemetry and captured API turns.** The Claude gateway persists request metadata
   and separate input, cache-creation input, cache-read input, and output token counts for shared
   metrics. The metrics page remains body-free; P6 separately and permanently stores eligible captured
-  Claude API turns for console-wide browsing. A turn is one provider request, not a reconstructed
-  session, and its API-user text may include client-added wrappers. Codex traffic is outside that boundary.
+  Claude API turns for console-wide browsing. Validated client session identifiers are HMAC-hidden
+  and group future turns into conversation timelines; legacy/unidentified turns remain standalone
+  rather than being guessed together by time. API-user text may include client-added wrappers.
+  Codex traffic is outside that boundary.
 - **The centre is a high-value host by design.** A root compromise of the centre can recover
   all active provider credentials. Keep OS access narrow, patch it, and keep an emergency
   service-stop and provider-token revocation procedure.

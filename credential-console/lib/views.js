@@ -285,6 +285,9 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-disclosure { margin: 0; }
 .conversation-disclosure h2 { margin-bottom: 8px; }
 .conversation-disclosure p { margin: 6px 0 0; }
+.conversation-subnav { display: inline-flex; width: fit-content; max-width: 100%; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: white; }
+.conversation-subnav a { min-width: 0; padding: 8px 12px; border-radius: 8px; color: var(--muted); font-size: 13px; font-weight: 800; text-decoration: none; overflow-wrap: anywhere; }
+.conversation-subnav a[aria-current="page"], .conversation-subnav a:hover { background: var(--ink); color: white; }
 .conversation-layout { display: grid; grid-template-columns: minmax(220px, 260px) minmax(0, 1fr); gap: 22px; align-items: start; }
 .conversation-filter-details { position: sticky; top: 72px; min-width: 0; }
 .conversation-filter-details > summary { display: none; }
@@ -304,6 +307,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-list { display: grid; gap: 10px; }
 .conversation-card, .conversation-result-row { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: #fbfcf9; }
 .conversation-result-row { min-width: 0; box-shadow: 0 7px 18px rgba(22,33,29,.035); }
+.conversation-session-row { border-left: 5px solid var(--green); }
 .conversation-card h2, .conversation-result-row h2 { margin: 0; font-size: 17px; }
 .conversation-card-head, .conversation-result-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
 .conversation-result-head { align-items: center; }
@@ -330,6 +334,22 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-detail-meta span { min-width: 0; overflow-wrap: anywhere; }
 .conversation-detail-shell .topbar > * { min-width: 0; }
 .conversation-detail-shell .conversation-text { max-width: 900px; }
+.conversation-session-detail-shell { width: min(100%, 980px); margin: 0 auto; }
+.conversation-session-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.conversation-session-summary .summary { grid-column: auto; }
+.conversation-session-summary .summary strong { font-size: 20px; overflow-wrap: anywhere; }
+.conversation-timeline { display: grid; gap: 16px; min-width: 0; }
+.conversation-timeline-turn { min-width: 0; border: 1px solid var(--line); border-radius: 16px; padding: 16px; background: #fbfcf9; box-shadow: var(--shadow-soft); }
+.conversation-timeline-turn-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.conversation-timeline-turn-head h2 { margin: 0; font-size: 16px; }
+.conversation-turn-messages { display: grid; gap: 12px; min-width: 0; }
+.conversation-message { width: min(92%, 820px); min-width: 0; border-radius: 14px; padding: 13px 15px; overflow-wrap: anywhere; }
+.conversation-message-user { margin-left: auto; background: #e8f2ec; border: 1px solid #cadfd2; }
+.conversation-message-assistant { margin-right: auto; background: white; border: 1px solid var(--line); }
+.conversation-message h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
+.conversation-message pre { margin: 0; padding: 13px; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.conversation-message .conversation-prompt-disclaimer { margin: 0 0 8px; }
+.conversation-session-state-note { margin: 8px 0 0; }
 @media (max-width: 800px) {
   .summary, .split { grid-column: span 12; }
   .topbar { align-items: flex-start; flex-wrap: wrap; }
@@ -349,6 +369,11 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .conversation-filter-details { position: static; }
   .conversation-results-head { display: grid; }
   .conversation-result-actions { justify-content: flex-start; }
+  .conversation-subnav { display: grid; width: 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .conversation-subnav a { text-align: center; }
+  .conversation-session-summary { grid-template-columns: 1fr; }
+  .conversation-message { width: 100%; }
+  .conversation-timeline-turn { padding: 12px; }
   .metrics-chart-wide { grid-column: auto; }
 }
 `;
@@ -382,7 +407,7 @@ function layout(title, content, { openMode = false, activeTab = null } = {}) {
     ${activeTab ? `<nav class="page-tabs" aria-label="Primary navigation">
       <a href="/" data-i18n="tab-overview"${activeTab === 'overview' ? ' aria-current="page"' : ''}>Overview</a>
       <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
-      <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>API turns</a>
+      <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
     </nav>` : ''}
     ${openMode ? openBanner : ''}
     ${content}
@@ -1679,12 +1704,12 @@ export function metricsView({
         <div>
           <span class="badge stored" data-i18n="metrics-label">Request metrics</span>
           <h1 data-i18n="metrics-heading">Claude gateway request metrics</h1>
-          <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not rendered here; eligible captured API turns appear in the API-turn archive.</p>
+          <p class="muted" data-i18n="metrics-intro">This page shows request metadata only. Request and response bodies are not rendered here; eligible captured API turns appear under Conversations and the captured-turn archive.</p>
           <p class="muted tiny" data-i18n="metrics-claude-only">Token accounting covers Claude gateway traffic only. Codex clients connect directly to their provider and are not included.</p>
         </div>
         <div class="actions">
           <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
-          <a class="button secondary" href="/conversations" data-i18n="metrics-conversations-link">View captured API turns</a>
+          <a class="button secondary" href="/conversations" data-i18n="metrics-conversations-link">View conversations</a>
         </div>
       </div>
       <div class="notice error metrics-attribution-notice" role="note">
@@ -1764,6 +1789,7 @@ const CONVERSATION_PERIOD_OPTIONS = Object.freeze([
 const CONVERSATION_LIMIT_OPTIONS = Object.freeze([25, 50]);
 const MAX_CONVERSATION_FACETS = 100;
 const MAX_CONVERSATION_SNIPPET_CHARS = 600;
+const MAX_CONVERSATION_TIMELINE_TEXT_CHARS = 16 * 1024;
 
 function conversationText(value) {
   return typeof value === 'string' ? value : '';
@@ -1779,6 +1805,7 @@ function conversationState(item) {
 
 function conversationDateText(value) {
   try {
+    if (value === null || value === undefined || value === '') return '—';
     const numeric = Number(value);
     if (Number.isFinite(numeric) && numeric >= 0) {
       const date = new Date(numeric);
@@ -1811,6 +1838,13 @@ function conversationPrivacyView(openMode) {
   </div>`;
 }
 
+function conversationSubnav(active) {
+  return `<nav class="conversation-subnav" aria-label="Conversation views">
+    <a href="/conversations" data-i18n="conversation-subnav-sessions"${active === 'sessions' ? ' aria-current="page"' : ''}>Conversations</a>
+    <a href="/conversation-turns" data-i18n="conversation-subnav-turns"${active === 'turns' ? ' aria-current="page"' : ''}>Captured API turns</a>
+  </nav>`;
+}
+
 function conversationFormField(name, value) {
   return `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value ?? '')}">`;
 }
@@ -1833,6 +1867,18 @@ function conversationSnippetText(value) {
   const text = conversationText(value);
   if (text.length <= MAX_CONVERSATION_SNIPPET_CHARS) return text;
   return `${Array.from(text).slice(0, MAX_CONVERSATION_SNIPPET_CHARS).join('')}…`;
+}
+
+function conversationTimelineText(value) {
+  const text = conversationText(value);
+  const points = Array.from(text);
+  if (points.length <= MAX_CONVERSATION_TIMELINE_TEXT_CHARS) {
+    return { text, omitted: false };
+  }
+  return {
+    text: points.slice(0, MAX_CONVERSATION_TIMELINE_TEXT_CHARS).join(''),
+    omitted: true,
+  };
 }
 
 function promptSourceI18n(source) {
@@ -1958,7 +2004,7 @@ function conversationItemView(item) {
     || item?.captureState === 'dropped'
     || item?.queueState === 'dropped';
   const detailLink = id
-    ? `<a class="button secondary" href="/conversations/${escapeHtml(encodeURIComponent(id))}" data-i18n="conversation-open">Open conversation</a>`
+    ? `<a class="button secondary" href="/conversation-turns/${escapeHtml(encodeURIComponent(id))}" data-i18n="conversation-open">Open captured turn</a>`
     : '';
   const device = item?.deviceName ?? item?.deviceId ?? '—';
   return `<article class="conversation-result-row" data-conversation-id="${escapeHtml(id)}">
@@ -2080,17 +2126,18 @@ export function conversationsView({
   ].join('');
   const nextForm = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
     ? ''
-    : `<form method="post" action="/conversations" class="conversation-pagination-form">
+    : `<form method="post" action="/conversation-turns" class="conversation-pagination-form">
         ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
   return layout('Captured API turns', `
     <section class="stack">
       ${conversationPrivacyView(openMode)}
+      ${conversationSubnav('turns')}
       <div class="conversation-layout">
         <details class="conversation-filter-details" open>
           <summary data-i18n="conversation-filters-heading">Filters</summary>
-          <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters">
+          <form method="post" action="/conversation-turns" class="card conversation-rail conversation-filters" aria-label="API-turn filters">
           <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
           <p class="muted tiny conversation-filter-hint" data-i18n="conversation-filter-hint">Type to search member suggestions; leave the field blank for everyone.</p>
           <label><span data-i18n="conversation-search">Search captured API turns</span>
@@ -2120,7 +2167,7 @@ export function conversationsView({
           </label>
           <div class="filter-actions">
             <button type="submit" data-i18n="conversation-search-submit">Search</button>
-            <a class="button secondary" href="/conversations" data-i18n="conversation-search-clear">Clear</a>
+            <a class="button secondary" href="/conversation-turns" data-i18n="conversation-search-clear">Clear</a>
           </div>
           </form>
         </details>
@@ -2147,6 +2194,307 @@ export function conversationsView({
   `, { openMode, activeTab: 'conversations' });
 }
 
+function conversationSessionSearchErrorView(error) {
+  const code = typeof error === 'string' ? error : error?.code;
+  if (code === 'conversation_filter_invalid') {
+    return '<div class="notice error" role="alert" data-i18n="conversation-session-filter-invalid">One or more conversation filters are invalid or too long. Clear the filters and try again.</div>';
+  }
+  if (code === 'search_query_too_short') {
+    return '<div class="notice error" role="alert" data-i18n="conversation-session-search-query-too-short">Search query is too short for this conversation archive. For large archives, enter at least three consecutive Chinese characters or more searchable text; remove standalone punctuation and split the query into simpler terms.</div>';
+  }
+  if (code === 'search_query_requires_indexed_terms') {
+    return '<div class="notice error" role="alert" data-i18n="conversation-session-search-requires-indexed-terms">Conversation search needs indexed terms. For large archives, enter at least three consecutive Chinese characters, remove special punctuation, or split the query into simpler terms.</div>';
+  }
+  return '<div class="notice error" role="alert" data-i18n="conversation-session-search-error">Conversation search could not be completed.</div>';
+}
+
+function standaloneTurnsNotice(count) {
+  const normalized = conversationCount(count);
+  if (!normalized) return '';
+  return `<div class="notice conversation-standalone-notice" role="note">
+    <strong data-i18n="conversation-standalone-heading">Standalone captured turns</strong>
+    <p><span data-i18n="conversation-standalone-notice">These older or uncorrelated API turns have no validated session identifier. They are never grouped by a time guess.</span> <strong>${escapeHtml(String(normalized))}</strong></p>
+    <a class="button secondary" href="/conversation-turns" data-i18n="conversation-standalone-link">View standalone and all captured API turns</a>
+  </div>`;
+}
+
+function conversationSessionItemView(item) {
+  const id = item?.id === null || item?.id === undefined ? '' : String(item.id);
+  const state = conversationState({ responseState: item?.latestResponseState });
+  const device = item?.deviceName ?? item?.deviceId ?? '—';
+  const promptItem = {
+    promptSnippet: item?.latestPromptSnippet,
+    promptSource: item?.latestPromptSource,
+    promptSuffixOmitted: item?.latestPromptSuffixOmitted === true,
+  };
+  const detailLink = id
+    ? `<a class="button secondary" href="/conversations/session/${escapeHtml(encodeURIComponent(id))}" data-i18n="conversation-session-open">Open conversation</a>`
+    : '';
+  return `<article class="conversation-result-row conversation-session-row" data-conversation-session-id="${escapeHtml(id)}">
+    <div class="conversation-result-head">
+      <div>
+        <h2><span data-i18n="conversation-session-heading">Conversation</span>${id ? ` #${escapeHtml(id)}` : ''}</h2>
+        <div class="conversation-result-meta">
+          <span><span data-i18n="conversation-session-turn-count">Turns</span>: ${escapeHtml(String(conversationCount(item?.turnCount)))}</span>
+          <span><span data-i18n="conversation-session-first-at">First captured</span>: ${escapeHtml(conversationDateText(item?.firstStartedAtMs))}</span>
+          <span><span data-i18n="conversation-session-last-at">Latest captured</span>: ${escapeHtml(conversationDateText(item?.lastStartedAtMs))}</span>
+          <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(item?.memberLabel ?? '—')}</span>
+          <span><span data-i18n="conversation-device">Device</span>: ${escapeHtml(device)}</span>
+          <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(item?.accountAlias ?? '—')}</span>
+          <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(item?.model ?? '—')}</span>
+        </div>
+      </div>
+      <div class="conversation-result-actions">${conversationStatusView(state)}${detailLink}</div>
+    </div>
+    <p class="muted tiny" data-i18n="conversation-session-latest-preview">Latest captured turn</p>
+    <div class="conversation-result-snippets">
+      ${conversationPromptSnippetView(promptItem)}
+      ${conversationSnippetView('conversation-response', 'Response', item?.latestResponseSnippet, 'conversation-empty-response')}
+    </div>
+  </article>`;
+}
+
+export function conversationSessionsView({
+  result = null,
+  searchResult = null,
+  search = null,
+  items = null,
+  nextBeforeId = null,
+  q = '',
+  period = 'all',
+  memberLabel = '',
+  deviceId = '',
+  accountId = '',
+  model = '',
+  responseState = '',
+  limit = 25,
+  openMode = false,
+  error = null,
+  queueDropped = null,
+} = {}) {
+  const envelope = conversationEnvelope({ result, searchResult, search, items, nextBeforeId, error });
+  const source = result ?? searchResult ?? search ?? {};
+  const query = typeof q === 'string' ? q : String(q ?? '');
+  const normalizedLimit = Number(limit) === 1
+    ? 1
+    : CONVERSATION_LIMIT_OPTIONS.includes(Number(limit)) ? Number(limit) : 25;
+  const normalizedPeriod = CONVERSATION_PERIOD_OPTIONS.some((option) => option.value === String(period))
+    ? String(period)
+    : 'all';
+  const normalizedMember = String(memberLabel ?? '');
+  const normalizedDevice = String(deviceId ?? '');
+  const normalizedAccount = String(accountId ?? '');
+  const normalizedModel = String(model ?? '');
+  const normalizedState = CONVERSATION_RESPONSE_STATES.includes(String(responseState))
+    ? String(responseState)
+    : '';
+  const facets = envelope.facets ?? {};
+  const droppedCount = conversationCount(envelope.dropped ?? queueDropped);
+  const standaloneCount = conversationCount(source?.standaloneCount);
+  const totalMatches = envelope.totalMatches === null || envelope.totalMatches === undefined
+    ? envelope.items.length
+    : envelope.totalMatches;
+  const errorNotice = envelope.error === null || envelope.error === undefined
+    ? ''
+    : conversationSessionSearchErrorView(envelope.error);
+  const droppedNotice = droppedCount > 0
+    ? `<div class="notice error conversation-queue-dropped" role="alert"><span data-i18n="conversation-queue-dropped">API-turn capture was dropped by the bounded queue.</span> <strong>${escapeHtml(String(droppedCount))}</strong></div>`
+    : '';
+  const facetNotice = facets.truncated === true
+    ? '<div class="notice" role="note" data-i18n="conversation-facets-truncated">Some filter values are omitted from the list; a selected value remains available.</div>'
+    : '';
+  const periodOptions = CONVERSATION_PERIOD_OPTIONS.map((option) => (
+    `<option value="${escapeHtml(option.value)}"${normalizedPeriod === option.value ? ' selected' : ''} data-i18n="${escapeHtml(option.i18n)}">${escapeHtml(option.label)}</option>`
+  )).join('');
+  const stateOptions = [
+    '<option value="" data-i18n="conversation-all-states">All response states</option>',
+    ...CONVERSATION_RESPONSE_STATES.map((state) => `<option value="${escapeHtml(state)}"${normalizedState === state ? ' selected' : ''} data-i18n="conversation-response-${escapeHtml(state)}">${escapeHtml(state)}</option>`),
+  ].join('');
+  const nextForm = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
+    ? ''
+    : `<form method="post" action="/conversations" class="conversation-pagination-form">
+        ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
+        <button type="submit" data-i18n="conversation-next-page">Next page</button>
+      </form>`;
+  const itemsView = envelope.items.map(conversationSessionItemView).join('');
+  return layout('Conversations', `
+    <section class="stack">
+      ${conversationPrivacyView(openMode)}
+      ${conversationSubnav('sessions')}
+      ${standaloneTurnsNotice(standaloneCount)}
+      <div class="conversation-layout">
+        <details class="conversation-filter-details" open>
+          <summary data-i18n="conversation-filters-heading">Filters</summary>
+          <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters">
+          <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
+          <p class="muted tiny conversation-filter-hint" data-i18n="conversation-session-filter-hint">Filters match any captured turn inside a correlated client session; each result card shows the latest turn's attribution and preview.</p>
+          <label><span data-i18n="conversation-session-search">Search conversations</span>
+            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Captured API user text or response" data-placeholder-en="Captured API user text or response" data-placeholder-zh="已捕获 API 用户文本或回复">
+          </label>
+          <label><span data-i18n="conversation-filter-period-label">Period</span><select name="period">${periodOptions}</select></label>
+          <label><span data-i18n="conversation-filter-member-label">Member</span>
+            <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
+            <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>
+          </label>
+          <label><span data-i18n="conversation-filter-device-label">Device</span><select name="device_id">${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select></label>
+          <label><span data-i18n="conversation-filter-account-label">Account</span><select name="account_id">${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select></label>
+          <label><span data-i18n="conversation-filter-model-label">Model</span><select name="model">${conversationFacetOptions(facets.models, normalizedModel, 'All models', 'conversation-all-models')}</select></label>
+          <label><span data-i18n="conversation-filter-state-label">Response state</span><select name="response_state">${stateOptions}</select></label>
+          <label><span data-i18n="conversation-filter-limit-label">Rows per page</span><select name="limit">${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label>
+          <div class="filter-actions">
+            <button type="submit" data-i18n="conversation-search-submit">Search</button>
+            <a class="button secondary" href="/conversations" data-i18n="conversation-search-clear">Clear</a>
+          </div>
+          </form>
+        </details>
+        <section class="conversation-results" aria-labelledby="conversation-sessions-results-heading">
+          <div class="conversation-results-head">
+            <div>
+              <span class="badge stored" data-i18n="conversation-sessions-label">Correlated client sessions</span>
+              <h1 id="conversation-sessions-results-heading" data-i18n="conversation-sessions-heading">Conversations</h1>
+              <p class="muted" data-i18n="conversation-sessions-intro">Captured turns are grouped only when Claude Code supplies a validated session identifier. This correlation does not authenticate the user; standalone turns are never grouped by time.</p>
+              ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
+            </div>
+            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-session-total-matches">matching conversations</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
+          </div>
+          ${errorNotice}
+          ${droppedNotice}
+          ${facetNotice}
+          <div class="conversation-list" aria-live="polite">
+            ${itemsView || '<p class="empty" data-i18n="conversation-session-no-results">No correlated conversations match this search.</p>'}
+          </div>
+          ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-session-pagination-hint">Conversations are ordered by their internal session record, newest first.</span>${nextForm}</div>` : ''}
+        </section>
+      </div>
+    </section>
+  `, { openMode, activeTab: 'conversations' });
+}
+
+function conversationSessionTurnView(turn, fallbackIndex) {
+  const displayIndex = Number.isSafeInteger(turn?.turnIndex) && turn.turnIndex > 0
+    ? turn.turnIndex
+    : fallbackIndex + 1;
+  const state = conversationState(turn);
+  const promptDisplay = derivePromptDisplay(
+    promptDisplayInput(turn, turn?.promptText ?? turn?.prompt),
+    { maxChars: MAX_CONVERSATION_TIMELINE_TEXT_CHARS },
+  );
+  const responseDisplay = conversationTimelineText(turn?.responseText ?? turn?.response);
+  const response = responseDisplay.text;
+  const turnId = Number.isSafeInteger(turn?.id) && turn.id > 0 ? turn.id : null;
+  const stateNotice = state === 'incomplete'
+    ? '<p class="notice conversation-session-state-note" data-i18n="conversation-session-incomplete-turn">This API turn ended before a complete assistant response was captured.</p>'
+    : state === 'truncated'
+      ? '<p class="notice conversation-session-state-note" data-i18n="conversation-session-truncated-turn">The captured assistant text reached a bounded limit and is incomplete.</p>'
+      : '';
+  const timelineClipNotice = responseDisplay.omitted || turn?.responseDisplayTruncated === true
+    ? '<p class="notice conversation-session-state-note" data-i18n="conversation-session-timeline-clipped">Long assistant text is shortened in this timeline. Open the individual turn to read the complete captured text.</p>'
+    : '';
+  const responseView = response
+    ? `<pre>${escapeHtml(response)}</pre>`
+    : '<p class="empty" data-i18n="conversation-session-empty-assistant">No assistant text was captured. This turn may contain tool activity, or its response body may have been unavailable.</p>';
+  return `<article class="conversation-timeline-turn" data-turn-index="${escapeHtml(String(displayIndex))}">
+    <div class="conversation-timeline-turn-head">
+      <div>
+        <h2><span data-i18n="conversation-session-turn">Turn</span> ${escapeHtml(String(displayIndex))}</h2>
+        <div class="conversation-detail-meta">
+          <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(turn?.startedAtMs))}</span>
+          <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(turn?.memberLabel ?? '—')}</span>
+          <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(turn?.accountAlias ?? '—')}</span>
+          <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(turn?.model ?? '—')}</span>
+        </div>
+      </div>
+      <div class="conversation-result-actions">
+        ${conversationStatusView(state)}
+        ${turnId ? `<a class="button secondary" href="/conversation-turns/${turnId}" data-i18n="conversation-session-open-turn">Open turn</a>` : ''}
+      </div>
+    </div>
+    <div class="conversation-turn-messages">
+      <section class="conversation-message conversation-message-user">
+        <h3 data-i18n="conversation-prompt">Captured API user text</h3>
+        <p class="conversation-prompt-disclaimer muted tiny" data-i18n="conversation-prompt-disclaimer">Captured from the final API user message; it may include client wrappers and is not guaranteed to be the user's original words.</p>
+        ${promptDisplay.text ? `<pre>${escapeHtml(promptDisplay.text)}</pre>` : '<p class="empty" data-i18n="conversation-empty-prompt">Not captured</p>'}
+        ${promptDisplayMetaView(promptDisplay)}
+      </section>
+      <section class="conversation-message conversation-message-assistant">
+        <h3 data-i18n="conversation-response">Response</h3>
+        ${responseView}
+        ${stateNotice}
+        ${timelineClipNotice}
+      </section>
+    </div>
+  </article>`;
+}
+
+export function conversationSessionDetailView({
+  result = null,
+  session = null,
+  id = null,
+  error = null,
+  openMode = false,
+} = {}) {
+  const envelope = result ?? {};
+  const record = session ?? (Object.hasOwn(envelope, 'session') ? envelope.session : null);
+  const errorText = error ?? envelope.error ?? null;
+  const errorNotice = errorText
+    ? `<div class="notice error" role="alert"><span data-i18n="conversation-session-read-error">Conversation could not be loaded.</span></div>`
+    : '';
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return layout('Conversation unavailable', `
+      <section class="stack conversation-session-detail-shell">
+        ${conversationPrivacyView(openMode)}
+        ${conversationSubnav('sessions')}
+        ${errorNotice || '<div class="notice error" role="alert" data-i18n="conversation-session-not-found">Conversation not found.</div>'}
+        <a class="button secondary" href="/conversations" data-i18n="conversation-session-back">Back to conversations</a>
+      </section>
+    `, { openMode, activeTab: 'conversations' });
+  }
+  const suppliedTurns = Array.isArray(record.turns) ? record.turns : [];
+  // MetricsStore returns at most 200 ordered turns. Keep a defensive input cap
+  // for test doubles/alternate implementations, then sort before the render
+  // cap so a reversed bounded result still becomes a forward timeline.
+  const sourceTurns = suppliedTurns.slice(0, 1_000);
+  const turns = sourceTurns.sort((left, right) => {
+    const leftIndex = Number.isSafeInteger(left?.turnIndex) ? left.turnIndex : Number.MAX_SAFE_INTEGER;
+    const rightIndex = Number.isSafeInteger(right?.turnIndex) ? right.turnIndex : Number.MAX_SAFE_INTEGER;
+    if (leftIndex !== rightIndex) return leftIndex - rightIndex;
+    const leftAt = Number.isFinite(Number(left?.startedAtMs)) ? Number(left.startedAtMs) : 0;
+    const rightAt = Number.isFinite(Number(right?.startedAtMs)) ? Number(right.startedAtMs) : 0;
+    return leftAt - rightAt;
+  }).slice(0, 200);
+  const turnCount = Number.isSafeInteger(record.turnCount) && record.turnCount >= 0
+    ? record.turnCount
+    : suppliedTurns.length;
+  const truncated = record.truncated === true || suppliedTurns.length > 200 || turnCount > turns.length;
+  const standaloneCount = conversationCount(record.standaloneCount ?? envelope.standaloneCount);
+  const sessionId = record.id ?? id ?? '—';
+  const timeline = turns.map(conversationSessionTurnView).join('');
+  return layout('Conversation', `
+    <section class="stack conversation-session-detail-shell">
+      ${conversationPrivacyView(openMode)}
+      ${conversationSubnav('sessions')}
+      ${standaloneTurnsNotice(standaloneCount)}
+      <div class="metrics-heading">
+        <div>
+          <span class="badge stored" data-i18n="conversation-sessions-label">Correlated client session</span>
+          <h1><span data-i18n="conversation-session-heading">Conversation</span> #${escapeHtml(String(sessionId))}</h1>
+          <p class="muted" data-i18n="conversation-session-detail-intro">Turns are shown oldest to newest from one correlated client session. The identifier is format-validated and HMAC-hidden, but it does not authenticate the user; the raw value is never displayed or stored here.</p>
+        </div>
+        <a class="button secondary" href="/conversations" data-i18n="conversation-session-back">Back to conversations</a>
+      </div>
+      <div class="conversation-session-summary">
+        <article class="card summary"><span class="muted" data-i18n="conversation-session-turn-count">Turns</span><strong>${escapeHtml(String(turnCount))}</strong></article>
+        <article class="card summary"><span class="muted" data-i18n="conversation-session-first-at">First captured</span><strong>${escapeHtml(conversationDateText(record.firstStartedAtMs))}</strong></article>
+        <article class="card summary"><span class="muted" data-i18n="conversation-session-last-at">Latest captured</span><strong>${escapeHtml(conversationDateText(record.lastStartedAtMs))}</strong></article>
+      </div>
+      ${truncated ? '<div class="notice" role="status" data-i18n="conversation-session-truncated">This conversation exceeds the bounded timeline budget. Only the oldest contiguous prefix, up to 200 turns and 8 MiB of stored text, is shown; open an individual turn for its full stored text.</div>' : ''}
+      <div class="conversation-timeline">
+        ${timeline || '<p class="empty" data-i18n="conversation-session-empty">No captured turns are available in this conversation.</p>'}
+      </div>
+    </section>
+  `, { openMode, activeTab: 'conversations' });
+}
+
 export function conversationDetailView({
   conversation = null,
   result = null,
@@ -2168,8 +2516,9 @@ export function conversationDetailView({
     return layout('Captured turn unavailable', `
       <section class="stack conversation-detail-shell">
         ${conversationPrivacyView(openMode)}
+        ${conversationSubnav('turns')}
         ${errorNotice || '<div class="notice error" role="alert" data-i18n="conversation-not-found">Captured API turn not found.</div>'}
-        <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to API turns</a>
+        <a class="button secondary" href="/conversation-turns" data-i18n="conversation-back">Back to API turns</a>
       </section>
     `, { openMode, activeTab: 'conversations' });
   }
@@ -2181,6 +2530,7 @@ export function conversationDetailView({
   return layout('Captured turn', `
     <section class="stack conversation-detail-shell">
       ${conversationPrivacyView(openMode)}
+      ${conversationSubnav('turns')}
       ${errorNotice}
       <div class="topbar">
         <div>
@@ -2205,7 +2555,7 @@ export function conversationDetailView({
         <h2 data-i18n="conversation-response">Response</h2>
         ${response ? `<pre>${escapeHtml(response)}</pre>` : '<p class="empty" data-i18n="conversation-empty-response">Not captured</p>'}
       </article>
-      <a class="button secondary" href="/conversations" data-i18n="conversation-back">Back to API turns</a>
+      <a class="button secondary" href="/conversation-turns" data-i18n="conversation-back">Back to API turns</a>
     </section>
   `, { openMode, activeTab: 'conversations' });
 }
