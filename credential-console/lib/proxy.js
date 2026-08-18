@@ -445,9 +445,22 @@ export async function handleClaudeProxy(req, res, {
   const startedAtMonotonic = performance.now();
   const requestMetadata = metadataTeeFactory({ capturePrompt: upstreamPath === '/v1/messages' });
   const requestLimit = passthroughCounter({ maxBytes: MAX_REQUEST_BYTES });
+  // The request body still streams to the upstream exactly as before; this
+  // Transform only records a side-copy so a transient upstream overload
+  // (HTTP 529/503) can be replayed without re-reading the client.
+  const bodyChunks = [];
+  const bodyAccumulator = new Transform({
+    transform(chunk, encoding, callback) {
+      bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      callback(null, chunk);
+    },
+  });
+  const RETRYABLE_UPSTREAM_STATUS = new Set([529, 503]);
+  const MAX_UPSTREAM_ATTEMPTS = 3;
+  const RETRY_BASE_DELAY_MS = 250;
+  const RETRY_MAX_DELAY_MS = 5000;
   let responseObservation = null;
   let responseUsageFinished = true;
-  let settled = false;
   let upstreamTtfbMs = null;
   let upstreamStatus = null;
   let upstreamRequestId = null;
@@ -458,6 +471,29 @@ export async function handleClaudeProxy(req, res, {
   let pendingOutcome = null;
   let requestBodyFinished = false;
   let responseFinished = false;
+  let currentUpstreamReq = null;
+  let retryTimer = null;
+  let attemptsUsed = 0;
+  let retryBackoffMs = RETRY_BASE_DELAY_MS;
+
+  const nextRetryDelayMs = (retryAfterHeader) => {
+    const backoff = retryBackoffMs;
+    retryBackoffMs = Math.min(retryBackoffMs * 2, RETRY_MAX_DELAY_MS);
+    if (typeof retryAfterHeader === 'string' && /^\s*\d+\s*$/.test(retryAfterHeader)) {
+      const seconds = Number(retryAfterHeader.trim());
+      if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.min(seconds * 1000, RETRY_MAX_DELAY_MS);
+      }
+    }
+    return backoff;
+  };
+
+  const cancelPendingRetry = () => {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  };
 
   const finalizeMetric = (outcome, statusCode = upstreamStatus) => {
     if (metricFinalized) return;
@@ -541,149 +577,188 @@ export async function handleClaudeProxy(req, res, {
     finalizeMetric(pendingOutcome ?? 'completed', res.statusCode);
   };
 
-  const upstreamReq = transport.request(
-    upstream,
-    {
-      method: req.method,
-      headers,
-      timeout: 10 * 60_000,
-    },
-    (upstreamRes) => {
-      settled = true;
-      activeUpstreamRes = upstreamRes;
-      upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
-      const status = upstreamRes.statusCode ?? 502;
-      upstreamStatus = status;
-      const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
-      upstreamRequestId = typeof requestId === 'string' ? requestId : null;
-      res.writeHead(status, {
-        ...responseHeaders(upstreamRes.headers),
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-      });
-      const responseFormat = upstreamPath === '/v1/messages' && status >= 200 && status < 400
-        ? responseUsageFormat(upstreamRes.headers['content-type'])
-        : null;
-      const observers = [];
-      if (responseFormat && requestMetrics?.enqueueRequest) {
+  const sendUpstream = (bodyBuffer) => {
+    if (clientAborted || metricFinalized) return undefined;
+    attemptsUsed += 1;
+    let attemptSettled = false;
+
+    const upstreamReq = transport.request(
+      upstream,
+      {
+        method: req.method,
+        headers: bodyBuffer
+          ? { ...headers, 'content-length': String(bodyBuffer.length) }
+          : headers,
+        timeout: 10 * 60_000,
+      },
+      (upstreamRes) => {
+        const status = upstreamRes.statusCode ?? 502;
+
+        if (RETRYABLE_UPSTREAM_STATUS.has(status)
+          && attemptsUsed < MAX_UPSTREAM_ATTEMPTS
+          && requestBodyFinished
+          && !clientAborted) {
+          log('claude_proxy_upstream_retry', {
+            account_id: account.id,
+            device_id: device.id,
+            status,
+            attempt: attemptsUsed,
+          });
+          upstreamRes.resume();
+          upstreamRes.once('error', () => {});
+          upstreamRes.once('end', () => {
+            if (clientAborted || metricFinalized) return;
+            retryTimer = setTimeout(() => {
+              retryTimer = null;
+              sendUpstream(bodyBuffer ?? Buffer.concat(bodyChunks));
+            }, nextRetryDelayMs(upstreamRes.headers['retry-after']));
+            if (typeof retryTimer.unref === 'function') retryTimer.unref();
+          });
+          return;
+        }
+
+        attemptSettled = true;
+        activeUpstreamRes = upstreamRes;
+        upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
+        upstreamStatus = status;
+        const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
+        upstreamRequestId = typeof requestId === 'string' ? requestId : null;
+        res.writeHead(status, {
+          ...responseHeaders(upstreamRes.headers),
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        const responseFormat = upstreamPath === '/v1/messages' && status >= 200 && status < 400
+          ? responseUsageFormat(upstreamRes.headers['content-type'])
+          : null;
+        const observers = [];
+        if (responseFormat && requestMetrics?.enqueueRequest) {
+          try {
+            observers.push(usageObserver(responseUsageParserFactory({ format: responseFormat })));
+          } catch (error) {
+            log('response_usage_parser_init_failed', {
+              account_id: account.id,
+              device_id: device.id,
+              code: error?.code ?? error?.name ?? 'unknown',
+            });
+          }
+        }
+        if (responseFormat && typeof requestMetrics?.enqueueCompletion === 'function') {
+          try {
+            observers.push(responseContentAssemblerFactory({ format: responseFormat }));
+          } catch (error) {
+            log('response_content_parser_init_failed', {
+              account_id: account.id,
+              device_id: device.id,
+              code: error?.code ?? error?.name ?? 'unknown',
+            });
+          }
+        }
+        const observer = observers.length
+          ? createCompositeResponseObserver(observers)
+          : null;
+        responseUsageFinished = false;
         try {
-          observers.push(usageObserver(responseUsageParserFactory({ format: responseFormat })));
+          responseObservation = responseObservationFactory({
+            contentEncoding: upstreamRes.headers['content-encoding'],
+            observer,
+          });
         } catch (error) {
-          log('response_usage_parser_init_failed', {
+          log('response_observation_init_failed', {
             account_id: account.id,
             device_id: device.id,
             code: error?.code ?? error?.name ?? 'unknown',
           });
+          responseObservation = createResponseObservationTee();
         }
-      }
-      if (responseFormat && typeof requestMetrics?.enqueueCompletion === 'function') {
-        try {
-          observers.push(responseContentAssemblerFactory({ format: responseFormat }));
-        } catch (error) {
-          log('response_content_parser_init_failed', {
+        Promise.resolve(responseObservation.done).then(
+          () => {
+            responseUsageFinished = true;
+            finalizeCompletedWhenReady();
+          },
+          () => {
+            responseUsageFinished = true;
+            finalizeCompletedWhenReady();
+          },
+        );
+        upstreamRes.pipe(responseObservation.stream).pipe(res);
+        upstreamRes.on('end', () => {
+          upstreamEnded = true;
+          store.markDeviceSeen(device.id).catch(() => {});
+          if (status >= 200 && status < 400) {
+            store.updateAccountHealth(account.id, { success: true }).catch(() => {});
+          } else if (status === 401 || status === 403) {
+            store.updateAccountHealth(account.id, {
+              success: false,
+              error: `upstream authentication failed (${status})`,
+            }).catch(() => {});
+          }
+        });
+
+        const failResponse = (error) => {
+          if (upstreamEnded || clientAborted || metricFinalized
+            || pendingOutcome === 'upstream_error_after_headers') return;
+          pendingOutcome = 'upstream_error_after_headers';
+          log('claude_proxy_failed', {
             account_id: account.id,
             device_id: device.id,
-            code: error?.code ?? error?.name ?? 'unknown',
+            code: error?.code ?? error?.name ?? 'upstream_response_incomplete',
+            duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
           });
-        }
-      }
-      const observer = observers.length
-        ? createCompositeResponseObserver(observers)
-        : null;
-      responseUsageFinished = false;
-      try {
-        responseObservation = responseObservationFactory({
-          contentEncoding: upstreamRes.headers['content-encoding'],
-          observer,
+          if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
+        };
+        upstreamRes.once('aborted', () => failResponse(new Error('upstream response aborted')));
+        upstreamRes.once('error', failResponse);
+        upstreamRes.once('close', () => {
+          if (!upstreamEnded && !upstreamRes.complete) {
+            failResponse(new Error('upstream response closed before completion'));
+          }
         });
-      } catch (error) {
-        log('response_observation_init_failed', {
-          account_id: account.id,
-          device_id: device.id,
-          code: error?.code ?? error?.name ?? 'unknown',
-        });
-        responseObservation = createResponseObservationTee();
-      }
-      Promise.resolve(responseObservation.done).then(
-        () => {
-          responseUsageFinished = true;
-          finalizeCompletedWhenReady();
-        },
-        () => {
-          responseUsageFinished = true;
-          finalizeCompletedWhenReady();
-        },
-      );
-      upstreamRes.pipe(responseObservation.stream).pipe(res);
-      upstreamRes.on('end', () => {
-        upstreamEnded = true;
-        store.markDeviceSeen(device.id).catch(() => {});
-        if (status >= 200 && status < 400) {
-          store.updateAccountHealth(account.id, { success: true }).catch(() => {});
-        } else if (status === 401 || status === 403) {
-          store.updateAccountHealth(account.id, {
-            success: false,
-            error: `upstream authentication failed (${status})`,
-          }).catch(() => {});
-        }
-      });
+      },
+    );
 
-      const failResponse = (error) => {
-        if (upstreamEnded || clientAborted || metricFinalized
-          || pendingOutcome === 'upstream_error_after_headers') return;
-        pendingOutcome = 'upstream_error_after_headers';
-        log('claude_proxy_failed', {
-          account_id: account.id,
-          device_id: device.id,
-          code: error?.code ?? error?.name ?? 'upstream_response_incomplete',
-          duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
-        });
-        if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
-      };
-      upstreamRes.once('aborted', () => failResponse(new Error('upstream response aborted')));
-      upstreamRes.once('error', failResponse);
-      upstreamRes.once('close', () => {
-        if (!upstreamEnded && !upstreamRes.complete) {
-          failResponse(new Error('upstream response closed before completion'));
+    currentUpstreamReq = upstreamReq;
+    upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('upstream request timed out')));
+    upstreamReq.on('error', (error) => {
+      if (clientAborted || metricFinalized || upstreamEnded) return;
+      if (error.code === 'ERR_REQUEST_BODY_TOO_LARGE') {
+        pendingOutcome = 'request_too_large';
+        if (!res.headersSent) {
+          res.once('finish', () => {
+            if (!req.destroyed) req.destroy();
+          });
+          sendJson(res, 413, {
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'request body too large' },
+          }, { Connection: 'close' });
+        } else if (!res.destroyed) {
+          res.destroy(error);
         }
+        return;
+      }
+      if (pendingOutcome?.startsWith('upstream_error')) return;
+      pendingOutcome = attemptSettled
+        ? 'upstream_error_after_headers'
+        : 'upstream_error_before_headers';
+      log('claude_proxy_failed', {
+        account_id: account.id,
+        device_id: device.id,
+        code: error.code ?? error.name ?? 'unknown',
+        duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
       });
-    },
-  );
-
-  upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('upstream request timed out')));
-  upstreamReq.on('error', (error) => {
-    if (clientAborted || metricFinalized || upstreamEnded) return;
-    if (error.code === 'ERR_REQUEST_BODY_TOO_LARGE') {
-      pendingOutcome = 'request_too_large';
-      if (!res.headersSent) {
-        res.once('finish', () => {
-          if (!req.destroyed) req.destroy();
-        });
-        sendJson(res, 413, {
-          type: 'error',
-          error: { type: 'invalid_request_error', message: 'request body too large' },
-        }, { Connection: 'close' });
-      } else if (!res.destroyed) {
+      if (!attemptSettled && !res.headersSent) {
+        sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: 'gateway upstream failure' } });
+      } else {
         res.destroy(error);
       }
-      return;
-    }
-    if (pendingOutcome?.startsWith('upstream_error')) return;
-    pendingOutcome = settled
-      ? 'upstream_error_after_headers'
-      : 'upstream_error_before_headers';
-    log('claude_proxy_failed', {
-      account_id: account.id,
-      device_id: device.id,
-      code: error.code ?? error.name ?? 'unknown',
-      duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
     });
-    if (!settled && !res.headersSent) {
-      sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: 'gateway upstream failure' } });
-    } else {
-      res.destroy(error);
+
+    if (bodyBuffer) {
+      upstreamReq.write(bodyBuffer);
+      upstreamReq.end();
     }
-  });
+    return upstreamReq;
+  };
 
   res.once('finish', () => {
     responseFinished = true;
@@ -707,16 +782,18 @@ export async function handleClaudeProxy(req, res, {
     if (res.writableFinished || metricFinalized) return;
     if (!pendingOutcome) pendingOutcome = 'client_aborted';
     if (pendingOutcome === 'client_aborted') clientAborted = true;
+    cancelPendingRetry();
     finalizeMetric(pendingOutcome, upstreamStatus);
-    if (!upstreamReq.destroyed) upstreamReq.destroy();
+    if (currentUpstreamReq && !currentUpstreamReq.destroyed) currentUpstreamReq.destroy();
     if (activeUpstreamRes && !activeUpstreamRes.destroyed) activeUpstreamRes.destroy();
   });
   req.once('aborted', () => {
     if (metricFinalized) return;
     clientAborted = true;
     pendingOutcome = 'client_aborted';
+    cancelPendingRetry();
     finalizeMetric(pendingOutcome, upstreamStatus);
-    if (!upstreamReq.destroyed) upstreamReq.destroy();
+    if (currentUpstreamReq && !currentUpstreamReq.destroyed) currentUpstreamReq.destroy();
     if (activeUpstreamRes && !activeUpstreamRes.destroyed) activeUpstreamRes.destroy();
   });
 
@@ -728,13 +805,15 @@ export async function handleClaudeProxy(req, res, {
     if (res.writableFinished) {
       finalizeMetric(pendingOutcome, upstreamStatus);
       if (!req.destroyed) req.destroy();
-    } else if (!upstreamReq.destroyed) {
-      upstreamReq.destroy(error);
+    } else if (currentUpstreamReq && !currentUpstreamReq.destroyed) {
+      currentUpstreamReq.destroy(error);
     }
   });
-  requestLimit.stream.once('finish', () => {
+  bodyAccumulator.once('finish', () => {
     requestBodyFinished = true;
     finalizeCompletedWhenReady();
   });
-  req.pipe(requestMetadata.stream).pipe(requestLimit.stream).pipe(upstreamReq);
+
+  const initialUpstreamReq = sendUpstream(null);
+  req.pipe(requestMetadata.stream).pipe(requestLimit.stream).pipe(bodyAccumulator).pipe(initialUpstreamReq);
 }
