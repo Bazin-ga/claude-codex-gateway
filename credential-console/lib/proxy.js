@@ -4,7 +4,8 @@ import { performance } from 'node:perf_hooks';
 import { Transform } from 'node:stream';
 import { sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
-import { createRequestMetadataTee } from './request-metadata.js';
+import { createRequestMetadataTee, REQUEST_METADATA_PREFIX_BYTES } from './request-metadata.js';
+import { createCaptureBudget, CAPTURE_MEMORY_AMPLIFICATION } from './capture-budget.js';
 import { displayPromptText } from './prompt-display.js';
 import { CLAUDE_SESSION_ID_PATTERN } from './store.js';
 import {
@@ -23,6 +24,17 @@ const ALLOWED_PATHS = new Set([
   '/v1/models',
 ]);
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
+// Shared across every in-flight request in this process: a per-request limit
+// bounds one capture, not the sum of them.
+const captureBudget = createCaptureBudget();
+// Cap one capture at what the shared pool could ever admit. Allowing a larger
+// prefix does not capture anything extra — a body over this size drains the
+// whole pool chunk by chunk, is refused near the end, discards what it built,
+// and blocks every concurrent capture while it does so.
+const CONVERSATION_PREFIX_BYTES = Math.min(
+  MAX_REQUEST_BYTES,
+  Math.floor(captureBudget.maxBytes() / CAPTURE_MEMORY_AMPLIFICATION),
+);
 const AUTH_FAILURE_LIMIT = { windowMs: 60_000, max: 30 };
 const DEVICE_REQUEST_LIMIT = { windowMs: 60_000, max: 120 };
 const DEVICE_CONCURRENCY_LIMIT = 8;
@@ -443,7 +455,16 @@ export async function handleClaudeProxy(req, res, {
 
   const startedAtMs = Date.now();
   const startedAtMonotonic = performance.now();
-  const requestMetadata = metadataTeeFactory({ capturePrompt: upstreamPath === '/v1/messages' });
+  const capturePrompt = upstreamPath === '/v1/messages';
+  const requestMetadata = metadataTeeFactory({
+    capturePrompt,
+    // Only pay the buffering cost where a prompt can actually be extracted.
+    prefixLimit: capturePrompt ? CONVERSATION_PREFIX_BYTES : REQUEST_METADATA_PREFIX_BYTES,
+    budget: captureBudget,
+  });
+  // Piping does not tell the tee that its source died; without this an aborted
+  // upload keeps its share of the shared pool forever.
+  requestMetadata.trackSource(req);
   const requestLimit = passthroughCounter({ maxBytes: MAX_REQUEST_BYTES });
   // The request body still streams to the upstream exactly as before; this
   // Transform only records a side-copy so a transient upstream overload

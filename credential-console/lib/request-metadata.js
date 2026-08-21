@@ -4,6 +4,18 @@ import { extractPromptCandidate } from './prompt-capture.js';
 
 export const REQUEST_METADATA_PREFIX_BYTES = 64 * 1024;
 
+/**
+ * How far a caller may raise `prefixLimit` above the default.
+ *
+ * Claude Code re-sends the whole conversation on every turn, and puts `stream`
+ * and the newest user message *after* `system`, `tools` and `messages` — so a
+ * 64 KiB prefix never reaches them once a session grows. Measured against a real
+ * deployment, only 6.5% of `/v1/messages` bodies fit in 64 KiB; the median is
+ * ~292 KB. This ceiling matches proxy.js's MAX_REQUEST_BYTES so that anything we
+ * are willing to forward is also something we can read metadata from.
+ */
+export const REQUEST_METADATA_PREFIX_MAX_BYTES = 32 * 1024 * 1024;
+
 const JSON_WHITESPACE = new Set([' ', '\t', '\r', '\n']);
 const JSON_DELIMITERS = new Set([',', ']', '}']);
 const KEY_CAPTURE_LIMIT = 256;
@@ -682,7 +694,7 @@ class TopLevelJsonScanner {
 function normalizedLimit(value, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
-  return Math.min(REQUEST_METADATA_PREFIX_BYTES, Math.max(0, Math.floor(number)));
+  return Math.min(REQUEST_METADATA_PREFIX_MAX_BYTES, Math.max(0, Math.floor(number)));
 }
 
 function normalizedModelLimit(value) {
@@ -695,6 +707,7 @@ export function createRequestMetadataTee({
   prefixLimit = REQUEST_METADATA_PREFIX_BYTES,
   maxModelChars = 256,
   capturePrompt = false,
+  budget = null,
 } = {}) {
   const boundedPrefixLimit = normalizedLimit(prefixLimit, REQUEST_METADATA_PREFIX_BYTES);
   const boundedModelLimit = normalizedModelLimit(maxModelChars);
@@ -703,6 +716,26 @@ export function createRequestMetadataTee({
   let capturedPrefixBytes = 0;
   const promptPrefix = [];
   let promptCandidate = null;
+  // Prompt buffering is the only unbounded-by-concurrency cost here, so it is
+  // the only thing the shared budget governs. Losing the reservation stops the
+  // buffering but not the scan: model and stream still come back.
+  let bufferingPrompt = capturePrompt;
+  // The amount the budget charged, not the bytes buffered: the two differ by the
+  // amplification factor, and handing back a recomputed figure drifts.
+  let reservedCost = 0;
+
+  function releaseReservation() {
+    if (reservedCost === 0) return;
+    budget?.release(reservedCost);
+    reservedCost = 0;
+  }
+
+  /** Give up prompt buffering for this request, returning what it held. */
+  function abandonPromptBuffer() {
+    bufferingPrompt = false;
+    promptPrefix.length = 0;
+    releaseReservation();
+  }
 
   const stream = new Transform({
     transform(chunk, encoding, callback) {
@@ -713,7 +746,17 @@ export function createRequestMetadataTee({
         if (take > 0) {
           try {
             parser.push(buffer.subarray(0, take));
-            if (capturePrompt) promptPrefix.push(Buffer.from(buffer.subarray(0, take)));
+            if (bufferingPrompt) {
+              const charged = budget ? budget.tryReserve(take) : 0;
+              if (charged === false) {
+                // The pool is exhausted by other in-flight captures. Drop this
+                // request's prompt rather than the request itself.
+                abandonPromptBuffer();
+              } else {
+                reservedCost += charged;
+                promptPrefix.push(Buffer.from(buffer.subarray(0, take)));
+              }
+            }
           } catch {
             // Metadata is best effort. Never turn a parser failure into a
             // failure of the byte-for-byte request proxy.
@@ -727,10 +770,14 @@ export function createRequestMetadataTee({
     flush(callback) {
       try {
         parser.finish({ prefixTruncated: requestBytes > capturedPrefixBytes });
-        if (capturePrompt && requestBytes === capturedPrefixBytes) {
+        if (bufferingPrompt && requestBytes === capturedPrefixBytes) {
           const metadata = parser.snapshot();
           promptCandidate = extractPromptCandidate(Buffer.concat(promptPrefix), {
             parseState: metadata.parseState,
+            // Whatever prefix this tee was allowed to buffer, the extractor must
+            // be allowed to read — otherwise its own default silently re-imposes
+            // the 64 KiB limit that raising `prefixLimit` was meant to lift.
+            maxInputBytes: boundedPrefixLimit,
           });
         }
       } catch {
@@ -739,17 +786,44 @@ export function createRequestMetadataTee({
         parser.fail();
       }
       promptPrefix.length = 0;
+      releaseReservation();
       callback();
     },
   });
 
+  // A body that never reaches flush must still return its reservation, or the
+  // shared pool leaks until capture is off process-wide. 'close' covers the
+  // paths where this Transform is itself ended or destroyed, and releasing is
+  // idempotent so the overlap with flush() is harmless.
+  //
+  // It does NOT cover an aborted upload: `source.pipe(tee)` only unpipes when
+  // the source dies, so this Transform is left open and never closes. Callers
+  // must therefore attach the request stream via `trackSource` — verified
+  // against a real client abort, where 6 MiB of body left 18 MiB reserved.
+  stream.on('close', releaseReservation);
+
   return {
     stream,
+
+    /**
+     * Release this tee's reservation when `source` terminates, however it does.
+     * Piping does not propagate a dead source to its destination, so without
+     * this an aborted upload holds its share of the pool forever.
+     */
+    trackSource(source) {
+      source?.once?.('close', releaseReservation);
+      source?.once?.('error', releaseReservation);
+      source?.once?.('aborted', releaseReservation);
+    },
+
     snapshot() {
       const metadata = parser.snapshot();
       return {
         requestBytes,
         capturedPrefixBytes,
+        // The limit actually in force after clamping, so callers (and tests)
+        // can observe that a request was clamped rather than infer it.
+        prefixLimit: boundedPrefixLimit,
         model: metadata.model,
         stream: metadata.stream,
         parseState: metadata.parseState,
