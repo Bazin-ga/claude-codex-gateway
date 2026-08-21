@@ -205,41 +205,64 @@ test('observer finalization never delays client EOF', async () => {
   assert.equal(observationDone, true);
 });
 
-test('compressed observers share a global reservation budget and release it', async () => {
-  const firstObserver = observer();
-  const secondObserver = observer();
-  const thirdObserver = observer();
-  const first = createResponseObservationTee({ contentEncoding: 'gzip', observer: firstObserver });
-  const second = createResponseObservationTee({ contentEncoding: 'gzip', observer: secondObserver });
-  const third = createResponseObservationTee({ contentEncoding: 'gzip', observer: thirdObserver });
-  assert.deepEqual(firstObserver.aborted, []);
-  assert.deepEqual(secondObserver.aborted, []);
-  assert.deepEqual(thirdObserver.aborted, ['global_budget']);
-  first.abort('test_cleanup');
-  await first.done;
-
-  const replacementObserver = observer();
-  const replacement = createResponseObservationTee({
+test('many concurrent observers coexist while their actual bytes stay small', async () => {
+  // The pool is charged for observed bytes, not for a per-response ceiling, so
+  // ordinary small responses no longer evict each other. Reserving the ceiling
+  // up front capped this at two concurrent compressed responses.
+  const observers = Array.from({ length: 16 }, () => observer());
+  const tees = observers.map((o) => createResponseObservationTee({
     contentEncoding: 'gzip',
-    observer: replacementObserver,
-  });
-  assert.deepEqual(replacementObserver.aborted, []);
-  second.abort('test_cleanup');
-  replacement.abort('test_cleanup');
-  await Promise.all([second.done, third.done, replacement.done]);
+    observer: o,
+  }));
+  assert.equal(
+    observers.every((o) => o.aborted.length === 0),
+    true,
+    'creating an observation reserves nothing by itself',
+  );
+
+  const payload = gzipSync(Buffer.from('hello'));
+  await Promise.all(tees.map((tee) => pipeline(
+    Readable.from([payload]),
+    tee.stream,
+    new Writable({ write(_c, _e, cb) { cb(); } }),
+  )));
+  await Promise.all(tees.map((tee) => tee.done));
+
+  assert.equal(
+    observers.every((o) => o.aborted.length === 0),
+    true,
+    'all sixteen keep their observation',
+  );
 });
 
-test('the global budget admits eight identity captures and refuses a ninth', async () => {
-  const active = Array.from({ length: 8 }, () => {
-    const observed = observer();
-    return { observed, tee: createResponseObservationTee({ observer: observed }) };
-  });
-  assert.equal(active.every(({ observed }) => observed.aborted.length === 0), true);
-  const ninthObserver = observer();
-  const ninth = createResponseObservationTee({ observer: ninthObserver });
-  assert.deepEqual(ninthObserver.aborted, ['global_budget']);
-  for (const { tee } of active) tee.abort('test_cleanup');
-  await Promise.all([...active.map(({ tee }) => tee.done), ninth.done]);
+test('the shared pool still bounds total observed bytes, and releases them', async () => {
+  const chunk = Buffer.alloc(1024 * 1024, 0x61);
+  const chunksToExceed = Math.ceil(MAX_GLOBAL_OBSERVATION_BUDGET_BYTES / chunk.length) + 2;
+
+  const hog = observer();
+  const hogTee = createResponseObservationTee({ observer: hog });
+  await pipeline(
+    Readable.from(Array.from({ length: chunksToExceed }, () => chunk)),
+    hogTee.stream,
+    new Writable({ write(_c, _e, cb) { cb(); } }),
+  );
+  await hogTee.done;
+  assert.ok(
+    hog.aborted.includes('global_budget') || hog.aborted.includes('raw_limit'),
+    `a single stream past the pool is shed, got ${JSON.stringify(hog.aborted)}`,
+  );
+
+  // The shed observation released what it held, so a later one still works.
+  const after = observer();
+  const afterTee = createResponseObservationTee({ observer: after });
+  await pipeline(
+    Readable.from([Buffer.from('small')]),
+    afterTee.stream,
+    new Writable({ write(_c, _e, cb) { cb(); } }),
+  );
+  await afterTee.done;
+  assert.deepEqual(after.aborted, [], 'the pool was returned after the hog settled');
+  assert.equal(Buffer.concat(after.chunks).toString(), 'small');
 });
 
 test('callers cannot raise per-response observation ceilings above the hard cap', async () => {

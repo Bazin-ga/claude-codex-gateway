@@ -4,6 +4,7 @@ import test from 'node:test';
 import { Writable } from 'node:stream';
 import {
   REQUEST_METADATA_PREFIX_BYTES,
+  REQUEST_METADATA_PREFIX_MAX_BYTES,
   createRequestMetadataTee,
 } from '../lib/request-metadata.js';
 
@@ -26,8 +27,39 @@ async function runCapture(input, options = {}, { oneByteChunks = false } = {}) {
   };
 }
 
-test('exports the fixed 64 KiB observation limit', () => {
+test('defaults to a 64 KiB observation prefix, raisable to 32 MiB', () => {
   assert.equal(REQUEST_METADATA_PREFIX_BYTES, 64 * 1024);
+  assert.equal(REQUEST_METADATA_PREFIX_MAX_BYTES, 32 * 1024 * 1024);
+});
+
+test('a raised prefixLimit reaches fields that sit past 64 KiB', async () => {
+  // Claude Code's shape: the fields we need come *after* the bulky ones, so a
+  // 64 KiB prefix never reaches them once a session has grown.
+  const filler = 'x'.repeat(200 * 1024);
+  const body = Buffer.from(`{"system":[{"type":"text","text":"${filler}"}],`
+    + '"messages":[{"role":"user","content":[{"type":"text","text":"the real question"}]}],'
+    + '"model":"claude-test","stream":true}');
+  assert.ok(body.length > REQUEST_METADATA_PREFIX_BYTES);
+
+  const clamped = await runCapture(body, { capturePrompt: true });
+  assert.equal(clamped.snapshot.stream, null, 'default prefix cannot reach stream');
+  assert.equal(clamped.conversationCandidate, null, 'default prefix captures nothing');
+
+  const raised = await runCapture(body, {
+    capturePrompt: true,
+    prefixLimit: REQUEST_METADATA_PREFIX_MAX_BYTES,
+  });
+  assert.equal(raised.snapshot.stream, true);
+  assert.equal(raised.snapshot.model, 'claude-test');
+  assert.match(raised.conversationCandidate.promptText, /the real question/);
+  assert.deepEqual(raised.output, body, 'body still passes through byte-for-byte');
+});
+
+test('prefixLimit is still clamped to the ceiling', async () => {
+  const body = Buffer.from('{"model":"claude-test","stream":true}');
+  const result = await runCapture(body, { prefixLimit: Number.MAX_SAFE_INTEGER });
+  assert.equal(result.snapshot.stream, true);
+  assert.ok(result.snapshot.capturedPrefixBytes <= REQUEST_METADATA_PREFIX_MAX_BYTES);
 });
 
 test('extracts root model and stream and preserves bytes', async () => {

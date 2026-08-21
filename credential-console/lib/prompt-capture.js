@@ -4,6 +4,15 @@ import { TextDecoder } from 'node:util';
 // These are deliberately below the P2 prefix ceiling.  A prompt candidate is
 // either retained in full or rejected; it is never silently truncated.
 export const PROMPT_CAPTURE_MAX_INPUT_BYTES = 64 * 1024;
+
+/**
+ * Ceiling for a caller-supplied `maxInputBytes`, mirroring
+ * REQUEST_METADATA_PREFIX_MAX_BYTES. The input is the request prefix the tee
+ * already buffered, so this bounds nothing new — it only stops the default from
+ * silently re-clamping a deliberately raised limit. What ends up stored is still
+ * governed by MAX_TEXT_BYTES below.
+ */
+export const PROMPT_CAPTURE_INPUT_CEILING_BYTES = 32 * 1024 * 1024;
 export const PROMPT_CAPTURE_MAX_TEXT_BLOCKS = 128;
 export const PROMPT_CAPTURE_MAX_BLOCK_BYTES = 16 * 1024;
 export const PROMPT_CAPTURE_MAX_TEXT_BYTES = 32 * 1024;
@@ -87,7 +96,7 @@ export function extractPromptCandidate(input, {
       maxInputBytes: boundedLimit(
         maxInputBytes,
         PROMPT_CAPTURE_MAX_INPUT_BYTES,
-        PROMPT_CAPTURE_MAX_INPUT_BYTES,
+        PROMPT_CAPTURE_INPUT_CEILING_BYTES,
       ),
       maxTextBlocks: boundedLimit(
         maxTextBlocks,

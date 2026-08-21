@@ -9,11 +9,9 @@ import {
 // consumer. Raw bytes still pass after either ceiling; only token extraction stops.
 export const MAX_OBSERVED_RAW_BYTES = 16 * 1024 * 1024;
 export const MAX_OBSERVED_DECODED_BYTES = 16 * 1024 * 1024;
+// Shared across all in-flight observations in this process, charged as bytes are
+// actually observed rather than reserved per response up front.
 export const MAX_GLOBAL_OBSERVATION_BUDGET_BYTES = 32 * 1024 * 1024;
-// P6's 2 MiB SSE line / JSON prefix and P5 usage parser both materialize UTF-16
-// strings. Four MiB leaves room for both bounded prefixes while admitting eight
-// normal identity streams within the 32 MiB process budget.
-const IDENTITY_OBSERVATION_RESERVATION_BYTES = 4 * 1024 * 1024;
 let reservedObservationBytes = 0;
 
 function boundedLimit(value, fallback, maximum) {
@@ -135,6 +133,28 @@ export function createResponseObservationTee({
     resolveDone();
   }
 
+  /**
+   * Take `bytes` more from the shared pool as they actually arrive.
+   *
+   * Reserving the per-response ceiling up front instead cost 16 MiB for a
+   * response whose median size is a few KB, so a 32 MiB pool admitted only two
+   * concurrent compressed responses and shed every one after that — losing both
+   * the conversation text and the token usage for them. Charging for observed
+   * bytes keeps the same global bound without the 1000x over-reservation.
+   *
+   * @returns {boolean} false when this observation has just been shed.
+   */
+  function reserveMore(bytes) {
+    if (!active || ended || bytes <= 0) return active && !ended;
+    if (reservedObservationBytes + bytes > MAX_GLOBAL_OBSERVATION_BUDGET_BYTES) {
+      safeAbort('global_budget');
+      return false;
+    }
+    reservedObservationBytes += bytes;
+    reservedBytes += bytes;
+    return true;
+  }
+
   function safeAbort(reason) {
     if (!active || ended) return;
     try {
@@ -163,6 +183,7 @@ export function createResponseObservationTee({
       safeAbort('decoded_limit');
       return;
     }
+    if (!reserveMore(chunk.length)) return;
     try {
       if (observer?.write?.(chunk) === false) safeAbort('observer_stopped');
     } catch {
@@ -170,18 +191,8 @@ export function createResponseObservationTee({
     }
   }
 
-  if (active && encoding !== 'unsupported') {
-    const requestedReservation = encoding === 'identity'
-      ? Math.min(decodedLimit, IDENTITY_OBSERVATION_RESERVATION_BYTES)
-      : Math.max(rawLimit, decodedLimit);
-    if (reservedObservationBytes + requestedReservation
-      <= MAX_GLOBAL_OBSERVATION_BUDGET_BYTES) {
-      reservedObservationBytes += requestedReservation;
-      reservedBytes = requestedReservation;
-    } else {
-      safeAbort('global_budget');
-    }
-  }
+  // Nothing is reserved up front: the pool is charged in `reserveMore` as bytes
+  // are actually observed, so a small response costs what it uses.
 
   if (!active) {
     settle();
@@ -201,6 +212,8 @@ export function createResponseObservationTee({
         observedRawBytes += chunk.length;
         if (observedRawBytes > rawLimit) {
           safeAbort('raw_limit');
+        } else if (!reserveMore(chunk.length)) {
+          // Shed by the shared pool; the chunk still reaches the client below.
         } else if (encoding === 'identity') {
           deliverDecoded(chunk);
         } else if (decoder && !decoder.destroyed) {
