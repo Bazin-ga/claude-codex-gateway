@@ -7,6 +7,9 @@ import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomToken } from './lib/security.js';
 import {
+  baseHeaders,
+  compressFor,
+  negotiateEncoding,
   parseCookies,
   readForm,
   redirect,
@@ -119,6 +122,32 @@ const CONVERSATION_IDENTIFIER_MAX_BYTES = 128;
 const CONVERSATION_MODEL_MAX_BYTES = 256;
 export const SHUTDOWN_DEADLINE_MS = 1_000;
 const CODEX_AGENT_ROOT = fileURLToPath(new URL('../codex-credential/client-agent/', import.meta.url));
+/**
+ * Compressed forms of the immutable metrics bundle, built on first use.
+ *
+ * Keyed by encoding and bounded by the number of encodings we negotiate (two),
+ * so this is a couple of hundred kilobytes held for the process lifetime rather
+ * than 15 ms of CPU burned per request.
+ */
+const metricsAssetVariants = new WeakMap();
+
+function metricsAssetVariant(asset, encoding) {
+  let byEncoding = metricsAssetVariants.get(asset);
+  if (!byEncoding) {
+    byEncoding = new Map();
+    metricsAssetVariants.set(asset, byEncoding);
+  }
+  const key = encoding ?? 'identity';
+  const cached = byEncoding.get(key);
+  if (cached) return cached;
+
+  const raw = Buffer.from(asset.body, 'utf8');
+  const body = encoding ? compressFor(encoding, raw) : raw;
+  const variant = { body, encoding: body === raw ? null : encoding };
+  byEncoding.set(key, variant);
+  return variant;
+}
+
 const METRICS_ASSET_ROOT = fileURLToPath(new URL('./assets/', import.meta.url));
 const METRICS_ASSET_MANIFEST = `${METRICS_ASSET_ROOT}metrics-echarts-manifest.json`;
 export const CODEX_AGENT_ASSETS = new Map([
@@ -1497,10 +1526,24 @@ export async function createCredentialConsole(options = {}) {
     }
 
     if (req.method === 'GET' && metricsAsset && path === metricsAsset.url) {
-      sendText(res, 200, metricsAsset.body, 'text/javascript; charset=utf-8', {
+      // This asset is 612 KB and immutable, so compressing it per request cost
+      // ~15 ms of synchronous brotli every time — on the same event loop that
+      // carries the Claude proxy. Compress each encoding once and reuse it.
+      const encoding = negotiateEncoding(req.headers['accept-encoding']);
+      const variant = metricsAssetVariant(metricsAsset, encoding);
+      res.writeHead(200, {
+        ...baseHeaders(),
+        'Content-Type': 'text/javascript; charset=utf-8',
         'Cache-Control': 'public, max-age=31536000, immutable',
-        ETag: `"${metricsAsset.sha256}"`,
+        Vary: 'Accept-Encoding',
+        // A strong validator must identify the representation, not just the
+        // resource, or a revalidating cache can hand one encoding's bytes to a
+        // client that asked for another.
+        ETag: `"${metricsAsset.sha256}${variant.encoding ? `-${variant.encoding}` : ''}"`,
+        ...(variant.encoding ? { 'Content-Encoding': variant.encoding } : {}),
+        'Content-Length': variant.body.length,
       });
+      res.end(req.method === 'HEAD' ? undefined : variant.body);
       return;
     }
 
@@ -2599,6 +2642,31 @@ function conversationFragmentSupported() {
     && typeof window.AbortController === 'function';
 }
 
+// A live region that survives every swap, so announcements are content changes
+// inside a node the screen reader is already watching.
+function conversationAnnouncer() {
+  let node = document.getElementById('conversation-live-status');
+  if (node) return node;
+  node = document.createElement('p');
+  node.id = 'conversation-live-status';
+  node.className = 'visually-hidden';
+  node.setAttribute('role', 'status');
+  node.setAttribute('aria-live', 'polite');
+  document.body.appendChild(node);
+  return node;
+}
+
+function announceConversationResults(region) {
+  const summary = region.querySelector('.conversation-result-summary');
+  const empty = region.querySelector('.conversation-list .empty');
+  const text = (empty ?? summary)?.textContent?.trim().replace(/\s+/g, ' ');
+  if (!text) return;
+  const node = conversationAnnouncer();
+  // Re-setting identical text is not a change; nudge it so a repeat search
+  // with the same result count is still announced.
+  node.textContent = node.textContent === text ? text + ' ' : text;
+}
+
 let conversationRequest = null;
 
 async function swapConversationResults(form, submitter) {
@@ -2639,12 +2707,38 @@ async function swapConversationResults(form, submitter) {
     if (!replacement) return false;
 
     translateSubtree(replacement, currentLanguage());
+
+    // Remember whether focus was inside the region we are about to remove.
+    const paging = Boolean(submitter && submitter.closest('.conversation-pagination'));
+    const hadFocus = region.contains(document.activeElement);
+
     region.replaceWith(replacement);
-    // Announce to assistive tech and put the eye where the answer is, without
-    // the jump-to-top a real navigation would have caused.
-    replacement.querySelector('.conversation-list')?.setAttribute('aria-busy', 'false');
-    if (submitter && submitter.closest('.conversation-pagination')) {
+
+    // A live region only announces changes that happen *inside* it. Replacing
+    // the region wholesale inserts a node with its content already present,
+    // which screen readers treat as initial content and stay silent about — so
+    // the announcement goes through a region that is never replaced.
+    announceConversationResults(replacement);
+
+    if (paging) {
+      // The control that was clicked has just been removed from the document,
+      // so focus would otherwise fall back to <body> and a keyboard user would
+      // restart the tab order from the top of the page on every page turn.
+      const next = replacement.querySelector('.conversation-pagination button')
+        ?? replacement.querySelector('[id$="results-heading"]');
+      if (next) {
+        if (!next.hasAttribute('tabindex') && next.tagName !== 'BUTTON') {
+          next.setAttribute('tabindex', '-1');
+        }
+        next.focus({ preventScroll: true });
+      }
       replacement.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    } else if (hadFocus) {
+      const heading = replacement.querySelector('[id$="results-heading"]');
+      if (heading) {
+        heading.setAttribute('tabindex', '-1');
+        heading.focus({ preventScroll: true });
+      }
     }
     return true;
   } catch (error) {

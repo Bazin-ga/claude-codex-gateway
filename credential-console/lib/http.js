@@ -17,19 +17,48 @@ const COMPRESSION_MIN_BYTES = 1024;
 const BROTLI_PARAMS = { [constants.BROTLI_PARAM_QUALITY]: 5 };
 const GZIP_LEVEL = 6;
 
-/** @returns {'br'|'gzip'|null} the best encoding the client accepted. */
-function negotiateEncoding(res) {
-  const header = res?.req?.headers?.['accept-encoding'];
-  if (!header) return null;
-  const accepted = new Set(
-    String(header)
-      .split(',')
-      .map((part) => part.split(';')[0].trim().toLowerCase())
-      .filter(Boolean),
-  );
-  if (accepted.has('br')) return 'br';
-  if (accepted.has('gzip')) return 'gzip';
+/**
+ * @returns {'br'|'gzip'|null} the best encoding the client accepted.
+ *
+ * Honours q-values. `br;q=0` is how RFC 9110 §12.5.3 says "I cannot decode
+ * this" — some proxies and gzip-only HTTP clients send exactly that, and
+ * reading it as acceptance hands them a body they cannot read.
+ */
+export function negotiateEncoding(acceptEncoding) {
+  if (!acceptEncoding) return null;
+  const weights = new Map();
+  for (const part of String(acceptEncoding).split(',')) {
+    const [rawName, ...params] = part.split(';');
+    const name = rawName.trim().toLowerCase();
+    if (!name) continue;
+    const q = params
+      .map((p) => /^\s*q\s*=\s*([0-9.]+)\s*$/i.exec(p)?.[1])
+      .find((value) => value !== undefined);
+    const weight = q === undefined ? 1 : Number(q);
+    weights.set(name, Number.isFinite(weight) ? weight : 0);
+  }
+  const acceptable = (name) => {
+    const explicit = weights.get(name);
+    if (explicit !== undefined) return explicit > 0;
+    // A wildcard only stands in for encodings the client did not name.
+    const wildcard = weights.get('*');
+    return wildcard !== undefined && wildcard > 0;
+  };
+  if (acceptable('br')) return 'br';
+  if (acceptable('gzip')) return 'gzip';
   return null;
+}
+
+/** Compress `payload` for `encoding`, or return it unchanged on failure. */
+export function compressFor(encoding, payload) {
+  if (!encoding) return payload;
+  try {
+    return encoding === 'br'
+      ? brotliCompressSync(payload, { params: BROTLI_PARAMS })
+      : gzipSync(payload, { level: GZIP_LEVEL });
+  } catch {
+    return payload;
+  }
 }
 
 /**
@@ -42,19 +71,17 @@ function negotiateEncoding(res) {
 function sendBuffer(res, status, payload, contentType, headers = {}) {
   const preEncoded = Object.keys(headers)
     .some((name) => name.toLowerCase() === 'content-encoding');
-  const encoding = preEncoded ? null : negotiateEncoding(res);
+  const encoding = preEncoded
+    ? null
+    : negotiateEncoding(res?.req?.headers?.['accept-encoding']);
   let body = payload;
   const negotiated = {};
 
   if (encoding && payload.length >= COMPRESSION_MIN_BYTES) {
-    try {
-      body = encoding === 'br'
-        ? brotliCompressSync(payload, { params: BROTLI_PARAMS })
-        : gzipSync(payload, { level: GZIP_LEVEL });
+    const compressed = compressFor(encoding, payload);
+    if (compressed !== payload) {
+      body = compressed;
       negotiated['Content-Encoding'] = encoding;
-    } catch {
-      // Never fail a response because it could not be compressed.
-      body = payload;
     }
   }
 

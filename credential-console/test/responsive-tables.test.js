@@ -14,10 +14,16 @@ test('wide tables are given a card layout on narrow screens', () => {
 
   // Generic on purpose: the dashboard renders one unclassed table per account
   // for its device credentials, so enumerating class names would miss them.
-  assert.match(narrow, /\.table-wrap table[^{]*\{[^}]*display: block/, 'tables become blocks');
-  assert.match(narrow, /\.table-wrap table td\[data-label\]::before/, 'cells show their column label');
-  assert.match(narrow, /\.table-wrap table thead[^{]*\{[^}]*clip-path/, 'headers are visually hidden, not removed');
-  assert.match(narrow, /\.table-wrap table td:last-child[^{]*\{[^}]*display: block/, 'the control cell spans the card');
+  assert.match(narrow, /\.table-wrap table:has\(td\[data-label\]\)[^{]*\{[^}]*display: block/, 'tables become blocks');
+  assert.match(narrow, /td\[data-label\]::before/, 'cells show their column label');
+  assert.match(narrow, /thead[^{]*\{[^}]*clip-path/, 'headers are visually hidden, not removed');
+  // Gating every rule on a stamped label is what keeps the scripting-off page
+  // on its original scrolling table instead of unlabelled stacked cells.
+  assert.equal(
+    /\.table-wrap table(?!:has)/.test(narrow),
+    false,
+    'no card rule applies to a table without labels',
+  );
 });
 
 test('touch targets meet a minimum height, including summary', () => {

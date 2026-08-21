@@ -34,6 +34,7 @@ jobs:
           npm test --prefix codex-credential/token-dispenser
       - name: Test credential console
         shell: bash
+        timeout-minutes: 15
         run: cd credential-console && npm test -- test/*.test.js
 
   windows-acl:

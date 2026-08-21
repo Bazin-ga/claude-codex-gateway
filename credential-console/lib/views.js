@@ -370,7 +370,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .metrics-chart-panel h2 { font-size: 16px; }
   .metrics-status-strip { gap: 8px 12px; }
   .metrics-scroll-hint { display: block; }
-  .metrics-table-card { padding: 14px; border-radius: 15px; }
+  .metrics-table:has(td[data-label])-card { padding: 14px; border-radius: 15px; }
 }
 .account-switch-form { min-width: 190px; }
 .account-switch-form[aria-busy="true"] { opacity: .72; }
@@ -414,6 +414,14 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-rail label { margin: 0; }
 .conversation-rail .filter-actions { display: grid; grid-template-columns: 1fr; gap: 8px; }
 .conversation-rail .filter-actions > * { width: 100%; text-align: center; }
+/* The results region while a filter is in flight. Without this the only
+   feedback during a ~250 ms round trip was nothing at all: the full navigation
+   this replaced at least moved the browser's own progress indicator. */
+.conversation-results.is-loading { opacity: 0.55; pointer-events: none; }
+.conversation-results.is-loading * { cursor: progress; }
+@media (prefers-reduced-motion: no-preference) {
+  .conversation-results { transition: opacity 120ms ease-out; }
+}
 .conversation-results { display: grid; gap: 14px; min-width: 0; }
 .conversation-results-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
 .conversation-results-head h1 { margin: 0; }
@@ -484,12 +492,12 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
    switch instead of being frozen at render time. Without scripting the table
    keeps its original scrolling layout, which still works. */
 @media (max-width: 720px) {
-  .table-wrap table, .metrics-table {
+  .table-wrap table:has(td[data-label]), .metrics-table:has(td[data-label]) {
     min-width: 0;
     display: block;
     table-layout: auto;
   }
-  .table-wrap table thead, .metrics-table thead {
+  .table-wrap table:has(td[data-label]) thead, .metrics-table:has(td[data-label]) thead {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -497,8 +505,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
     clip-path: inset(50%);
     white-space: nowrap;
   }
-  .table-wrap table tbody, .metrics-table tbody { display: block; }
-  .table-wrap table tr, .metrics-table tr {
+  .table-wrap table:has(td[data-label]) tbody, .metrics-table:has(td[data-label]) tbody { display: block; }
+  .table-wrap table:has(td[data-label]) tr, .metrics-table:has(td[data-label]) tr {
     display: block;
     border: 1px solid var(--line);
     border-radius: var(--radius-md);
@@ -506,7 +514,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
     padding: 4px 14px;
     margin-bottom: 12px;
   }
-  .table-wrap table td, .metrics-table td {
+  .table-wrap table:has(td[data-label]) td, .metrics-table:has(td[data-label]) td {
     display: grid;
     grid-template-columns: minmax(0, 40%) minmax(0, 1fr);
     gap: 12px;
@@ -519,40 +527,50 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
     white-space: normal;
     overflow-wrap: anywhere;
   }
-  .table-wrap table tr td:last-child, .metrics-table tr td:last-child { border-bottom: 0; }
+  .table-wrap table:has(td[data-label]) tr td:last-child, .metrics-table:has(td[data-label]) tr td:last-child { border-bottom: 0; }
   /* Only label a cell once app.js has supplied one, so a scripting-off page
      never shows an empty label column. */
-  .table-wrap table td[data-label]::before, .metrics-table td[data-label]::before {
+  .table-wrap table:has(td[data-label]) td[data-label]::before, .metrics-table:has(td[data-label]) td[data-label]::before {
     content: attr(data-label);
     font-weight: 700;
     color: var(--muted);
     font-size: 12px;
   }
   .accounts-table td[data-label] { grid-template-columns: minmax(0, 40%) minmax(0, 1fr); }
-  .table-wrap table td:not([data-label]), .metrics-table td:not([data-label]) {
+  .table-wrap table:has(td[data-label]) td:not([data-label]), .metrics-table:has(td[data-label]) td:not([data-label]) {
     display: block;
+  }
+  /* A cell holding its own multi-column widget cannot survive being squeezed
+     into 60% of a 390px card: the usage-quota cell rendered one character per
+     line. Any cell with nested structure spans the card, not just the last. */
+  .table-wrap table:has(td[data-label]) td:has(.quota-grid, .quota-window, form),
+  .metrics-table:has(td[data-label]) td:has(.quota-grid, form) { display: block; }
+  .table-wrap table:has(td[data-label]) td:has(.quota-grid, .quota-window, form)::before,
+  .metrics-table:has(td[data-label]) td:has(.quota-grid, form)::before {
+    display: block;
+    margin-bottom: 6px;
   }
   /* The last cell holds the row's controls — a select, buttons, sometimes a
      whole form. At 60% of a 390px screen those get clipped, so it spans the
      card and its controls are held inside it. */
-  .table-wrap table td:last-child, .metrics-table td:last-child { display: block; }
-  .table-wrap table td:last-child::before, .metrics-table td:last-child::before {
+  .table-wrap table:has(td[data-label]) td:last-child, .metrics-table:has(td[data-label]) td:last-child { display: block; }
+  .table-wrap table:has(td[data-label]) td:last-child::before, .metrics-table:has(td[data-label]) td:last-child::before {
     display: block;
     margin-bottom: 6px;
   }
-  .table-wrap table td input, .table-wrap table td select, .table-wrap table td .button,
-  .table-wrap table td button, .table-wrap table td form {
+  .table-wrap table:has(td[data-label]) td input, .table-wrap table:has(td[data-label]) td select, .table-wrap table:has(td[data-label]) td .button,
+  .table-wrap table:has(td[data-label]) td button, .table-wrap table:has(td[data-label]) td form {
     min-width: 0;
     max-width: 100%;
     box-sizing: border-box;
   }
-  .table-wrap table td:last-child input, .table-wrap table td:last-child select,
-  .table-wrap table td:last-child button, .table-wrap table td:last-child .button {
+  .table-wrap table:has(td[data-label]) td:last-child input, .table-wrap table:has(td[data-label]) td:last-child select,
+  .table-wrap table:has(td[data-label]) td:last-child button, .table-wrap table:has(td[data-label]) td:last-child .button {
     width: 100%;
   }
-  .table-wrap table td.empty, .metrics-table td.empty { display: block; text-align: left; }
+  .table-wrap table:has(td[data-label]) td.empty, .metrics-table:has(td[data-label]) td.empty { display: block; text-align: left; }
   /* Cards manage their own width, so the horizontal scroller is dead weight. */
-  .table-wrap { overflow-x: visible; }
+  .table-wrap:has(td[data-label]) { overflow-x: visible; }
 }
 
 @media (max-width: 800px) {
@@ -561,6 +579,9 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   button, .button, input, select { min-height: 44px; }
   /* <summary> is a real control on touch; it was left at ~19px. */
   summary { min-height: 44px; display: flex; align-items: center; }
+  /* Named explicitly because specificity, not cascade order, is the problem:
+     a 0,1,1 rule outside this query beats the 0,0,1 rule inside it. */
+  .metrics-segmented button, .metrics-segmented .button { min-height: 44px; }
   .page-tabs a, .language-switch button { min-height: 44px; display: inline-flex; align-items: center; }
   .table-wrap { overflow-x: auto; }
   .zone-heading { display: grid; }

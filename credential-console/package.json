@@ -8,7 +8,7 @@
     "build:metrics-assets": "node scripts/build-metrics-assets.mjs",
     "check:metrics-assets": "node scripts/build-metrics-assets.mjs --check",
     "start": "node --no-warnings server.js",
-    "test": "node --no-warnings --test",
+    "test": "node --no-warnings --test --test-timeout=60000",
     "check": "node --no-warnings --check server.js && node --no-warnings --check cli.js && node --no-warnings --check web/metrics-echarts.entry.js && npm run check:metrics-assets"
   },
   "engines": {
