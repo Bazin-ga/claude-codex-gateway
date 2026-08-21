@@ -475,10 +475,92 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-message pre { margin: 0; padding: 13px; max-width: 100%; color: var(--ink); background: rgba(255,255,255,.78); border: 1px solid rgba(22,33,29,.1); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .conversation-message .conversation-prompt-disclaimer { margin: 0 0 8px; }
 .conversation-session-state-note { margin: 8px 0 0; }
+/* Wide data tables become cards on a phone.
+
+   These tables are 6-9 columns and .accounts-table carries min-width: 1000px,
+   so on a 390px screen the only previous option was dragging a 1000px table
+   sideways. Each cell instead becomes a labelled row; the label text is stamped
+   from the (already translated) header by app.js, so it follows the language
+   switch instead of being frozen at render time. Without scripting the table
+   keeps its original scrolling layout, which still works. */
+@media (max-width: 720px) {
+  .table-wrap table, .metrics-table {
+    min-width: 0;
+    display: block;
+    table-layout: auto;
+  }
+  .table-wrap table thead, .metrics-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .table-wrap table tbody, .metrics-table tbody { display: block; }
+  .table-wrap table tr, .metrics-table tr {
+    display: block;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: white;
+    padding: 4px 14px;
+    margin-bottom: 12px;
+  }
+  .table-wrap table td, .metrics-table td {
+    display: grid;
+    grid-template-columns: minmax(0, 40%) minmax(0, 1fr);
+    gap: 12px;
+    align-items: baseline;
+    padding: 9px 0;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    width: auto;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .table-wrap table tr td:last-child, .metrics-table tr td:last-child { border-bottom: 0; }
+  /* Only label a cell once app.js has supplied one, so a scripting-off page
+     never shows an empty label column. */
+  .table-wrap table td[data-label]::before, .metrics-table td[data-label]::before {
+    content: attr(data-label);
+    font-weight: 700;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .accounts-table td[data-label] { grid-template-columns: minmax(0, 40%) minmax(0, 1fr); }
+  .table-wrap table td:not([data-label]), .metrics-table td:not([data-label]) {
+    display: block;
+  }
+  /* The last cell holds the row's controls — a select, buttons, sometimes a
+     whole form. At 60% of a 390px screen those get clipped, so it spans the
+     card and its controls are held inside it. */
+  .table-wrap table td:last-child, .metrics-table td:last-child { display: block; }
+  .table-wrap table td:last-child::before, .metrics-table td:last-child::before {
+    display: block;
+    margin-bottom: 6px;
+  }
+  .table-wrap table td input, .table-wrap table td select, .table-wrap table td .button,
+  .table-wrap table td button, .table-wrap table td form {
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .table-wrap table td:last-child input, .table-wrap table td:last-child select,
+  .table-wrap table td:last-child button, .table-wrap table td:last-child .button {
+    width: 100%;
+  }
+  .table-wrap table td.empty, .metrics-table td.empty { display: block; text-align: left; }
+  /* Cards manage their own width, so the horizontal scroller is dead weight. */
+  .table-wrap { overflow-x: visible; }
+}
+
 @media (max-width: 800px) {
   .summary, .split { grid-column: span 12; }
   .topbar { align-items: flex-start; flex-wrap: wrap; }
   button, .button, input, select { min-height: 44px; }
+  /* <summary> is a real control on touch; it was left at ~19px. */
+  summary { min-height: 44px; display: flex; align-items: center; }
   .page-tabs a, .language-switch button { min-height: 44px; display: inline-flex; align-items: center; }
   .table-wrap { overflow-x: auto; }
   .zone-heading { display: grid; }

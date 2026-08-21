@@ -2545,6 +2545,51 @@ document.addEventListener('click', async (event) => {
 // from the identical code path.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Card labels for wide tables on narrow screens
+//
+// Below 720px the account and metrics tables render as cards, one labelled row
+// per cell. The label is copied from the header cell rather than written into
+// the markup, so it is whatever the header currently says — which means it
+// follows the language switch instead of being frozen in English at render
+// time. Setting display:block on table elements also drops their implicit
+// semantics, so the roles are restored explicitly.
+// ---------------------------------------------------------------------------
+
+const CARD_TABLE_SELECTOR = '.table-wrap table, .metrics-table';
+
+function stampTableCardLabels(root) {
+  root.querySelectorAll?.(CARD_TABLE_SELECTOR).forEach((table) => {
+    const headers = Array.from(table.querySelectorAll('thead th'))
+      .map((cell) => cell.textContent.trim());
+    if (!headers.length) return;
+
+    table.setAttribute('role', 'table');
+    table.querySelectorAll('thead, tbody').forEach((group) => group.setAttribute('role', 'rowgroup'));
+    table.querySelectorAll('tr').forEach((row) => row.setAttribute('role', 'row'));
+    table.querySelectorAll('thead th').forEach((cell) => cell.setAttribute('role', 'columnheader'));
+
+    table.querySelectorAll('tbody tr').forEach((row) => {
+      Array.from(row.children).forEach((cell, index) => {
+        cell.setAttribute('role', 'cell');
+        // A colspan cell (the empty-state row) spans every column, so no single
+        // header describes it.
+        const spans = Number(cell.getAttribute('colspan') ?? 1) > 1;
+        const label = headers[index];
+        if (spans || !label) {
+          cell.removeAttribute('data-label');
+          return;
+        }
+        cell.dataset.label = label;
+      });
+    });
+  });
+}
+
+stampTableCardLabels(document);
+// Re-stamp after a language switch so the labels are translated too.
+window.addEventListener('credential-console-language', () => stampTableCardLabels(document));
+
 const CONVERSATION_RESULT_ACTIONS = new Set(['/conversations', '/conversation-turns']);
 
 function conversationFragmentSupported() {
