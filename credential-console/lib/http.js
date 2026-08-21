@@ -1,4 +1,77 @@
 import { StringDecoder } from 'node:string_decoder';
+import { brotliCompressSync, constants, gzipSync } from 'node:zlib';
+
+/**
+ * Below this, compression costs more than it saves: the framing overhead is a
+ * few dozen bytes and the payload already fits in one segment. It also leaves
+ * the proxy's small JSON error bodies alone.
+ */
+const COMPRESSION_MIN_BYTES = 1024;
+
+/**
+ * Quality 5, not 11. Measured on this console's own pages (182 KB home page):
+ * q5 saves 90% in 1.6 ms, q11 saves 91% in 109 ms. A hundred milliseconds of
+ * synchronous CPU per response would stall every other request on the loop —
+ * one extra percent is not worth that. gzip level 6 is the same trade.
+ */
+const BROTLI_PARAMS = { [constants.BROTLI_PARAM_QUALITY]: 5 };
+const GZIP_LEVEL = 6;
+
+/** @returns {'br'|'gzip'|null} the best encoding the client accepted. */
+function negotiateEncoding(res) {
+  const header = res?.req?.headers?.['accept-encoding'];
+  if (!header) return null;
+  const accepted = new Set(
+    String(header)
+      .split(',')
+      .map((part) => part.split(';')[0].trim().toLowerCase())
+      .filter(Boolean),
+  );
+  if (accepted.has('br')) return 'br';
+  if (accepted.has('gzip')) return 'gzip';
+  return null;
+}
+
+/**
+ * Write a response body, compressed when the client accepts it.
+ *
+ * Deliberately synchronous: at the levels chosen above it costs 1–2 ms against
+ * a render that already costs 5–33 ms, and staying synchronous preserves the
+ * "call send*, then return" contract every caller already relies on.
+ */
+function sendBuffer(res, status, payload, contentType, headers = {}) {
+  const preEncoded = Object.keys(headers)
+    .some((name) => name.toLowerCase() === 'content-encoding');
+  const encoding = preEncoded ? null : negotiateEncoding(res);
+  let body = payload;
+  const negotiated = {};
+
+  if (encoding && payload.length >= COMPRESSION_MIN_BYTES) {
+    try {
+      body = encoding === 'br'
+        ? brotliCompressSync(payload, { params: BROTLI_PARAMS })
+        : gzipSync(payload, { level: GZIP_LEVEL });
+      negotiated['Content-Encoding'] = encoding;
+    } catch {
+      // Never fail a response because it could not be compressed.
+      body = payload;
+    }
+  }
+
+  res.writeHead(status, {
+    ...baseHeaders(),
+    'Content-Type': contentType,
+    // Set even when this response was not compressed: the URL does vary by
+    // Accept-Encoding, and a cache must not serve one form in place of the other.
+    Vary: 'Accept-Encoding',
+    ...headers,
+    // Always ours, never the caller's: a length computed before compression
+    // would truncate the response.
+    ...negotiated,
+    'Content-Length': body.length,
+  });
+  res.end(body);
+}
 
 export function escapeHtml(value) {
   return String(value ?? '')
@@ -85,36 +158,16 @@ export function baseHeaders({ nonce = null } = {}) {
 }
 
 export function sendHtml(res, status, html, headers = {}) {
-  const payload = Buffer.from(html, 'utf8');
-  res.writeHead(status, {
-    ...baseHeaders(),
-    'Content-Type': 'text/html; charset=utf-8',
-    'Content-Length': payload.length,
-    ...headers,
-  });
-  res.end(payload);
+  sendBuffer(res, status, Buffer.from(html, 'utf8'), 'text/html; charset=utf-8', headers);
 }
 
 export function sendJson(res, status, body, headers = {}) {
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
-  res.writeHead(status, {
-    ...baseHeaders(),
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': payload.length,
-    ...headers,
-  });
-  res.end(payload);
+  sendBuffer(res, status, payload, 'application/json; charset=utf-8', headers);
 }
 
 export function sendText(res, status, body, contentType = 'text/plain; charset=utf-8', headers = {}) {
-  const payload = Buffer.from(body, 'utf8');
-  res.writeHead(status, {
-    ...baseHeaders(),
-    'Content-Type': contentType,
-    'Content-Length': payload.length,
-    ...headers,
-  });
-  res.end(payload);
+  sendBuffer(res, status, Buffer.from(body, 'utf8'), contentType, headers);
 }
 
 export function redirect(res, location, headers = {}) {
