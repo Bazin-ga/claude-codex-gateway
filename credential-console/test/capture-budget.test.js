@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import {
   CAPTURE_BUDGET_DEFAULT_BYTES,
@@ -33,20 +34,21 @@ test('exports a positive default ceiling', () => {
 test('reserves against estimated peak memory, not raw buffered bytes', () => {
   assert.ok(CAPTURE_MEMORY_AMPLIFICATION > 1, 'buffering costs more than it holds');
   const budget = createCaptureBudget({ maxBytes: 100, amplification: 4 });
-  assert.equal(budget.tryReserve(25), true);
-  assert.equal(budget.inFlightBytes(), 100, '25 buffered bytes cost 100');
+  assert.equal(budget.tryReserve(25), 100, '25 buffered bytes are charged 100');
+  assert.equal(budget.inFlightBytes(), 100);
   assert.equal(budget.tryReserve(1), false, 'the ceiling counts amplified cost');
-  budget.release(25);
+  // Hand back what was charged, not the byte count that produced it.
+  budget.release(100);
   assert.equal(budget.inFlightBytes(), 0);
 });
 
 test('reserves up to the ceiling and refuses past it', () => {
   const budget = createCaptureBudget({ maxBytes: 100, amplification: 1 });
-  assert.equal(budget.tryReserve(60), true);
-  assert.equal(budget.tryReserve(40), true);
+  assert.equal(budget.tryReserve(60), 60);
+  assert.equal(budget.tryReserve(40), 40);
   assert.equal(budget.tryReserve(1), false, 'exceeding the ceiling is refused');
   budget.release(40);
-  assert.equal(budget.tryReserve(40), true, 'released bytes become available again');
+  assert.equal(budget.tryReserve(40), 40, 'released room becomes available again');
   assert.equal(budget.inFlightBytes(), 100);
 });
 
@@ -55,7 +57,7 @@ test('release never drives the pool negative', () => {
   budget.tryReserve(10);
   budget.release(999);
   assert.equal(budget.inFlightBytes(), 0);
-  assert.equal(budget.tryReserve(100), true);
+  assert.equal(budget.tryReserve(100), 100);
 });
 
 test('a request that exhausts the budget still proxies and still reports metadata', async () => {
@@ -138,4 +140,53 @@ test('concurrent captures share one ceiling', async () => {
   const captured = [first, second].filter((t) => t.conversationCandidate() !== null);
   assert.equal(captured.length, 1, 'the pool admits one and sheds the other');
   assert.equal(budget.inFlightBytes(), 0, 'both reservations are returned');
+});
+
+test('a non-integer amplification does not drift the pool', async () => {
+  // Reservations are per chunk and rounded up individually; recomputing the
+  // charge from total bytes at release time would leave the difference behind
+  // on every request. The module's own measured figures are non-integer, so
+  // this is a configuration someone will plausibly choose.
+  const budget = createCaptureBudget({ maxBytes: 8 * 1024 * 1024, amplification: 2.7 });
+  const tee = createRequestMetadataTee({
+    capturePrompt: true,
+    prefixLimit: REQUEST_METADATA_PREFIX_MAX_BYTES,
+    budget,
+  });
+
+  tee.stream.on('data', () => {});
+  const body = bodyWithTrailingPrompt(100 * 1024, 'drifted');
+  for (let offset = 0; offset < body.length; offset += 101) {
+    tee.stream.write(body.subarray(offset, Math.min(offset + 101, body.length)));
+  }
+  tee.stream.end();
+  await once(tee.stream, 'end');
+
+  assert.equal(budget.inFlightBytes(), 0, 'every reserved byte is handed back');
+});
+
+test('trackSource releases when an aborted upload never reaches flush', async () => {
+  // `source.pipe(tee)` does not destroy the tee when the source dies, so the
+  // tee's own 'close' never fires and its reservation would be held forever.
+  const budget = createCaptureBudget({ maxBytes: 8 * 1024 * 1024 });
+  const tee = createRequestMetadataTee({
+    capturePrompt: true,
+    prefixLimit: REQUEST_METADATA_PREFIX_MAX_BYTES,
+    budget,
+  });
+
+  const source = new PassThrough();
+  tee.trackSource(source);
+  tee.stream.on('data', () => {});
+  tee.stream.on('error', () => {});
+  source.pipe(tee.stream);
+  source.write(bodyWithTrailingPrompt(64 * 1024, 'abandoned').subarray(0, 32 * 1024));
+  await new Promise((resolve) => { setImmediate(resolve); });
+  assert.ok(budget.inFlightBytes() > 0, 'bytes are held while the upload is live');
+
+  source.destroy();
+  await once(source, 'close');
+
+  assert.equal(budget.inFlightBytes(), 0, 'the dead source released the reservation');
+  assert.equal(tee.stream.destroyed, false, 'and it did so without the tee closing');
 });

@@ -57,15 +57,23 @@ test('a raised prefixLimit reaches fields that sit past 64 KiB', async () => {
 
 test('prefixLimit is still clamped to the ceiling', async () => {
   const body = Buffer.from('{"model":"claude-test","stream":true}');
-  const result = await runCapture(body, { prefixLimit: Number.MAX_SAFE_INTEGER });
-  assert.equal(result.snapshot.stream, true);
-  assert.ok(result.snapshot.capturedPrefixBytes <= REQUEST_METADATA_PREFIX_MAX_BYTES);
+  // Assert the limit in force, not the bytes a tiny body happened to use — the
+  // latter is under the ceiling no matter what, so it passes with no clamp at all.
+  const clamped = await runCapture(body, { prefixLimit: Number.MAX_SAFE_INTEGER });
+  assert.equal(clamped.snapshot.prefixLimit, REQUEST_METADATA_PREFIX_MAX_BYTES);
+
+  const honoured = await runCapture(body, { prefixLimit: 4096 });
+  assert.equal(honoured.snapshot.prefixLimit, 4096, 'a limit under the ceiling is kept');
+
+  const defaulted = await runCapture(body, { prefixLimit: 'nonsense' });
+  assert.equal(defaulted.snapshot.prefixLimit, REQUEST_METADATA_PREFIX_BYTES);
 });
 
 test('extracts root model and stream and preserves bytes', async () => {
   const body = Buffer.from('{"model":"claude-test","stream":true}');
   const result = await runCapture(body);
   assert.deepEqual(result.snapshot, {
+    prefixLimit: REQUEST_METADATA_PREFIX_BYTES,
     requestBytes: body.length,
     capturedPrefixBytes: body.length,
     model: 'claude-test',
@@ -200,6 +208,7 @@ test('parses fields when syntax is split around keys, escapes, and delimiters', 
   await once(stream, 'end');
   const body = Buffer.concat(chunks);
   assert.deepEqual(snapshot(), {
+    prefixLimit: REQUEST_METADATA_PREFIX_BYTES,
     requestBytes: body.length,
     capturedPrefixBytes: body.length,
     model: 'root-é',
@@ -270,6 +279,7 @@ test('snapshot is safe and useful before the request body ends', async () => {
   const first = Buffer.from('{"model":"partial');
   stream.write(first);
   assert.deepEqual(snapshot(), {
+    prefixLimit: REQUEST_METADATA_PREFIX_BYTES,
     requestBytes: first.length,
     capturedPrefixBytes: first.length,
     model: null,

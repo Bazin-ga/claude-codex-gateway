@@ -12,6 +12,19 @@ export const MAX_OBSERVED_DECODED_BYTES = 16 * 1024 * 1024;
 // Shared across all in-flight observations in this process, charged as bytes are
 // actually observed rather than reserved per response up front.
 export const MAX_GLOBAL_OBSERVATION_BUDGET_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Most an observation is charged, however long it streams.
+ *
+ * Observers retain bounded prefixes, not the whole stream, so charging every
+ * byte would meter cumulative throughput rather than resident memory: a long
+ * SSE conversation would accumulate charge without ever holding it, and a few
+ * of them would starve the pool — reintroducing the very shedding this budget
+ * was reworked to stop. Past this point an observation costs nothing more,
+ * because it holds nothing more.
+ */
+export const MAX_OBSERVATION_CHARGE_BYTES = 4 * 1024 * 1024;
+
 let reservedObservationBytes = 0;
 
 function boundedLimit(value, fallback, maximum) {
@@ -146,12 +159,14 @@ export function createResponseObservationTee({
    */
   function reserveMore(bytes) {
     if (!active || ended || bytes <= 0) return active && !ended;
-    if (reservedObservationBytes + bytes > MAX_GLOBAL_OBSERVATION_BUDGET_BYTES) {
+    const wanted = Math.min(bytes, MAX_OBSERVATION_CHARGE_BYTES - reservedBytes);
+    if (wanted <= 0) return true; // already charged for all this one can hold
+    if (reservedObservationBytes + wanted > MAX_GLOBAL_OBSERVATION_BUDGET_BYTES) {
       safeAbort('global_budget');
       return false;
     }
-    reservedObservationBytes += bytes;
-    reservedBytes += bytes;
+    reservedObservationBytes += wanted;
+    reservedBytes += wanted;
     return true;
   }
 
@@ -212,10 +227,14 @@ export function createResponseObservationTee({
         observedRawBytes += chunk.length;
         if (observedRawBytes > rawLimit) {
           safeAbort('raw_limit');
+        } else if (encoding === 'identity') {
+          // Charged once, inside deliverDecoded: for identity the raw and
+          // decoded buffers are the same bytes, so charging here as well would
+          // halve the pool for exactly the uncompressed responses this rework
+          // set out to stop shedding.
+          deliverDecoded(chunk);
         } else if (!reserveMore(chunk.length)) {
           // Shed by the shared pool; the chunk still reaches the client below.
-        } else if (encoding === 'identity') {
-          deliverDecoded(chunk);
         } else if (decoder && !decoder.destroyed) {
           // Never wait on decoder backpressure: doing so would make telemetry a
           // second flow-control authority. The raw ceiling bounds queued input.

@@ -51,20 +51,27 @@ export function createCaptureBudget({
   return {
     /**
      * Reserve room to buffer `bytes` more of a request body.
-     * @returns {boolean} whether the shared ceiling allows it.
+     *
+     * Returns the amount charged so the caller can hand back exactly that.
+     * Recomputing the charge at release time instead would drift: reservations
+     * are per chunk and rounded up individually, so `sum(ceil(x_i * f))` can
+     * exceed `ceil(sum(x_i) * f)` for any non-integer factor, leaking the
+     * difference on every request until the pool is exhausted.
+     *
+     * @returns {number|false} bytes charged, or false when the ceiling refuses.
      */
     tryReserve(bytes) {
       const amount = cost(bytes);
-      if (amount === 0) return true;
+      if (amount === 0) return 0;
       if (inFlight + amount > ceiling) return false;
       inFlight += amount;
-      return true;
+      return amount;
     },
 
-    /** Return the room reserved for `bytes`. Never drifts below zero. */
-    release(bytes) {
-      const amount = cost(bytes);
-      if (amount === 0) return;
+    /** Hand back an amount previously returned by `tryReserve`. */
+    release(charged) {
+      const amount = Number(charged);
+      if (!Number.isFinite(amount) || amount <= 0) return;
       inFlight = Math.max(0, inFlight - amount);
     },
 

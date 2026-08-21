@@ -720,12 +720,14 @@ export function createRequestMetadataTee({
   // the only thing the shared budget governs. Losing the reservation stops the
   // buffering but not the scan: model and stream still come back.
   let bufferingPrompt = capturePrompt;
-  let reservedBytes = 0;
+  // The amount the budget charged, not the bytes buffered: the two differ by the
+  // amplification factor, and handing back a recomputed figure drifts.
+  let reservedCost = 0;
 
   function releaseReservation() {
-    if (reservedBytes === 0) return;
-    budget?.release(reservedBytes);
-    reservedBytes = 0;
+    if (reservedCost === 0) return;
+    budget?.release(reservedCost);
+    reservedCost = 0;
   }
 
   /** Give up prompt buffering for this request, returning what it held. */
@@ -745,12 +747,13 @@ export function createRequestMetadataTee({
           try {
             parser.push(buffer.subarray(0, take));
             if (bufferingPrompt) {
-              if (budget && !budget.tryReserve(take)) {
+              const charged = budget ? budget.tryReserve(take) : 0;
+              if (charged === false) {
                 // The pool is exhausted by other in-flight captures. Drop this
                 // request's prompt rather than the request itself.
                 abandonPromptBuffer();
               } else {
-                reservedBytes += take;
+                reservedCost += charged;
                 promptPrefix.push(Buffer.from(buffer.subarray(0, take)));
               }
             }
@@ -788,19 +791,39 @@ export function createRequestMetadataTee({
     },
   });
 
-  // A body that never reaches flush — client abort, upstream error, destroy —
-  // must still return its reservation, or the shared pool leaks until capture is
-  // permanently off. 'close' fires on every terminal path, and releasing is
-  // idempotent, so the double call with flush() is harmless.
+  // A body that never reaches flush must still return its reservation, or the
+  // shared pool leaks until capture is off process-wide. 'close' covers the
+  // paths where this Transform is itself ended or destroyed, and releasing is
+  // idempotent so the overlap with flush() is harmless.
+  //
+  // It does NOT cover an aborted upload: `source.pipe(tee)` only unpipes when
+  // the source dies, so this Transform is left open and never closes. Callers
+  // must therefore attach the request stream via `trackSource` — verified
+  // against a real client abort, where 6 MiB of body left 18 MiB reserved.
   stream.on('close', releaseReservation);
 
   return {
     stream,
+
+    /**
+     * Release this tee's reservation when `source` terminates, however it does.
+     * Piping does not propagate a dead source to its destination, so without
+     * this an aborted upload holds its share of the pool forever.
+     */
+    trackSource(source) {
+      source?.once?.('close', releaseReservation);
+      source?.once?.('error', releaseReservation);
+      source?.once?.('aborted', releaseReservation);
+    },
+
     snapshot() {
       const metadata = parser.snapshot();
       return {
         requestBytes,
         capturedPrefixBytes,
+        // The limit actually in force after clamping, so callers (and tests)
+        // can observe that a request was clamped rather than infer it.
+        prefixLimit: boundedPrefixLimit,
         model: metadata.model,
         stream: metadata.stream,
         parseState: metadata.parseState,

@@ -8,6 +8,7 @@ import {
   createResponseObservationTee,
   createCompositeResponseObserver,
   MAX_GLOBAL_OBSERVATION_BUDGET_BYTES,
+  MAX_OBSERVATION_CHARGE_BYTES,
   MAX_OBSERVED_DECODED_BYTES,
   MAX_OBSERVED_RAW_BYTES,
 } from '../lib/response-observation.js';
@@ -235,24 +236,41 @@ test('many concurrent observers coexist while their actual bytes stay small', as
   );
 });
 
-test('the shared pool still bounds total observed bytes, and releases them', async () => {
-  const chunk = Buffer.alloc(1024 * 1024, 0x61);
-  const chunksToExceed = Math.ceil(MAX_GLOBAL_OBSERVATION_BUDGET_BYTES / chunk.length) + 2;
+test('the shared pool sheds with global_budget once concurrent holders fill it', async () => {
+  // The pool is a *concurrency* bound, so one stream can never demonstrate it:
+  // a single stream hits the 16 MiB raw ceiling before the 32 MiB pool. Hold
+  // several open at once instead, each charged up to MAX_OBSERVATION_CHARGE_BYTES.
+  const holders = Math.ceil(MAX_GLOBAL_OBSERVATION_BUDGET_BYTES / MAX_OBSERVATION_CHARGE_BYTES);
+  const chunk = Buffer.alloc(MAX_OBSERVATION_CHARGE_BYTES, 0x61);
 
-  const hog = observer();
-  const hogTee = createResponseObservationTee({ observer: hog });
-  await pipeline(
-    Readable.from(Array.from({ length: chunksToExceed }, () => chunk)),
-    hogTee.stream,
-    new Writable({ write(_c, _e, cb) { cb(); } }),
-  );
-  await hogTee.done;
-  assert.ok(
-    hog.aborted.includes('global_budget') || hog.aborted.includes('raw_limit'),
-    `a single stream past the pool is shed, got ${JSON.stringify(hog.aborted)}`,
+  const open = [];
+  for (let i = 0; i < holders; i += 1) {
+    const observed = observer();
+    const tee = createResponseObservationTee({ observer: observed });
+    tee.stream.on('data', () => {});
+    tee.stream.write(chunk);
+    open.push({ observed, tee });
+  }
+  assert.equal(
+    open.every(({ observed }) => observed.aborted.length === 0),
+    true,
+    'holders that fit are all admitted',
   );
 
-  // The shed observation released what it held, so a later one still works.
+  // One more, while they are still open, must be refused by the pool itself.
+  const extra = observer();
+  const extraTee = createResponseObservationTee({ observer: extra });
+  extraTee.stream.on('data', () => {});
+  extraTee.stream.write(Buffer.alloc(1024, 0x62));
+  assert.deepEqual(
+    extra.aborted,
+    ['global_budget'],
+    'the pool refuses, and says so — not raw_limit or any other reason',
+  );
+
+  for (const { tee } of open) tee.abort('test_cleanup');
+  await Promise.all(open.map(({ tee }) => tee.done));
+
   const after = observer();
   const afterTee = createResponseObservationTee({ observer: after });
   await pipeline(
@@ -261,10 +279,71 @@ test('the shared pool still bounds total observed bytes, and releases them', asy
     new Writable({ write(_c, _e, cb) { cb(); } }),
   );
   await afterTee.done;
-  assert.deepEqual(after.aborted, [], 'the pool was returned after the hog settled');
+  assert.deepEqual(after.aborted, [], 'the pool was returned once the holders settled');
   assert.equal(Buffer.concat(after.chunks).toString(), 'small');
 });
 
+test('an identity stream is charged once, not once per path', async () => {
+  // raw and decoded are the same bytes for identity. Sizes must sit below the
+  // per-observation cap, or that cap absorbs the double charge and hides it.
+  const each = 2 * 1024 * 1024;
+  assert.ok(each * 2 <= MAX_OBSERVATION_CHARGE_BYTES, 'double charge must stay under the cap');
+  const holders = Math.floor(MAX_GLOBAL_OBSERVATION_BUDGET_BYTES / each);
+
+  const open = [];
+  for (let i = 0; i < holders; i += 1) {
+    const observed = observer();
+    const tee = createResponseObservationTee({ observer: observed });
+    tee.stream.on('data', () => {});
+    tee.stream.write(Buffer.alloc(each, 0x61));
+    open.push({ observed, tee });
+  }
+
+  assert.equal(
+    open.filter(({ observed }) => observed.aborted.length > 0).length,
+    0,
+    `${holders} identity streams of ${each} bytes exactly fill the pool once; `
+      + 'charging raw and decoded separately would shed half of them',
+  );
+
+  for (const { tee } of open) tee.abort('test_cleanup');
+  await Promise.all(open.map(({ tee }) => tee.done));
+});
+
+test('a long stream stops accruing charge once it can hold no more', async () => {
+  // Observers retain bounded prefixes, so a long stream must stop costing once
+  // it passes the cap. Charging its whole throughput would starve the pool.
+  const long = observer();
+  const longTee = createResponseObservationTee({ observer: long });
+  longTee.stream.on('data', () => {});
+  const piece = Buffer.alloc(1024 * 1024, 0x61);
+  for (let sent = 0; sent < MAX_OBSERVED_RAW_BYTES; sent += piece.length) {
+    longTee.stream.write(piece);
+  }
+  assert.deepEqual(long.aborted, [], 'a single long stream is never shed by the pool');
+
+  // With the cap it holds MAX_OBSERVATION_CHARGE_BYTES; without it, far more.
+  // Fill almost all of the remainder and require every one to be admitted.
+  const remaining = MAX_GLOBAL_OBSERVATION_BUDGET_BYTES - MAX_OBSERVATION_CHARGE_BYTES;
+  const holders = Math.floor(remaining / MAX_OBSERVATION_CHARGE_BYTES);
+  const open = [];
+  for (let i = 0; i < holders; i += 1) {
+    const observed = observer();
+    const tee = createResponseObservationTee({ observer: observed });
+    tee.stream.on('data', () => {});
+    tee.stream.write(Buffer.alloc(MAX_OBSERVATION_CHARGE_BYTES, 0x62));
+    open.push({ observed, tee });
+  }
+  assert.equal(
+    open.filter(({ observed }) => observed.aborted.length > 0).length,
+    0,
+    'the long stream was charged its cap, not its throughput',
+  );
+
+  longTee.abort('test_cleanup');
+  for (const { tee } of open) tee.abort('test_cleanup');
+  await Promise.all([longTee.done, ...open.map(({ tee }) => tee.done)]);
+});
 test('callers cannot raise per-response observation ceilings above the hard cap', async () => {
   const observed = observer();
   const tee = createResponseObservationTee({
