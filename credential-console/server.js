@@ -1363,9 +1363,14 @@ export async function createCredentialConsole(options = {}) {
         }
       }
       const page = conversationSearchPage(formUrl, { mode: conversationCollection.mode });
+      // A browser with scripting asks for just the results region. Everything
+      // else — including that same browser with scripting disabled — gets the
+      // whole document from this same code path, so the two cannot drift.
+      const wantsFragment = req.headers['x-fragment'] === 'conversation-results';
       sendHtml(res, page.statusCode ?? 200, conversationCollection.view({
         ...page,
         openMode,
+        fragment: wantsFragment,
       }));
       return;
     }
@@ -2085,15 +2090,27 @@ function currentLanguage() {
   return document.documentElement.lang === 'zh-CN' ? 'zh' : 'en';
 }
 
-function applyLanguage(language) {
-  const selected = language === 'zh' ? 'zh' : 'en';
-  document.documentElement.lang = selected === 'zh' ? 'zh-CN' : 'en';
-  document.querySelectorAll('[data-i18n]').forEach((element) => {
+// Translate one subtree. Needed as a unit because results are re-rendered in
+// place: freshly inserted nodes carry data-i18n and would otherwise stay English
+// on a Chinese page.
+function translateSubtree(root, selected) {
+  root.querySelectorAll('[data-i18n]').forEach((element) => {
     if (!element.dataset.i18nEn) element.dataset.i18nEn = element.textContent;
     element.textContent = selected === 'zh'
       ? (translations[element.dataset.i18n] ?? element.dataset.i18nEn)
       : element.dataset.i18nEn;
   });
+  root.querySelectorAll('[data-placeholder-en]').forEach((element) => {
+    element.placeholder = selected === 'zh'
+      ? (element.dataset.placeholderZh ?? element.dataset.placeholderEn)
+      : element.dataset.placeholderEn;
+  });
+}
+
+function applyLanguage(language) {
+  const selected = language === 'zh' ? 'zh' : 'en';
+  document.documentElement.lang = selected === 'zh' ? 'zh-CN' : 'en';
+  translateSubtree(document, selected);
   document.querySelectorAll('[data-account-option], [data-account-label]').forEach((element) => {
     const alias = element.dataset.accountAlias ?? '';
     const status = element.dataset.accountStatus ?? '';
@@ -2102,11 +2119,7 @@ function applyLanguage(language) {
     const translatedStatus = selected === 'zh' ? (translations[key] ?? englishStatus) : englishStatus;
     element.textContent = alias + ' · ' + translatedStatus;
   });
-  document.querySelectorAll('[data-placeholder-en]').forEach((element) => {
-    element.placeholder = selected === 'zh'
-      ? (element.dataset.placeholderZh ?? element.dataset.placeholderEn)
-      : element.dataset.placeholderEn;
-  });
+
   document.querySelectorAll('[data-metric-point-title]').forEach((element) => {
     if (!element.dataset.metricPointTitleEn) element.dataset.metricPointTitleEn = element.textContent;
     const key = element.dataset.metricSeriesKey ?? '';
@@ -2518,6 +2531,110 @@ document.addEventListener('click', async (event) => {
     URL.revokeObjectURL(href);
   }
 });
+
+// ---------------------------------------------------------------------------
+// In-place conversation results
+//
+// Filtering and paging used to be full navigations. Over the ~207 ms round trip
+// to a remote console that meant re-sending and re-parsing the entire document
+// for a list that is a few KB. The same request now asks for just the results
+// region and swaps it in.
+//
+// Strictly progressive enhancement: without scripting, or if anything here
+// fails, the form performs its normal POST and the server returns a full page
+// from the identical code path.
+// ---------------------------------------------------------------------------
+
+const CONVERSATION_RESULT_ACTIONS = new Set(['/conversations', '/conversation-turns']);
+
+function conversationFragmentSupported() {
+  return typeof window.fetch === 'function'
+    && typeof window.FormData === 'function'
+    && typeof window.URLSearchParams === 'function'
+    && typeof window.AbortController === 'function';
+}
+
+let conversationRequest = null;
+
+async function swapConversationResults(form, submitter) {
+  const region = document.querySelector('.conversation-results');
+  if (!region) return false;
+
+  const action = new URL(form.action, location.href);
+  if (!CONVERSATION_RESULT_ACTIONS.has(action.pathname)) return false;
+
+  const body = new URLSearchParams(new FormData(form));
+  // A submit button can carry the cursor for the next page; FormData omits it.
+  if (submitter && submitter.name) body.set(submitter.name, submitter.value ?? '');
+
+  // Only the newest filter matters; abandon whatever is still in flight.
+  conversationRequest?.abort();
+  const controller = new AbortController();
+  conversationRequest = controller;
+
+  region.setAttribute('aria-busy', 'true');
+  region.classList.add('is-loading');
+  try {
+    const response = await fetch(action.pathname, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Fragment': 'conversation-results',
+      },
+      body: body.toString(),
+      credentials: 'same-origin',
+      signal: controller.signal,
+    });
+    if (!response.ok) return false;
+    const html = await response.text();
+
+    const holder = document.createElement('div');
+    holder.innerHTML = html;
+    const replacement = holder.querySelector('.conversation-results');
+    if (!replacement) return false;
+
+    translateSubtree(replacement, currentLanguage());
+    region.replaceWith(replacement);
+    // Announce to assistive tech and put the eye where the answer is, without
+    // the jump-to-top a real navigation would have caused.
+    replacement.querySelector('.conversation-list')?.setAttribute('aria-busy', 'false');
+    if (submitter && submitter.closest('.conversation-pagination')) {
+      replacement.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
+    return true;
+  } catch (error) {
+    // An aborted request was superseded on purpose; do not fall back to a
+    // navigation that would undo the newer one.
+    return error && error.name === 'AbortError';
+  } finally {
+    if (conversationRequest === controller) conversationRequest = null;
+    region.removeAttribute('aria-busy');
+    region.classList.remove('is-loading');
+  }
+}
+
+if (conversationFragmentSupported()) {
+  document.addEventListener('submit', (event) => {
+    if (event.defaultPrevented) return;
+    const form = event.target.closest?.('form');
+    if (!form) return;
+    let action;
+    try {
+      action = new URL(form.action, location.href);
+    } catch {
+      return;
+    }
+    if (String(form.method).toLowerCase() !== 'post') return;
+    if (!CONVERSATION_RESULT_ACTIONS.has(action.pathname)) return;
+    if (!document.querySelector('.conversation-results')) return;
+
+    event.preventDefault();
+    swapConversationResults(form, event.submitter).then((handled) => {
+      // Anything unexpected: let the browser do what it would have done.
+      if (!handled) form.submit();
+    });
+  });
+}
 `, 'text/javascript; charset=utf-8');
       return;
     }

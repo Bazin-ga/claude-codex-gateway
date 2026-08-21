@@ -2461,6 +2461,7 @@ function conversationSearchErrorView(error) {
 }
 
 export function conversationsView({
+  fragment = false,
   result = null,
   searchResult = null,
   search = null,
@@ -2533,6 +2534,29 @@ export function conversationsView({
         ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
+  const resultsSection = `
+        <section class="conversation-results" aria-labelledby="conversation-results-heading">
+          <div class="conversation-results-head">
+            <div>
+              <span class="badge stored" data-i18n="conversations-label">API fragment diagnostics</span>
+              <h1 id="conversation-results-heading" data-i18n="conversations-heading">API fragment diagnostics</h1>
+              <p class="muted" data-i18n="conversations-intro">Search immutable per-request Claude API fragments. They may contain wrappers, reminders, or tool-loop intermediates and are not user rounds.</p>
+              ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
+            </div>
+            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
+          </div>
+          ${errorNotice}
+          ${droppedNotice}
+          ${facetNotice}
+          <div class="conversation-list" aria-live="polite">
+            ${itemsView || '<p class="empty" data-i18n="conversation-no-results">No captured API turns match this search.</p>'}
+          </div>
+          ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-pagination-hint">Results are ordered newest first.</span>${nextForm}</div>` : ''}
+        </section>
+`;
+  // A fragment request re-renders only the results, so a filter change costs
+  // a few KB instead of the whole document over a high-latency link.
+  if (fragment) return resultsSection;
   return layout('API fragment diagnostics', `
     <section class="stack">
       ${conversationPrivacyView(openMode)}
@@ -2574,24 +2598,7 @@ export function conversationsView({
           </div>
           </form>
         </details>
-        <section class="conversation-results" aria-labelledby="conversation-results-heading">
-          <div class="conversation-results-head">
-            <div>
-              <span class="badge stored" data-i18n="conversations-label">API fragment diagnostics</span>
-              <h1 id="conversation-results-heading" data-i18n="conversations-heading">API fragment diagnostics</h1>
-              <p class="muted" data-i18n="conversations-intro">Search immutable per-request Claude API fragments. They may contain wrappers, reminders, or tool-loop intermediates and are not user rounds.</p>
-              ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
-            </div>
-            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
-          </div>
-          ${errorNotice}
-          ${droppedNotice}
-          ${facetNotice}
-          <div class="conversation-list" aria-live="polite">
-            ${itemsView || '<p class="empty" data-i18n="conversation-no-results">No captured API turns match this search.</p>'}
-          </div>
-          ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-pagination-hint">Results are ordered newest first.</span>${nextForm}</div>` : ''}
-        </section>
+        ${resultsSection}
       </div>
     </section>
   `, { openMode, activeTab: 'conversations' });
@@ -2670,6 +2677,7 @@ function conversationSessionItemView(item) {
 }
 
 export function conversationSessionsView({
+  fragment = false,
   result = null,
   searchResult = null,
   search = null,
@@ -2763,6 +2771,31 @@ export function conversationSessionsView({
       <a class="button" href="/#conversation-capture-upgrade" data-i18n="conversation-round-install-hooks">Install conversation capture update</a>
     </div>
   </div>`;
+  const resultsSection = `
+        <section class="conversation-results" aria-labelledby="conversation-sessions-results-heading">
+          <div class="conversation-results-head">
+            <div>
+              <span class="badge stored" data-i18n="conversation-sessions-label">Reliable hook-backed conversations</span>
+              <h1 id="conversation-sessions-results-heading" data-i18n="conversation-sessions-heading">Conversations</h1>
+              <p class="muted" data-i18n="conversation-sessions-intro">Each round pairs the exact prompt emitted by Claude Code UserPromptSubmit with the final visible response emitted by Stop. Tool-loop API requests do not become fake user turns. Session and prompt identifiers are stored only as device-bound HMACs.</p>
+              ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
+            </div>
+            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-session-total-matches">matching conversations</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
+          </div>
+          ${errorNotice}
+          ${droppedNotice}
+          ${facetNotice}
+          <div class="conversation-list" aria-live="polite">
+            ${itemsView || (hasActiveFilters
+              ? '<p class="empty" data-i18n="conversation-session-no-results">No reliable conversations match these filters.</p>'
+              : emptyRounds)}
+          </div>
+          ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-session-pagination-hint">Conversations are ordered by latest hook activity, newest first.</span>${nextForm}</div>` : ''}
+        </section>
+`;
+  // A fragment request re-renders only the results, so a filter change costs
+  // a few KB instead of the whole document over a high-latency link.
+  if (fragment) return resultsSection;
   return layout('Conversations', `
     <section class="stack">
       ${conversationPrivacyView(openMode, { reliable: true })}
@@ -2792,26 +2825,7 @@ export function conversationSessionsView({
           </div>
           </form>
         </details>
-        <section class="conversation-results" aria-labelledby="conversation-sessions-results-heading">
-          <div class="conversation-results-head">
-            <div>
-              <span class="badge stored" data-i18n="conversation-sessions-label">Reliable hook-backed conversations</span>
-              <h1 id="conversation-sessions-results-heading" data-i18n="conversation-sessions-heading">Conversations</h1>
-              <p class="muted" data-i18n="conversation-sessions-intro">Each round pairs the exact prompt emitted by Claude Code UserPromptSubmit with the final visible response emitted by Stop. Tool-loop API requests do not become fake user turns. Session and prompt identifiers are stored only as device-bound HMACs.</p>
-              ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
-            </div>
-            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-session-total-matches">matching conversations</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
-          </div>
-          ${errorNotice}
-          ${droppedNotice}
-          ${facetNotice}
-          <div class="conversation-list" aria-live="polite">
-            ${itemsView || (hasActiveFilters
-              ? '<p class="empty" data-i18n="conversation-session-no-results">No reliable conversations match these filters.</p>'
-              : emptyRounds)}
-          </div>
-          ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-session-pagination-hint">Conversations are ordered by latest hook activity, newest first.</span>${nextForm}</div>` : ''}
-        </section>
+        ${resultsSection}
       </div>
     </section>
   `, { openMode, activeTab: 'conversations' });
