@@ -1167,6 +1167,34 @@ if (navigationSupported()) {
     });
   });
 
+  // A GET form is a navigation with a query string, so it goes through the same
+  // path as a link. This is what makes /metrics filtering cost one fragment
+  // instead of a document, its script and its chart payload in series.
+  document.addEventListener('submit', (event) => {
+    if (event.defaultPrevented) return;
+    const form = event.target.closest?.('form');
+    if (!form || String(form.method).toLowerCase() !== 'get') return;
+    if (form.dataset.noBoost !== undefined) return;
+    let action;
+    try {
+      action = new URL(form.action, location.href);
+    } catch {
+      return;
+    }
+    if (action.origin !== location.origin) return;
+    if (!document.querySelector('[data-page-content]')) return;
+
+    const submitter = event.submitter;
+    const params = new URLSearchParams(new FormData(form));
+    if (submitter && submitter.name) params.set(submitter.name, submitter.value ?? '');
+    action.search = params.toString();
+
+    event.preventDefault();
+    navigateTo(action.href).then((handled) => {
+      if (!handled) location.assign(action.href);
+    });
+  });
+
   window.addEventListener('popstate', (event) => {
     if (!event.state?.boosted && !document.querySelector('[data-page-content]')) return;
     navigateTo(location.href, { push: false }).then((handled) => {

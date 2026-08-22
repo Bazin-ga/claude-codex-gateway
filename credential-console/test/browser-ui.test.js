@@ -251,3 +251,41 @@ describe('a page that needs a lazily-loaded script still gets it', async () => {
     assert.equal(bound, 'true', 'the dashboard bound to DOM that arrived after load');
   });
 });
+
+describe('a GET filter form navigates without reloading, and the chart survives', async () => {
+  await withPage({ width: 1440, height: 1000 }, async (page, baseUrl, errors) => {
+    await page.goto(baseUrl + '/metrics', { waitUntil: 'networkidle' });
+    await page.evaluate(() => { window.__documentIdentity = 'original'; });
+    await page.waitForFunction(
+      () => document.querySelector('[data-metrics-dashboard]')?.dataset.metricsBound === 'true',
+      { timeout: 10_000 },
+    );
+    let fullLoads = 0;
+    page.on('load', () => { fullLoads += 1; });
+
+    const select = await page.$('.metrics-filters select');
+    if (select) {
+      const values = await page.evaluate((el) => [...el.options].map((o) => o.value), select);
+      await page.selectOption('.metrics-filters select', values[values.length - 1]);
+    }
+    await page.click('.metrics-filters button[type="submit"]');
+    await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+
+    assert.equal(fullLoads, 0, 'filtering metrics reloaded the document');
+    assert.equal(
+      await page.evaluate(() => window.__documentIdentity === 'original'),
+      true,
+      'the document survived the filter',
+    );
+    assert.ok(
+      await page.evaluate(() => location.search.length > 0),
+      'the filter is in the address bar',
+    );
+    // The chart is the reason this page was the hardest to do in place.
+    await page.waitForFunction(
+      () => document.querySelector('[data-metrics-dashboard]')?.dataset.metricsBound === 'true',
+      { timeout: 10_000 },
+    );
+    assert.deepEqual(errors, []);
+  });
+});
