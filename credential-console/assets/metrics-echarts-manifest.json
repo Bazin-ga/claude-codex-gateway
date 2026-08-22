@@ -1,9 +1,9 @@
 {
   "version": 1,
   "echartsVersion": "6.1.0",
-  "file": "metrics-echarts.84c0d904ccd8.js",
-  "url": "/assets/metrics-echarts.84c0d904ccd8.js",
-  "sha256": "84c0d904ccd8f9ce28ba4c3250120870b59e3e8d25b5f78b22afa865c92e0696",
-  "integrity": "sha384-SQh6RXXU0ieEFEuvvVSGItAlr7XiOrb0gT8zC9a3VL1HXTH8fA9C3smTPTlQ3y7X",
-  "bytes": 612415
+  "file": "metrics-echarts.0beb8e1fff1f.js",
+  "url": "/assets/metrics-echarts.0beb8e1fff1f.js",
+  "sha256": "0beb8e1fff1f717f19deb51ce4ab6371ade24ccb9ecc62df5532d074555b2c3c",
+  "integrity": "sha384-F6rTtPNBxL35OMwRiLelQ9d1iXx6o/OZbZj26mTpfH4NCRtG/8G0TDE2M1cCBWyI",
+  "bytes": 612565
 }

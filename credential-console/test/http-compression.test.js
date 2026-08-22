@@ -53,7 +53,7 @@ async function rawFetch(acceptEncoding, handler) {
 test('a large HTML response is brotli-compressed when the client accepts br', async () => {
   const { headers, body } = await rawFetch('br, gzip', (req, res) => sendHtml(res, 200, BIG));
   assert.equal(headers['content-encoding'], 'br');
-  assert.equal(headers.vary, 'Accept-Encoding');
+  assert.equal(headers.vary, 'Accept-Encoding, X-Fragment');
   assert.equal(brotliDecompressSync(body).toString('utf8'), BIG, 'decompresses to the original');
   assert.equal(Number(headers['content-length']), body.length, 'length describes the wire bytes');
   assert.ok(body.length < Buffer.byteLength(BIG) / 4, 'materially smaller');
@@ -83,7 +83,7 @@ test('small bodies are left alone', async () => {
   const { headers, body } = await rawFetch('br', (req, res) => sendHtml(res, 200, small));
   assert.equal(headers['content-encoding'], undefined, 'not worth the framing overhead');
   assert.equal(body.toString('utf8'), small);
-  assert.equal(headers.vary, 'Accept-Encoding', 'still varies, so caches stay correct');
+  assert.equal(headers.vary, 'Accept-Encoding, X-Fragment', 'still varies, so caches stay correct');
 });
 
 test('JSON and text responses compress on the same terms', async () => {

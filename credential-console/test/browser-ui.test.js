@@ -193,3 +193,61 @@ describe('a filter updates in place, shows progress, and announces the result', 
     assert.ok(after.announced.length > 0, 'a persistent live region carries the announcement');
   });
 });
+
+describe('tab navigation replaces the page, not the document', async () => {
+  await withPage({ width: 1280, height: 900 }, async (page, baseUrl, errors) => {
+    await page.goto(baseUrl + '/', { waitUntil: 'networkidle' });
+    // A marker on the window survives only if the document is never rebuilt.
+    await page.evaluate(() => { window.__documentIdentity = 'original'; });
+    let fullLoads = 0;
+    page.on('load', () => { fullLoads += 1; });
+
+    for (const [href, expectedPath] of [
+      ['/metrics', '/metrics'],
+      ['/conversations', '/conversations'],
+      ['/', '/'],
+    ]) {
+      await page.click(`.page-tabs a[href="${href}"]`);
+      await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+      const state = await page.evaluate(() => ({
+        alive: window.__documentIdentity === 'original',
+        path: location.pathname,
+        current: document.querySelector('.page-tabs a[aria-current="page"]')?.getAttribute('href'),
+        title: document.title,
+      }));
+      assert.equal(state.alive, true, `${href} rebuilt the document`);
+      assert.equal(state.path, expectedPath, 'the address bar follows');
+      assert.equal(state.current, href, 'the active tab follows');
+      assert.ok(state.title.length > 0, 'the title follows');
+    }
+    assert.equal(fullLoads, 0, 'no navigation caused a document load');
+    assert.deepEqual(errors, []);
+
+    // Back must return within the console rather than leaving it.
+    await page.goBack();
+    await page.waitForTimeout(400);
+    assert.equal(
+      await page.evaluate(() => window.__documentIdentity === 'original'),
+      true,
+      'Back stayed in the same document',
+    );
+  });
+});
+
+describe('a page that needs a lazily-loaded script still gets it', async () => {
+  await withPage({ width: 1280, height: 900 }, async (page, baseUrl) => {
+    // The chart bundle is referenced from the document head, which a swapped
+    // page region does not contain — it has to be carried across explicitly.
+    await page.goto(baseUrl + '/', { waitUntil: 'networkidle' });
+    await page.click('.page-tabs a[href="/metrics"]');
+    await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+    await page.waitForFunction(
+      () => document.querySelector('[data-metrics-dashboard]')?.dataset.metricsBound === 'true',
+      { timeout: 10_000 },
+    );
+    const bound = await page.evaluate(
+      () => document.querySelector('[data-metrics-dashboard]').dataset.metricsBound,
+    );
+    assert.equal(bound, 'true', 'the dashboard bound to DOM that arrived after load');
+  });
+});

@@ -22,9 +22,19 @@ echarts.use([
   SVGRenderer,
 ]);
 
-const dashboard = document.querySelector('[data-metrics-dashboard]');
-
-if (dashboard) {
+/**
+ * Bind the dashboard to whatever is in the document now.
+ *
+ * Navigation re-renders the page inside the existing document, so this can no
+ * longer be a one-shot at load: arriving at /metrics from another tab has to
+ * bind to DOM that did not exist when this module first ran.
+ */
+function bootMetricsDashboard() {
+  const dashboard = document.querySelector('[data-metrics-dashboard]');
+  if (!dashboard) return;
+  if (dashboard.dataset.metricsBound === 'true') return;
+  dashboard.dataset.metricsBound = 'true';
+  {
   const colors = Object.freeze({
     input: '#0072b2',
     cacheCreation: '#e69f00',
@@ -581,4 +591,9 @@ if (dashboard) {
   }, { once: true });
 
   load();
+  }
 }
+
+bootMetricsDashboard();
+// Arriving at /metrics without a document load.
+window.addEventListener('credential-console-navigated', bootMetricsDashboard);

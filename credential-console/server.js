@@ -2576,6 +2576,155 @@ document.addEventListener('click', async (event) => {
 });
 
 // ---------------------------------------------------------------------------
+// Boosted navigation
+//
+// Tabs, sub-nav and detail links were full document loads. Over a ~207 ms round
+// trip that means re-downloading and re-parsing the shell, the styles and the
+// script to change the part of the page that actually differs.
+//
+// A click now fetches only the page region and swaps it into the existing
+// document. Progressive enhancement throughout: anything unexpected falls back
+// to the navigation the browser would have done anyway.
+// ---------------------------------------------------------------------------
+
+function navigationSupported() {
+  return typeof window.fetch === 'function'
+    && typeof window.AbortController === 'function'
+    && typeof history.pushState === 'function';
+}
+
+/** Scripts the shell loads lazily, e.g. the metrics bundle on /metrics only. */
+function ensureScripts(descriptors) {
+  const present = new Set(
+    Array.from(document.querySelectorAll('script[src]')).map((s) => s.src),
+  );
+  return Promise.all(descriptors
+    .filter((d) => d && d.src && !present.has(new URL(d.src, location.href).href))
+    .map((d) => new Promise((resolve) => {
+      const script = document.createElement('script');
+      script.src = d.src;
+      if (d.integrity) script.integrity = d.integrity;
+      if (d.crossorigin) script.crossOrigin = d.crossorigin;
+      script.defer = true;
+      // Never block navigation on an asset that fails to load.
+      script.onload = resolve;
+      script.onerror = resolve;
+      document.head.appendChild(script);
+    })));
+}
+
+let navigationRequest = null;
+
+async function navigateTo(url, { push = true } = {}) {
+  const region = document.querySelector('[data-page-content]');
+  if (!region) return false;
+
+  navigationRequest?.abort();
+  const controller = new AbortController();
+  navigationRequest = controller;
+
+  document.documentElement.setAttribute('data-navigating', '');
+  try {
+    const response = await fetch(url, {
+      headers: { 'X-Fragment': 'page' },
+      credentials: 'same-origin',
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    // A redirect to a different page (login, error) is a real navigation.
+    if (!response.ok || new URL(response.url).pathname !== new URL(url, location.href).pathname) {
+      return false;
+    }
+    const html = await response.text();
+    const title = decodeURIComponent(response.headers.get('X-Page-Title') ?? '');
+
+    region.innerHTML = html;
+    if (title) document.title = title;
+    if (push) history.pushState({ boosted: true }, '', url);
+
+    // The shell stays, so anything the shell set up for the old page has to be
+    // re-applied to the new one.
+    translateSubtree(region, currentLanguage());
+    stampTableCardLabels(region);
+    markActiveTab(url);
+    region.querySelectorAll('details[data-persist-details]').forEach(restoreDetails);
+
+    let scripts = [];
+    try {
+      scripts = JSON.parse(decodeURIComponent(response.headers.get('X-Page-Scripts') ?? '[]'));
+    } catch {
+      scripts = [];
+    }
+    await ensureScripts(scripts);
+    // Tell page-specific scripts (the metrics dashboard) to bind to the new DOM.
+    window.dispatchEvent(new CustomEvent('credential-console-navigated', {
+      detail: { url: String(url) },
+    }));
+
+    window.scrollTo({ top: 0 });
+    document.querySelector('[data-page-content] h1')?.setAttribute('tabindex', '-1');
+    document.querySelector('[data-page-content] h1')?.focus({ preventScroll: true });
+    return true;
+  } catch (error) {
+    return Boolean(error && error.name === 'AbortError');
+  } finally {
+    if (navigationRequest === controller) navigationRequest = null;
+    document.documentElement.removeAttribute('data-navigating');
+  }
+}
+
+function markActiveTab(url) {
+  const path = new URL(url, location.href).pathname;
+  document.querySelectorAll('.page-tabs a').forEach((link) => {
+    const target = new URL(link.getAttribute('href'), location.href).pathname;
+    if (target === path) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  });
+}
+
+function boostableLink(event) {
+  if (event.defaultPrevented) return null;
+  // Let the browser handle anything the user asked to open differently.
+  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return null;
+  const link = event.target.closest?.('a[href]');
+  if (!link) return null;
+  if (link.target && link.target !== '_self') return null;
+  if (link.hasAttribute('download') || link.dataset.noBoost !== undefined) return null;
+  let url;
+  try {
+    url = new URL(link.getAttribute('href'), location.href);
+  } catch {
+    return null;
+  }
+  if (url.origin !== location.origin) return null;
+  // A same-page anchor is the browser's job.
+  if (url.pathname === location.pathname && url.hash) return null;
+  return url;
+}
+
+if (navigationSupported()) {
+  document.addEventListener('click', (event) => {
+    const url = boostableLink(event);
+    if (!url) return;
+    event.preventDefault();
+    navigateTo(url.href).then((handled) => {
+      if (!handled) location.assign(url.href);
+    });
+  });
+
+  window.addEventListener('popstate', (event) => {
+    if (!event.state?.boosted && !document.querySelector('[data-page-content]')) return;
+    navigateTo(location.href, { push: false }).then((handled) => {
+      if (!handled) location.reload();
+    });
+  });
+
+  // So the first Back after a boosted navigation returns here rather than
+  // leaving the console.
+  history.replaceState({ boosted: true }, '', location.href);
+}
+
+// ---------------------------------------------------------------------------
 // In-place conversation results
 //
 // Filtering and paging used to be full navigations. Over the ~207 ms round trip

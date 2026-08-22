@@ -90,7 +90,7 @@ function sendBuffer(res, status, payload, contentType, headers = {}) {
     'Content-Type': contentType,
     // Set even when this response was not compressed: the URL does vary by
     // Accept-Encoding, and a cache must not serve one form in place of the other.
-    Vary: 'Accept-Encoding',
+    Vary: 'Accept-Encoding, X-Fragment',
     ...headers,
     // Always ours, never the caller's: a length computed before compression
     // would truncate the response.
@@ -98,6 +98,45 @@ function sendBuffer(res, status, payload, contentType, headers = {}) {
     'Content-Length': body.length,
   });
   res.end(body);
+}
+
+/**
+ * Sentinels around the per-page region of the document.
+ *
+ * Navigation can then re-render one page inside the existing document instead
+ * of replacing it, without every view function having to learn about it: the
+ * page is rendered exactly as always and the region is sliced out afterwards.
+ * String markers rather than parsing, so the boundary is exact and cannot be
+ * confused by user content that happens to contain similar markup.
+ */
+export const PAGE_CONTENT_START = '<!--page-content-->';
+export const PAGE_CONTENT_END = '<!--/page-content-->';
+
+/**
+ * @returns {{content: string, title: string, scripts: object[]}|null}
+ *
+ * `scripts` matters because a page's script tags live in the document head, not
+ * in the region being swapped: /metrics loads the chart bundle there, so a
+ * navigation that only replaced the region would show an empty chart frame.
+ */
+export function extractPageContent(html) {
+  const start = html.indexOf(PAGE_CONTENT_START);
+  const end = html.lastIndexOf(PAGE_CONTENT_END);
+  if (start === -1 || end === -1 || end < start) return null;
+  const title = /<title>([^<]*)<\/title>/.exec(html)?.[1] ?? '';
+  const scripts = [];
+  for (const tag of html.slice(0, start).match(/<script\b[^>]*src="[^"]+"[^>]*>/g) ?? []) {
+    const src = /src="([^"]+)"/.exec(tag)?.[1];
+    if (!src) continue;
+    scripts.push({
+      src,
+      // Carried through so an injected tag keeps the same guarantees as one the
+      // document would have shipped.
+      integrity: /integrity="([^"]+)"/.exec(tag)?.[1] ?? null,
+      crossorigin: /crossorigin="([^"]+)"/.exec(tag)?.[1] ?? null,
+    });
+  }
+  return { content: html.slice(start + PAGE_CONTENT_START.length, end), title, scripts };
 }
 
 export function escapeHtml(value) {
@@ -185,6 +224,21 @@ export function baseHeaders({ nonce = null } = {}) {
 }
 
 export function sendHtml(res, status, html, headers = {}) {
+  // A navigation asks for just the page region: same document, new page. The
+  // page was rendered exactly as it always is; only the slice differs, so a
+  // boosted navigation and a real one cannot drift apart.
+  if (res?.req?.headers?.['x-fragment'] === 'page') {
+    const page = extractPageContent(html);
+    if (page) {
+      sendBuffer(res, status, Buffer.from(page.content, 'utf8'), 'text/html; charset=utf-8', {
+        ...headers,
+        // Header-safe for any title, including CJK.
+        'X-Page-Title': encodeURIComponent(page.title),
+        'X-Page-Scripts': encodeURIComponent(JSON.stringify(page.scripts)),
+      });
+      return;
+    }
+  }
   sendBuffer(res, status, Buffer.from(html, 'utf8'), 'text/html; charset=utf-8', headers);
 }
 

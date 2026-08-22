@@ -1,4 +1,4 @@
-import { escapeHtml } from './http.js';
+import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { derivePromptDisplay } from './prompt-display.js';
 import {
@@ -418,6 +418,13 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
    feedback during a ~250 ms round trip was nothing at all: the full navigation
    this replaced at least moved the browser's own progress indicator. */
 .conversation-results.is-loading { opacity: 0.55; pointer-events: none; }
+/* Same idea for a whole-page navigation: without it a boosted click over a
+   ~207 ms link looks like nothing happened, because the browser's own progress
+   indicator no longer runs. */
+[data-navigating] [data-page-content] { opacity: 0.55; pointer-events: none; }
+@media (prefers-reduced-motion: no-preference) {
+  [data-page-content] { transition: opacity 120ms ease-out; }
+}
 .conversation-results.is-loading * { cursor: progress; }
 @media (prefers-reduced-motion: no-preference) {
   .conversation-results { transition: opacity 120ms ease-out; }
@@ -649,8 +656,8 @@ function layout(title, content, {
       <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
       <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
     </nav>` : ''}
-    ${openMode ? openBanner : ''}
-    ${content}
+    <div data-page-content>${PAGE_CONTENT_START}${openMode ? openBanner : ''}
+    ${content}${PAGE_CONTENT_END}</div>
   </main>
 </body>
 </html>`;
