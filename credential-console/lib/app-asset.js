@@ -1074,6 +1074,8 @@ async function navigateTo(url, { push = true } = {}) {
   const region = document.querySelector('[data-page-content]');
   if (!region) return false;
 
+  const samePage = new URL(url, location.href).pathname === location.pathname;
+
   navigationRequest?.abort();
   const controller = new AbortController();
   navigationRequest = controller;
@@ -1116,9 +1118,17 @@ async function navigateTo(url, { push = true } = {}) {
       detail: { url: String(url) },
     }));
 
-    window.scrollTo({ top: 0 });
-    document.querySelector('[data-page-content] h1')?.setAttribute('tabindex', '-1');
-    document.querySelector('[data-page-content] h1')?.focus({ preventScroll: true });
+    // Only a real change of page starts at the top. Re-running a filter on the
+    // page you are already reading is not a new page, and throwing the reader
+    // back to the top is exactly what made the old full reload unpleasant.
+    if (!samePage) {
+      window.scrollTo({ top: 0 });
+      const heading = document.querySelector('[data-page-content] h1');
+      if (heading) {
+        heading.setAttribute('tabindex', '-1');
+        heading.focus({ preventScroll: true });
+      }
+    }
     return true;
   } catch (error) {
     return Boolean(error && error.name === 'AbortError');

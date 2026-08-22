@@ -263,6 +263,7 @@ describe('a GET filter form navigates without reloading, and the chart survives'
     let fullLoads = 0;
     page.on('load', () => { fullLoads += 1; });
 
+    await page.evaluate(() => { window.__outgoingDashboard = document.querySelector('[data-metrics-dashboard]'); });
     const select = await page.$('.metrics-filters select');
     if (select) {
       const values = await page.evaluate((el) => [...el.options].map((o) => o.value), select);
@@ -286,6 +287,86 @@ describe('a GET filter form navigates without reloading, and the chart survives'
       () => document.querySelector('[data-metrics-dashboard]')?.dataset.metricsBound === 'true',
       { timeout: 10_000 },
     );
+    // Filtering replaces the dashboard node too, so the outgoing one must be
+    // released as the incoming one binds — otherwise every filter leaks a full
+    // set of chart instances against a node no longer in the document.
+    assert.equal(
+      await page.evaluate(() => document.contains(window.__outgoingDashboard)),
+      false,
+      'the dashboard really was replaced',
+    );
+    assert.equal(
+      await page.evaluate(() => window.__outgoingDashboard.dataset.metricsBound),
+      undefined,
+      'the replaced dashboard was released, not left bound',
+    );
     assert.deepEqual(errors, []);
+  });
+});
+
+describe('leaving the metrics page disposes its charts', async () => {
+  await withPage({ width: 1440, height: 1000 }, async (page, baseUrl) => {
+    await page.goto(baseUrl + '/metrics', { waitUntil: 'networkidle' });
+    await page.waitForFunction(
+      () => document.querySelector('[data-metrics-dashboard]')?.dataset.metricsBound === 'true',
+      { timeout: 10_000 },
+    );
+    // Hold a reference to a live chart host, then navigate away. ECharts marks
+    // its host with _echarts_instance_ and clears it on dispose, so the
+    // detached node tells us whether the instance was released or leaked.
+    // Hold a reference to the live dashboard, then navigate away. Teardown
+    // clears its bound flag, which is the state this module actually owns —
+    // ECharts does not remove its own marker attribute on dispose.
+    await page.evaluate(() => {
+      window.__dashboard = document.querySelector('[data-metrics-dashboard]');
+      window.__wasBound = window.__dashboard?.dataset.metricsBound === 'true';
+      window.__hadChart = !!window.__dashboard?.querySelector('[data-metrics-chart] svg, [data-metrics-chart] canvas');
+    });
+    assert.equal(await page.evaluate(() => window.__wasBound), true, 'the dashboard was bound');
+    assert.equal(await page.evaluate(() => window.__hadChart), true, 'and had rendered a chart');
+
+    await page.click('.page-tabs a[href="/conversations"]');
+    await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+    await page.waitForTimeout(300);
+
+    assert.equal(
+      await page.evaluate(() => window.__dashboard.dataset.metricsBound),
+      undefined,
+      'the detached dashboard was released rather than left bound and leaking',
+    );
+
+    // And coming back binds a working dashboard again.
+    await page.click('.page-tabs a[href="/metrics"]');
+    await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+    await page.waitForFunction(
+      () => document.querySelector('[data-metrics-dashboard]')?.dataset.metricsBound === 'true',
+      { timeout: 10_000 },
+    );
+  });
+});
+
+describe('filtering keeps your place; changing page does not', async () => {
+  await withPage({ width: 1440, height: 900 }, async (page, baseUrl) => {
+    await page.goto(baseUrl + '/metrics', { waitUntil: 'networkidle' });
+    await page.evaluate(() => window.scrollTo(0, 700));
+    await page.waitForTimeout(150);
+    const before = await page.evaluate(() => Math.round(window.scrollY));
+    assert.ok(before > 300, 'scrolled far enough for the test to mean something');
+
+    await page.click('.metrics-filters button[type="submit"]');
+    await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+    const afterFilter = await page.evaluate(() => Math.round(window.scrollY));
+    // Re-running a filter on the page you are reading is not a new page.
+    assert.ok(afterFilter > 0, `filtering jumped to the top (${before} -> ${afterFilter})`);
+
+    await page.evaluate(() => window.scrollTo(0, 700));
+    await page.waitForTimeout(150);
+    await page.click('.page-tabs a[href="/conversations"]');
+    await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+    assert.equal(
+      await page.evaluate(() => Math.round(window.scrollY)),
+      0,
+      'a real page change starts at the top',
+    );
   });
 });
