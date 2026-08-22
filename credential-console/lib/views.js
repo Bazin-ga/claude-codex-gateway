@@ -1,3 +1,4 @@
+import { APP_ASSET_URL } from './app-asset.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { derivePromptDisplay } from './prompt-display.js';
@@ -412,7 +413,29 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-rail h2 { margin: 0; font-size: 17px; }
 .conversation-filter-hint { margin: 0; }
 .conversation-rail label { margin: 0; }
-.conversation-rail .filter-actions { display: grid; grid-template-columns: 1fr; gap: 8px; }
+.conversation-rail .filter-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* Selects apply as soon as they change, so the button is only needed for the
+   free-text field; Clear is a way out, not a peer of the primary action. */
+.conversation-rail .filter-actions .button.secondary,
+.conversation-rail .filter-actions a.button {
+  background: none;
+  border: 0;
+  padding: 0 2px;
+  color: var(--muted);
+  text-decoration: underline;
+  font-weight: 600;
+  box-shadow: none;
+}
+/* Eight equally-weighted fields made a rail taller than the viewport. */
+.conversation-rail label { display: grid; gap: 4px; }
+.conversation-rail label > span { font-size: 12px; font-weight: 700; color: var(--muted); }
+.conversation-rail { gap: 10px; }
+.conversation-rows { display: inline-flex; align-items: center; gap: 6px; }
+.conversation-rows select { padding: 2px 6px; font-size: 12px; }
+/* Compact only where there is a pointer; a touch target keeps its size. */
+@media (hover: hover) and (pointer: fine) {
+  .conversation-rows select { min-height: 0; }
+}
 .conversation-rail .filter-actions > * { width: 100%; text-align: center; }
 /* The results region while a filter is in flight. Without this the only
    feedback during a ~250 ms round trip was nothing at all: the full navigation
@@ -637,7 +660,7 @@ function layout(title, content, {
   <title>${escapeHtml(title)} · Credential Console</title>
   <style>${styles}</style>
   <noscript><style>html[data-language-pending] body { visibility: visible; animation: none; }</style></noscript>
-  <script src="/assets/app.js" defer></script>
+  <script src="${escapeHtml(APP_ASSET_URL)}" defer></script>
   ${metricsScript}
 </head>
 <body>
@@ -2138,10 +2161,10 @@ export function metricsView({
             <select name="member_label">${metricOptions(options.members, selectedMember, 'All members', 'metrics-all-members')}</select>
           </label>
           <label><span data-i18n="metrics-filter-account">Account</span>
-            <select name="account_id">${metricOptions(options.accounts, selectedAccount, 'All accounts', 'metrics-all-accounts')}</select>
+            <select name="account_id" data-autoapply>${metricOptions(options.accounts, selectedAccount, 'All accounts', 'metrics-all-accounts')}</select>
           </label>
           <label><span data-i18n="metrics-filter-model">Model</span>
-            <select name="model">${metricOptions(options.models, selectedModel, 'All models', 'metrics-all-models')}</select>
+            <select name="model" data-autoapply>${metricOptions(options.models, selectedModel, 'All models', 'metrics-all-models')}</select>
           </label>
           <div class="filter-actions">
             <button type="submit" data-i18n="metrics-apply-filters">Apply</button>
@@ -2653,7 +2676,7 @@ export function conversationsView({
               <p class="muted" data-i18n="conversations-intro">Search immutable per-request Claude API fragments. They may contain wrappers, reminders, or tool-loop intermediates and are not user rounds.</p>
               ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
             </div>
-            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
+            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <label class="conversation-rows"><span class="muted tiny" data-i18n="conversation-filter-limit-label">Rows per page</span><select name="limit" form="conversation-filter-form" data-autoapply>${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
           </div>
           ${errorNotice}
           ${droppedNotice}
@@ -2674,33 +2697,30 @@ export function conversationsView({
       <div class="conversation-layout">
         <details class="conversation-filter-details" data-persist-details="turn-filters" open>
           <summary data-i18n="conversation-filters-heading">Filters</summary>
-          <form method="post" action="/conversation-turns" class="card conversation-rail conversation-filters" aria-label="API-turn filters" data-reset-scroll>
+          <form id="conversation-filter-form" method="post" action="/conversation-turns" class="card conversation-rail conversation-filters" aria-label="API-turn filters" data-reset-scroll>
           <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
-          <p class="muted tiny conversation-filter-hint" data-i18n="conversation-filter-hint">Type to search member suggestions; leave the field blank for everyone.</p>
           <label><span data-i18n="conversation-search">Search captured API turns</span>
-            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Captured API user text or response" data-placeholder-en="Captured API user text or response" data-placeholder-zh="已捕获 API 用户文本或回复">
+            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Text in prompt or reply" data-placeholder-en="Text in prompt or reply" data-placeholder-zh="已捕获 API 用户文本或回复">
           </label>
           <label><span data-i18n="conversation-filter-period-label">Period</span>
-            <select name="period">${periodOptions}</select>
+            <select name="period" data-autoapply>${periodOptions}</select>
           </label>
           <label><span data-i18n="conversation-filter-member-label">Member</span>
             <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
             <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>
+            <p class="muted tiny conversation-filter-hint" data-i18n="conversation-filter-hint">Type to search member suggestions; leave the field blank for everyone.</p>
           </label>
           <label><span data-i18n="conversation-filter-device-label">Device</span>
-            <select name="device_id">${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select>
+            <select name="device_id" data-autoapply>${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select>
           </label>
           <label><span data-i18n="conversation-filter-account-label">Account</span>
-            <select name="account_id">${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select>
+            <select name="account_id" data-autoapply>${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select>
           </label>
           <label><span data-i18n="conversation-filter-model-label">Model</span>
-            <select name="model">${conversationFacetOptions(facets.models, normalizedModel, 'All models', 'conversation-all-models')}</select>
+            <select name="model" data-autoapply>${conversationFacetOptions(facets.models, normalizedModel, 'All models', 'conversation-all-models')}</select>
           </label>
           <label><span data-i18n="conversation-filter-state-label">Response state</span>
-            <select name="response_state">${stateOptions}</select>
-          </label>
-          <label><span data-i18n="conversation-filter-limit-label">Rows per page</span>
-            <select name="limit">${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select>
+            <select name="response_state" data-autoapply>${stateOptions}</select>
           </label>
           <div class="filter-actions">
             <button type="submit" data-i18n="conversation-search-submit">Search</button>
@@ -2890,7 +2910,7 @@ export function conversationSessionsView({
               <p class="muted" data-i18n="conversation-sessions-intro">Each round pairs the exact prompt emitted by Claude Code UserPromptSubmit with the final visible response emitted by Stop. Tool-loop API requests do not become fake user turns. Session and prompt identifiers are stored only as device-bound HMACs.</p>
               ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
             </div>
-            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-session-total-matches">matching conversations</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
+            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-session-total-matches">matching conversations</span> · <label class="conversation-rows"><span class="muted tiny" data-i18n="conversation-filter-limit-label">Rows per page</span><select name="limit" form="conversation-filter-form" data-autoapply>${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
           </div>
           ${errorNotice}
           ${droppedNotice}
@@ -2914,21 +2934,20 @@ export function conversationSessionsView({
       <div class="conversation-layout">
         <details class="conversation-filter-details" data-persist-details="session-filters" open>
           <summary data-i18n="conversation-filters-heading">Filters</summary>
-          <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters" data-reset-scroll>
+          <form id="conversation-filter-form" method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters" data-reset-scroll>
           <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
-          <p class="muted tiny conversation-filter-hint" data-i18n="conversation-session-filter-hint">Filters match reliable hook-backed user rounds. API fragments are searched separately in diagnostics.</p>
           <label><span data-i18n="conversation-session-search">Search conversations</span>
-            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Exact submitted prompt or final response" data-placeholder-en="Exact submitted prompt or final response" data-placeholder-zh="原始提交文字或最终回复">
+            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Text in prompt or reply" data-placeholder-en="Text in prompt or reply" data-placeholder-zh="原始提交文字或最终回复">
           </label>
-          <label><span data-i18n="conversation-filter-period-label">Period</span><select name="period">${periodOptions}</select></label>
+          <label><span data-i18n="conversation-filter-period-label">Period</span><select name="period" data-autoapply>${periodOptions}</select></label>
           <label><span data-i18n="conversation-filter-member-label">Member</span>
             <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
             <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>
+            <p class="muted tiny conversation-filter-hint" data-i18n="conversation-session-filter-hint">Filters match reliable hook-backed user rounds. API fragments are searched separately in diagnostics.</p>
           </label>
-          <label><span data-i18n="conversation-filter-device-label">Device</span><select name="device_id">${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select></label>
-          <label><span data-i18n="conversation-filter-account-label">Account</span><select name="account_id">${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select></label>
-          <label><span data-i18n="conversation-filter-state-label">Response state</span><select name="response_state">${stateOptions}</select></label>
-          <label><span data-i18n="conversation-filter-limit-label">Rows per page</span><select name="limit">${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label>
+          <label><span data-i18n="conversation-filter-device-label">Device</span><select name="device_id" data-autoapply>${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select></label>
+          <label><span data-i18n="conversation-filter-account-label">Account</span><select name="account_id" data-autoapply>${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select></label>
+          <label><span data-i18n="conversation-filter-state-label">Response state</span><select name="response_state" data-autoapply>${stateOptions}</select></label>
           <div class="filter-actions">
             <button type="submit" data-i18n="conversation-search-submit">Search</button>
             <a class="button secondary" href="/conversations" data-i18n="conversation-search-clear">Clear</a>

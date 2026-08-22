@@ -35,7 +35,8 @@ test('touch targets meet a minimum height, including summary', () => {
 });
 
 test('the client stamps card labels from the live header, and re-stamps on language change', async () => {
-  const source = await readFile(new URL('../server.js', import.meta.url), 'utf8');
+  const source = (await readFile(new URL('../server.js', import.meta.url), 'utf8'))
+    + (await readFile(new URL('../lib/app-asset.js', import.meta.url), 'utf8'));
   const fn = source.slice(source.indexOf('function stampTableCardLabels'));
   assert.ok(fn.startsWith('function stampTableCardLabels'), 'the stamping function is shipped');
 
