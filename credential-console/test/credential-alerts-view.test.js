@@ -86,7 +86,8 @@ test('warning-only summary uses polite status semantics and action text stays tr
   })]);
   assert.match(html, /role="status" aria-live="polite"/);
   assert.match(html, /credential-alert-health-stale/);
-  const source = await readFile(new URL('../server.js', import.meta.url), 'utf8');
+  const source = (await readFile(new URL('../server.js', import.meta.url), 'utf8'))
+    + (await readFile(new URL('../lib/app-asset.js', import.meta.url), 'utf8'));
   const viewSource = await readFile(new URL('../lib/views.js', import.meta.url), 'utf8');
   for (const key of [
     'credential-health-heading',
