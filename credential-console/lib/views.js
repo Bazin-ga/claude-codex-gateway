@@ -603,6 +603,22 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .table-wrap:has(td[data-label]) { overflow-x: visible; }
 }
 
+/* The sticky tab bar wraps to two lines on a phone (~110px) and then covers
+   whatever you scroll to — measured, it hid the Model select and the Apply
+   button on /metrics. Anything scrolled to keeps clear of it. */
+@media (max-width: 800px) {
+  /* The bar sticks at top: 10px and wraps to ~110px, so it occupies up to
+     120px; the rest is breathing room rather than a flush fit. */
+  :root { --sticky-nav: 132px; }
+  /* On the elements themselves rather than their containers: the control that
+     gets scrolled to is the one that must clear the bar, and enumerating
+     containers missed the rows-per-page select sitting with the result count. */
+  input, select, textarea, button, a.button, summary, label,
+  h1, h2, h3, [id], [tabindex], .conversation-results, [data-page-content] {
+    scroll-margin-top: var(--sticky-nav);
+  }
+}
+
 @media (max-width: 800px) {
   .summary, .split { grid-column: span 12; }
   .topbar { align-items: flex-start; flex-wrap: wrap; }

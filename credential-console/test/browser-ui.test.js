@@ -370,3 +370,28 @@ describe('filtering keeps your place; changing page does not', async () => {
     );
   });
 });
+
+describe('the sticky tab bar does not cover what you scroll to', async () => {
+  await withPage({ width: 390, height: 844 }, async (page, baseUrl) => {
+    for (const path of ['/metrics', '/conversation-turns']) {
+      await page.goto(baseUrl + path, { waitUntil: 'networkidle' });
+      const covered = await page.evaluate(() => {
+        const nav = document.querySelector('.page-tabs');
+        if (!nav) return [];
+        const hidden = [];
+        for (const control of document.querySelectorAll('select, input, button[type="submit"]')) {
+          control.scrollIntoView({ block: 'start' });
+          const box = control.getBoundingClientRect();
+          const bar = nav.getBoundingClientRect();
+          if (box.width > 0 && box.top < bar.bottom && box.bottom > bar.top) {
+            hidden.push(`${control.tagName}[${control.name || ''}]`);
+          }
+        }
+        return hidden;
+      });
+      // On a phone the bar wraps to two lines (~110px) and used to sit over the
+      // control you had just scrolled to.
+      assert.deepEqual(covered, [], `${path} has controls under the sticky bar`);
+    }
+  });
+});
