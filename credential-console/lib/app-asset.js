@@ -1316,6 +1316,20 @@ async function swapConversationResults(form, submitter) {
     const paging = Boolean(submitter && submitter.closest('.conversation-pagination'));
     const hadFocus = region.contains(document.activeElement);
 
+    // Put the applied filter in the address bar so it survives a refresh, is
+    // reachable with Back, and can be shared. Replace rather than push: typing
+    // into a search box should not bury the previous page under history
+    // entries, one per keystroke.
+    try {
+      const filtered = new URL(action.pathname, location.href);
+      for (const [key, value] of body.entries()) {
+        if (value !== '') filtered.searchParams.set(key, value);
+      }
+      history.replaceState({ boosted: true }, '', filtered.pathname + filtered.search);
+    } catch {
+      // The address bar is a convenience; never fail the update over it.
+    }
+
     region.replaceWith(replacement);
 
     // A live region only announces changes that happen *inside* it. Replacing

@@ -1391,9 +1391,13 @@ export async function createCredentialConsole(options = {}) {
     if (conversationCollection && ['GET', 'POST'].includes(req.method)) {
       const session = requireSession(req, res);
       if (!session) return;
-      // Search state stays out of URLs: GET is the default landing page, while
-      // the read-only filter form submits a bounded POST.
-      const formUrl = new URL(path, url);
+      // Filters live in the URL. This reverses an earlier decision to keep
+      // search terms out of it: with results updating in place, a filter that
+      // the address bar does not carry cannot survive a refresh, cannot be
+      // reached with Back, and cannot be shared. The cost is that a search term
+      // now appears in the URL, in browser history, and in any access log that
+      // records query strings — accepted deliberately, not overlooked.
+      const formUrl = new URL(path + url.search, url);
       if (req.method === 'POST') {
         let form;
         try {

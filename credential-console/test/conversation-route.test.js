@@ -228,17 +228,23 @@ function cookieFrom(response) {
   return response.headers.get('set-cookie')?.split(';')[0] ?? '';
 }
 
-test('open conversation routes use a default GET and POST-only filter/search state', async () => {
+test('open conversation routes carry filter state in the URL', async () => {
   const metrics = conversationMetrics();
   const app = await fixture({ requestMetrics: metrics });
   try {
-    const list = await fetch(`${app.baseUrl}/conversations?q=secret-query&before_id=12&limit=1`);
+    // Filters are read from the query string so a filtered view survives a
+    // refresh, is reachable with Back, and can be shared. This deliberately
+    // reverses the earlier behaviour, where these parameters were ignored.
+    // Rounds paginate by activity time; before_id belongs to the turns route.
+    const list = await fetch(`${app.baseUrl}/conversations?q=needle&limit=1`);
     assert.equal(list.status, 200);
     const cookie = cookieFrom(list);
     assert.notEqual(cookie, '');
     const listHtml = await list.text();
-    assert.deepEqual(metrics.calls.searches[0], { q: '', beforeId: null, limit: 25 });
-    assert.equal(listHtml.includes('secret-query'), false);
+    const applied = metrics.calls.searches.at(-1);
+    assert.equal(applied.q, 'needle', 'the query string reached the store');
+    assert.equal(applied.limit, 1, 'and so did the page size');
+    assert.ok(listHtml.includes('needle'), 'the applied filter is reflected back into the form');
     assert.match(listHtml, /data-i18n="conversation-round-privacy-notice"/);
     assert.match(listHtml, /data-i18n="conversation-open-warning"/);
     assert.match(listHtml, /data-i18n="conversation-round-dropped"/);
@@ -596,6 +602,21 @@ test('a spoofed fragment header cannot bypass the session requirement', async ()
       body: 'q=secret',
     });
     assert.notEqual(response.status, 200, 'auth is enforced before rendering anything');
+  } finally {
+    await app.close();
+  }
+});
+
+test('a URL with no filters is still an unfiltered landing page', async () => {
+  const metrics = conversationMetrics();
+  const app = await fixture({ requestMetrics: metrics });
+  try {
+    const response = await fetch(`${app.baseUrl}/conversations`);
+    assert.equal(response.status, 200);
+    await response.text();
+    const search = metrics.calls.searches.at(-1);
+    assert.equal(search.q, '', 'no query means no filter');
+    assert.equal(search.limit, 25, 'and the default page size');
   } finally {
     await app.close();
   }
