@@ -930,21 +930,33 @@ function accountSelectionForDevice(device, accounts) {
   const selectedAccountId = typeof device.selected_account_id === 'string'
     ? device.selected_account_id
     : null;
-  const claudeAccounts = new Set(
-    accounts.filter((account) => account.provider === 'claude').map((account) => account.id),
+  // Mirrors the store's rule (see #deviceAccountPolicy): an allowlist may hold
+  // either provider, but not both. Judging validity by "is Claude" would paint
+  // every Codex device as misconfigured and then offer, as the remedy, the one
+  // action the store refuses.
+  const gatewayProvider = new Map(
+    accounts
+      .filter((account) => ['claude', 'codex'].includes(account.provider))
+      .map((account) => [account.id, account.provider]),
+  );
+  const allowedProviders = new Set(
+    Array.isArray(allowedAccountIds)
+      ? allowedAccountIds.map((id) => gatewayProvider.get(id))
+      : [],
   );
   const allowedValid = Array.isArray(allowedAccountIds)
     && allowedAccountIds.length > 0
     && allowedAccountIds.every((id) => typeof id === 'string' && id.length > 0)
     && new Set(allowedAccountIds).size === allowedAccountIds.length
-    && allowedAccountIds.every((id) => claudeAccounts.has(id))
+    && allowedAccountIds.every((id) => gatewayProvider.has(id))
+    && allowedProviders.size === 1
     && originalAccountId !== null
     && allowedAccountIds.includes(originalAccountId);
   const selectedValid = selectedAccountId !== null
     && allowedValid
     && allowedAccountIds.includes(selectedAccountId)
-    && claudeAccounts.has(selectedAccountId);
-  const originalValid = originalAccountId !== null && claudeAccounts.has(originalAccountId);
+    && gatewayProvider.has(selectedAccountId);
+  const originalValid = originalAccountId !== null && gatewayProvider.has(originalAccountId);
   const invalid = !allowedValid || !selectedValid || !originalValid;
   return {
     allowedAccountIds: Array.isArray(allowedAccountIds) ? allowedAccountIds : [],
@@ -967,9 +979,11 @@ function accountLabelView(account, fallback = 'Unknown account') {
   return `<span data-account-label data-account-alias="${escapeHtml(account.alias)}" data-account-status="${escapeHtml(account.status)}">${escapeHtml(accountDisplayLabel(account))}</span>`;
 }
 
-function accountSelectionOptions(accounts, selectedAccountId) {
+function accountSelectionOptions(accounts, selectedAccountId, provider = 'claude') {
   return accounts
-    .filter((account) => account.provider === 'claude')
+    // Only same-provider accounts: the store refuses a cross-provider switch,
+    // so offering one would present an action guaranteed to fail.
+    .filter((account) => account.provider === provider)
     // Keep the account selector distinct from the legacy machine-merge option
     // vocabulary, whose existing dashboard tests intentionally count the
     // double-quoted machine values. Both quote styles are valid HTML; the value
@@ -994,7 +1008,9 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   if (selection.invalid) {
     return '<div class="notice error tiny" data-i18n="account-selection-invalid">Account selection configuration is invalid; no account was guessed.</div>';
   }
-  const options = accountSelectionOptions(accounts, selection.selectedAccountId);
+  const deviceProvider = accountForId(accounts, selection.selectedAccountId ?? selection.originalAccountId)
+    ?.provider ?? 'claude';
+  const options = accountSelectionOptions(accounts, selection.selectedAccountId, deviceProvider);
   if (!options) {
     return '<div class="muted tiny" data-i18n="no-claude-accounts">No Claude accounts are registered.</div>';
   }
@@ -3299,15 +3315,16 @@ export function dashboardView({
     .map((entry) => [entry.accountId, entry]));
   const activeDevices = devices.filter((device) => !device.revoked_at);
   const healthy = alerts.accounts.filter((account) => account.severity === 'ok').length;
+  // Claude only: this list feeds the Claude Code card's picker and its quota
+  // block. A Codex account here would render Codex quota under a Claude heading
+  // and offer a Claude installer for it.
   const selfServiceAccounts = accounts.filter((account) => (
-    ['claude', 'codex'].includes(account.provider)
+    account.provider === 'claude'
     && ['stored', 'healthy'].includes(account.status)
     && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
   ));
   const selfServiceOptions = selfServiceAccounts.map((account) => (
-    // The provider is named in the label because the two produce different
-    // client setups, and the alias alone does not always say which is which.
-    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)} · ${escapeHtml(account.provider === 'codex' ? 'Codex' : 'Claude Code')}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
+    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
   )).join('');
   const claudeHookProfiles = accounts
     .filter((account) => account.provider === 'claude')
@@ -3458,6 +3475,18 @@ export function dashboardView({
               </label>
               <div><button type="submit" data-i18n="get-codex">Get Codex installer</button></div>
             </form>` : '<div class="notice" data-i18n="codex-unavailable">Codex self-service enrollment is not configured yet. An administrator must connect dispenser enrollment.</div>'}
+            ${primaryCodex?.external?.kind === 'codex-credential' ? `<hr>
+            <h3>Or route turns through this console</h3>
+            <p class="muted tiny">The installer above pulls a credential and then talks to chatgpt.com directly, so those turns are not metered here. This alternative keeps the credential on the server and meters each device. It needs no dispenser enrollment, only an authorized account.</p>
+            <form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="codex-gateway-self-service">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <input type="hidden" name="account_id" value="${escapeHtml(primaryCodex.id)}">
+              ${memberLabelField}
+              <label><span data-i18n="device-name">Device name</span>
+                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
+              </label>
+              <div><button type="submit">Get Codex gateway token</button></div>
+            </form>` : ''}
           </article>
         </div>
         ${openMode ? '<p class="muted tiny" data-i18n="member-label-note">Nobody checks the label. It only keeps two members\' device names apart.</p>' : ''}
@@ -4072,6 +4101,8 @@ export function codexDeviceConfiguredView({
   const gateway = String(codexGatewayUrl ?? '').replace(/\/$/, '');
   const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
   const configToml = `# ~/.codex/config.toml
+# model_provider is a top-level key. It must sit ABOVE every [table]; appending
+# this block to a config that already has one binds it into that table instead.
 model_provider = "gateway"
 
 [model_providers.gateway]
@@ -4096,11 +4127,12 @@ env_key = "${tokenEnvVar}"`;
         <button type="button" data-download-target="codex-config" data-download-name="codex-${escapeHtml(profile)}-config.toml">Download config.toml</button>
         <button type="button" class="secondary" data-copy-target="codex-config">Copy configuration</button>
       </div>
-      <div class="notice">Turns now go through the console, which meters them per device. Everything else the CLI does — plugins, analytics, sign-in — keeps talking to chatgpt.com directly.</div>
+      <div class="notice">Turns now go through the console, which meters them per device. Nothing else is proxied, so a device holding no ChatGPT sign-in of its own loses the features that need one — <code>codex cloud</code>, plugin and app listings, and the quota figures in <code>codex /status</code>. Running a turn needs none of them.</div>
+      <div class="notice">On Windows PowerShell the token is set with <code>$env:${escapeHtml(tokenEnvVar)} = '&lt;token&gt;'</code>, not <code>export</code>.</div>
       <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
     </section>
-  `, { openMode });
+  `, { openMode, completedDraft: 'codex-gateway-self-service' });
 }
 
 export function messageView(title, message, {

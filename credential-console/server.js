@@ -67,6 +67,7 @@ const BIND = process.env.CREDENTIAL_CONSOLE_BIND ?? '127.0.0.1';
 const PORT = Number(process.env.CREDENTIAL_CONSOLE_PORT ?? 9443);
 const PUBLIC_BASE_URL = process.env.CREDENTIAL_CONSOLE_PUBLIC_URL ?? `https://127.0.0.1:${PORT}`;
 const CLAUDE_GATEWAY_URL = process.env.CREDENTIAL_CONSOLE_CLAUDE_GATEWAY_URL;
+const CODEX_GATEWAY_URL = process.env.CREDENTIAL_CONSOLE_CODEX_GATEWAY_URL;
 const TLS_CERT = process.env.CREDENTIAL_CONSOLE_TLS_CERT;
 const TLS_KEY = process.env.CREDENTIAL_CONSOLE_TLS_KEY;
 const COOKIE_SECURE = process.env.CREDENTIAL_CONSOLE_COOKIE_SECURE !== '0';
@@ -562,6 +563,7 @@ export async function createCredentialConsole(options = {}) {
   // gateway is a route on this very server, so a second setting could only ever
   // be wrong.
   const codexGatewayUrl = options.codexGatewayUrl
+    ?? CODEX_GATEWAY_URL
     ?? `${publicBaseUrl.replace(/\/$/, '')}${CODEX_PROXY_PREFIX}`;
   const cookieSecure = options.cookieSecure ?? COOKIE_SECURE;
   const adminAuth = options.adminAuth ?? ADMIN_AUTH;

@@ -86,6 +86,43 @@ function decodeEntities(html) {
     .replaceAll('&amp;', '&');
 }
 
+test('a cross-provider switch is refused without writing anything', async () => {
+  const store = await newStore();
+  const codex = await codexAccount(store);
+  const claude = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-target',
+    emailLabel: 'owner@example.com',
+    credential: { oauth_token: 'claude-target-token' },
+  });
+  const { device } = await store.issueDeviceCredential({
+    accountId: codex.id,
+    memberLabel: 'member@example.com',
+    deviceName: 'member-laptop',
+  });
+
+  await assert.rejects(
+    store.configureDeviceAccount({ deviceId: device.id, selectedAccountId: claude.id, actor: 'test' }),
+    /configured for a different provider/,
+  );
+
+  // The refusal has to happen before the row is touched. Appending the Claude
+  // account would make the allowlist mixed, and that mutation is persisted
+  // before anything revalidates it — a crash before the rollback would leave a
+  // device that no longer resolves and that this same method could no longer
+  // repair, because it reads the policy on entry.
+  const stored = store.state.devices.find((entry) => entry.id === device.id);
+  assert.deepEqual(stored.allowed_account_ids, [codex.id], 'the allowlist is untouched');
+  assert.equal(stored.selected_account_id, codex.id);
+  assert.equal(store.resolveDeviceAccount(device).account.id, codex.id, 'the device still resolves');
+
+  // Re-reading from disk proves nothing mixed was persisted and rolled back in
+  // a way that could survive a crash at the wrong moment.
+  const reopened = await new CredentialStore(store.home, { allowKeyInit: false }).init();
+  const persisted = reopened.state.devices.find((entry) => entry.id === device.id);
+  assert.deepEqual(persisted.allowed_account_ids, [codex.id]);
+});
+
 test('the Codex setup page configures the CLI to send the device token', () => {
   const html = codexDeviceConfiguredView({
     account: { alias: 'codex-shared-1', provider: 'codex' },

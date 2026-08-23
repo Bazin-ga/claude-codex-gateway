@@ -10,6 +10,7 @@ import {
   handleCodexProxy,
   readPublishedCodexCredential,
 } from '../lib/codex-proxy.js';
+import { DEVICE_CONCURRENCY_LIMIT, deviceConcurrency } from '../lib/proxy.js';
 
 const DEVICE_TOKEN = 'codex-device-test-token';
 const ACCESS_TOKEN = 'codex-upstream-access-token';
@@ -143,11 +144,12 @@ function sseUpstream(body = TURN_SSE, status = 200) {
   };
 }
 
-function post(url, body, headers = {}) {
+function post(url, body, headers = {}, signal = undefined) {
   return fetch(`${url}/codex-api/responses`, {
     method: 'POST',
     headers: { 'x-api-key': DEVICE_TOKEN, 'content-type': 'application/json', ...headers },
     body,
+    signal,
   });
 }
 
@@ -172,6 +174,46 @@ test('a device token is exchanged for the subscription credential', async (t) =>
   assert.equal(seen.headers['chatgpt-account-id'], UPSTREAM_ACCOUNT_ID);
   assert.equal(seen.headers.originator, 'codex_cli_rs', 'client identity headers survive');
   assert.equal(seen.headers['user-agent'], 'codex_cli_rs/0.138.0');
+});
+
+test('the correlation headers a real CLI sends are forwarded, and quota headers come back', async (t) => {
+  const home = await credentialHome(t);
+  const seen = {};
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'x-codex-primary-used-percent': '41',
+        'x-codex-rate-limit-reached-type': 'none',
+        'x-codex-turn-state': 'state-token',
+        'x-console-secret': 'must-not-reach-the-client',
+      });
+      res.end(TURN_SSE);
+    },
+    seen,
+  });
+
+  // Hyphens, not underscores. Node lower-cases header names but does not
+  // translate separators, so an allow-list entry spelled `session_id` can never
+  // match what the CLI actually sends.
+  const response = await post(proxyUrl, '{}', {
+    'session-id': '01a02f48-5128-7e00-8b86-3cc24fa376a1',
+    'thread-id': 'thread-42',
+    'x-codex-turn-state': 'state-token',
+  });
+
+  assert.equal(seen.headers['session-id'], '01a02f48-5128-7e00-8b86-3cc24fa376a1');
+  assert.equal(seen.headers['thread-id'], 'thread-42');
+  assert.equal(seen.headers['x-codex-turn-state'], 'state-token', 'turn state survives outbound');
+
+  // Without these the client's own quota display stays blank and it cannot tell
+  // a rate limit from an ordinary failure.
+  assert.equal(response.headers.get('x-codex-primary-used-percent'), '41');
+  assert.equal(response.headers.get('x-codex-rate-limit-reached-type'), 'none');
+  assert.equal(response.headers.get('x-codex-turn-state'), 'state-token');
+  assert.equal(response.headers.get('x-console-secret'), null, 'the response list is still closed');
+  await response.text();
 });
 
 test('the client credential never reaches the upstream', async (t) => {
@@ -391,6 +433,118 @@ test('an upstream rejection of the subscription token is recorded against the ac
   const recorded = await waitFor(() => health[0]);
   assert.equal(recorded.success, false);
   assert.match(recorded.error, /451/);
+});
+
+test('a client that gives up while the credential is being read leaks nothing', async (t) => {
+  const home = await credentialHome(t);
+  const metrics = sink();
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const upstream = http.createServer((req, res) => res.writeHead(200).end());
+  const upstreamUrl = await listen(upstream);
+  const proxy = http.createServer((req, res) => {
+    Promise.resolve(handleCodexProxy(req, res, {
+      store: storeFixture(codexAccount(home)),
+      upstreamBaseUrl: upstreamUrl,
+      requestMetrics: metrics,
+      // Stands in for the real readFile, whose libuv round trip is the only
+      // await in the handler and therefore the whole window this test is about.
+      credentialReader: async (account) => {
+        await held;
+        return readPublishedCodexCredential(account);
+      },
+    })).catch(() => {});
+  });
+  const proxyUrl = await listen(proxy);
+  t.after(async () => { await Promise.all([close(proxy), close(upstream)]); });
+
+  const before = deviceConcurrency.get(DEVICE.id) ?? 0;
+  const attempts = DEVICE_CONCURRENCY_LIMIT + 2;
+  for (let i = 0; i < attempts; i += 1) {
+    const controller = new AbortController();
+    const pending = post(proxyUrl, '{}', {}, controller.signal).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    await pending;
+  }
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  // The slot map is shared with the Claude proxy, so a leak here would 429 this
+  // device on /claude as well, permanently, until the process restarted.
+  assert.equal(
+    deviceConcurrency.get(DEVICE.id) ?? 0,
+    before,
+    'no concurrency slot was stranded by the cancellations',
+  );
+
+  // And the device must still be servable afterwards.
+  const response = await post(proxyUrl, '{}');
+  assert.notEqual(response.status, 429, 'the device is not rate-limited by its own cancellations');
+  await response.text();
+});
+
+test('an oversized chunked upload is refused without taking the process down', async (t) => {
+  const home = await credentialHome(t);
+  let upstreamCalls = 0;
+  const metrics = sink();
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => {
+      upstreamCalls += 1;
+      req.resume();
+      req.on('end', () => res.writeHead(200, { 'content-type': 'text/event-stream' }).end(TURN_SSE));
+    },
+    requestMetrics: metrics,
+  });
+
+  // No content-length, so the declared-size guard cannot fire and the byte
+  // counter is what stops this. Its 'error' has no default handler: before the
+  // listener existed this was an uncaughtException that killed the console — and
+  // with it every in-flight Claude turn. node:test fails the file if that
+  // happens, so reaching the assertions at all is part of what is being tested.
+  //
+  // The write loop must respect backpressure. A loop that ignores `write()`'s
+  // return value never delivers enough bytes to trip the limit, and the bug
+  // hides.
+  const { port } = new URL(proxyUrl);
+  const status = await new Promise((resolve, reject) => {
+    const request = http.request({
+      port,
+      path: '/codex-api/responses',
+      method: 'POST',
+      headers: { 'x-api-key': DEVICE_TOKEN, 'content-type': 'application/json' },
+    }, (response) => {
+      response.resume();
+      resolve(response.statusCode);
+    });
+    request.on('error', (error) => {
+      // A reset instead of a reply is an acceptable refusal; a dead process is not.
+      if (['ECONNRESET', 'EPIPE'].includes(error.code)) resolve('reset');
+      else reject(error);
+    });
+    const megabyte = Buffer.alloc(1024 * 1024, 'x');
+    let written = 0;
+    const pump = () => {
+      while (written < 40) {
+        written += 1;
+        if (!request.write(megabyte)) {
+          request.once('drain', pump);
+          return;
+        }
+      }
+      request.end();
+    };
+    pump();
+  });
+
+  assert.ok([413, 'reset'].includes(status), `refused rather than accepted (got ${status})`);
+  assert.equal(upstreamCalls <= 1, true, 'at most one upstream attempt was made');
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'request_too_large', 'the refusal is recorded as what it was');
+  if (status === 413) {
+    assert.equal(row.statusCode, 413, 'the status the client was sent is the status recorded');
+  }
 });
 
 test('a large streamed turn arrives intact', async (t) => {

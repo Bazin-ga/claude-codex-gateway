@@ -63,8 +63,21 @@ function forwardHeaders(headers) {
     'content-type',
     'openai-beta',
     'originator',
-    'session_id',
+    // Observed on a real codex-cli request. These are hyphenated: an earlier
+    // `session_id` entry could never match, because Node lower-cases header
+    // names but does not translate underscores, so the CLI's session identity
+    // was being stripped silently.
+    'session-id',
+    'thread-id',
     'user-agent',
+    'x-client-request-id',
+    'x-codex-beta-features',
+    // Carried in both directions; the backend appears to use it for turn and
+    // cache affinity, and dropping it would cost prompt-cache hits — which show
+    // up as a larger billed prompt, not as an error.
+    'x-codex-turn-state',
+    'x-codex-turn-metadata',
+    'x-codex-window-id',
   ];
   return Object.fromEntries(
     allowed
@@ -80,6 +93,16 @@ function responseHeaders(headers) {
     'request-id',
     'retry-after',
     'x-request-id',
+    // The client's own quota display and back-off depend on these. Stripping
+    // them leaves `codex /status` permanently blank and denies the CLI the one
+    // signal that tells it a rate limit was reached rather than a request
+    // merely failing.
+    'x-codex-active-limit',
+    'x-codex-credits-balance',
+    'x-codex-primary-used-percent',
+    'x-codex-secondary-used-percent',
+    'x-codex-rate-limit-reached-type',
+    'x-codex-turn-state',
   ];
   return Object.fromEntries(
     allowed
@@ -235,6 +258,22 @@ export async function handleCodexProxy(req, res, {
     sendJson(res, 503, errorBody('api_error', code));
     return;
   }
+  // The credential read above is this handler's only await, and every listener
+  // that frees a resource is registered after it. If the client went away while
+  // it was pending, `res` has already emitted 'close' and every once() below
+  // would be waiting on an event that cannot fire again: the concurrency slot
+  // would be taken and never released, and that Map is shared with the Claude
+  // proxy, so after DEVICE_CONCURRENCY_LIMIT such cancellations the device is
+  // 429'd on /claude too, until the process restarts. handleClaudeProxy is
+  // immune only because its credential read is synchronous.
+  if (res.destroyed || req.destroyed) {
+    log('codex_proxy_client_gone_during_credential_read', {
+      account_id: account.id,
+      device_id: device.id,
+    });
+    recordRejected(null, 'client_disconnected');
+    return;
+  }
   if (credential.expiresAtMs <= now()) {
     // Forwarding an expired token buys a 451 from upstream and an opaque client
     // failure; saying so here is diagnosable, and the refresh centre — not this
@@ -322,6 +361,14 @@ export async function handleCodexProxy(req, res, {
   let clientAborted = false;
   let metricFinalized = false;
   let responseFinished = false;
+  // The upstream can answer before the client has finished uploading — a 400 on
+  // an oversized context does exactly that. Finalising then would read
+  // requestBytes and the model/stream metadata mid-body, undercounting the very
+  // numbers this proxy exists to collect.
+  let requestBodyFinished = false;
+  // Set by whichever failure got there first, so a response that finishes after
+  // the fact is not recorded as a clean turn.
+  let pendingOutcome = null;
 
   const finalizeMetric = (outcome, statusCode = upstreamStatus) => {
     if (metricFinalized) return;
@@ -364,7 +411,9 @@ export async function handleCodexProxy(req, res, {
   // Usage lands in the terminal SSE event, which can arrive after the last byte
   // has been written to the client. Waiting for both keeps the token counts.
   const finalizeCompletedWhenReady = () => {
-    if (responseFinished && observationFinished) finalizeMetric('completed');
+    if (responseFinished && observationFinished && requestBodyFinished) {
+      finalizeMetric(pendingOutcome ?? 'completed');
+    }
   };
 
   const upstreamReq = transport.request(
@@ -435,6 +484,7 @@ export async function handleCodexProxy(req, res, {
 
       const failResponse = (error) => {
         if (upstreamEnded || clientAborted || metricFinalized) return;
+        pendingOutcome = 'upstream_error_after_headers';
         log('codex_proxy_failed', {
           account_id: account.id,
           device_id: device.id,
@@ -457,6 +507,22 @@ export async function handleCodexProxy(req, res, {
   upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('upstream request timed out')));
   upstreamReq.on('error', (error) => {
     if (clientAborted || metricFinalized || upstreamEnded) return;
+    if (error.code === 'ERR_REQUEST_BODY_TOO_LARGE') {
+      // Destroying the upstream request is how the size guard above surfaces
+      // here; answer the client with the real reason, not a generic 502.
+      pendingOutcome = 'request_too_large';
+      if (!res.headersSent) {
+        res.once('finish', () => {
+          if (!req.destroyed) req.destroy();
+        });
+        sendJson(res, 413, errorBody('invalid_request_error', 'request body too large'), {
+          Connection: 'close',
+        });
+      } else if (!res.destroyed) {
+        res.destroy(error);
+      }
+      return;
+    }
     log('codex_proxy_upstream_error', {
       account_id: account.id,
       device_id: device.id,
@@ -486,6 +552,38 @@ export async function handleCodexProxy(req, res, {
   });
   res.once('finish', () => {
     responseFinished = true;
+    const outcome = pendingOutcome ?? (upstreamEnded ? 'completed' : 'gateway_response');
+    if (outcome === 'completed') {
+      finalizeCompletedWhenReady();
+      return;
+    }
+    // The gateway wrote this response itself, so the upstream status is null and
+    // res.statusCode is the only true one — a 413 recorded as null would vanish
+    // from any dashboard that buckets by status.
+    finalizeMetric(outcome, Number.isInteger(res.statusCode) ? res.statusCode : upstreamStatus);
+  });
+
+  // The declared-length check above only catches a client that announces an
+  // oversized body. A chunked upload declares nothing, so the counter is what
+  // actually stops it — and the 'error' it emits has no default handler. Without
+  // this listener that error is an uncaughtException, which takes down the whole
+  // console process, and with it every in-flight Claude turn. One enrolled Codex
+  // device could otherwise stop the gateway at will.
+  requestLimit.stream.once('error', (error) => {
+    if (error.code !== 'ERR_REQUEST_BODY_TOO_LARGE') return;
+    pendingOutcome = 'request_too_large';
+    req.unpipe(requestMetadata.stream);
+    requestMetadata.stream.destroy();
+    if (res.writableFinished) {
+      finalizeMetric(pendingOutcome, upstreamStatus);
+      if (!req.destroyed) req.destroy();
+    } else if (!upstreamReq.destroyed) {
+      upstreamReq.destroy(error);
+    }
+  });
+
+  requestLimit.stream.once('finish', () => {
+    requestBodyFinished = true;
     finalizeCompletedWhenReady();
   });
 

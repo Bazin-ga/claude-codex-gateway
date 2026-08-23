@@ -341,8 +341,11 @@ test('open mode self-serves a Codex installer keyed to the self-asserted member 
     const cookie = cookieFrom(dashboardResponse);
     const dashboard = await dashboardResponse.text();
     assert.match(dashboard, /Get Codex installer/);
-    // Both self-service forms carry the label; the admin enrollment form has its own.
-    assert.equal((dashboard.match(/name="member_label" required pattern=/g) ?? []).length, 2);
+    // Every self-service form carries the label; the admin enrollment form has
+    // its own. Three of them now: Claude, the Codex installer, and the Codex
+    // gateway token.
+    assert.match(dashboard, /Get Codex gateway token/);
+    assert.equal((dashboard.match(/name="member_label" required pattern=/g) ?? []).length, 3);
     const csrf = csrfFrom(dashboard);
 
     const missingLabel = await fetch(`${app.baseUrl}/codex/self-service`, {

@@ -14,11 +14,29 @@ import { TextDecoder } from 'node:util';
  * The interface is identical on purpose — push/finish/snapshot with the same
  * snapshot keys — so the proxy's observer plumbing takes either one unchanged.
  */
-export const CODEX_USAGE_MAX_BYTES = 1024 * 1024;
-export const CODEX_USAGE_MAX_EVENTS = 8192;
+/**
+ * Deliberately far larger than the Anthropic parser's 1 MiB / 8192, and the
+ * difference is not tuning — it is the protocols being mirror images. Anthropic
+ * reports usage in the *first* event (`message_start`), so a prefix cap costs
+ * nothing there. The Responses API reports it only in the *last* one, so any cap
+ * the stream can reach discards the whole turn's accounting.
+ *
+ * That failure would also be one-sided: the turns that overrun a cap are the
+ * longest and most expensive, so capping low undercounts exactly the traffic
+ * worth metering. Observed ceiling in a 143k-turn corpus was 21,756 output
+ * tokens — roughly one SSE event each, about 1.3 MB of framing.
+ *
+ * The byte ceiling matches MAX_OBSERVED_DECODED_BYTES in response-observation.js,
+ * which cuts the tee off first anyway; memory is bounded by the per-event cap
+ * below, not by these, because nothing here retains the stream.
+ */
+export const CODEX_USAGE_MAX_BYTES = 16 * 1024 * 1024;
+export const CODEX_USAGE_MAX_EVENTS = 1_000_000;
+/** One oversized event is skipped; it must not cost the turn its usage. */
+export const CODEX_USAGE_MAX_EVENT_BYTES = 1024 * 1024;
 
-const MAX_CONFIG_BYTES = 16 * 1024 * 1024;
-const MAX_CONFIG_EVENTS = 32 * 1024;
+const MAX_CONFIG_BYTES = 64 * 1024 * 1024;
+const MAX_CONFIG_EVENTS = 4_000_000;
 const AUTO_DETECT_CHARS = 256;
 
 /**
@@ -30,6 +48,7 @@ const TERMINAL_TYPES = new Set([
   'response.completed',
   'response.incomplete',
   'response.failed',
+  'response.cancelled',
 ]);
 
 function emptyUsage() {
@@ -124,11 +143,16 @@ export class CodexUsageParser {
     format = 'auto',
     maxBytes = CODEX_USAGE_MAX_BYTES,
     maxEvents = CODEX_USAGE_MAX_EVENTS,
+    maxEventBytes = CODEX_USAGE_MAX_EVENT_BYTES,
   } = {}) {
     this.format = format === 'sse' || format === 'json' ? format : 'auto';
     this.mode = this.format === 'auto' ? null : this.format;
     this.maxBytes = boundedLimit(maxBytes, CODEX_USAGE_MAX_BYTES, MAX_CONFIG_BYTES);
     this.maxEvents = boundedLimit(maxEvents, CODEX_USAGE_MAX_EVENTS, MAX_CONFIG_EVENTS);
+    this.maxEventBytes = Math.min(
+      boundedLimit(maxEventBytes, CODEX_USAGE_MAX_EVENT_BYTES, MAX_CONFIG_BYTES),
+      this.maxBytes,
+    );
 
     this.decoder = new TextDecoder('utf-8', { fatal: true });
     this.usage = emptyUsage();
@@ -140,6 +164,11 @@ export class CodexUsageParser {
     this.jsonText = '';
     this.sseLine = '';
     this.dataParts = [];
+    this.eventBytes = 0;
+    this.eventOversized = false;
+    // Set when the vendor's own arithmetic stops closing, which is the signal
+    // that `input_tokens` no longer means what the normalisation assumes.
+    this.inconsistentTotals = false;
     this.invalid = false;
     this.truncated = false;
     this.limitExceeded = false;
@@ -195,8 +224,14 @@ export class CodexUsageParser {
       if (!this.invalid && !this.truncated && !this.limitExceeded) {
         if (!this.mode) this.mode = this.format === 'auto' ? this.probeMode(this.autoProbe) : this.format;
         if (this.mode === 'json') this.finishJson();
-        // An SSE stream that stops mid-event is simply missing its terminal
-        // event; the usage already collected still stands.
+        else {
+          // An upstream that closes after the terminal event's `data:` line but
+          // before its blank line would otherwise have that event discarded —
+          // and on this protocol that event is the only one carrying usage.
+          // Flushing is safe: an incomplete payload just fails JSON.parse.
+          if (this.sseLine) { this.feedSse('\n'); }
+          this.dispatchSseEvent();
+        }
       }
     }
 
@@ -268,14 +303,32 @@ export class CodexUsageParser {
       if (field !== 'data') continue;
       let value = colon === -1 ? '' : line.slice(colon + 1);
       if (value.startsWith(' ')) value = value.slice(1);
+      // Bound one event rather than the stream. Nothing else here retains
+      // bytes, so this is the only place a hostile payload could grow memory —
+      // and dropping the offending event must not cost the turn its usage,
+      // which arrives in a later one.
+      this.eventBytes += value.length + 1;
+      if (this.eventBytes > this.maxEventBytes) {
+        this.eventOversized = true;
+        this.dataParts = [];
+        continue;
+      }
       this.dataParts.push(value);
     }
   }
 
   dispatchSseEvent() {
+    if (this.eventOversized) {
+      this.eventOversized = false;
+      this.eventBytes = 0;
+      this.dataParts = [];
+      this.eventsSeen += 1;
+      return;
+    }
     if (this.dataParts.length === 0) return;
     const payload = this.dataParts.join('\n');
     this.dataParts = [];
+    this.eventBytes = 0;
     this.eventsSeen += 1;
     if (this.eventsSeen > this.maxEvents) {
       this.limitExceeded = true;
@@ -310,8 +363,22 @@ export class CodexUsageParser {
   applyUsage(rawUsage) {
     const normalized = normalizeCodexUsage(rawUsage);
     if (!normalized) return;
-    this.usage = normalized;
+    // Merge per key. An event carrying only `output_tokens` must not erase an
+    // input count already seen: replacing wholesale would turn a known-good row
+    // into a wrong-shaped one, which is worse than a missing figure.
+    for (const key of Object.keys(this.usage)) {
+      if (normalized[key] !== null) this.usage[key] = normalized[key];
+    }
     this.sawUsage = true;
+    // The whole normalisation rests on `input_tokens` being the entire prompt.
+    // If the vendor ever changes that, this stops closing — and it is far better
+    // to see the row marked partial than to silently undercount every turn.
+    const total = tokenCount(rawUsage.total_tokens);
+    const input = tokenCount(rawUsage.input_tokens);
+    const output = tokenCount(rawUsage.output_tokens);
+    if (total !== null && input !== null && output !== null && total !== input + output) {
+      this.inconsistentTotals = true;
+    }
   }
 
   finishJson() {
@@ -341,6 +408,8 @@ export class CodexUsageParser {
 
   deriveUsageState(parseState) {
     if (!this.sawUsage) return 'unavailable';
+    // Never claim 'complete' for numbers whose own totals disagree.
+    if (this.inconsistentTotals) return 'partial';
     const complete = parseState === 'complete'
       && this.usage.inputTokens !== null
       && this.usage.outputTokens !== null;

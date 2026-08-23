@@ -166,6 +166,70 @@ test('malformed counts cannot produce a value the metrics schema rejects', () =>
   assert.equal(normalizeCodexUsage({ id: 'no usage here' }), null);
 });
 
+test('a long turn still reports its usage, because usage arrives last', () => {
+  // The expensive turns are the long ones. With the Anthropic parser's 1 MiB /
+  // 8192-event budget this stream exceeded both and reported nothing at all —
+  // a one-sided undercount of exactly the traffic worth metering. 25k deltas is
+  // about what a 21,756-output-token turn produces, the largest seen in a
+  // 143k-turn corpus.
+  const parser = new CodexUsageParser({ format: 'sse' });
+  const delta = `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'x'.repeat(40) })}\n\n`;
+  for (let i = 0; i < 25_000; i += 1) parser.push(delta);
+  parser.push(sse(COMPLETED));
+  const usage = parser.finish();
+
+  assert.ok(usage.bytesSeen > 1024 * 1024, `stream exceeded the old cap (${usage.bytesSeen} bytes)`);
+  assert.ok(usage.eventsSeen > 8192, `stream exceeded the old event cap (${usage.eventsSeen} events)`);
+  assert.equal(usage.parseState, 'complete', 'the terminal event was still reached');
+  assert.equal(usage.inputTokens, 100);
+  assert.equal(usage.outputTokens, 42);
+  assert.equal(usage.usageState, 'complete');
+});
+
+test('a terminal event missing its blank line is still counted', () => {
+  // Upstream closing right after the last `data:` line would otherwise discard
+  // the only event that carries usage.
+  const usage = parseCodexUsage(`data: ${JSON.stringify(COMPLETED)}\n`);
+  assert.equal(usage.inputTokens, 100);
+  assert.equal(usage.outputTokens, 42);
+});
+
+test('a later partial figure does not erase an earlier known one', () => {
+  const usage = parseCodexUsage(sse(
+    COMPLETED,
+    { type: 'response.completed', response: { usage: { output_tokens: 7 } } },
+  ));
+  assert.equal(usage.outputTokens, 7, 'the newer figure wins where present');
+  assert.equal(usage.inputTokens, 100, 'the older input count survives');
+  assert.equal(usage.cacheReadInputTokens, 900);
+});
+
+test("usage whose own totals do not add up is never reported as complete", () => {
+  // The normalisation assumes input_tokens is the whole prompt. If the vendor
+  // changed that, total_tokens would stop closing — better a partial row than a
+  // silent undercount of every turn.
+  const usage = parseCodexUsage(sse({
+    type: 'response.completed',
+    response: { usage: { input_tokens: 100, output_tokens: 10, total_tokens: 999 } },
+  }));
+  assert.equal(usage.usageState, 'partial');
+
+  const consistent = parseCodexUsage(sse({
+    type: 'response.completed',
+    response: { usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 } },
+  }));
+  assert.equal(consistent.usageState, 'complete');
+});
+
+test('one oversized event is skipped without costing the turn its usage', () => {
+  const parser = new CodexUsageParser({ format: 'sse', maxEventBytes: 4096 });
+  parser.push(`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'y'.repeat(20_000) })}\n\n`);
+  parser.push(sse(COMPLETED));
+  const usage = parser.finish();
+  assert.equal(usage.parseState, 'complete', 'the stream survived the oversized event');
+  assert.equal(usage.outputTokens, 42);
+});
+
 test('the event budget bounds what a hostile stream can cost', () => {
   const parser = new CodexUsageParser({ format: 'sse', maxEvents: 3 });
   parser.push(sse(
