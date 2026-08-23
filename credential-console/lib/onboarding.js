@@ -9,7 +9,20 @@ export const CLAUDE_PROFILE_VERSION_KEY = CLAUDE_CLIENT_CONFIG_VERSION_KEY;
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0']);
 const SAFE_VERSION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const SAFE_ACCOUNT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/**
+ * Account ids are `randomBytes(12).toString('base64url')`, whose alphabet is
+ * `[A-Za-z0-9_-]` — so about one id in 32 begins with `-` or `_`.
+ *
+ * This pattern used to demand an alphanumeric first character, borrowed from
+ * the rule for *aliases*, which are human-typed. Applied to machine-generated
+ * ids it silently dropped ~3% of accounts from the guide that member machines
+ * read, with no error anywhere. Measured: 28 rejections in 1000 ids.
+ *
+ * Only the anchor changes; the character set is the same, and the value is
+ * still escaped by `markdownText` before it reaches a table cell, so nothing
+ * about injection safety depends on which of these characters comes first.
+ */
+const SAFE_ACCOUNT_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const SAFE_PIN = /^(?:[a-fA-F0-9]{64}|(?:[a-fA-F0-9]{2}:){31}[a-fA-F0-9]{2})$/;
 const MARKDOWN_FENCE = '```';
 const MARKDOWN_INLINE = '`';

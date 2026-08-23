@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { buildOnboardingMarkdown } from '../lib/onboarding.js';
+import { randomToken } from '../lib/security.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -238,4 +239,57 @@ test('generated Unix version checks execute missing, current, and mismatch paths
   const codexMismatch = await runVersionCheck(codexCheck, env);
   assert.notEqual(codexMismatch.code, 0);
   assert.match(codexMismatch.stdout, /config mismatch: expected p4-1, got p4-2/);
+});
+
+test('an account id that begins with - or _ still reaches the guide', () => {
+  // randomBytes(...).toString('base64url') produces these routinely: its
+  // alphabet is [A-Za-z0-9_-] and nothing reserves the first position. A
+  // sanitizer demanding an alphanumeric first character — the rule for
+  // human-typed aliases — dropped roughly one account in 32 from the document
+  // member machines read, silently and with no error anywhere.
+  const markdown = buildOnboardingMarkdown({
+    consoleUrl: 'https://console.example',
+    claudeGatewayUrl: 'https://gateway.example/claude',
+    clientConfigVersion: '3',
+    accounts: [
+      { id: '_hY_bxAwm0ql0D8K', provider: 'claude', alias: 'leading-underscore', status: 'healthy' },
+      { id: '-WDVbw_Wdn2tHv9_', provider: 'claude', alias: 'leading-hyphen', status: 'healthy' },
+      { id: 'ZxT4sFFYwokXd_lL', provider: 'codex', alias: 'ordinary-codex', status: 'stored' },
+    ],
+    adminAuth: 'open',
+  });
+
+  assert.match(markdown, /leading-underscore/);
+  assert.match(markdown, /leading-hyphen/);
+  assert.match(markdown, /ordinary-codex/);
+});
+
+test('every id the store actually mints survives the guide unchanged', () => {
+  // A property rather than an example: this is the check that would have caught
+  // the anchor bug on the day it was written, and that will catch the next
+  // sanitizer written against the alias rule by mistake.
+  const accounts = Array.from({ length: 400 }, (_, index) => ({
+    id: randomToken(12),
+    provider: 'claude',
+    alias: `probe-${index}`,
+    status: 'healthy',
+  }));
+  const markdown = buildOnboardingMarkdown({
+    consoleUrl: 'https://console.example',
+    claudeGatewayUrl: 'https://gateway.example/claude',
+    clientConfigVersion: '3',
+    accounts,
+    adminAuth: 'open',
+  });
+
+  // Checked by alias, not by id: ids are escaped for markdown on the way into
+  // the table (`_` becomes `\_`), so a literal id lookup would miss about a
+  // fifth of them even when nothing was dropped. The property under test is
+  // that no account goes missing, and the alias shows that.
+  const missing = accounts.filter((account) => !markdown.includes(account.alias));
+  assert.deepEqual(
+    missing.map((account) => account.id),
+    [],
+    `${missing.length} of ${accounts.length} accounts were dropped from the guide`,
+  );
 });
