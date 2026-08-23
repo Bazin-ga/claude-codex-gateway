@@ -268,6 +268,62 @@ configuration and does not render a Codex account picker. The generated client p
 for that one configured domain. Multi-domain control-plane routing remains separate work even though
 the client-side profile store can safely hold several independently installed domains.
 
+## Routing Codex turns through the gateway
+
+The client agent above pulls a credential and then talks to `chatgpt.com` itself, so those turns
+are invisible here: no per-device accounting, no rate limiting, and no sign that a subscription
+has been rejected until every machine fails at once. `/codex-api` is the alternative — the Codex
+counterpart of the `/claude` mount, offered as a second form on the Codex card.
+
+The result page prints configuration rather than an installer, because pointing the CLI at the
+gateway is two settings in a file the user already has:
+
+```toml
+# ~/.codex/config.toml   (model_provider must precede every [table])
+model_provider = "gateway"
+
+[model_providers.gateway]
+name = "gateway"
+base_url = "https://<public-console>/codex-api"
+wire_api = "responses"
+env_key = "CODEX_GATEWAY_TOKEN"
+```
+
+with `CODEX_GATEWAY_TOKEN` set to the device token. Two details are easy to get wrong:
+
+- **`env_key`, not `requires_openai_auth`.** The latter makes the CLI authenticate with the
+  ChatGPT token in its own `auth.json`, which this gateway rejects by design — the device presents
+  a device token and never holds the subscription credential. codex-cli 0.138.0 refuses to start
+  with `Missing environment variable` when the named variable is unset, which is how the auth
+  source was confirmed.
+- **`model_provider`, not `chatgpt_base_url`.** The CLI sends plugin, analytics and apps traffic to
+  the latter; none of that belongs on a shared subscription credential. Overriding only the
+  provider routes just the turns. `/codex-api` proxies `/responses` and nothing else, so a device
+  with no ChatGPT sign-in of its own loses `codex cloud`, plugin listings and the `codex /status`
+  quota figures — none of which a turn needs.
+
+The proxy reads the *published* credential — the same refresh-token-free file every enrolled
+machine already pulls, and the one `usage.js` reads for quota. It holds exactly what a client
+machine holds; `refresh_token` is not filtered on the way through, it is never read.
+
+Two things learned only by running it against the real endpoint, both of which had silently
+zeroed the metering:
+
+- **It sends no `content-type`.** Attaching the usage parser only when that header names a known
+  format — safe for Anthropic, which always sends one — wrote every row with null tokens. The
+  parser now sniffs the opening bytes instead.
+- **Usage arrives in the *last* event**, the mirror image of Anthropic's `message_start`. The byte
+  and event caps inherited from that parser were therefore exactly inverted, and dropped the
+  accounting for the longest and most expensive turns.
+
+Token counts are translated on the way in. OpenAI reports `input_tokens` as the whole prompt with
+`input_tokens_details` (`cached_tokens`, `cache_write_tokens`) as a breakdown of it, while these
+columns follow Anthropic's meaning, where the cache figures sit outside `input_tokens`. Both are
+subtracted, so `input + cache_read + cache_creation` remains the whole prompt counted exactly once;
+`total_tokens` is checked as an invariant, so the day that stops holding shows up as a partial row
+rather than a permanent silent undercount. A device's rate-limit budget is shared with the Claude
+proxy rather than duplicated.
+
 ## AI onboarding and the private live guide
 
 The repository's [`AI-ONBOARDING.md`](../AI-ONBOARDING.md) is the public, generic edition. It is
