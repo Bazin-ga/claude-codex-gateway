@@ -285,6 +285,29 @@ test('Codex token accounting is normalised to the columns this console sums', as
   assert.equal(row.usageState, 'complete');
 });
 
+test('tokens are still counted when the upstream sends no content-type', async (t) => {
+  const home = await credentialHome(t);
+  const metrics = sink();
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => {
+      // Exactly what chatgpt.com does on a streamed turn: SSE with no
+      // content-type. Gating the usage parser on that header wrote every Codex
+      // row with null tokens.
+      res.writeHead(200);
+      res.end(TURN_SSE);
+    },
+    requestMetrics: metrics,
+  });
+
+  await post(proxyUrl, JSON.stringify({ model: 'gpt-5.4', stream: true }));
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.inputTokens, 100, 'the turn was metered despite the missing header');
+  assert.equal(row.cacheReadInputTokens, 900);
+  assert.equal(row.outputTokens, 42);
+  assert.equal(row.usageState, 'complete');
+});
+
 test('a recorded Codex turn satisfies the real metrics schema', async (t) => {
   const home = await credentialHome(t);
   const metricsHome = await mkdtemp(join(tmpdir(), 'codex-metrics-'));

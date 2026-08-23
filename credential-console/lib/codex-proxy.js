@@ -431,8 +431,14 @@ export async function handleCodexProxy(req, res, {
         'X-Content-Type-Options': 'nosniff',
       });
 
+      // chatgpt.com returns a streamed turn with *no* content-type header at
+      // all — verified against the live endpoint. Gating the parser on that
+      // header, as the Claude proxy safely can, meant every Codex row was
+      // written with null tokens and usage_state 'unavailable'. Fall back to
+      // the parser's own sniffing, which reads the first bytes and yields
+      // 'unavailable' harmlessly for anything it cannot make sense of.
       const responseFormat = status >= 200 && status < 400
-        ? responseUsageFormat(upstreamRes.headers['content-type'])
+        ? (responseUsageFormat(upstreamRes.headers['content-type']) ?? 'auto')
         : null;
       let observer = null;
       if (responseFormat && requestMetrics?.enqueueRequest) {
