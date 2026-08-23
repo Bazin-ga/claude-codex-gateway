@@ -42,9 +42,47 @@ test('both spellings of the cached-token field are understood', () => {
   );
 });
 
-test('cache creation is left null rather than invented', () => {
-  assert.equal(parseCodexUsage(sse(COMPLETED)).cacheCreationInputTokens, null);
+test('cache writes are recorded, and absent ones stay null rather than zero', () => {
+  // Observed live on chatgpt.com/backend-api/codex/responses: the breakdown is
+  // nested and carries cache_write_tokens alongside cached_tokens.
+  const usage = normalizeCodexUsage({
+    input_tokens: 1000,
+    input_tokens_details: { cached_tokens: 700, cache_write_tokens: 200 },
+    output_tokens: 9,
+  });
+  assert.equal(usage.cacheCreationInputTokens, 200);
+  assert.equal(usage.cacheReadInputTokens, 700);
+  assert.equal(usage.inputTokens, 100);
+  assert.equal(
+    usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens,
+    1000,
+    'the three columns partition the prompt, counting it exactly once',
+  );
+
+  // A response that reports no breakdown at all must not claim zero writes.
   assert.equal(normalizeCodexUsage({ input_tokens: 1, output_tokens: 1 }).cacheCreationInputTokens, null);
+});
+
+test('the exact usage shape returned by the live endpoint is understood', () => {
+  // Copied verbatim from a real turn, so a change in the upstream shape shows up
+  // here rather than as silently missing columns on the metrics page.
+  const usage = parseCodexUsage(sse({
+    type: 'response.completed',
+    response: {
+      usage: {
+        input_tokens: 13521,
+        input_tokens_details: { cache_write_tokens: 0, cached_tokens: 0 },
+        output_tokens: 5,
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 13526,
+      },
+    },
+  }));
+  assert.equal(usage.inputTokens, 13521);
+  assert.equal(usage.cacheReadInputTokens, 0);
+  assert.equal(usage.cacheCreationInputTokens, 0);
+  assert.equal(usage.outputTokens, 5, 'reasoning tokens are already inside output_tokens');
+  assert.equal(usage.usageState, 'complete');
 });
 
 test('a turn that ran out of room still reports what it burned', () => {

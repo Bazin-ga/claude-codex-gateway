@@ -65,16 +65,18 @@ function tokenCount(value) {
 }
 
 /**
- * Read the cached-prompt count, which the two Codex endpoints spell differently:
- * the public Responses API nests it under `input_tokens_details.cached_tokens`,
- * while the chatgpt.com backend has been observed emitting a flat
- * `cached_input_tokens`. Accept either rather than betting on one.
+ * Read one field of the input-token breakdown.
+ *
+ * Observed live against chatgpt.com/backend-api/codex/responses, which nests the
+ * breakdown: `input_tokens_details: { cached_tokens, cache_write_tokens }`. The
+ * flat spellings are accepted as well because the public Responses API and this
+ * backend have not always agreed, and guessing wrong silently loses a column.
  */
-function cachedInputTokens(usage) {
-  const flat = tokenCount(usage.cached_input_tokens);
-  if (flat !== null) return flat;
+function inputDetail(usage, nested, flat) {
+  const direct = tokenCount(usage[flat]);
+  if (direct !== null) return direct;
   const details = usage.input_tokens_details;
-  return isRecord(details) ? tokenCount(details.cached_tokens) : null;
+  return isRecord(details) ? tokenCount(details[nested]) : null;
 }
 
 /**
@@ -82,29 +84,37 @@ function cachedInputTokens(usage) {
  * of this console stores and sums.
  *
  * The two vendors disagree about what "input" means, and the difference is not
- * cosmetic: OpenAI's `input_tokens` is the whole prompt *including* the cached
- * prefix, whereas Anthropic's `input_tokens` counts only the uncached remainder
- * and reports cache reads separately. Storing OpenAI's number as-is alongside
- * `cache_read_input_tokens` would count the cached prefix twice in every total
- * on the metrics page. Subtracting keeps one meaning per column.
+ * cosmetic. OpenAI's `input_tokens` is the whole prompt and
+ * `input_tokens_details` is a breakdown *of* it; Anthropic's `input_tokens`
+ * counts only the part that was neither read from nor written to cache, and
+ * reports those two separately. Storing OpenAI's number as-is alongside the
+ * cache columns would count the cached prefix twice in every total on the
+ * metrics page. Subtracting keeps one meaning per column and preserves the
+ * invariant those totals rely on: input + cache_read + cache_creation is the
+ * whole prompt, counted once.
  *
- * Cache *creation* has no Responses-API equivalent — caching there is implicit
- * and unpriced — so that column stays null rather than being invented.
+ * `output_tokens` needs no adjustment: reasoning tokens are a subset of it, and
+ * Anthropic's output column likewise counts everything generated. A live turn
+ * confirmed the arithmetic — input_tokens 13521 + output_tokens 5 =
+ * total_tokens 13526, with the details nested inside input_tokens.
  */
 export function normalizeCodexUsage(usage) {
   if (!isRecord(usage)) return null;
   const rawInput = tokenCount(usage.input_tokens);
-  const cached = cachedInputTokens(usage);
+  const cacheRead = inputDetail(usage, 'cached_tokens', 'cached_input_tokens');
+  const cacheWrite = inputDetail(usage, 'cache_write_tokens', 'cache_creation_input_tokens');
   const output = tokenCount(usage.output_tokens);
-  if (rawInput === null && cached === null && output === null) return null;
+  if (rawInput === null && cacheRead === null && cacheWrite === null && output === null) {
+    return null;
+  }
   return {
     inputTokens: rawInput === null
       ? null
-      // Clamped: a malformed payload claiming more cached than total input must
-      // not produce a negative count that fails the column's CHECK constraint.
-      : Math.max(0, rawInput - (cached ?? 0)),
-    cacheCreationInputTokens: null,
-    cacheReadInputTokens: cached,
+      // Clamped: a malformed payload whose parts exceed the whole must not
+      // produce a negative count, which the column's CHECK would reject.
+      : Math.max(0, rawInput - (cacheRead ?? 0) - (cacheWrite ?? 0)),
+    cacheCreationInputTokens: cacheWrite,
+    cacheReadInputTokens: cacheRead,
     outputTokens: output,
   };
 }
