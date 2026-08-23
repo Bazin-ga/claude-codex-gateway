@@ -1009,7 +1009,10 @@ test('partial, malformed, unknown, non-Claude, and not-allowed policies are expl
   row.allowed_account_ids = [claude.id, 'p3-unknown-account'];
   assert.throws(() => store.resolveDeviceAccount(row), /was not found/);
   row.allowed_account_ids = [claude.id, codex.id];
-  assert.throws(() => store.resolveDeviceAccount(row), /not a Claude account/);
+  // A Codex account in an allowlist is legitimate on its own — the Codex
+  // gateway needs exactly that — but mixing providers on one device is not:
+  // the client is configured for one of them and cannot use the other.
+  assert.throws(() => store.resolveDeviceAccount(row), /mixes providers/);
   row.allowed_account_ids = [claude.id];
   row.selected_account_id = codex.id;
   assert.throws(() => store.resolveDeviceAccount(row), /not allowed/);

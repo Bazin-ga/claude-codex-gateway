@@ -21,6 +21,7 @@ import {
 import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
+import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
 import { CLIENT_CONFIG_VERSION } from './lib/client-config-version.js';
@@ -44,6 +45,7 @@ import { assertCodexSeedHomeWritable, seedCodexCredentialHome } from './lib/code
 import {
   claudeAuthorizationView,
   dashboardView,
+  codexDeviceConfiguredView,
   deviceConfiguredView,
   enrollmentCreatedView,
   enrollmentView,
@@ -556,6 +558,11 @@ export async function createCredentialConsole(options = {}) {
   const claudeGatewayUrl = options.claudeGatewayUrl
     ?? CLAUDE_GATEWAY_URL
     ?? `${publicBaseUrl.replace(/\/$/, '')}/claude`;
+  // Derived from the same base rather than configured separately: the Codex
+  // gateway is a route on this very server, so a second setting could only ever
+  // be wrong.
+  const codexGatewayUrl = options.codexGatewayUrl
+    ?? `${publicBaseUrl.replace(/\/$/, '')}${CODEX_PROXY_PREFIX}`;
   const cookieSecure = options.cookieSecure ?? COOKIE_SECURE;
   const adminAuth = options.adminAuth ?? ADMIN_AUTH;
   // Overridable only so a test can drive the eviction path without minting the real
@@ -599,6 +606,12 @@ export async function createCredentialConsole(options = {}) {
   }
   // Open mode has no login, so every rendered page has to say so.
   const openMode = adminAuth === 'open';
+  // Both providers issue the same kind of device token but need different client
+  // instructions; handing a Codex enrollee the Claude launcher would be
+  // confidently wrong.
+  const configuredDeviceView = (result) => (result.account?.provider === 'codex'
+    ? codexDeviceConfiguredView({ ...result, codexGatewayUrl, openMode })
+    : deviceConfiguredView({ ...result, claudeGatewayUrl, openMode }));
   const deleteMetricsPageCache = (key) => {
     const entry = metricsPageCache.get(key);
     if (!entry) return false;
@@ -1318,6 +1331,15 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    if (path.startsWith(`${CODEX_PROXY_PREFIX}/`)) {
+      await handleCodexProxy(req, res, {
+        store,
+        upstreamBaseUrl: options.codexUpstreamBaseUrl,
+        requestMetrics,
+      });
+      return;
+    }
+
     if (path === '/onboarding.md') {
       if (req.method !== 'GET') {
         sendText(
@@ -1775,11 +1797,7 @@ export async function createCredentialConsole(options = {}) {
           memberLabel: memberLabelFor(session, form),
           deviceName: String(form.device_name ?? '').trim(),
         });
-        sendHtml(res, 200, deviceConfiguredView({
-          ...result,
-          claudeGatewayUrl,
-          openMode,
-        }));
+        sendHtml(res, 200, configuredDeviceView(result));
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }
@@ -2334,11 +2352,7 @@ export async function createCredentialConsole(options = {}) {
           code: redeemParams.code,
           deviceName: String(form.device_name ?? '').trim(),
         });
-        sendHtml(res, 200, deviceConfiguredView({
-          ...result,
-          claudeGatewayUrl,
-          openMode,
-        }));
+        sendHtml(res, 200, configuredDeviceView(result));
       } catch (error) {
         const enrollment = store.enrollmentByCode(redeemParams.code);
         const account = enrollment ? store.accountById(enrollment.account_id) : null;

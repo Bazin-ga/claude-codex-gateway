@@ -1,0 +1,185 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { CodexUsageParser, normalizeCodexUsage, parseCodexUsage } from '../lib/codex-usage.js';
+
+function sse(...events) {
+  return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('');
+}
+
+const COMPLETED = {
+  type: 'response.completed',
+  response: { id: 'r1', usage: { input_tokens: 1000, cached_input_tokens: 900, output_tokens: 42 } },
+};
+
+test('the cached prefix is counted once, not twice', () => {
+  const usage = parseCodexUsage(sse(COMPLETED));
+  assert.equal(usage.inputTokens, 100);
+  assert.equal(usage.cacheReadInputTokens, 900);
+  assert.equal(usage.outputTokens, 42);
+  assert.equal(
+    usage.inputTokens + usage.cacheReadInputTokens,
+    1000,
+    'the two columns still add up to the prompt the vendor billed',
+  );
+  assert.equal(usage.usageState, 'complete');
+});
+
+test('both spellings of the cached-token field are understood', () => {
+  const nested = parseCodexUsage(sse({
+    type: 'response.completed',
+    response: { usage: { input_tokens: 80, input_tokens_details: { cached_tokens: 30 }, output_tokens: 5 } },
+  }));
+  assert.equal(nested.inputTokens, 50);
+  assert.equal(nested.cacheReadInputTokens, 30);
+
+  const flat = parseCodexUsage(sse({
+    type: 'response.completed',
+    response: { usage: { input_tokens: 80, cached_input_tokens: 30, output_tokens: 5 } },
+  }));
+  assert.deepEqual(
+    [flat.inputTokens, flat.cacheReadInputTokens],
+    [nested.inputTokens, nested.cacheReadInputTokens],
+  );
+});
+
+test('cache creation is left null rather than invented', () => {
+  assert.equal(parseCodexUsage(sse(COMPLETED)).cacheCreationInputTokens, null);
+  assert.equal(normalizeCodexUsage({ input_tokens: 1, output_tokens: 1 }).cacheCreationInputTokens, null);
+});
+
+test('a turn that ran out of room still reports what it burned', () => {
+  for (const type of ['response.incomplete', 'response.failed']) {
+    const usage = parseCodexUsage(sse({
+      type,
+      response: { usage: { input_tokens: 10, output_tokens: 4 } },
+    }));
+    assert.equal(usage.usageState, 'complete', type);
+    assert.equal(usage.outputTokens, 4, type);
+  }
+});
+
+test('usage seen before any terminal event is partial, not complete', () => {
+  const usage = parseCodexUsage(sse({
+    type: 'response.in_progress',
+    response: { usage: { input_tokens: 5, output_tokens: 1 } },
+  }));
+  assert.equal(usage.parseState, 'partial');
+  assert.equal(usage.usageState, 'partial');
+  assert.equal(usage.inputTokens, 5, 'the numbers are still kept');
+});
+
+test('a stream that dies mid-turn keeps the usage it already saw', () => {
+  const parser = new CodexUsageParser({ format: 'sse' });
+  parser.push(sse({ type: 'response.in_progress', response: { usage: { input_tokens: 7, output_tokens: 2 } } }));
+  const usage = parser.finish({ truncated: true });
+  assert.equal(usage.parseState, 'truncated');
+  assert.equal(usage.inputTokens, 7);
+  assert.equal(usage.usageState, 'partial');
+});
+
+test('a later terminal event supersedes an earlier partial figure', () => {
+  const usage = parseCodexUsage(sse(
+    { type: 'response.in_progress', response: { usage: { input_tokens: 10, output_tokens: 1 } } },
+    COMPLETED,
+  ));
+  assert.equal(usage.inputTokens, 100);
+  assert.equal(usage.outputTokens, 42);
+});
+
+test('one unparseable event does not discard the rest of the turn', () => {
+  const stream = 'data: {not json\n\n' + sse(COMPLETED);
+  const usage = parseCodexUsage(stream);
+  assert.equal(usage.outputTokens, 42, 'the terminal event was still read');
+  assert.equal(usage.usageState, 'complete');
+});
+
+test('a response with no usage at all reports unavailable rather than zero', () => {
+  const usage = parseCodexUsage(sse({ type: 'response.completed', response: { id: 'r1' } }));
+  assert.equal(usage.usageState, 'unavailable');
+  assert.equal(usage.inputTokens, null);
+  assert.equal(usage.outputTokens, null, 'a missing count is not a zero count');
+});
+
+test('a non-streaming JSON body is accounted for too', () => {
+  const usage = parseCodexUsage(JSON.stringify({
+    id: 'resp_1',
+    usage: { input_tokens: 60, cached_input_tokens: 20, output_tokens: 9 },
+  }));
+  assert.equal(usage.inputTokens, 40);
+  assert.equal(usage.cacheReadInputTokens, 20);
+  assert.equal(usage.outputTokens, 9);
+  assert.equal(usage.usageState, 'complete');
+});
+
+test('malformed counts cannot produce a value the metrics schema rejects', () => {
+  // The token columns carry `CHECK (... >= 0)`; a negative would abort the write.
+  const impossible = parseCodexUsage(sse({
+    type: 'response.completed',
+    response: { usage: { input_tokens: 5, cached_input_tokens: 9, output_tokens: 1 } },
+  }));
+  assert.equal(impossible.inputTokens, 0, 'clamped, not negative');
+
+  for (const bad of [{ input_tokens: -3 }, { input_tokens: 1.5 }, { input_tokens: '10' }]) {
+    const usage = normalizeCodexUsage({ ...bad, output_tokens: 2 });
+    assert.equal(usage.inputTokens, null, JSON.stringify(bad));
+    assert.equal(usage.outputTokens, 2);
+  }
+  assert.equal(normalizeCodexUsage(null), null);
+  assert.equal(normalizeCodexUsage({ id: 'no usage here' }), null);
+});
+
+test('the event budget bounds what a hostile stream can cost', () => {
+  const parser = new CodexUsageParser({ format: 'sse', maxEvents: 3 });
+  parser.push(sse(
+    { type: 'response.output_text.delta', delta: 'a' },
+    { type: 'response.output_text.delta', delta: 'b' },
+    { type: 'response.output_text.delta', delta: 'c' },
+    { type: 'response.output_text.delta', delta: 'd' },
+  ));
+  assert.equal(parser.finish().parseState, 'limit');
+
+  const byBytes = new CodexUsageParser({ format: 'sse', maxBytes: 32 });
+  byBytes.push(sse(COMPLETED));
+  assert.equal(byBytes.finish().parseState, 'truncated');
+});
+
+test('events split across chunk boundaries are reassembled', () => {
+  const stream = sse(COMPLETED);
+  const parser = new CodexUsageParser({ format: 'sse' });
+  for (const byte of Buffer.from(stream, 'utf8')) parser.push(Buffer.from([byte]));
+  const usage = parser.finish();
+  assert.equal(usage.inputTokens, 100, 'byte-at-a-time delivery parses identically');
+  assert.equal(usage.outputTokens, 42);
+  assert.equal(usage.usageState, 'complete');
+});
+
+test('multi-byte characters split across chunks do not corrupt the parse', () => {
+  const bytes = Buffer.from(sse({
+    type: 'response.completed',
+    response: { id: '中文标识', usage: { input_tokens: 12, output_tokens: 3 } },
+  }), 'utf8');
+  const parser = new CodexUsageParser({ format: 'sse' });
+  for (let i = 0; i < bytes.length; i += 3) parser.push(bytes.subarray(i, i + 3));
+  const usage = parser.finish();
+  assert.equal(usage.inputTokens, 12);
+  assert.equal(usage.outputTokens, 3);
+});
+
+test('the format is detected without being told', () => {
+  assert.equal(parseCodexUsage(sse(COMPLETED)).outputTokens, 42);
+  assert.equal(parseCodexUsage('{"usage":{"input_tokens":3,"output_tokens":1}}').outputTokens, 1);
+  assert.equal(parseCodexUsage('   \n{"usage":{"output_tokens":1}}').outputTokens, 1, 'leading whitespace');
+});
+
+test('a [DONE] sentinel is not mistaken for an event payload', () => {
+  const usage = parseCodexUsage(sse(COMPLETED) + 'data: [DONE]\n\n');
+  assert.equal(usage.outputTokens, 42);
+  assert.equal(usage.usageState, 'complete');
+});
+
+test('comments and CRLF framing are handled', () => {
+  const stream = ': keep-alive\r\n\r\n'
+    + `data: ${JSON.stringify(COMPLETED)}\r\n\r\n`;
+  const usage = parseCodexUsage(stream);
+  assert.equal(usage.outputTokens, 42);
+});

@@ -3300,12 +3300,14 @@ export function dashboardView({
   const activeDevices = devices.filter((device) => !device.revoked_at);
   const healthy = alerts.accounts.filter((account) => account.severity === 'ok').length;
   const selfServiceAccounts = accounts.filter((account) => (
-    account.provider === 'claude'
+    ['claude', 'codex'].includes(account.provider)
     && ['stored', 'healthy'].includes(account.status)
     && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
   ));
   const selfServiceOptions = selfServiceAccounts.map((account) => (
-    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
+    // The provider is named in the label because the two produce different
+    // client setups, and the alias alone does not always say which is which.
+    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)} · ${escapeHtml(account.provider === 'codex' ? 'Codex' : 'Claude Code')}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
   )).join('');
   const claudeHookProfiles = accounts
     .filter((account) => account.provider === 'claude')
@@ -4041,6 +4043,64 @@ Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
     </section>
   `, { openMode, completedDraft: 'claude-self-service' });
+}
+
+/**
+ * The Codex counterpart of `deviceConfiguredView`.
+ *
+ * Deliberately configuration, not an installer. The Claude page can generate a
+ * launcher because it owns the whole profile; pointing the Codex CLI at the
+ * gateway is two settings in a file the user already has, and a script that
+ * rewrote `config.toml` would be far more likely to clobber someone's existing
+ * setup than to save them a step.
+ *
+ * `model_provider` rather than `chatgpt_base_url`: the CLI sends plugin,
+ * analytics and apps traffic to the latter, none of which this gateway proxies
+ * or should proxy. Overriding only the provider leaves that traffic on its
+ * normal path and routes just the turns.
+ *
+ * `env_key`, not `requires_openai_auth`: the latter makes the CLI authenticate
+ * with the ChatGPT token from its own `auth.json`, which this gateway would
+ * reject — the whole point is that the device presents a device token and never
+ * holds the subscription credential. Verified against codex-cli 0.138.0, which
+ * refuses to start with `Missing environment variable` when the named variable
+ * is absent.
+ */
+export function codexDeviceConfiguredView({
+  account, device, token, codexGatewayUrl, tokenEnvVar = 'CODEX_GATEWAY_TOKEN', openMode = false,
+}) {
+  const gateway = String(codexGatewayUrl ?? '').replace(/\/$/, '');
+  const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
+  const configToml = `# ~/.codex/config.toml
+model_provider = "gateway"
+
+[model_providers.gateway]
+name = "gateway"
+base_url = "${gateway}"
+wire_api = "responses"
+env_key = "${tokenEnvVar}"`;
+  const tokenExport = `export ${tokenEnvVar}=${shellSingleQuote(token)}`;
+  return layout('Codex device configured', `
+    <section class="stack">
+      <div class="notice success">Device <strong>${escapeHtml(device.name)}</strong> is enrolled for <strong>${escapeHtml(account.alias)}</strong>.</div>
+      <h1>Copy this token now</h1>
+      <p class="muted">This device token is displayed once and cannot be recovered from the control plane. Re-enroll if it is lost.</p>
+      <h2>1. Token</h2>
+      <pre id="codex-token">${escapeHtml(tokenExport)}</pre>
+      <div class="setup-actions">
+        <button type="button" class="secondary" data-copy-target="codex-token">Copy token</button>
+      </div>
+      <h2>2. Point the Codex CLI at the gateway</h2>
+      <pre id="codex-config">${escapeHtml(configToml)}</pre>
+      <div class="setup-actions">
+        <button type="button" data-download-target="codex-config" data-download-name="codex-${escapeHtml(profile)}-config.toml">Download config.toml</button>
+        <button type="button" class="secondary" data-copy-target="codex-config">Copy configuration</button>
+      </div>
+      <div class="notice">Turns now go through the console, which meters them per device. Everything else the CLI does — plugins, analytics, sign-in — keeps talking to chatgpt.com directly.</div>
+      <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
+      <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+    </section>
+  `, { openMode });
 }
 
 export function messageView(title, message, {
