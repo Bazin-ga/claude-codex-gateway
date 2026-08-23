@@ -124,6 +124,10 @@ export function extractPageContent(html) {
   const end = html.lastIndexOf(PAGE_CONTENT_END);
   if (start === -1 || end === -1 || end < start) return null;
   const title = /<title>([^<]*)<\/title>/.exec(html)?.[1] ?? '';
+  // Which tab is current is the server's answer, not something the client can
+  // infer: /conversation-turns and /conversations are siblings, so no prefix
+  // rule relates them, and guessing wrong removes a highlight already correct.
+  const activeTab = /data-active-tab="([^"]*)"/.exec(html)?.[1] ?? '';
   const scripts = [];
   for (const tag of html.slice(0, start).match(/<script\b[^>]*src="[^"]+"[^>]*>/g) ?? []) {
     const src = /src="([^"]+)"/.exec(tag)?.[1];
@@ -136,7 +140,7 @@ export function extractPageContent(html) {
       crossorigin: /crossorigin="([^"]+)"/.exec(tag)?.[1] ?? null,
     });
   }
-  return { content: html.slice(start + PAGE_CONTENT_START.length, end), title, scripts };
+  return { content: html.slice(start + PAGE_CONTENT_START.length, end), title, scripts, activeTab };
 }
 
 export function escapeHtml(value) {
@@ -235,6 +239,7 @@ export function sendHtml(res, status, html, headers = {}) {
         // Header-safe for any title, including CJK.
         'X-Page-Title': encodeURIComponent(page.title),
         'X-Page-Scripts': encodeURIComponent(JSON.stringify(page.scripts)),
+        'X-Active-Tab': page.activeTab,
       });
       return;
     }

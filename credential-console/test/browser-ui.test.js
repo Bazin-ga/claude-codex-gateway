@@ -395,3 +395,58 @@ describe('the sticky tab bar does not cover what you scroll to', async () => {
     }
   });
 });
+
+describe('KPI headlines fit their cards at every width', async () => {
+  for (const width of [1920, 1440, 390]) {
+    await withPage({ width, height: 1000 }, async (page, baseUrl) => {
+      await page.goto(baseUrl + '/metrics', { waitUntil: 'networkidle' });
+      const result = await page.evaluate(() => {
+        const cards = [...document.querySelectorAll('.metrics-kpi strong')];
+        return {
+          count: cards.length,
+          clipped: cards.filter((e) => e.scrollWidth > e.clientWidth + 2).map((e) => e.textContent.trim()),
+          titled: cards.filter((e) => (e.getAttribute('title') ?? '').length > 0).length,
+        };
+      });
+      if (result.count === 0) return;
+      // A 7-digit grouped integer needs ~158px in a ~145px card, so five of six
+      // token cards were rendering as `1,887,…` — indistinguishable from 1.8
+      // million or 1.8 billion.
+      assert.deepEqual(result.clipped, [], `${width}px clipped a KPI headline`);
+      assert.equal(result.titled, result.count, 'every abbreviated headline keeps its exact value');
+    });
+  }
+});
+
+describe('a filter announces its result count, not the surrounding furniture', async () => {
+  await withPage({ width: 1280, height: 900 }, async (page, baseUrl) => {
+    await page.goto(baseUrl + '/conversation-turns', { waitUntil: 'networkidle' });
+    await page.fill('input[name="q"]', 'zzzz-definitely-absent-zzzz');
+    await page.waitForTimeout(800);
+    await page.waitForFunction(() => !document.querySelector('.conversation-results.is-loading'));
+    const empty = await page.evaluate(
+      () => document.getElementById('conversation-live-status')?.textContent ?? '',
+    );
+    // Two defects met here: the announcement selector matched a per-row "Not
+    // captured" placeholder, and a regex lost its backslash to the template
+    // literal the client script used to live in, replacing every letter s.
+    assert.ok(empty.length > 0, 'something is announced');
+    assert.ok(!/turn  match|thi   earch/.test(empty), 'the text is not mangled');
+    assert.ok(!/Rows per page|Back to dashboard/.test(empty), 'no surrounding controls are read out');
+  });
+});
+
+describe('the server decides which tab is current', async () => {
+  await withPage({ width: 1280, height: 900 }, async (page, baseUrl) => {
+    await page.goto(baseUrl + '/conversations', { waitUntil: 'networkidle' });
+    await page.click('a[href="/conversation-turns"]');
+    await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+    // /conversation-turns and /conversations are siblings, so no path rule
+    // relates them; inferring on the client removed a correct highlight.
+    assert.equal(
+      await page.evaluate(() => document.querySelector('.page-tabs a[aria-current]')?.getAttribute('href')),
+      '/conversations',
+      'a sub-page still highlights its section',
+    );
+  });
+});

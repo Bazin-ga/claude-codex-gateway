@@ -54,7 +54,7 @@ test('Chinese app translations include the onboarding visibility and copy labels
   // The client script and its translation dictionary live in lib/app-asset.js
   // so they can be content-addressed; the keys are still shipped from here.
   const serverSource = (await readFile(join(CONSOLE_ROOT, 'server.js'), 'utf8'))
-    + (await readFile(join(CONSOLE_ROOT, 'lib', 'app-asset.js'), 'utf8'));
+    + (await readFile(join(CONSOLE_ROOT, 'web', 'console-client.js'), 'utf8'));
   for (const key of [
     'ai-onboarding-guide',
     'ai-onboarding-intro',

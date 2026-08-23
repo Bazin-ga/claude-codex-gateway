@@ -439,7 +439,7 @@ test('Chinese translations and operator documentation cover permanent captured-t
   const [server, rootReadme, rootReadmeZh, consoleReadme, deploy] = await Promise.all([
     Promise.all([
       readFile(new URL('../server.js', import.meta.url), 'utf8'),
-      readFile(new URL('../lib/app-asset.js', import.meta.url), 'utf8'),
+      readFile(new URL('../web/console-client.js', import.meta.url), 'utf8'),
     ]).then((parts) => parts.join('\n')),
     readFile(new URL('../../README.md', import.meta.url), 'utf8'),
     readFile(new URL('../../README.zh-CN.md', import.meta.url), 'utf8'),

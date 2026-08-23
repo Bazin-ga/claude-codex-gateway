@@ -371,7 +371,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .metrics-chart-panel h2 { font-size: 16px; }
   .metrics-status-strip { gap: 8px 12px; }
   .metrics-scroll-hint { display: block; }
-  .metrics-table:has(td[data-label])-card { padding: 14px; border-radius: 15px; }
+  .metrics-table-card { padding: 14px; border-radius: 15px; }
 }
 .account-switch-form { min-width: 190px; }
 .account-switch-form[aria-busy="true"] { opacity: .72; }
@@ -603,6 +603,12 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
   .table-wrap:has(td[data-label]) { overflow-x: visible; }
 }
 
+/* Desktop needs this too: the bar is ~49px there and still covers a section
+   heading scrolled to by an anchor or by paging. */
+:root { --sticky-nav-desktop: 70px; }
+h1, h2, h3, [id], [tabindex], input, select, textarea, button, a.button, summary, label,
+.conversation-results, [data-page-content] { scroll-margin-top: var(--sticky-nav-desktop); }
+
 /* The sticky tab bar wraps to two lines on a phone (~110px) and then covers
    whatever you scroll to — measured, it hid the Model select and the Apply
    button on /metrics. Anything scrolled to keeps clear of it. */
@@ -695,7 +701,7 @@ function layout(title, content, {
       <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
       <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
     </nav>` : ''}
-    <div data-page-content>${PAGE_CONTENT_START}${openMode ? openBanner : ''}
+    <div data-page-content data-active-tab="${escapeHtml(activeTab ?? '')}">${PAGE_CONTENT_START}${openMode ? openBanner : ''}
     ${content}${PAGE_CONTENT_END}</div>
   </main>
 </body>
@@ -1231,6 +1237,11 @@ function metricTokenText(value) {
   return value === null ? '—' : metricDisplayNumber(value);
 }
 
+/** The same value abbreviated for a headline, keeping `—` for unknown. */
+function metricTokenHeadline(value) {
+  return value === null ? '—' : metricCompactNumber(value);
+}
+
 const TOKEN_METRIC_FIELDS = Object.freeze([
   'totalInputTokens',
   'totalCacheCreationInputTokens',
@@ -1291,6 +1302,33 @@ function metricDisplayNumber(value, { decimals = 0 } = {}) {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
+}
+
+/**
+ * A KPI headline that fits its card.
+ *
+ * The grouped integer does not: at 1440px each of six KPI cards has ~145px of
+ * inner width, and a 7-digit figure needs ~158px. Five of the six token cards
+ * were being clipped to `1,887,…`, which cannot be told apart from 1.8 million
+ * or 1.8 billion — the page's headline number carried no information at all.
+ * The charts on this same page already abbreviate; this matches them, and the
+ * exact figure stays in the title attribute and the line beneath.
+ */
+function metricCompactNumber(value) {
+  const numeric = finiteMetricNumber(value, { max: 9_000_000_000_000_000 });
+  const abs = Math.abs(numeric);
+  const scale = abs >= 1e12 ? [1e12, 'T']
+    : abs >= 1e9 ? [1e9, 'B']
+      : abs >= 1e6 ? [1e6, 'M']
+        : abs >= 10_000 ? [1e3, 'K']
+          : null;
+  // Below 10,000 the exact number is both short enough and more useful.
+  if (!scale) return Math.round(numeric).toLocaleString('en-US');
+  const scaled = numeric / scale[0];
+  return `${scaled.toLocaleString('en-US', {
+    minimumFractionDigits: scaled < 100 ? 1 : 0,
+    maximumFractionDigits: scaled < 100 ? 1 : 0,
+  })}${scale[1]}`;
 }
 
 function metricHourLabel(value) {
@@ -2191,27 +2229,27 @@ export function metricsView({
       <div class="metrics-kpi-grid">
         <article class="metrics-kpi metrics-kpi-primary">
           <span data-i18n="metrics-known-total">Known token total</span>
-          <strong title="${escapeHtml(metricTokenText(knownTokenTotal))}">${escapeHtml(metricTokenText(knownTokenTotal))}</strong>
+          <strong title="${escapeHtml(metricTokenText(knownTokenTotal))}">${escapeHtml(metricTokenHeadline(knownTokenTotal))}</strong>
           <small data-i18n="${coveragePartial ? 'metrics-known-total-lower-bound' : 'metrics-known-total-exact'}">${coveragePartial ? 'Lower bound for the selected period' : 'Exact across complete reported categories'}</small>
         </article>
         <article class="metrics-kpi metrics-kpi-input"><span data-i18n="metrics-token-input">Input tokens</span>
-          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalInputTokens))}</strong>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalInputTokens))}">${escapeHtml(metricTokenHeadline(normalizedTokenTotals.totalInputTokens))}</strong>
           <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalInputTokensKnownCount))}</small>
         </article>
         <article class="metrics-kpi metrics-kpi-output"><span data-i18n="metrics-token-output">Output tokens</span>
-          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalOutputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalOutputTokens))}</strong>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalOutputTokens))}">${escapeHtml(metricTokenHeadline(normalizedTokenTotals.totalOutputTokens))}</strong>
           <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalOutputTokensKnownCount))}</small>
         </article>
         <article class="metrics-kpi metrics-kpi-cache-read"><span data-i18n="metrics-token-cache-read">Cache read input tokens</span>
-          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheReadInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheReadInputTokens))}</strong>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheReadInputTokens))}">${escapeHtml(metricTokenHeadline(normalizedTokenTotals.totalCacheReadInputTokens))}</strong>
           <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalCacheReadInputTokensKnownCount))}</small>
         </article>
         <article class="metrics-kpi metrics-kpi-cache-create"><span data-i18n="metrics-token-cache-creation">Cache creation input tokens</span>
-          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheCreationInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheCreationInputTokens))}</strong>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheCreationInputTokens))}">${escapeHtml(metricTokenHeadline(normalizedTokenTotals.totalCacheCreationInputTokens))}</strong>
           <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalCacheCreationInputTokensKnownCount))}</small>
         </article>
         <article class="metrics-kpi"><span data-i18n="metrics-consumption-requests">Consumption requests</span>
-          <strong title="${escapeHtml(metricDisplayNumber(consumptionTotal))}">${escapeHtml(metricDisplayNumber(consumptionTotal))}</strong>
+          <strong title="${escapeHtml(metricDisplayNumber(consumptionTotal))}">${escapeHtml(metricCompactNumber(consumptionTotal))}</strong>
           <small><span data-i18n="metrics-request-outcomes">Successful / errors</span>: ${escapeHtml(metricDisplayNumber(metricCount(totals.success)))} / ${escapeHtml(metricDisplayNumber(metricCount(totals.errors)))}</small>
         </article>
       </div>
