@@ -1186,8 +1186,14 @@ function markActiveTab(activeTab) {
   // and /conversation-turns are siblings, so no path rule relates them, and an
   // exact-match guess silently removed a highlight that was already correct.
   const href = TAB_HREF_BY_NAME[activeTab];
+  const nav = document.querySelector('.page-tabs');
+  if (!nav) return;
+  // The bar lives outside the swapped region, so a page the server renders
+  // without one — an enrolment landing page, say — would otherwise inherit the
+  // bar from wherever the reader came from and disagree with its own reload.
+  nav.hidden = !href;
   if (!href) return;
-  document.querySelectorAll('.page-tabs a').forEach((link) => {
+  nav.querySelectorAll('a').forEach((link) => {
     if (link.getAttribute('href') === href) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
   });
