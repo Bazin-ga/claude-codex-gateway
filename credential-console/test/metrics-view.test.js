@@ -558,7 +558,8 @@ test('long chart series cap marker titles and bound raw hourly tables', () => {
 });
 
 test('P5 metrics labels have Chinese translation entries', async () => {
-  const serverSource = await readFile(new URL('../server.js', import.meta.url), 'utf8');
+  const serverSource = (await readFile(new URL('../server.js', import.meta.url), 'utf8'))
+    + (await readFile(new URL('../web/console-client.js', import.meta.url), 'utf8'));
   for (const key of [
     'tab-overview',
     'tab-metrics',

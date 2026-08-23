@@ -35,14 +35,14 @@ const CONVERSATION_PREFIX_BYTES = Math.min(
   MAX_REQUEST_BYTES,
   Math.floor(captureBudget.maxBytes() / CAPTURE_MEMORY_AMPLIFICATION),
 );
-const AUTH_FAILURE_LIMIT = { windowMs: 60_000, max: 30 };
-const DEVICE_REQUEST_LIMIT = { windowMs: 60_000, max: 120 };
-const DEVICE_CONCURRENCY_LIMIT = 8;
-const authFailures = new Map();
-const deviceRequests = new Map();
-const deviceConcurrency = new Map();
+export const AUTH_FAILURE_LIMIT = { windowMs: 60_000, max: 30 };
+export const DEVICE_REQUEST_LIMIT = { windowMs: 60_000, max: 120 };
+export const DEVICE_CONCURRENCY_LIMIT = 8;
+export const authFailures = new Map();
+export const deviceRequests = new Map();
+export const deviceConcurrency = new Map();
 
-function passthroughCounter({ maxBytes = null } = {}) {
+export function passthroughCounter({ maxBytes = null } = {}) {
   let bytes = 0;
   const stream = new Transform({
     transform(chunk, encoding, callback) {
@@ -59,7 +59,7 @@ function passthroughCounter({ maxBytes = null } = {}) {
   return { stream, bytes: () => bytes };
 }
 
-function unavailableUsage() {
+export function unavailableUsage() {
   return {
     inputTokens: null,
     cacheCreationInputTokens: null,
@@ -69,14 +69,14 @@ function unavailableUsage() {
   };
 }
 
-function responseUsageFormat(contentType) {
+export function responseUsageFormat(contentType) {
   const mediaType = String(contentType ?? '').split(';', 1)[0].trim().toLowerCase();
   if (mediaType === 'text/event-stream') return 'sse';
   if (mediaType === 'application/json' || mediaType.endsWith('+json')) return 'json';
   return null;
 }
 
-function usageObserver(parser) {
+export function usageObserver(parser) {
   return {
     write(chunk) {
       const state = parser.push(chunk).parseState;
@@ -88,7 +88,7 @@ function usageObserver(parser) {
   };
 }
 
-function safeUsageSnapshot(observation) {
+export function safeUsageSnapshot(observation) {
   let snapshot;
   try {
     snapshot = observation?.snapshot?.();
@@ -181,11 +181,11 @@ function threadKeyForRequest(store, deviceId, sessionId) {
   }
 }
 
-function log(event, detail = {}) {
+export function log(event, detail = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...detail }));
 }
 
-function enqueueMetricSafely(requestMetrics, row, { accountId, deviceId, conversation = null }) {
+export function enqueueMetricSafely(requestMetrics, row, { accountId, deviceId, conversation = null }) {
   if (!requestMetrics?.enqueueRequest && !requestMetrics?.enqueueCompletion) return;
   try {
     const result = conversation && typeof requestMetrics.enqueueCompletion === 'function'
@@ -207,14 +207,14 @@ function enqueueMetricSafely(requestMetrics, row, { accountId, deviceId, convers
   }
 }
 
-function sourceIp(req) {
+export function sourceIp(req) {
   const peer = req.socket.remoteAddress ?? 'unknown';
   const loopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
   if (!loopback) return peer;
   return String(req.headers['x-forwarded-for'] ?? peer).split(',')[0].trim();
 }
 
-function rateLimited(bucket, key, limit) {
+export function rateLimited(bucket, key, limit) {
   const now = Date.now();
   const record = bucket.get(key);
   if (!record || now - record.since > limit.windowMs) {

@@ -1,4 +1,5 @@
-import { escapeHtml } from './http.js';
+import { APP_ASSET_URL } from './app-asset.js';
+import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { derivePromptDisplay } from './prompt-display.js';
 import {
@@ -412,8 +413,45 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-rail h2 { margin: 0; font-size: 17px; }
 .conversation-filter-hint { margin: 0; }
 .conversation-rail label { margin: 0; }
-.conversation-rail .filter-actions { display: grid; grid-template-columns: 1fr; gap: 8px; }
+.conversation-rail .filter-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+/* Selects apply as soon as they change, so the button is only needed for the
+   free-text field; Clear is a way out, not a peer of the primary action. */
+.conversation-rail .filter-actions .button.secondary,
+.conversation-rail .filter-actions a.button {
+  background: none;
+  border: 0;
+  padding: 0 2px;
+  color: var(--muted);
+  text-decoration: underline;
+  font-weight: 600;
+  box-shadow: none;
+}
+/* Eight equally-weighted fields made a rail taller than the viewport. */
+.conversation-rail label { display: grid; gap: 4px; }
+.conversation-rail label > span { font-size: 12px; font-weight: 700; color: var(--muted); }
+.conversation-rail { gap: 10px; }
+.conversation-rows { display: inline-flex; align-items: center; gap: 6px; }
+.conversation-rows select { padding: 2px 6px; font-size: 12px; }
+/* Compact only where there is a pointer; a touch target keeps its size. */
+@media (hover: hover) and (pointer: fine) {
+  .conversation-rows select { min-height: 0; }
+}
 .conversation-rail .filter-actions > * { width: 100%; text-align: center; }
+/* The results region while a filter is in flight. Without this the only
+   feedback during a ~250 ms round trip was nothing at all: the full navigation
+   this replaced at least moved the browser's own progress indicator. */
+.conversation-results.is-loading { opacity: 0.55; pointer-events: none; }
+/* Same idea for a whole-page navigation: without it a boosted click over a
+   ~207 ms link looks like nothing happened, because the browser's own progress
+   indicator no longer runs. */
+[data-navigating] [data-page-content] { opacity: 0.55; pointer-events: none; }
+@media (prefers-reduced-motion: no-preference) {
+  [data-page-content] { transition: opacity 120ms ease-out; }
+}
+.conversation-results.is-loading * { cursor: progress; }
+@media (prefers-reduced-motion: no-preference) {
+  .conversation-results { transition: opacity 120ms ease-out; }
+}
 .conversation-results { display: grid; gap: 14px; min-width: 0; }
 .conversation-results-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
 .conversation-results-head h1 { margin: 0; }
@@ -475,10 +513,127 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-message pre { margin: 0; padding: 13px; max-width: 100%; color: var(--ink); background: rgba(255,255,255,.78); border: 1px solid rgba(22,33,29,.1); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .conversation-message .conversation-prompt-disclaimer { margin: 0 0 8px; }
 .conversation-session-state-note { margin: 8px 0 0; }
+/* Wide data tables become cards on a phone.
+
+   These tables are 6-9 columns and .accounts-table carries min-width: 1000px,
+   so on a 390px screen the only previous option was dragging a 1000px table
+   sideways. Each cell instead becomes a labelled row; the label text is stamped
+   from the (already translated) header by app.js, so it follows the language
+   switch instead of being frozen at render time. Without scripting the table
+   keeps its original scrolling layout, which still works. */
+@media (max-width: 720px) {
+  .table-wrap table:has(td[data-label]), .metrics-table:has(td[data-label]) {
+    min-width: 0;
+    display: block;
+    table-layout: auto;
+  }
+  .table-wrap table:has(td[data-label]) thead, .metrics-table:has(td[data-label]) thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .table-wrap table:has(td[data-label]) tbody, .metrics-table:has(td[data-label]) tbody { display: block; }
+  .table-wrap table:has(td[data-label]) tr, .metrics-table:has(td[data-label]) tr {
+    display: block;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: white;
+    padding: 4px 14px;
+    margin-bottom: 12px;
+  }
+  .table-wrap table:has(td[data-label]) td, .metrics-table:has(td[data-label]) td {
+    display: grid;
+    grid-template-columns: minmax(0, 40%) minmax(0, 1fr);
+    gap: 12px;
+    align-items: baseline;
+    padding: 9px 0;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    width: auto;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .table-wrap table:has(td[data-label]) tr td:last-child, .metrics-table:has(td[data-label]) tr td:last-child { border-bottom: 0; }
+  /* Only label a cell once app.js has supplied one, so a scripting-off page
+     never shows an empty label column. */
+  .table-wrap table:has(td[data-label]) td[data-label]::before, .metrics-table:has(td[data-label]) td[data-label]::before {
+    content: attr(data-label);
+    font-weight: 700;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .accounts-table td[data-label] { grid-template-columns: minmax(0, 40%) minmax(0, 1fr); }
+  .table-wrap table:has(td[data-label]) td:not([data-label]), .metrics-table:has(td[data-label]) td:not([data-label]) {
+    display: block;
+  }
+  /* A cell holding its own multi-column widget cannot survive being squeezed
+     into 60% of a 390px card: the usage-quota cell rendered one character per
+     line. Any cell with nested structure spans the card, not just the last. */
+  .table-wrap table:has(td[data-label]) td:has(.quota-grid, .quota-window, form),
+  .metrics-table:has(td[data-label]) td:has(.quota-grid, form) { display: block; }
+  .table-wrap table:has(td[data-label]) td:has(.quota-grid, .quota-window, form)::before,
+  .metrics-table:has(td[data-label]) td:has(.quota-grid, form)::before {
+    display: block;
+    margin-bottom: 6px;
+  }
+  /* The last cell holds the row's controls — a select, buttons, sometimes a
+     whole form. At 60% of a 390px screen those get clipped, so it spans the
+     card and its controls are held inside it. */
+  .table-wrap table:has(td[data-label]) td:last-child, .metrics-table:has(td[data-label]) td:last-child { display: block; }
+  .table-wrap table:has(td[data-label]) td:last-child::before, .metrics-table:has(td[data-label]) td:last-child::before {
+    display: block;
+    margin-bottom: 6px;
+  }
+  .table-wrap table:has(td[data-label]) td input, .table-wrap table:has(td[data-label]) td select, .table-wrap table:has(td[data-label]) td .button,
+  .table-wrap table:has(td[data-label]) td button, .table-wrap table:has(td[data-label]) td form {
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .table-wrap table:has(td[data-label]) td:last-child input, .table-wrap table:has(td[data-label]) td:last-child select,
+  .table-wrap table:has(td[data-label]) td:last-child button, .table-wrap table:has(td[data-label]) td:last-child .button {
+    width: 100%;
+  }
+  .table-wrap table:has(td[data-label]) td.empty, .metrics-table:has(td[data-label]) td.empty { display: block; text-align: left; }
+  /* Cards manage their own width, so the horizontal scroller is dead weight. */
+  .table-wrap:has(td[data-label]) { overflow-x: visible; }
+}
+
+/* Desktop needs this too: the bar is ~49px there and still covers a section
+   heading scrolled to by an anchor or by paging. */
+:root { --sticky-nav-desktop: 70px; }
+h1, h2, h3, [id], [tabindex], input, select, textarea, button, a.button, summary, label,
+.conversation-results, [data-page-content] { scroll-margin-top: var(--sticky-nav-desktop); }
+
+/* The sticky tab bar wraps to two lines on a phone (~110px) and then covers
+   whatever you scroll to — measured, it hid the Model select and the Apply
+   button on /metrics. Anything scrolled to keeps clear of it. */
+@media (max-width: 800px) {
+  /* The bar sticks at top: 10px and wraps to ~110px, so it occupies up to
+     120px; the rest is breathing room rather than a flush fit. */
+  :root { --sticky-nav: 132px; }
+  /* On the elements themselves rather than their containers: the control that
+     gets scrolled to is the one that must clear the bar, and enumerating
+     containers missed the rows-per-page select sitting with the result count. */
+  input, select, textarea, button, a.button, summary, label,
+  h1, h2, h3, [id], [tabindex], .conversation-results, [data-page-content] {
+    scroll-margin-top: var(--sticky-nav);
+  }
+}
+
 @media (max-width: 800px) {
   .summary, .split { grid-column: span 12; }
   .topbar { align-items: flex-start; flex-wrap: wrap; }
   button, .button, input, select { min-height: 44px; }
+  /* <summary> is a real control on touch; it was left at ~19px. */
+  summary { min-height: 44px; display: flex; align-items: center; }
+  /* Named explicitly because specificity, not cascade order, is the problem:
+     a 0,1,1 rule outside this query beats the 0,0,1 rule inside it. */
+  .metrics-segmented button, .metrics-segmented .button { min-height: 44px; }
   .page-tabs a, .language-switch button { min-height: 44px; display: inline-flex; align-items: center; }
   .table-wrap { overflow-x: auto; }
   .zone-heading { display: grid; }
@@ -527,7 +682,7 @@ function layout(title, content, {
   <title>${escapeHtml(title)} · Credential Console</title>
   <style>${styles}</style>
   <noscript><style>html[data-language-pending] body { visibility: visible; animation: none; }</style></noscript>
-  <script src="/assets/app.js" defer></script>
+  <script src="${escapeHtml(APP_ASSET_URL)}" defer></script>
   ${metricsScript}
 </head>
 <body>
@@ -546,8 +701,8 @@ function layout(title, content, {
       <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
       <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
     </nav>` : ''}
-    ${openMode ? openBanner : ''}
-    ${content}
+    <div data-page-content data-active-tab="${escapeHtml(activeTab ?? '')}">${PAGE_CONTENT_START}${openMode ? openBanner : ''}
+    ${content}${PAGE_CONTENT_END}</div>
   </main>
 </body>
 </html>`;
@@ -775,21 +930,33 @@ function accountSelectionForDevice(device, accounts) {
   const selectedAccountId = typeof device.selected_account_id === 'string'
     ? device.selected_account_id
     : null;
-  const claudeAccounts = new Set(
-    accounts.filter((account) => account.provider === 'claude').map((account) => account.id),
+  // Mirrors the store's rule (see #deviceAccountPolicy): an allowlist may hold
+  // either provider, but not both. Judging validity by "is Claude" would paint
+  // every Codex device as misconfigured and then offer, as the remedy, the one
+  // action the store refuses.
+  const gatewayProvider = new Map(
+    accounts
+      .filter((account) => ['claude', 'codex'].includes(account.provider))
+      .map((account) => [account.id, account.provider]),
+  );
+  const allowedProviders = new Set(
+    Array.isArray(allowedAccountIds)
+      ? allowedAccountIds.map((id) => gatewayProvider.get(id))
+      : [],
   );
   const allowedValid = Array.isArray(allowedAccountIds)
     && allowedAccountIds.length > 0
     && allowedAccountIds.every((id) => typeof id === 'string' && id.length > 0)
     && new Set(allowedAccountIds).size === allowedAccountIds.length
-    && allowedAccountIds.every((id) => claudeAccounts.has(id))
+    && allowedAccountIds.every((id) => gatewayProvider.has(id))
+    && allowedProviders.size === 1
     && originalAccountId !== null
     && allowedAccountIds.includes(originalAccountId);
   const selectedValid = selectedAccountId !== null
     && allowedValid
     && allowedAccountIds.includes(selectedAccountId)
-    && claudeAccounts.has(selectedAccountId);
-  const originalValid = originalAccountId !== null && claudeAccounts.has(originalAccountId);
+    && gatewayProvider.has(selectedAccountId);
+  const originalValid = originalAccountId !== null && gatewayProvider.has(originalAccountId);
   const invalid = !allowedValid || !selectedValid || !originalValid;
   return {
     allowedAccountIds: Array.isArray(allowedAccountIds) ? allowedAccountIds : [],
@@ -812,9 +979,11 @@ function accountLabelView(account, fallback = 'Unknown account') {
   return `<span data-account-label data-account-alias="${escapeHtml(account.alias)}" data-account-status="${escapeHtml(account.status)}">${escapeHtml(accountDisplayLabel(account))}</span>`;
 }
 
-function accountSelectionOptions(accounts, selectedAccountId) {
+function accountSelectionOptions(accounts, selectedAccountId, provider = 'claude') {
   return accounts
-    .filter((account) => account.provider === 'claude')
+    // Only same-provider accounts: the store refuses a cross-provider switch,
+    // so offering one would present an action guaranteed to fail.
+    .filter((account) => account.provider === provider)
     // Keep the account selector distinct from the legacy machine-merge option
     // vocabulary, whose existing dashboard tests intentionally count the
     // double-quoted machine values. Both quote styles are valid HTML; the value
@@ -839,7 +1008,9 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   if (selection.invalid) {
     return '<div class="notice error tiny" data-i18n="account-selection-invalid">Account selection configuration is invalid; no account was guessed.</div>';
   }
-  const options = accountSelectionOptions(accounts, selection.selectedAccountId);
+  const deviceProvider = accountForId(accounts, selection.selectedAccountId ?? selection.originalAccountId)
+    ?.provider ?? 'claude';
+  const options = accountSelectionOptions(accounts, selection.selectedAccountId, deviceProvider);
   if (!options) {
     return '<div class="muted tiny" data-i18n="no-claude-accounts">No Claude accounts are registered.</div>';
   }
@@ -1082,6 +1253,11 @@ function metricTokenText(value) {
   return value === null ? '—' : metricDisplayNumber(value);
 }
 
+/** The same value abbreviated for a headline, keeping `—` for unknown. */
+function metricTokenHeadline(value) {
+  return value === null ? '—' : metricCompactNumber(value);
+}
+
 const TOKEN_METRIC_FIELDS = Object.freeze([
   'totalInputTokens',
   'totalCacheCreationInputTokens',
@@ -1142,6 +1318,33 @@ function metricDisplayNumber(value, { decimals = 0 } = {}) {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
+}
+
+/**
+ * A KPI headline that fits its card.
+ *
+ * The grouped integer does not: at 1440px each of six KPI cards has ~145px of
+ * inner width, and a 7-digit figure needs ~158px. Five of the six token cards
+ * were being clipped to `1,887,…`, which cannot be told apart from 1.8 million
+ * or 1.8 billion — the page's headline number carried no information at all.
+ * The charts on this same page already abbreviate; this matches them, and the
+ * exact figure stays in the title attribute and the line beneath.
+ */
+function metricCompactNumber(value) {
+  const numeric = finiteMetricNumber(value, { max: 9_000_000_000_000_000 });
+  const abs = Math.abs(numeric);
+  const scale = abs >= 1e12 ? [1e12, 'T']
+    : abs >= 1e9 ? [1e9, 'B']
+      : abs >= 1e6 ? [1e6, 'M']
+        : abs >= 10_000 ? [1e3, 'K']
+          : null;
+  // Below 10,000 the exact number is both short enough and more useful.
+  if (!scale) return Math.round(numeric).toLocaleString('en-US');
+  const scaled = numeric / scale[0];
+  return `${scaled.toLocaleString('en-US', {
+    minimumFractionDigits: scaled < 100 ? 1 : 0,
+    maximumFractionDigits: scaled < 100 ? 1 : 0,
+  })}${scale[1]}`;
 }
 
 function metricHourLabel(value) {
@@ -2028,10 +2231,10 @@ export function metricsView({
             <select name="member_label">${metricOptions(options.members, selectedMember, 'All members', 'metrics-all-members')}</select>
           </label>
           <label><span data-i18n="metrics-filter-account">Account</span>
-            <select name="account_id">${metricOptions(options.accounts, selectedAccount, 'All accounts', 'metrics-all-accounts')}</select>
+            <select name="account_id" data-autoapply>${metricOptions(options.accounts, selectedAccount, 'All accounts', 'metrics-all-accounts')}</select>
           </label>
           <label><span data-i18n="metrics-filter-model">Model</span>
-            <select name="model">${metricOptions(options.models, selectedModel, 'All models', 'metrics-all-models')}</select>
+            <select name="model" data-autoapply>${metricOptions(options.models, selectedModel, 'All models', 'metrics-all-models')}</select>
           </label>
           <div class="filter-actions">
             <button type="submit" data-i18n="metrics-apply-filters">Apply</button>
@@ -2042,27 +2245,27 @@ export function metricsView({
       <div class="metrics-kpi-grid">
         <article class="metrics-kpi metrics-kpi-primary">
           <span data-i18n="metrics-known-total">Known token total</span>
-          <strong title="${escapeHtml(metricTokenText(knownTokenTotal))}">${escapeHtml(metricTokenText(knownTokenTotal))}</strong>
+          <strong title="${escapeHtml(metricTokenText(knownTokenTotal))}">${escapeHtml(metricTokenHeadline(knownTokenTotal))}</strong>
           <small data-i18n="${coveragePartial ? 'metrics-known-total-lower-bound' : 'metrics-known-total-exact'}">${coveragePartial ? 'Lower bound for the selected period' : 'Exact across complete reported categories'}</small>
         </article>
         <article class="metrics-kpi metrics-kpi-input"><span data-i18n="metrics-token-input">Input tokens</span>
-          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalInputTokens))}</strong>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalInputTokens))}">${escapeHtml(metricTokenHeadline(normalizedTokenTotals.totalInputTokens))}</strong>
           <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalInputTokensKnownCount))}</small>
         </article>
         <article class="metrics-kpi metrics-kpi-output"><span data-i18n="metrics-token-output">Output tokens</span>
-          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalOutputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalOutputTokens))}</strong>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalOutputTokens))}">${escapeHtml(metricTokenHeadline(normalizedTokenTotals.totalOutputTokens))}</strong>
           <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalOutputTokensKnownCount))}</small>
         </article>
         <article class="metrics-kpi metrics-kpi-cache-read"><span data-i18n="metrics-token-cache-read">Cache read input tokens</span>
-          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheReadInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheReadInputTokens))}</strong>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheReadInputTokens))}">${escapeHtml(metricTokenHeadline(normalizedTokenTotals.totalCacheReadInputTokens))}</strong>
           <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalCacheReadInputTokensKnownCount))}</small>
         </article>
         <article class="metrics-kpi metrics-kpi-cache-create"><span data-i18n="metrics-token-cache-creation">Cache creation input tokens</span>
-          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheCreationInputTokens))}">${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheCreationInputTokens))}</strong>
+          <strong title="${escapeHtml(metricTokenText(normalizedTokenTotals.totalCacheCreationInputTokens))}">${escapeHtml(metricTokenHeadline(normalizedTokenTotals.totalCacheCreationInputTokens))}</strong>
           <small><span data-i18n="metrics-token-known-count">Known values</span>: ${escapeHtml(metricDisplayNumber(normalizedTokenTotals.totalCacheCreationInputTokensKnownCount))}</small>
         </article>
         <article class="metrics-kpi"><span data-i18n="metrics-consumption-requests">Consumption requests</span>
-          <strong title="${escapeHtml(metricDisplayNumber(consumptionTotal))}">${escapeHtml(metricDisplayNumber(consumptionTotal))}</strong>
+          <strong title="${escapeHtml(metricDisplayNumber(consumptionTotal))}">${escapeHtml(metricCompactNumber(consumptionTotal))}</strong>
           <small><span data-i18n="metrics-request-outcomes">Successful / errors</span>: ${escapeHtml(metricDisplayNumber(metricCount(totals.success)))} / ${escapeHtml(metricDisplayNumber(metricCount(totals.errors)))}</small>
         </article>
       </div>
@@ -2461,6 +2664,7 @@ function conversationSearchErrorView(error) {
 }
 
 export function conversationsView({
+  fragment = false,
   result = null,
   searchResult = null,
   search = null,
@@ -2533,47 +2737,7 @@ export function conversationsView({
         ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
-  return layout('API fragment diagnostics', `
-    <section class="stack">
-      ${conversationPrivacyView(openMode)}
-      ${conversationSubnav('turns')}
-      <div class="conversation-layout">
-        <details class="conversation-filter-details" data-persist-details="turn-filters" open>
-          <summary data-i18n="conversation-filters-heading">Filters</summary>
-          <form method="post" action="/conversation-turns" class="card conversation-rail conversation-filters" aria-label="API-turn filters" data-reset-scroll>
-          <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
-          <p class="muted tiny conversation-filter-hint" data-i18n="conversation-filter-hint">Type to search member suggestions; leave the field blank for everyone.</p>
-          <label><span data-i18n="conversation-search">Search captured API turns</span>
-            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Captured API user text or response" data-placeholder-en="Captured API user text or response" data-placeholder-zh="已捕获 API 用户文本或回复">
-          </label>
-          <label><span data-i18n="conversation-filter-period-label">Period</span>
-            <select name="period">${periodOptions}</select>
-          </label>
-          <label><span data-i18n="conversation-filter-member-label">Member</span>
-            <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
-            <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>
-          </label>
-          <label><span data-i18n="conversation-filter-device-label">Device</span>
-            <select name="device_id">${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select>
-          </label>
-          <label><span data-i18n="conversation-filter-account-label">Account</span>
-            <select name="account_id">${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select>
-          </label>
-          <label><span data-i18n="conversation-filter-model-label">Model</span>
-            <select name="model">${conversationFacetOptions(facets.models, normalizedModel, 'All models', 'conversation-all-models')}</select>
-          </label>
-          <label><span data-i18n="conversation-filter-state-label">Response state</span>
-            <select name="response_state">${stateOptions}</select>
-          </label>
-          <label><span data-i18n="conversation-filter-limit-label">Rows per page</span>
-            <select name="limit">${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select>
-          </label>
-          <div class="filter-actions">
-            <button type="submit" data-i18n="conversation-search-submit">Search</button>
-            <a class="button secondary" href="/conversation-turns" data-i18n="conversation-search-clear">Clear</a>
-          </div>
-          </form>
-        </details>
+  const resultsSection = `
         <section class="conversation-results" aria-labelledby="conversation-results-heading">
           <div class="conversation-results-head">
             <div>
@@ -2582,7 +2746,7 @@ export function conversationsView({
               <p class="muted" data-i18n="conversations-intro">Search immutable per-request Claude API fragments. They may contain wrappers, reminders, or tool-loop intermediates and are not user rounds.</p>
               ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
             </div>
-            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
+            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-total-matches">matches</span> · <label class="conversation-rows"><span class="muted tiny" data-i18n="conversation-filter-limit-label">Rows per page</span><select name="limit" form="conversation-filter-form" data-autoapply>${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
           </div>
           ${errorNotice}
           ${droppedNotice}
@@ -2592,6 +2756,49 @@ export function conversationsView({
           </div>
           ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-pagination-hint">Results are ordered newest first.</span>${nextForm}</div>` : ''}
         </section>
+`;
+  // A fragment request re-renders only the results, so a filter change costs
+  // a few KB instead of the whole document over a high-latency link.
+  if (fragment) return resultsSection;
+  return layout('API fragment diagnostics', `
+    <section class="stack">
+      ${conversationPrivacyView(openMode)}
+      ${conversationSubnav('turns')}
+      <div class="conversation-layout">
+        <details class="conversation-filter-details" data-persist-details="turn-filters" open>
+          <summary data-i18n="conversation-filters-heading">Filters</summary>
+          <form id="conversation-filter-form" method="post" action="/conversation-turns" class="card conversation-rail conversation-filters" aria-label="API-turn filters" data-reset-scroll>
+          <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
+          <label><span data-i18n="conversation-search">Search captured API turns</span>
+            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Text in prompt or reply" data-placeholder-en="Text in prompt or reply" data-placeholder-zh="已捕获 API 用户文本或回复">
+          </label>
+          <label><span data-i18n="conversation-filter-period-label">Period</span>
+            <select name="period" data-autoapply>${periodOptions}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-member-label">Member</span>
+            <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
+            <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>
+            <p class="muted tiny conversation-filter-hint" data-i18n="conversation-filter-hint">Type to search member suggestions; leave the field blank for everyone.</p>
+          </label>
+          <label><span data-i18n="conversation-filter-device-label">Device</span>
+            <select name="device_id" data-autoapply>${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-account-label">Account</span>
+            <select name="account_id" data-autoapply>${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-model-label">Model</span>
+            <select name="model" data-autoapply>${conversationFacetOptions(facets.models, normalizedModel, 'All models', 'conversation-all-models')}</select>
+          </label>
+          <label><span data-i18n="conversation-filter-state-label">Response state</span>
+            <select name="response_state" data-autoapply>${stateOptions}</select>
+          </label>
+          <div class="filter-actions">
+            <button type="submit" data-i18n="conversation-search-submit">Search</button>
+            <a class="button secondary" href="/conversation-turns" data-i18n="conversation-search-clear">Clear</a>
+          </div>
+          </form>
+        </details>
+        ${resultsSection}
       </div>
     </section>
   `, { openMode, activeTab: 'conversations' });
@@ -2670,6 +2877,7 @@ function conversationSessionItemView(item) {
 }
 
 export function conversationSessionsView({
+  fragment = false,
   result = null,
   searchResult = null,
   search = null,
@@ -2763,35 +2971,7 @@ export function conversationSessionsView({
       <a class="button" href="/#conversation-capture-upgrade" data-i18n="conversation-round-install-hooks">Install conversation capture update</a>
     </div>
   </div>`;
-  return layout('Conversations', `
-    <section class="stack">
-      ${conversationPrivacyView(openMode, { reliable: true })}
-      ${conversationSubnav('sessions')}
-      ${legacyFragmentsNotice(legacyCount)}
-      <div class="conversation-layout">
-        <details class="conversation-filter-details" data-persist-details="session-filters" open>
-          <summary data-i18n="conversation-filters-heading">Filters</summary>
-          <form method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters" data-reset-scroll>
-          <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
-          <p class="muted tiny conversation-filter-hint" data-i18n="conversation-session-filter-hint">Filters match reliable hook-backed user rounds. API fragments are searched separately in diagnostics.</p>
-          <label><span data-i18n="conversation-session-search">Search conversations</span>
-            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Exact submitted prompt or final response" data-placeholder-en="Exact submitted prompt or final response" data-placeholder-zh="原始提交文字或最终回复">
-          </label>
-          <label><span data-i18n="conversation-filter-period-label">Period</span><select name="period">${periodOptions}</select></label>
-          <label><span data-i18n="conversation-filter-member-label">Member</span>
-            <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
-            <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>
-          </label>
-          <label><span data-i18n="conversation-filter-device-label">Device</span><select name="device_id">${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select></label>
-          <label><span data-i18n="conversation-filter-account-label">Account</span><select name="account_id">${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select></label>
-          <label><span data-i18n="conversation-filter-state-label">Response state</span><select name="response_state">${stateOptions}</select></label>
-          <label><span data-i18n="conversation-filter-limit-label">Rows per page</span><select name="limit">${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label>
-          <div class="filter-actions">
-            <button type="submit" data-i18n="conversation-search-submit">Search</button>
-            <a class="button secondary" href="/conversations" data-i18n="conversation-search-clear">Clear</a>
-          </div>
-          </form>
-        </details>
+  const resultsSection = `
         <section class="conversation-results" aria-labelledby="conversation-sessions-results-heading">
           <div class="conversation-results-head">
             <div>
@@ -2800,7 +2980,7 @@ export function conversationSessionsView({
               <p class="muted" data-i18n="conversation-sessions-intro">Each round pairs the exact prompt emitted by Claude Code UserPromptSubmit with the final visible response emitted by Stop. Tool-loop API requests do not become fake user turns. Session and prompt identifiers are stored only as device-bound HMACs.</p>
               ${conversationActiveChips({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState })}
             </div>
-            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-session-total-matches">matching conversations</span> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
+            <div class="conversation-result-summary" aria-live="polite"><strong>${escapeHtml(String(totalMatches))}</strong> <span data-i18n="conversation-session-total-matches">matching conversations</span> · <label class="conversation-rows"><span class="muted tiny" data-i18n="conversation-filter-limit-label">Rows per page</span><select name="limit" form="conversation-filter-form" data-autoapply>${CONVERSATION_LIMIT_OPTIONS.map((value) => `<option value="${value}"${normalizedLimit === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label> · <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a></div>
           </div>
           ${errorNotice}
           ${droppedNotice}
@@ -2812,6 +2992,39 @@ export function conversationSessionsView({
           </div>
           ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-session-pagination-hint">Conversations are ordered by latest hook activity, newest first.</span>${nextForm}</div>` : ''}
         </section>
+`;
+  // A fragment request re-renders only the results, so a filter change costs
+  // a few KB instead of the whole document over a high-latency link.
+  if (fragment) return resultsSection;
+  return layout('Conversations', `
+    <section class="stack">
+      ${conversationPrivacyView(openMode, { reliable: true })}
+      ${conversationSubnav('sessions')}
+      ${legacyFragmentsNotice(legacyCount)}
+      <div class="conversation-layout">
+        <details class="conversation-filter-details" data-persist-details="session-filters" open>
+          <summary data-i18n="conversation-filters-heading">Filters</summary>
+          <form id="conversation-filter-form" method="post" action="/conversations" class="card conversation-rail conversation-filters" aria-label="Conversation filters" data-reset-scroll>
+          <h2 class="visually-hidden" data-i18n="conversation-filters-heading">Filters</h2>
+          <label><span data-i18n="conversation-session-search">Search conversations</span>
+            <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Text in prompt or reply" data-placeholder-en="Text in prompt or reply" data-placeholder-zh="原始提交文字或最终回复">
+          </label>
+          <label><span data-i18n="conversation-filter-period-label">Period</span><select name="period" data-autoapply>${periodOptions}</select></label>
+          <label><span data-i18n="conversation-filter-member-label">Member</span>
+            <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
+            <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>
+            <p class="muted tiny conversation-filter-hint" data-i18n="conversation-session-filter-hint">Filters match reliable hook-backed user rounds. API fragments are searched separately in diagnostics.</p>
+          </label>
+          <label><span data-i18n="conversation-filter-device-label">Device</span><select name="device_id" data-autoapply>${conversationFacetOptions(facets.devices, normalizedDevice, 'All devices', 'conversation-all-devices')}</select></label>
+          <label><span data-i18n="conversation-filter-account-label">Account</span><select name="account_id" data-autoapply>${conversationFacetOptions(facets.accounts, normalizedAccount, 'All accounts', 'conversation-all-accounts')}</select></label>
+          <label><span data-i18n="conversation-filter-state-label">Response state</span><select name="response_state" data-autoapply>${stateOptions}</select></label>
+          <div class="filter-actions">
+            <button type="submit" data-i18n="conversation-search-submit">Search</button>
+            <a class="button secondary" href="/conversations" data-i18n="conversation-search-clear">Clear</a>
+          </div>
+          </form>
+        </details>
+        ${resultsSection}
       </div>
     </section>
   `, { openMode, activeTab: 'conversations' });
@@ -3102,6 +3315,9 @@ export function dashboardView({
     .map((entry) => [entry.accountId, entry]));
   const activeDevices = devices.filter((device) => !device.revoked_at);
   const healthy = alerts.accounts.filter((account) => account.severity === 'ok').length;
+  // Claude only: this list feeds the Claude Code card's picker and its quota
+  // block. A Codex account here would render Codex quota under a Claude heading
+  // and offer a Claude installer for it.
   const selfServiceAccounts = accounts.filter((account) => (
     account.provider === 'claude'
     && ['stored', 'healthy'].includes(account.status)
@@ -3259,6 +3475,18 @@ export function dashboardView({
               </label>
               <div><button type="submit" data-i18n="get-codex">Get Codex installer</button></div>
             </form>` : '<div class="notice" data-i18n="codex-unavailable">Codex self-service enrollment is not configured yet. An administrator must connect dispenser enrollment.</div>'}
+            ${primaryCodex?.external?.kind === 'codex-credential' ? `<hr>
+            <h3>Or route turns through this console</h3>
+            <p class="muted tiny">The installer above pulls a credential and then talks to chatgpt.com directly, so those turns are not metered here. This alternative keeps the credential on the server and meters each device. It needs no dispenser enrollment, only an authorized account.</p>
+            <form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="codex-gateway-self-service">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <input type="hidden" name="account_id" value="${escapeHtml(primaryCodex.id)}">
+              ${memberLabelField}
+              <label><span data-i18n="device-name">Device name</span>
+                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
+              </label>
+              <div><button type="submit">Get Codex gateway token</button></div>
+            </form>` : ''}
           </article>
         </div>
         ${openMode ? '<p class="muted tiny" data-i18n="member-label-note">Nobody checks the label. It only keeps two members\' device names apart.</p>' : ''}
@@ -3844,6 +4072,67 @@ Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
     </section>
   `, { openMode, completedDraft: 'claude-self-service' });
+}
+
+/**
+ * The Codex counterpart of `deviceConfiguredView`.
+ *
+ * Deliberately configuration, not an installer. The Claude page can generate a
+ * launcher because it owns the whole profile; pointing the Codex CLI at the
+ * gateway is two settings in a file the user already has, and a script that
+ * rewrote `config.toml` would be far more likely to clobber someone's existing
+ * setup than to save them a step.
+ *
+ * `model_provider` rather than `chatgpt_base_url`: the CLI sends plugin,
+ * analytics and apps traffic to the latter, none of which this gateway proxies
+ * or should proxy. Overriding only the provider leaves that traffic on its
+ * normal path and routes just the turns.
+ *
+ * `env_key`, not `requires_openai_auth`: the latter makes the CLI authenticate
+ * with the ChatGPT token from its own `auth.json`, which this gateway would
+ * reject — the whole point is that the device presents a device token and never
+ * holds the subscription credential. Verified against codex-cli 0.138.0, which
+ * refuses to start with `Missing environment variable` when the named variable
+ * is absent.
+ */
+export function codexDeviceConfiguredView({
+  account, device, token, codexGatewayUrl, tokenEnvVar = 'CODEX_GATEWAY_TOKEN', openMode = false,
+}) {
+  const gateway = String(codexGatewayUrl ?? '').replace(/\/$/, '');
+  const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
+  const configToml = `# ~/.codex/config.toml
+# model_provider is a top-level key. It must sit ABOVE every [table]; appending
+# this block to a config that already has one binds it into that table instead.
+model_provider = "gateway"
+
+[model_providers.gateway]
+name = "gateway"
+base_url = "${gateway}"
+wire_api = "responses"
+env_key = "${tokenEnvVar}"`;
+  const tokenExport = `export ${tokenEnvVar}=${shellSingleQuote(token)}`;
+  return layout('Codex device configured', `
+    <section class="stack">
+      <div class="notice success">Device <strong>${escapeHtml(device.name)}</strong> is enrolled for <strong>${escapeHtml(account.alias)}</strong>.</div>
+      <h1>Copy this token now</h1>
+      <p class="muted">This device token is displayed once and cannot be recovered from the control plane. Re-enroll if it is lost.</p>
+      <h2>1. Token</h2>
+      <pre id="codex-token">${escapeHtml(tokenExport)}</pre>
+      <div class="setup-actions">
+        <button type="button" class="secondary" data-copy-target="codex-token">Copy token</button>
+      </div>
+      <h2>2. Point the Codex CLI at the gateway</h2>
+      <pre id="codex-config">${escapeHtml(configToml)}</pre>
+      <div class="setup-actions">
+        <button type="button" data-download-target="codex-config" data-download-name="codex-${escapeHtml(profile)}-config.toml">Download config.toml</button>
+        <button type="button" class="secondary" data-copy-target="codex-config">Copy configuration</button>
+      </div>
+      <div class="notice">Turns now go through the console, which meters them per device. Nothing else is proxied, so a device holding no ChatGPT sign-in of its own loses the features that need one — <code>codex cloud</code>, plugin and app listings, and the quota figures in <code>codex /status</code>. Running a turn needs none of them.</div>
+      <div class="notice">On Windows PowerShell the token is set with <code>$env:${escapeHtml(tokenEnvVar)} = '&lt;token&gt;'</code>, not <code>export</code>.</div>
+      <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
+      <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+    </section>
+  `, { openMode, completedDraft: 'codex-gateway-self-service' });
 }
 
 export function messageView(title, message, {

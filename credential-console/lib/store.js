@@ -380,14 +380,26 @@ export class CredentialStore {
           'DEVICE_CONFIGURATION_INVALID',
         );
       }
-      if (account.provider !== 'claude') {
+      if (!['claude', 'codex'].includes(account.provider)) {
         throw storeError(
-          `device account policy account ${id} is not a Claude account`,
+          `device account policy account ${id} is not a gateway account`,
           'DEVICE_CONFIGURATION_INVALID',
         );
       }
       return id;
     });
+    // Homogeneous by provider. A device is configured for one client — Claude
+    // Code reads ANTHROPIC_BASE_URL, the Codex CLI reads a model_providers
+    // block — so an allowlist spanning both could only ever offer it an account
+    // it cannot use. Previously this was enforced by admitting Claude alone;
+    // the rule is now stated directly so a Codex-only device is equally valid.
+    const providers = new Set(allowedAccountIds.map((id) => this.accountById(id).provider));
+    if (providers.size > 1) {
+      throw storeError(
+        'device account policy mixes providers',
+        'DEVICE_CONFIGURATION_INVALID',
+      );
+    }
     if (new Set(allowedAccountIds).size !== allowedAccountIds.length) {
       throw storeError(
         'device account policy allowlist contains duplicates',
@@ -602,6 +614,19 @@ export class CredentialStore {
           throw storeError('target account is not a Claude account', 'DEVICE_CONFIGURATION_INVALID');
         }
         const policy = this.#deviceAccountPolicy(device);
+        // Refuse before touching the row, not after. Appending a Claude account
+        // to a Codex device's allowlist makes it mixed, and the mutation below
+        // is persisted before anything revalidates it: a crash between that
+        // write and the rollback would leave a device that no longer resolves
+        // and that this very method can no longer repair, since it reads the
+        // policy on entry. Hand-editing state.json would be the only way back.
+        const currentProvider = this.accountById(policy.selectedAccountId)?.provider;
+        if (currentProvider && currentProvider !== account.provider) {
+          throw storeError(
+            'device is configured for a different provider',
+            'DEVICE_CONFIGURATION_INVALID',
+          );
+        }
         const allowed = [...policy.allowedAccountIds];
         const allowedAdded = allowed.includes(selectedAccountId) ? [] : [selectedAccountId];
         allowed.push(...allowedAdded);
@@ -1168,8 +1193,17 @@ export class CredentialStore {
     return this.serialized(async () => {
       const account = this.accountById(accountId);
       if (!account) throw new Error('account not found');
-      if (account.provider !== 'claude' || !account.credential) {
-        throw new Error('account is not available for Claude Code self-service');
+      // "Usable" means something different per provider, because the console
+      // holds the two credentials in different places by design: a Claude
+      // credential is stored here, encrypted, while a Codex account keeps only
+      // a pointer to the home the refresh centre publishes into. Demanding
+      // `credential` of both made Codex permanently unissuable, which is what
+      // left the Codex gateway route unreachable in practice.
+      const usable = account.provider === 'claude'
+        ? Boolean(account.credential)
+        : account.provider === 'codex' && account.external?.kind === 'codex-credential';
+      if (!usable) {
+        throw new Error('account is not available for gateway self-service');
       }
       if (account.expires_at && Date.parse(account.expires_at) <= Date.now()) {
         throw new Error('account credential is expired');

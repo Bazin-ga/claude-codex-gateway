@@ -22,9 +22,37 @@ echarts.use([
   SVGRenderer,
 ]);
 
-const dashboard = document.querySelector('[data-metrics-dashboard]');
+/**
+ * Bind the dashboard to whatever is in the document now.
+ *
+ * Navigation re-renders the page inside the existing document, so this can no
+ * longer be a one-shot at load: arriving at /metrics from another tab has to
+ * bind to DOM that did not exist when this module first ran.
+ */
+/**
+ * Undo the previous binding.
+ *
+ * Navigation replaces the dashboard without ever unloading the document, so
+ * `pagehide` — which used to be the only cleanup — never fires. Without this,
+ * every visit to /metrics left its chart instances and observers alive against
+ * detached nodes: measured at ~1.4 MB per visit, monotonic across a forced GC,
+ * and eventually slow enough to look like a hang.
+ */
+let teardownMetricsDashboard = null;
 
-if (dashboard) {
+function bootMetricsDashboard() {
+  const dashboard = document.querySelector('[data-metrics-dashboard]');
+  if (!dashboard) {
+    // Left the page entirely: release the previous dashboard.
+    teardownMetricsDashboard?.();
+    teardownMetricsDashboard = null;
+    return;
+  }
+  if (dashboard.dataset.metricsBound === 'true') return;
+  teardownMetricsDashboard?.();
+  teardownMetricsDashboard = null;
+  dashboard.dataset.metricsBound = 'true';
+  {
   const colors = Object.freeze({
     input: '#0072b2',
     cacheCreation: '#e69f00',
@@ -572,13 +600,28 @@ if (dashboard) {
     if (payload) renderAll();
   });
 
-  window.addEventListener('pagehide', () => {
+  const releaseDashboard = () => {
     observers.splice(0).forEach((observer) => observer.disconnect());
     for (const chart of instances.values()) {
       if (!chart.isDisposed()) chart.dispose();
     }
     instances.clear();
-  }, { once: true });
+    // A torn-down dashboard must stop claiming to be bound, or a node that
+    // comes back into the document would be skipped and render nothing.
+    delete dashboard.dataset.metricsBound;
+  };
+  teardownMetricsDashboard = releaseDashboard;
+  window.addEventListener('pagehide', releaseDashboard, { once: true });
 
   load();
+  }
 }
+
+bootMetricsDashboard();
+// Arriving at /metrics without a document load.
+window.addEventListener('credential-console-navigated', () => {
+  // Two frames: one for the swapped nodes to be laid out, one for the styles
+  // that size them. Initialising before that gives ECharts a near-zero width
+  // and it renders every axis label on top of itself.
+  requestAnimationFrame(() => requestAnimationFrame(bootMetricsDashboard));
+});

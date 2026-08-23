@@ -228,17 +228,23 @@ function cookieFrom(response) {
   return response.headers.get('set-cookie')?.split(';')[0] ?? '';
 }
 
-test('open conversation routes use a default GET and POST-only filter/search state', async () => {
+test('open conversation routes carry filter state in the URL', async () => {
   const metrics = conversationMetrics();
   const app = await fixture({ requestMetrics: metrics });
   try {
-    const list = await fetch(`${app.baseUrl}/conversations?q=secret-query&before_id=12&limit=1`);
+    // Filters are read from the query string so a filtered view survives a
+    // refresh, is reachable with Back, and can be shared. This deliberately
+    // reverses the earlier behaviour, where these parameters were ignored.
+    // Rounds paginate by activity time; before_id belongs to the turns route.
+    const list = await fetch(`${app.baseUrl}/conversations?q=needle&limit=1`);
     assert.equal(list.status, 200);
     const cookie = cookieFrom(list);
     assert.notEqual(cookie, '');
     const listHtml = await list.text();
-    assert.deepEqual(metrics.calls.searches[0], { q: '', beforeId: null, limit: 25 });
-    assert.equal(listHtml.includes('secret-query'), false);
+    const applied = metrics.calls.searches.at(-1);
+    assert.equal(applied.q, 'needle', 'the query string reached the store');
+    assert.equal(applied.limit, 1, 'and so did the page size');
+    assert.ok(listHtml.includes('needle'), 'the applied filter is reflected back into the form');
     assert.match(listHtml, /data-i18n="conversation-round-privacy-notice"/);
     assert.match(listHtml, /data-i18n="conversation-open-warning"/);
     assert.match(listHtml, /data-i18n="conversation-round-dropped"/);
@@ -523,6 +529,94 @@ test('conversation filters reject malformed and oversized UTF-8 values before me
     });
     assert.equal(oversized.status, 413);
     assert.equal(metrics.calls.searches.length, baselineSearches);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a fragment request returns only the results region from the same route', async () => {
+  const metrics = conversationMetrics();
+  const app = await fixture({ requestMetrics: metrics });
+  try {
+    const landing = await fetch(`${app.baseUrl}/conversations`);
+    const cookie = cookieFrom(landing);
+    const fullHtml = await landing.text();
+
+    const fragment = await fetch(`${app.baseUrl}/conversations`, {
+      method: 'POST',
+      headers: {
+        cookie,
+        'content-type': 'application/x-www-form-urlencoded',
+        'x-fragment': 'conversation-results',
+      },
+      body: new URLSearchParams({ q: 'reliable', limit: '25' }).toString(),
+    });
+    assert.equal(fragment.status, 200);
+    assert.match(fragment.headers.get('content-type') ?? '', /text\/html/);
+    const fragmentHtml = await fragment.text();
+
+    assert.match(fragmentHtml, /^\s*<section class="conversation-results"/);
+    assert.equal(/<!doctype/i.test(fragmentHtml), false, 'no document wrapper');
+    assert.equal(fragmentHtml.includes('conversation-filters'), false, 'no filter form');
+    assert.ok(
+      Buffer.byteLength(fragmentHtml) < Buffer.byteLength(fullHtml) / 2,
+      'the fragment is the small response the client asked for',
+    );
+
+    // The filter still reached the store, so the fragment is a real search.
+    const applied = metrics.calls.searches.at(-1);
+    assert.equal(applied.q, 'reliable');
+  } finally {
+    await app.close();
+  }
+});
+
+test('without the fragment header the same POST still returns a whole document', async () => {
+  const app = await fixture({ requestMetrics: conversationMetrics() });
+  try {
+    const landing = await fetch(`${app.baseUrl}/conversation-turns`);
+    const cookie = cookieFrom(landing);
+    const response = await fetch(`${app.baseUrl}/conversation-turns`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ q: 'anything' }).toString(),
+    });
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, /<!doctype html>/i, 'scripting-off browsers keep working');
+    assert.match(html, /conversation-filters/, 'and still get the filter form back');
+  } finally {
+    await app.close();
+  }
+});
+
+test('a spoofed fragment header cannot bypass the session requirement', async () => {
+  const app = await fixture({ requestMetrics: conversationMetrics(), adminAuth: 'tailscale' });
+  try {
+    const response = await fetch(`${app.baseUrl}/conversations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        'x-fragment': 'conversation-results',
+      },
+      body: 'q=secret',
+    });
+    assert.notEqual(response.status, 200, 'auth is enforced before rendering anything');
+  } finally {
+    await app.close();
+  }
+});
+
+test('a URL with no filters is still an unfiltered landing page', async () => {
+  const metrics = conversationMetrics();
+  const app = await fixture({ requestMetrics: metrics });
+  try {
+    const response = await fetch(`${app.baseUrl}/conversations`);
+    assert.equal(response.status, 200);
+    await response.text();
+    const search = metrics.calls.searches.at(-1);
+    assert.equal(search.q, '', 'no query means no filter');
+    assert.equal(search.limit, 25, 'and the default page size');
   } finally {
     await app.close();
   }
