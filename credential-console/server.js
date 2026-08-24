@@ -40,6 +40,7 @@ import {
   completeCodexAuthorization as exchangeCodexAuthorization,
   createCodexAuthorizationRequest,
   parseCodexAuthorizationRedirect,
+  parseCodexAuthJson,
 } from './lib/codex-oauth.js';
 import { assertCodexSeedHomeWritable, seedCodexCredentialHome } from './lib/codex-seed.js';
 import {
@@ -2135,6 +2136,64 @@ export async function createCredentialConsole(options = {}) {
         }
       } catch (error) {
         log('codex_account_authorization_failed', {
+          account_id: account.id,
+          account_alias: account.alias,
+          identity,
+          error: error.message,
+        });
+        sendHtml(res, 400, codexAuthorizationPage(account, session, { error: error.message }));
+      }
+      return;
+    }
+
+    const codexPasteParams = routeMatch(path, '/accounts/:id/codex-authorization/paste');
+    if (req.method === 'POST' && codexPasteParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      // The body is a credential, so it is never read with the default cap that
+      // would silently truncate it into something unparseable.
+      const form = await readForm(req, 256 * 1024).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const account = codexAccountOr404(codexPasteParams.id);
+      if (!account) return;
+      const identity = session.admin_identity ?? 'administrator';
+      try {
+        if (!codexSeedHome) {
+          throw new Error('no Codex credential home is configured, so there is nowhere to write this');
+        }
+        const { credential, identity: authorized } = parseCodexAuthJson(form.credential_json);
+        const expectedEmail = String(account.email_label ?? '').trim().toLowerCase();
+        if (expectedEmail && String(authorized.email ?? '').trim().toLowerCase() !== expectedEmail) {
+          throw new Error(`the pasted credential belongs to a different account than ${expectedEmail}`);
+        }
+        store.assertCodexSeedHome({ accountId: account.id, seedHome: codexSeedHome });
+        const seeded = await seedCodexCredentialHome(codexSeedHome, credential);
+        await store.recordCodexSeed({
+          accountId: account.id,
+          seededHome: codexSeedHome,
+          expiresAt: seeded?.expiresAt ?? null,
+          actor: identity,
+        });
+        log('codex_credential_pasted', {
+          account_id: account.id,
+          account_alias: account.alias,
+          email: authorized.email,
+          plan: authorized.planType,
+          seeded_home: codexSeedHome,
+          identity,
+        });
+        sendHtml(res, 200, messageView(
+          'Codex credential stored',
+          `The credential was written to ${seeded.home} and is not shown here. Any refresh quarantine on that home has been cleared.`,
+          { openMode, detail: `${account.alias} → ${seeded.home}` },
+        ));
+      } catch (error) {
+        // The message is shape-only by construction, so it is safe to render and
+        // to log. The credential itself is never in either.
+        log('codex_credential_paste_failed', {
           account_id: account.id,
           account_alias: account.alias,
           identity,

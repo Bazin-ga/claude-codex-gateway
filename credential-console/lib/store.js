@@ -1071,19 +1071,50 @@ export class CredentialStore {
       if (!account || account.provider !== 'codex') throw new Error('Codex account was not found');
       flow.used_at = nowIso();
       delete flow.verifier;
-      if (seededHome) {
-        // Only where to read the credential's health, never the credential.
-        account.external ??= { kind: 'codex-credential', home: seededHome };
-        account.status = 'stored';
-        account.expires_at = expiresAt;
-        account.last_success_at = nowIso();
-        delete account.last_failure;
-        delete account.last_failure_at;
-      }
+      if (seededHome) this.#bindCodexSeed(account, seededHome, expiresAt);
       this.audit('codex_authorization_completed', {
         oauth_flow_id: flow.id,
         account_id: account.id,
         seeded_home: seededHome,
+      });
+      await this.persist();
+      return account;
+    });
+  }
+
+  /**
+   * Record that a credential was written into `seededHome`, and mark the account
+   * healthy again.
+   *
+   * Shared by the OAuth completion above and the pasted-credential route, so the
+   * two cannot drift: however a credential arrives, the account records the same
+   * thing — where to read its health, never the credential itself.
+   */
+  #bindCodexSeed(account, seededHome, expiresAt) {
+    // Only where to read the credential's health, never the credential.
+    account.external ??= { kind: 'codex-credential', home: seededHome };
+    account.status = 'stored';
+    account.expires_at = expiresAt;
+    account.last_success_at = nowIso();
+    delete account.last_failure;
+    delete account.last_failure_at;
+  }
+
+  /**
+   * The pasted-credential counterpart of `completeCodexAuthorization`: same
+   * binding, no OAuth session, because there was no redirect to carry one.
+   */
+  async recordCodexSeed({ accountId, seededHome, expiresAt = null, actor = null }) {
+    return this.serialized(async () => {
+      const account = this.accountById(accountId);
+      if (!account || account.provider !== 'codex') throw new Error('Codex account was not found');
+      if (!seededHome) throw new Error('a seeded home is required');
+      this.#bindCodexSeed(account, seededHome, expiresAt);
+      // The credential is never an argument here, so it can never reach the log.
+      this.audit('codex_credential_pasted', {
+        account_id: account.id,
+        seeded_home: seededHome,
+        actor,
       });
       await this.persist();
       return account;

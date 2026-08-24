@@ -171,6 +171,58 @@ export function codexIdentityFrom(idToken) {
   };
 }
 
+/**
+ * Validate a pasted `~/.codex/auth.json` and normalise it into the shape the
+ * refresh centre stores.
+ *
+ * The redirect flow exists partly because it never puts a credential in front
+ * of a human. Pasting one does, which is a deliberate trade: it is the only
+ * route that still works when the round trip cannot be completed — a
+ * quarantined refresh chain, a browser that cannot reach the console, or a
+ * credential minted on another machine.
+ *
+ * Every rejection is phrased in terms of the *shape* of the input. Nothing
+ * derived from the credential appears in a message, because these are rendered
+ * straight back into the page.
+ */
+export function parseCodexAuthJson(value) {
+  const text = String(value ?? '').trim();
+  if (!text) throw new Error('paste the contents of ~/.codex/auth.json');
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('that is not valid JSON; paste the whole file, including the outer braces');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('the pasted JSON is not an object');
+  }
+  const tokens = parsed.tokens;
+  if (tokens === null || typeof tokens !== 'object' || Array.isArray(tokens)) {
+    throw new Error('the pasted JSON has no "tokens" object; this does not look like an auth.json');
+  }
+  const field = (name) => (typeof tokens[name] === 'string' ? tokens[name].trim() : '');
+  const idToken = field('id_token');
+  const accessToken = field('access_token');
+  const refreshToken = field('refresh_token');
+  if (!idToken) throw new Error('tokens.id_token is missing');
+  if (!accessToken) throw new Error('tokens.access_token is missing');
+  if (!refreshToken) {
+    // A *distributed* credential carries an intentionally invalid refresh_token
+    // so no client can rotate the centre's token away. Seeding one of those back
+    // in would leave the centre permanently unable to refresh — the opposite of
+    // what re-seeding is for.
+    throw new Error(
+      'tokens.refresh_token is empty. That is the shape handed out to client machines,'
+      + ' which deliberately cannot refresh. Paste the auth.json from the login itself.',
+    );
+  }
+  // Throws on a malformed or non-Codex id_token, and yields the account id
+  // without having to trust the pasted one.
+  const identity = codexIdentityFrom(idToken);
+  return { credential: buildCodexAuthJson({ idToken, accessToken, refreshToken }), identity };
+}
+
 /** Assemble the exact `auth.json` the codex CLI and the refresh center both read. */
 export function buildCodexAuthJson({ idToken, accessToken, refreshToken }, { now = new Date() } = {}) {
   const { accountId } = codexIdentityFrom(idToken);

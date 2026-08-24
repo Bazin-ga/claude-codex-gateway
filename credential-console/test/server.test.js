@@ -809,6 +809,74 @@ test('a bare authorization code completes the account\'s one live Codex session'
   }
 });
 
+test('a pasted auth.json seeds the home and clears the quarantine, exactly as the redirect does', async () => {
+  // This is the route that exists for when the redirect cannot be completed —
+  // and a quarantined refresh chain is the case that motivated it, because the
+  // centre refuses to refresh until a fresh seed clears the marker.
+  const seedHome = await mkdtemp(join(tmpdir(), 'credential-console-paste-'));
+  const tokens = syntheticCodexTokens();
+  const app = await fixture({ adminAuth: 'open', codex: { codexSeedHome: seedHome } });
+  try {
+    const account = await app.store.addAccount({ provider: 'codex', alias: 'codex-paste-1' });
+    const seedStore = new CodexCredentialStore(seedHome);
+    await seedStore.init();
+    await seedStore.beginRefreshAttempt({ reason: 'test-ambiguous-rotation' });
+    assert.notEqual(await seedStore.readRefreshAttempt(), null);
+
+    const page = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization`, {});
+    const cookie = cookieFrom(page);
+    const pageHtml = await page.text();
+    assert.match(pageHtml, /Or paste an existing auth\.json/);
+    const csrf = csrfFrom(pageHtml);
+
+    const pasted = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization/paste`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        csrf,
+        credential_json: JSON.stringify({
+          OPENAI_API_KEY: null,
+          tokens: {
+            id_token: tokens.idToken,
+            access_token: tokens.accessToken,
+            refresh_token: tokens.refreshToken,
+            account_id: tokens.accountId,
+          },
+        }),
+      }),
+    });
+
+    assert.equal(pasted.status, 200);
+    const pastedHtml = await pasted.text();
+    assert.match(pastedHtml, /The credential was written to/);
+    // Pasting is the one path where a human had the credential in hand; the page
+    // must not hand it back to them again.
+    for (const secret of [tokens.refreshToken, tokens.accessToken, tokens.idToken]) {
+      assert.equal(pastedHtml.includes(secret), false, 'the credential is echoed back');
+    }
+
+    const stored = JSON.parse(await readFile(join(seedHome, 'secret', 'credential.json'), 'utf8'));
+    assert.equal(stored.tokens.refresh_token, tokens.refreshToken);
+    assert.equal(stored.tokens.account_id, tokens.accountId);
+
+    const published = JSON.parse(await readFile(join(seedHome, 'public', 'current.json'), 'utf8'));
+    assert.equal('refresh_token' in published, false, 'the published copy can never rotate');
+    assert.equal(published.access_token, tokens.accessToken);
+
+    // The whole point: the centre can refresh again.
+    assert.equal(await seedStore.readRefreshAttempt(), null, 'quarantine was not cleared');
+
+    assert.equal(account.status, 'stored');
+    assert.equal(account.external.home, seedHome);
+    const persisted = await readFile(join(app.home, 'state.json'), 'utf8');
+    for (const secret of [tokens.refreshToken, tokens.accessToken, tokens.idToken]) {
+      assert.equal(persisted.includes(secret), false, 'a credential reached state.json');
+    }
+  } finally {
+    await app.close();
+  }
+});
+
 test('a configured seed home receives the credential and publishes it without the refresh token', async () => {
   const seedHome = await mkdtemp(join(tmpdir(), 'credential-console-seed-'));
   const tokens = syntheticCodexTokens();

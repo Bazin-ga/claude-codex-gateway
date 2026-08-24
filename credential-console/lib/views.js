@@ -3682,6 +3682,17 @@ export function codexAuthorizationView({
             <button type="submit" data-i18n="complete-authorization">Complete authorization</button>
           </form>
         ` : ''}
+        <hr>
+        <h2 data-i18n="codex-paste-heading">Or paste an existing auth.json</h2>
+        <p class="muted tiny" data-i18n="codex-paste-intro">For when the redirect cannot be completed — a quarantined refresh chain, a browser that cannot reach this console, or a credential minted on another machine. This writes the credential straight into the credential home and clears any refresh quarantine, exactly as a fresh authorization would. Unlike the flow above there is no 15-minute window and no code to spend, so a mistake costs nothing but a retry.</p>
+        <form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-authorization/paste" class="stack" autocomplete="off">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <label><span data-i18n="codex-paste-label">Contents of ~/.codex/auth.json</span>
+            <textarea name="credential_json" required minlength="8" spellcheck="false" autocomplete="off" placeholder='{"OPENAI_API_KEY":null,"tokens":{"id_token":"...","access_token":"...","refresh_token":"...","account_id":"..."}}'></textarea>
+          </label>
+          <button type="submit" data-i18n="codex-paste-submit">Store this credential</button>
+        </form>
+        <div class="notice error" data-i18n="codex-paste-warning">Paste the auth.json from the login itself, not one taken off a client machine — a distributed copy carries a deliberately invalid refresh_token and would leave the refresh centre unable to renew anything. Clear the clipboard afterwards.</div>
         <div class="notice" data-i18n="codex-auth-security">The authorization session is single-use, expires in 15 minutes, and is replaced when a new one starts. A pasted address is checked against the state this console issued; a bare code carries no state and relies on PKCE and there being exactly one live session. The PKCE verifier is encrypted at rest and the resulting credential is never written to state.json, the audit log, or a log line.</div>
         <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
       </div>
