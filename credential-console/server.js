@@ -1688,6 +1688,9 @@ export async function createCredentialConsole(options = {}) {
         claudeGatewayUrl,
         onboardingUrl,
         error: url.searchParams.get('error'),
+        // Carried in the URL so a filtered view is linkable and survives a
+        // reload, the same way the conversation and metrics filters work.
+        accountFilter: url.searchParams.get('account'),
         completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
       }));
       return;
@@ -2291,6 +2294,50 @@ export async function createCredentialConsole(options = {}) {
         redirect(res, '/');
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/devices/account') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const actor = session.admin_identity ?? 'anonymous';
+      const fromAccountId = String(form.from_account_id ?? '');
+      try {
+        // The count the operator was looking at. The store refuses if the set
+        // has changed since, so a bulk move can never be bigger than what was
+        // on screen.
+        const declared = Number(form.expected_count);
+        const summary = await store.bulkConfigureDeviceAccount({
+          fromAccountId,
+          selectedAccountId: String(form.selected_account_id ?? ''),
+          expectedCount: Number.isSafeInteger(declared) && declared >= 0 ? declared : null,
+          actor,
+          actorType: 'console',
+        });
+        log('device_account_bulk_configured', {
+          from_account_id: fromAccountId,
+          to_account_id: summary.targetAccountId,
+          switched: summary.switched.length,
+          skipped: summary.skipped.length,
+          actor,
+        });
+        const target = store.accountById(summary.targetAccountId);
+        const detail = summary.skipped.length
+          ? `${summary.skipped.length} left alone: ${summary.skipped.map((entry) => entry.reason).join('; ')}`
+          : null;
+        sendHtml(res, 200, messageView(
+          'Accounts switched',
+          `${summary.switched.length} credential(s) moved to ${target?.alias ?? summary.targetAccountId}.`,
+          { openMode, detail },
+        ));
+      } catch (error) {
+        redirect(res, `/?account=${encodeURIComponent(fromAccountId)}&error=${encodeURIComponent(error.message)}`);
       }
       return;
     }

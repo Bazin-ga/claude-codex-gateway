@@ -3305,6 +3305,7 @@ export function dashboardView({
   claudeGatewayUrl = null,
   onboardingUrl = null,
   error = null,
+  accountFilter = null,
   completedDraft = null,
   credentialAlerts = null,
   now = Date.now(),
@@ -3417,14 +3418,30 @@ export function dashboardView({
     `<option value="${escapeHtml(entry.machine_id)}">${escapeHtml(entry.names.join(', ') || entry.machine_id)} · ${escapeHtml(entry.machine_id)}</option>`
   )).join('');
   const entryView = (entry) => machineEntryView(entry, { accounts, csrf, machineOptions });
-  const liveMachines = inventory.filter((entry) => entry.active > 0 && !entry.legacy);
+  // Filtering is judged on the *device* rows, not the machine: one machine can
+  // hold Claude credentials on several accounts, so a machine is shown when any
+  // of its rows matches, and the count below counts rows rather than machines.
+  const switchableAccounts = accounts.filter((account) => (
+    account.provider === 'claude' && account.status !== 'disabled'
+  ));
+  const filterAccount = switchableAccounts.find((account) => account.id === accountFilter) ?? null;
+  const rowsOnFilteredAccount = (entry) => (entry.devices ?? []).filter((device) => (
+    !device.revoked_at
+    && accountSelectionForDevice(device, accounts).selectedAccountId === filterAccount?.id
+  ));
+  const matchesFilter = (entry) => !filterAccount || rowsOnFilteredAccount(entry).length > 0;
+  const filteredCount = filterAccount
+    ? inventory.reduce((total, entry) => total + rowsOnFilteredAccount(entry).length, 0)
+    : 0;
+
+  const liveMachines = inventory.filter((entry) => entry.active > 0 && !entry.legacy && matchesFilter(entry));
   // Kept in a group of their own rather than mixed in among machines: an issuance
   // nobody can attribute is not an inventory entry, and listing it as one would be
   // the quiet guess this whole view exists to avoid.
-  const unattributed = inventory.filter((entry) => entry.active > 0 && entry.legacy);
+  const unattributed = inventory.filter((entry) => entry.active > 0 && entry.legacy && matchesFilter(entry));
   // Everything a machine ever held is kept, but one holding nothing live is history
   // rather than inventory, so it starts folded away.
-  const retiredMachines = inventory.filter((entry) => entry.active === 0);
+  const retiredMachines = inventory.filter((entry) => entry.active === 0 && matchesFilter(entry));
 
   return layout('Dashboard', `
     <div class="stack">
@@ -3569,6 +3586,32 @@ export function dashboardView({
               <div class="muted tiny" data-i18n="machines-intro">One row per machine, with every credential it holds underneath. A machine is identified by an opaque random handle — reported by its own agent, or minted here for one issuance when the machine has no agent to report one. It says nothing about who is using it, and the member label beside it is self-asserted and unverified.</div>
             </div></div>
             ${openMode ? '<div class="notice error open-banner" role="status" data-i18n="open-account-switch-warning">Open mode has no verified actor: anyone who can reach this console can switch any active device. The actor is recorded as anonymous; a member label is not an actor.</div>' : ''}
+            ${switchableAccounts.length ? `<form method="get" action="/" class="machine-filter" data-autoapply>
+              <label><span>Filter by Claude account</span>
+                <select name="account" data-draft-field>
+                  <option value="">All accounts</option>
+                  ${switchableAccounts.map((account) => (
+                    `<option value="${escapeHtml(account.id)}"${account.id === filterAccount?.id ? ' selected' : ''}>${escapeHtml(account.alias)}</option>`
+                  )).join('')}
+                </select>
+              </label>
+              <noscript><button type="submit">Apply</button></noscript>
+            </form>` : ''}
+            ${filterAccount ? (filteredCount ? `<form method="post" action="/devices/account" class="bulk-switch stack">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <input type="hidden" name="from_account_id" value="${escapeHtml(filterAccount.id)}">
+              <input type="hidden" name="expected_count" value="${filteredCount}">
+              <div><strong>${filteredCount}</strong> active credential(s) on <strong>${escapeHtml(filterAccount.alias)}</strong>.</div>
+              <label><span>Move all of them to</span>
+                <select name="selected_account_id" required>
+                  ${switchableAccounts.filter((account) => account.id !== filterAccount.id).map((account) => (
+                    `<option value="${escapeHtml(account.id)}">${escapeHtml(accountDisplayLabel(account))}</option>`
+                  )).join('')}
+                </select>
+              </label>
+              <button type="submit" class="danger">Switch all ${filteredCount}</button>
+              <div class="muted tiny">Applies to whatever is on this account when you press it, and refuses if that is no longer ${filteredCount}. Rows it cannot move are reported and left alone.</div>
+            </form>` : `<div class="notice"><span>No active credential is on <strong>${escapeHtml(filterAccount.alias)}</strong>.</span></div>`) : ''}
             ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
             <div class="machine-list">${liveMachines.map(entryView).join('')
               || '<p class="empty" data-i18n="no-machines">No machine holds a credential yet.</p>'}</div>

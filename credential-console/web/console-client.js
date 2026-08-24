@@ -1498,6 +1498,29 @@ function applyConversationFilter(form) {
   });
 }
 
+/**
+ * The dashboard's Claude-account filter.
+ *
+ * Deliberately its own handler rather than reusing the `[data-autoapply]` one
+ * below: that path is built around the conversation results fragment and is on
+ * the hot path for the page carrying almost all the traffic. A plain boosted
+ * navigation is all this needs, and it keeps the two independent.
+ */
+document.addEventListener('change', (event) => {
+  const select = event.target;
+  if (!select?.matches?.('.machine-filter select[name="account"]')) return;
+  const form = select.closest('form');
+  if (!form) return;
+  const url = new URL(form.getAttribute('action') || location.pathname, location.href);
+  // An empty value means "all", and an empty query parameter reads better than
+  // `?account=` in the address bar and in a shared link.
+  if (select.value) url.searchParams.set('account', select.value);
+  else url.searchParams.delete('account');
+  navigateTo(url.href).then((handled) => {
+    if (!handled) form.submit();
+  }).catch(() => form.submit());
+});
+
 if (conversationFragmentSupported()) {
   document.addEventListener('change', (event) => {
     const node = event.target;

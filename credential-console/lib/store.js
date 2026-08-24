@@ -1083,6 +1083,128 @@ export class CredentialStore {
   }
 
   /**
+   * Which active Claude devices currently answer to `accountId`.
+   *
+   * Rows whose policy will not resolve are excluded rather than guessed at: the
+   * dashboard already shows them as invalid, and a bulk move must not silently
+   * decide what a malformed row meant.
+   */
+  devicesOnAccount(accountId) {
+    if (typeof accountId !== 'string' || !accountId) return [];
+    return this.state.devices.filter((device) => {
+      if (device.revoked_at) return false;
+      try {
+        return this.#deviceAccountPolicy(device).selectedAccountId === accountId;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  /**
+   * Move every active device currently on `fromAccountId` to `selectedAccountId`.
+   *
+   * The device set is recomputed here rather than taken from the caller, so the
+   * action is exactly "everything on A goes to B" and cannot be widened by a
+   * tampered form. `expectedCount` is the guard against the set having changed
+   * since the operator looked at it: switching thirty devices when the screen
+   * said three is the mistake worth refusing outright.
+   *
+   * One `persist()` for the whole batch. Per-device persistence would be slow
+   * and, worse, could leave half the fleet moved if it failed midway.
+   */
+  async bulkConfigureDeviceAccount({
+    fromAccountId,
+    selectedAccountId,
+    expectedCount = null,
+    actor = null,
+    actorType = 'console',
+  }) {
+    return this.serialized(async () => {
+      if (actorType !== 'console') {
+        throw storeError('console policy is required', 'DEVICE_CONFIGURATION_INVALID');
+      }
+      if (typeof selectedAccountId !== 'string' || !selectedAccountId) {
+        throw storeError('target account id is required', 'DEVICE_CONFIGURATION_INVALID');
+      }
+      if (fromAccountId === selectedAccountId) {
+        throw storeError('the target account is the one being moved from', 'DEVICE_CONFIGURATION_INVALID');
+      }
+      const target = this.accountById(selectedAccountId);
+      this.#assertSwitchableAccount(target);
+
+      const devices = this.devicesOnAccount(fromAccountId);
+      if (expectedCount !== null && devices.length !== expectedCount) {
+        throw storeError(
+          `the list changed: ${devices.length} devices are on that account now, not ${expectedCount}.`
+          + ' Re-check the filter and try again.',
+          'DEVICE_CONFIGURATION_STALE',
+        );
+      }
+      if (devices.length === 0) {
+        return { switched: [], skipped: [], targetAccountId: selectedAccountId };
+      }
+
+      const applied = [];
+      const skipped = [];
+      try {
+        for (const device of devices) {
+          const before = this.#captureDeviceAccountFields(device);
+          this.pendingDeviceAccountFields.set(device.id, before);
+          try {
+            this.#assertDeviceMutable(device);
+            const policy = this.#deviceAccountPolicy(device);
+            const currentProvider = this.accountById(policy.selectedAccountId)?.provider;
+            if (currentProvider && currentProvider !== target.provider) {
+              throw storeError(
+                'device is configured for a different provider',
+                'DEVICE_CONFIGURATION_INVALID',
+              );
+            }
+            const allowed = [...policy.allowedAccountIds];
+            const allowedAdded = allowed.includes(selectedAccountId) ? [] : [selectedAccountId];
+            allowed.push(...allowedAdded);
+            device.allowed_account_ids = allowed;
+            device.selected_account_id = selectedAccountId;
+            applied.push({ device, before, previousAccountId: policy.selectedAccountId, allowedAdded });
+          } catch (error) {
+            // One bad row must not sink the batch; it is reported instead.
+            this.#restoreDeviceAccountFields(device, before);
+            this.pendingDeviceAccountFields.delete(device.id);
+            skipped.push({ deviceId: device.id, reason: error.message });
+          }
+        }
+
+        for (const entry of applied) {
+          this.audit('device_account_configured', this.#deviceAccountAudit({
+            device: entry.device,
+            previousAccountId: entry.previousAccountId,
+            nextAccountId: selectedAccountId,
+            outcome: 'success',
+            reason: 'bulk',
+            allowedAdded: entry.allowedAdded,
+            actor,
+            actorType,
+          }));
+        }
+        await this.persist();
+      } catch (error) {
+        for (const entry of applied) {
+          this.#restoreDeviceAccountFields(entry.device, entry.before);
+        }
+        for (const entry of applied) this.pendingDeviceAccountFields.delete(entry.device.id);
+        throw error;
+      }
+      for (const entry of applied) this.pendingDeviceAccountFields.delete(entry.device.id);
+      return {
+        switched: applied.map((entry) => entry.device.id),
+        skipped,
+        targetAccountId: selectedAccountId,
+      };
+    });
+  }
+
+  /**
    * Record that a credential was written into `seededHome`, and mark the account
    * healthy again.
    *
