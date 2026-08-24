@@ -1089,16 +1089,37 @@ export class CredentialStore {
    * dashboard already shows them as invalid, and a bulk move must not silently
    * decide what a malformed row meant.
    */
-  devicesOnAccount(accountId) {
-    if (typeof accountId !== 'string' || !accountId) return [];
+  devicesMatching({ accountId = null, memberLabel = null } = {}) {
+    const wantAccount = typeof accountId === 'string' && accountId ? accountId : null;
+    const wantMember = typeof memberLabel === 'string' && memberLabel ? memberLabel : null;
+    if (!wantAccount && !wantMember) return [];
     return this.state.devices.filter((device) => {
       if (device.revoked_at) return false;
+      if (wantMember && device.member_label !== wantMember) return false;
+      if (!wantAccount) return true;
       try {
-        return this.#deviceAccountPolicy(device).selectedAccountId === accountId;
+        return this.#deviceAccountPolicy(device).selectedAccountId === wantAccount;
       } catch {
         return false;
       }
     });
+  }
+
+  /** The single-filter case, kept because it reads better where it is used. */
+  devicesOnAccount(accountId) {
+    return this.devicesMatching({ accountId });
+  }
+
+  /** Every member label currently attached to an active device, sorted. */
+  activeMemberLabels() {
+    const labels = new Set();
+    for (const device of this.state.devices) {
+      if (device.revoked_at) continue;
+      if (typeof device.member_label === 'string' && device.member_label) {
+        labels.add(device.member_label);
+      }
+    }
+    return [...labels].sort((a, b) => a.localeCompare(b));
   }
 
   /**
@@ -1114,7 +1135,8 @@ export class CredentialStore {
    * and, worse, could leave half the fleet moved if it failed midway.
    */
   async bulkConfigureDeviceAccount({
-    fromAccountId,
+    fromAccountId = null,
+    memberLabel = null,
     selectedAccountId,
     expectedCount = null,
     actor = null,
@@ -1127,13 +1149,18 @@ export class CredentialStore {
       if (typeof selectedAccountId !== 'string' || !selectedAccountId) {
         throw storeError('target account id is required', 'DEVICE_CONFIGURATION_INVALID');
       }
-      if (fromAccountId === selectedAccountId) {
+      if (fromAccountId && fromAccountId === selectedAccountId) {
         throw storeError('the target account is the one being moved from', 'DEVICE_CONFIGURATION_INVALID');
+      }
+      // Without a filter this would move the entire fleet. That is never what a
+      // mis-click meant, so it is refused rather than guarded by the count alone.
+      if (!fromAccountId && !memberLabel) {
+        throw storeError('a filter is required before moving anything', 'DEVICE_CONFIGURATION_INVALID');
       }
       const target = this.accountById(selectedAccountId);
       this.#assertSwitchableAccount(target);
 
-      const devices = this.devicesOnAccount(fromAccountId);
+      const devices = this.devicesMatching({ accountId: fromAccountId, memberLabel });
       if (expectedCount !== null && devices.length !== expectedCount) {
         throw storeError(
           `the list changed: ${devices.length} devices are on that account now, not ${expectedCount}.`
@@ -1154,6 +1181,12 @@ export class CredentialStore {
           try {
             this.#assertDeviceMutable(device);
             const policy = this.#deviceAccountPolicy(device);
+            if (policy.selectedAccountId === selectedAccountId) {
+              // Already there. Filtering by member can catch devices spread over
+              // several accounts, and counting a no-op as a move would overstate
+              // what happened.
+              throw storeError('already on the target account', 'DEVICE_CONFIGURATION_NOOP');
+            }
             const currentProvider = this.accountById(policy.selectedAccountId)?.provider;
             if (currentProvider && currentProvider !== target.provider) {
               throw storeError(

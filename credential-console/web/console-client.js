@@ -1508,14 +1508,18 @@ function applyConversationFilter(form) {
  */
 document.addEventListener('change', (event) => {
   const select = event.target;
-  if (!select?.matches?.('.machine-filter select[name="account"]')) return;
+  if (!select?.matches?.('.machine-filter select[name="account"], .machine-filter select[name="member"]')) return;
   const form = select.closest('form');
   if (!form) return;
   const url = new URL(form.getAttribute('action') || location.pathname, location.href);
   // An empty value means "all", and an empty query parameter reads better than
   // `?account=` in the address bar and in a shared link.
-  if (select.value) url.searchParams.set('account', select.value);
-  else url.searchParams.delete('account');
+  // Both selects submit together, so narrowing by one keeps the other.
+  for (const name of ['account', 'member']) {
+    const value = form.elements[name]?.value ?? '';
+    if (value) url.searchParams.set(name, value);
+    else url.searchParams.delete(name);
+  }
   navigateTo(url.href).then((handled) => {
     if (!handled) form.submit();
   }).catch(() => form.submit());

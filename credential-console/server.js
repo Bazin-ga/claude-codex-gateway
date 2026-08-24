@@ -1691,6 +1691,7 @@ export async function createCredentialConsole(options = {}) {
         // Carried in the URL so a filtered view is linkable and survives a
         // reload, the same way the conversation and metrics filters work.
         accountFilter: url.searchParams.get('account'),
+        memberFilter: url.searchParams.get('member'),
         completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
       }));
       return;
@@ -2314,14 +2315,16 @@ export async function createCredentialConsole(options = {}) {
         // on screen.
         const declared = Number(form.expected_count);
         const summary = await store.bulkConfigureDeviceAccount({
-          fromAccountId,
+          fromAccountId: fromAccountId || null,
+          memberLabel: String(form.member_label ?? '') || null,
           selectedAccountId: String(form.selected_account_id ?? ''),
           expectedCount: Number.isSafeInteger(declared) && declared >= 0 ? declared : null,
           actor,
           actorType: 'console',
         });
         log('device_account_bulk_configured', {
-          from_account_id: fromAccountId,
+          from_account_id: fromAccountId || null,
+          member_label: String(form.member_label ?? '') || null,
           to_account_id: summary.targetAccountId,
           switched: summary.switched.length,
           skipped: summary.skipped.length,
@@ -2337,7 +2340,11 @@ export async function createCredentialConsole(options = {}) {
           { openMode, detail },
         ));
       } catch (error) {
-        redirect(res, `/?account=${encodeURIComponent(fromAccountId)}&error=${encodeURIComponent(error.message)}`);
+        const back = new URLSearchParams();
+        if (fromAccountId) back.set('account', fromAccountId);
+        if (form.member_label) back.set('member', String(form.member_label));
+        back.set('error', error.message);
+        redirect(res, `/?${back}`);
       }
       return;
     }

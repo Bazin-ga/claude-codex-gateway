@@ -3306,6 +3306,7 @@ export function dashboardView({
   onboardingUrl = null,
   error = null,
   accountFilter = null,
+  memberFilter = null,
   completedDraft = null,
   credentialAlerts = null,
   now = Date.now(),
@@ -3425,14 +3426,27 @@ export function dashboardView({
     account.provider === 'claude' && account.status !== 'disabled'
   ));
   const filterAccount = switchableAccounts.find((account) => account.id === accountFilter) ?? null;
-  const rowsOnFilteredAccount = (entry) => (entry.devices ?? []).filter((device) => (
-    !device.revoked_at
-    && accountSelectionForDevice(device, accounts).selectedAccountId === filterAccount?.id
-  ));
-  const matchesFilter = (entry) => !filterAccount || rowsOnFilteredAccount(entry).length > 0;
-  const filteredCount = filterAccount
-    ? inventory.reduce((total, entry) => total + rowsOnFilteredAccount(entry).length, 0)
+  const memberLabels = [...new Set(devices
+    .filter((device) => !device.revoked_at && device.member_label)
+    .map((device) => device.member_label))].sort((a, b) => a.localeCompare(b));
+  const filterMember = memberLabels.includes(memberFilter) ? memberFilter : null;
+  const anyFilter = Boolean(filterAccount || filterMember);
+  // Both conditions apply together: "everyone under this GitHub account who is
+  // currently on that Claude account" is the selection worth acting on.
+  const matchedRows = (entry) => (entry.devices ?? []).filter((device) => {
+    if (device.revoked_at) return false;
+    if (filterMember && device.member_label !== filterMember) return false;
+    if (!filterAccount) return true;
+    return accountSelectionForDevice(device, accounts).selectedAccountId === filterAccount.id;
+  });
+  const matchesFilter = (entry) => !anyFilter || matchedRows(entry).length > 0;
+  const filteredCount = anyFilter
+    ? inventory.reduce((total, entry) => total + matchedRows(entry).length, 0)
     : 0;
+  const filterSummary = [
+    filterAccount ? `on <strong>${escapeHtml(filterAccount.alias)}</strong>` : null,
+    filterMember ? `for <strong>${escapeHtml(filterMember)}</strong>` : null,
+  ].filter(Boolean).join(' ');
 
   const liveMachines = inventory.filter((entry) => entry.active > 0 && !entry.legacy && matchesFilter(entry));
   // Kept in a group of their own rather than mixed in among machines: an issuance
@@ -3586,32 +3600,41 @@ export function dashboardView({
               <div class="muted tiny" data-i18n="machines-intro">One row per machine, with every credential it holds underneath. A machine is identified by an opaque random handle — reported by its own agent, or minted here for one issuance when the machine has no agent to report one. It says nothing about who is using it, and the member label beside it is self-asserted and unverified.</div>
             </div></div>
             ${openMode ? '<div class="notice error open-banner" role="status" data-i18n="open-account-switch-warning">Open mode has no verified actor: anyone who can reach this console can switch any active device. The actor is recorded as anonymous; a member label is not an actor.</div>' : ''}
-            ${switchableAccounts.length ? `<form method="get" action="/" class="machine-filter" data-autoapply>
-              <label><span>Filter by Claude account</span>
-                <select name="account" data-draft-field>
+            ${switchableAccounts.length ? `<form method="get" action="/" class="machine-filter">
+              <label><span>Claude account</span>
+                <select name="account">
                   <option value="">All accounts</option>
                   ${switchableAccounts.map((account) => (
                     `<option value="${escapeHtml(account.id)}"${account.id === filterAccount?.id ? ' selected' : ''}>${escapeHtml(account.alias)}</option>`
                   )).join('')}
                 </select>
               </label>
+              <label><span>Member</span>
+                <select name="member">
+                  <option value="">Everyone</option>
+                  ${memberLabels.map((label) => (
+                    `<option value="${escapeHtml(label)}"${label === filterMember ? ' selected' : ''}>${escapeHtml(label)}</option>`
+                  )).join('')}
+                </select>
+              </label>
               <noscript><button type="submit">Apply</button></noscript>
             </form>` : ''}
-            ${filterAccount ? (filteredCount ? `<form method="post" action="/devices/account" class="bulk-switch stack">
+            ${anyFilter ? (filteredCount ? `<form method="post" action="/devices/account" class="bulk-switch stack">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-              <input type="hidden" name="from_account_id" value="${escapeHtml(filterAccount.id)}">
+              <input type="hidden" name="from_account_id" value="${escapeHtml(filterAccount?.id ?? '')}">
+              <input type="hidden" name="member_label" value="${escapeHtml(filterMember ?? '')}">
               <input type="hidden" name="expected_count" value="${filteredCount}">
-              <div><strong>${filteredCount}</strong> active credential(s) on <strong>${escapeHtml(filterAccount.alias)}</strong>.</div>
+              <div><strong>${filteredCount}</strong> active credential(s) ${filterSummary}.</div>
               <label><span>Move all of them to</span>
                 <select name="selected_account_id" required>
-                  ${switchableAccounts.filter((account) => account.id !== filterAccount.id).map((account) => (
+                  ${switchableAccounts.filter((account) => account.id !== filterAccount?.id).map((account) => (
                     `<option value="${escapeHtml(account.id)}">${escapeHtml(accountDisplayLabel(account))}</option>`
                   )).join('')}
                 </select>
               </label>
               <button type="submit" class="danger">Switch all ${filteredCount}</button>
-              <div class="muted tiny">Applies to whatever is on this account when you press it, and refuses if that is no longer ${filteredCount}. Rows it cannot move are reported and left alone.</div>
-            </form>` : `<div class="notice"><span>No active credential is on <strong>${escapeHtml(filterAccount.alias)}</strong>.</span></div>`) : ''}
+              <div class="muted tiny">Applies to whatever matches when you press it, and refuses if that is no longer ${filteredCount}. Rows already on the target, or that cannot move, are reported and left alone.</div>
+            </form>` : `<div class="notice"><span>No active credential matches ${filterSummary}.</span></div>`) : ''}
             ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
             <div class="machine-list">${liveMachines.map(entryView).join('')
               || '<p class="empty" data-i18n="no-machines">No machine holds a credential yet.</p>'}</div>
