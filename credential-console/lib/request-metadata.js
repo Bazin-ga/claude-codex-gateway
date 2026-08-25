@@ -708,6 +708,10 @@ export function createRequestMetadataTee({
   maxModelChars = 256,
   capturePrompt = false,
   budget = null,
+  // Which request format the buffered prefix is in. The tee itself is
+  // format-agnostic — it buffers bytes — so the extractor is the only part that
+  // has to know, and injecting it keeps the Claude default untouched.
+  extractPrompt = extractPromptCandidate,
 } = {}) {
   const boundedPrefixLimit = normalizedLimit(prefixLimit, REQUEST_METADATA_PREFIX_BYTES);
   const boundedModelLimit = normalizedModelLimit(maxModelChars);
@@ -772,7 +776,7 @@ export function createRequestMetadataTee({
         parser.finish({ prefixTruncated: requestBytes > capturedPrefixBytes });
         if (bufferingPrompt && requestBytes === capturedPrefixBytes) {
           const metadata = parser.snapshot();
-          promptCandidate = extractPromptCandidate(Buffer.concat(promptPrefix), {
+          promptCandidate = extractPrompt(Buffer.concat(promptPrefix), {
             parseState: metadata.parseState,
             // Whatever prefix this tee was allowed to buffer, the extractor must
             // be allowed to read — otherwise its own default silently re-imposes

@@ -1,16 +1,24 @@
+import { Buffer } from 'node:buffer';
 import http from 'node:http';
 import https from 'node:https';
 import { readFile } from 'node:fs/promises';
 import { sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
 import { createRequestMetadataTee, REQUEST_METADATA_PREFIX_BYTES } from './request-metadata.js';
-import { createResponseObservationTee } from './response-observation.js';
+import {
+  createCompositeResponseObserver,
+  createResponseObservationTee,
+} from './response-observation.js';
 import { createCodexUsageParser } from './codex-usage.js';
+import { createCodexResponseContentAssembler } from './codex-response-content.js';
+import { codexTurnMetadata, extractCodexPromptCandidate } from './codex-prompt-capture.js';
 import {
   AUTH_FAILURE_LIMIT,
+  CONVERSATION_PREFIX_BYTES,
   DEVICE_CONCURRENCY_LIMIT,
   DEVICE_REQUEST_LIMIT,
   authFailures,
+  captureBudget,
   deviceConcurrency,
   deviceRequests,
   enqueueMetricSafely,
@@ -18,8 +26,10 @@ import {
   passthroughCounter,
   rateLimited,
   responseUsageFormat,
+  safeConversationResponse,
   safeUsageSnapshot,
   sourceIp,
+  threadKeyForRequest,
   unavailableUsage,
   usageObserver,
 } from './proxy.js';
@@ -158,6 +168,7 @@ export async function handleCodexProxy(req, res, {
   metadataTeeFactory = createRequestMetadataTee,
   responseObservationFactory = createResponseObservationTee,
   codexUsageParserFactory = createCodexUsageParser,
+  codexContentAssemblerFactory = createCodexResponseContentAssembler,
   credentialReader = readPublishedCodexCredential,
   now = Date.now,
 }) {
@@ -343,9 +354,16 @@ export async function handleCodexProxy(req, res, {
 
   const startedAtMs = now();
   const startedAtMonotonic = performance.now();
+  const capturePrompt = typeof requestMetrics?.enqueueCompletion === 'function';
   const requestMetadata = metadataTeeFactory({
-    capturePrompt: false,
-    prefixLimit: REQUEST_METADATA_PREFIX_BYTES,
+    capturePrompt,
+    // Only pay the buffering cost where a prompt can actually be extracted.
+    prefixLimit: capturePrompt ? CONVERSATION_PREFIX_BYTES : REQUEST_METADATA_PREFIX_BYTES,
+    // The same shared pool the Claude path draws from: two independent budgets
+    // would each be within their limit while together exceeding the memory the
+    // limit exists to bound.
+    budget: captureBudget,
+    extractPrompt: extractCodexPromptCandidate,
   });
   // Piping does not tell the tee that its source died; without this an aborted
   // upload keeps its share of the shared pool forever.
@@ -384,6 +402,38 @@ export async function handleCodexProxy(req, res, {
         code: error?.code ?? error?.name ?? 'unknown',
       });
     }
+    let conversation = null;
+    if (capturePrompt) {
+      try {
+        const prompt = requestMetadata.conversationCandidate?.();
+        if (prompt?.promptText) {
+          const turn = codexTurnMetadata(req.headers);
+          // The CLI's own session id, which it also sends as a `session-id`
+          // header. Grouping turns into a thread needs nothing more, and the
+          // raw id is never stored — threadKeyForSession derives an HMAC.
+          const sessionId = turn?.sessionId
+            ?? (typeof req.headers['session-id'] === 'string' ? req.headers['session-id'] : null);
+          conversation = {
+            promptText: prompt.promptText,
+            promptBytes: Buffer.byteLength(prompt.promptText, 'utf8'),
+            // The Codex CLI sends its preamble as separate input items rather
+            // than wrapped around the prompt, so what was extracted is already
+            // exactly what the person typed — there is nothing to unwrap and no
+            // other source to distinguish.
+            promptSource: 'captured_api_user_text',
+            promptSuffixOmitted: prompt.suffixOmitted,
+            threadKey: threadKeyForRequest(store, device.id, sessionId),
+            ...safeConversationResponse(responseObservation),
+          };
+        }
+      } catch (error) {
+        log('codex_conversation_capture_failed', {
+          account_id: account.id,
+          device_id: device.id,
+          code: error?.code ?? error?.name ?? 'unknown',
+        });
+      }
+    }
     enqueueMetricSafely(requestMetrics, {
       startedAtMs,
       method: req.method ?? 'UNKNOWN',
@@ -405,7 +455,7 @@ export async function handleCodexProxy(req, res, {
       responseBytes: responseObservation?.bytes?.() ?? 0,
       upstreamRequestId,
       ...safeUsageSnapshot(responseObservation),
-    }, { accountId: account.id, deviceId: device.id });
+    }, { accountId: account.id, deviceId: device.id, conversation });
   };
 
   // Usage lands in the terminal SSE event, which can arrive after the last byte
@@ -440,10 +490,10 @@ export async function handleCodexProxy(req, res, {
       const responseFormat = status >= 200 && status < 400
         ? (responseUsageFormat(upstreamRes.headers['content-type']) ?? 'auto')
         : null;
-      let observer = null;
+      const observers = [];
       if (responseFormat && requestMetrics?.enqueueRequest) {
         try {
-          observer = usageObserver(codexUsageParserFactory({ format: responseFormat }));
+          observers.push(usageObserver(codexUsageParserFactory({ format: responseFormat })));
         } catch (error) {
           log('codex_usage_parser_init_failed', {
             account_id: account.id,
@@ -452,6 +502,18 @@ export async function handleCodexProxy(req, res, {
           });
         }
       }
+      if (responseFormat && capturePrompt) {
+        try {
+          observers.push(codexContentAssemblerFactory());
+        } catch (error) {
+          log('codex_content_parser_init_failed', {
+            account_id: account.id,
+            device_id: device.id,
+            code: error?.code ?? error?.name ?? 'unknown',
+          });
+        }
+      }
+      const observer = observers.length ? createCompositeResponseObserver(observers) : null;
       observationFinished = false;
       try {
         responseObservation = responseObservationFactory({

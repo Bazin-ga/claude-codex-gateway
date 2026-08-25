@@ -26,12 +26,12 @@ const ALLOWED_PATHS = new Set([
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 // Shared across every in-flight request in this process: a per-request limit
 // bounds one capture, not the sum of them.
-const captureBudget = createCaptureBudget();
+export const captureBudget = createCaptureBudget();
 // Cap one capture at what the shared pool could ever admit. Allowing a larger
 // prefix does not capture anything extra — a body over this size drains the
 // whole pool chunk by chunk, is refused near the end, discards what it built,
 // and blocks every concurrent capture while it does so.
-const CONVERSATION_PREFIX_BYTES = Math.min(
+export const CONVERSATION_PREFIX_BYTES = Math.min(
   MAX_REQUEST_BYTES,
   Math.floor(captureBudget.maxBytes() / CAPTURE_MEMORY_AMPLIFICATION),
 );
@@ -124,7 +124,7 @@ export function safeUsageSnapshot(observation) {
   return usage;
 }
 
-function safeConversationResponse(observation) {
+export function safeConversationResponse(observation) {
   let snapshot;
   try {
     snapshot = observation?.snapshot?.();
@@ -163,7 +163,7 @@ function claudeSessionId(headers) {
     : null;
 }
 
-function threadKeyForRequest(store, deviceId, sessionId) {
+export function threadKeyForRequest(store, deviceId, sessionId) {
   if (!sessionId) return null;
   const derive = typeof store?.threadKeyForSession === 'function'
     ? store.threadKeyForSession

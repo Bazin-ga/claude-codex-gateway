@@ -592,3 +592,122 @@ test('a large streamed turn arrives intact', async (t) => {
   const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-5.4', stream: true }));
   assert.equal(await response.text(), body, 'every chunk survives the proxy in order');
 });
+
+const REAL_TURN_BODY = JSON.stringify({
+  model: 'gpt-5.4',
+  instructions: 'You are Codex.',
+  stream: true,
+  store: false,
+  // The shape a real codex-cli sends: its preamble arrives as separate input
+  // items, and the person's prompt is the last user message.
+  input: [
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: '<permissions instructions>…' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>…</environment_context>' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'what does this repo do?' }] },
+  ],
+});
+
+const REPLY_SSE = [
+  'data: {"type":"response.created","response":{"id":"r1"}}\n\n',
+  'data: {"type":"response.output_text.delta","item_id":"i1","content_index":0,"delta":"It "}\n\n',
+  'data: {"type":"response.output_text.delta","item_id":"i1","content_index":0,"delta":"proxies."}\n\n',
+  'data: {"type":"response.output_text.done","item_id":"i1","content_index":0,"text":"It proxies."}\n\n',
+  'data: {"type":"response.completed","response":{"id":"r1","usage":'
+    + '{"input_tokens":50,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":3}}}\n\n',
+].join('');
+
+function conversationSink() {
+  return {
+    rows: [],
+    conversations: [],
+    enqueueRequest(row) { this.rows.push(row); },
+    enqueueCompletion({ metrics, conversation }) {
+      this.rows.push(metrics);
+      this.conversations.push(conversation);
+    },
+  };
+}
+
+test('a Codex turn records what was asked and what came back', async (t) => {
+  const home = await credentialHome(t);
+  const metrics = conversationSink();
+  const { proxyUrl } = await startHarness(t, {
+    store: {
+      ...storeFixture(codexAccount(home)),
+      threadKeyForSession: () => 'a'.repeat(64),
+    },
+    upstreamHandler: (req, res) => {
+      res.writeHead(200);
+      res.end(REPLY_SSE);
+    },
+    requestMetrics: metrics,
+  });
+
+  const response = await post(proxyUrl, REAL_TURN_BODY, {
+    'session-id': '01a031c6-ed33-7523-8259-13caac4b3e8a',
+  });
+  assert.equal(response.status, 200);
+  await response.text();
+
+  const conversation = await waitFor(() => metrics.conversations[0]);
+  // The preamble items are not the prompt; the last user message is.
+  assert.equal(conversation.promptText, 'what does this repo do?');
+  assert.equal(conversation.promptSource, 'captured_api_user_text');
+  assert.equal(conversation.promptSuffixOmitted, false);
+  assert.equal(conversation.responseText, 'It proxies.');
+  assert.equal(conversation.responseState, 'complete');
+  assert.equal(conversation.threadKey, 'a'.repeat(64), 'turns are grouped by the CLI session');
+});
+
+test('turns without a session id are still recorded, just ungrouped', async (t) => {
+  const home = await credentialHome(t);
+  const metrics = conversationSink();
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => { res.writeHead(200); res.end(REPLY_SSE); },
+    requestMetrics: metrics,
+  });
+
+  await post(proxyUrl, REAL_TURN_BODY).then((r) => r.text());
+  const conversation = await waitFor(() => metrics.conversations[0]);
+  assert.equal(conversation.promptText, 'what does this repo do?');
+  assert.equal(conversation.threadKey, null, 'no session means no thread, not a dropped turn');
+});
+
+test('nothing is captured when there is nowhere to put it', async (t) => {
+  const home = await credentialHome(t);
+  // A sink with no enqueueCompletion: the tee must not pay to buffer a prompt
+  // that has no destination.
+  const metrics = sink();
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => { res.writeHead(200); res.end(REPLY_SSE); },
+    requestMetrics: metrics,
+  });
+
+  await post(proxyUrl, REAL_TURN_BODY).then((r) => r.text());
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'completed');
+  assert.equal(row.inputTokens, 50, 'usage is still metered');
+});
+
+test('a turn carrying no user message records no conversation', async (t) => {
+  const home = await credentialHome(t);
+  const metrics = conversationSink();
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => { res.writeHead(200); res.end(REPLY_SSE); },
+    requestMetrics: metrics,
+  });
+
+  // A tool-result continuation: no new user message in this request.
+  await post(proxyUrl, JSON.stringify({
+    model: 'gpt-5.4',
+    stream: true,
+    input: [{ type: 'function_call_output', call_id: 'c1', output: 'done' }],
+  })).then((r) => r.text());
+
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'completed');
+  assert.deepEqual(metrics.conversations, [], 'inventing a prompt would be worse than none');
+});
