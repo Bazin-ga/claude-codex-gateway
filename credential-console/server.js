@@ -1120,11 +1120,16 @@ export async function createCredentialConsole(options = {}) {
       .filter((device) => device.member_label)
       .map((device) => [device.member_label, { value: device.member_label, label: device.member_label }]))
       .values()];
+    // Both gateway providers, because both now produce conversation rows. This
+    // map is also what turns an account id into a name in the filter: while it
+    // held Claude alone, a Codex account fell through to `?? value` and the
+    // dropdown offered a raw id — `YfgZbzz1VmxLc40G (1)` instead of
+    // `codex-shared-1 (1)`.
     const fallbackAccounts = store.publicAccounts()
-      .filter((account) => account.provider === 'claude')
+      .filter((account) => ['claude', 'codex'].includes(account.provider))
       .map((account) => ({
-      value: account.id,
-      label: account.alias,
+        value: account.id,
+        label: account.alias,
       }));
     const fallbackFacets = {
       members: fallbackMembers,

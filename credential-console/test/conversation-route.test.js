@@ -621,3 +621,57 @@ test('a URL with no filters is still an unfiltered landing page', async () => {
     await app.close();
   }
 });
+
+test('the account filter names a Codex account instead of showing its id', async (t) => {
+  // The facet query returns account *ids* out of request_metrics; the dropdown
+  // turns them into names through a map the route builds from the account list.
+  // That map held Claude accounts only, so a Codex id fell through to `?? value`
+  // and the filter read `YfgZbzz1VmxLc40G (1)` instead of `codex-shared-1 (1)`.
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-codex-facet-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const claude = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-shared-1',
+    emailLabel: 'owner@example.com',
+    credential: { oauth_token: 'sk-ant-oat-example' },
+  });
+  const codex = await store.addAccount({
+    provider: 'codex',
+    alias: 'codex-shared-1',
+    emailLabel: '',
+    external: { kind: 'codex-credential', home: '/var/lib/codex-credential' },
+  });
+
+  const requestMetrics = conversationMetrics();
+  const inner = requestMetrics.queryConversationFacets.bind(requestMetrics);
+  requestMetrics.queryConversationFacets = (options) => ({
+    ...inner(options),
+    // Both providers now produce conversation rows, so both appear here.
+    accounts: [{ value: codex.id, count: 1 }, { value: claude.id, count: 4 }],
+  });
+
+  const created = await createCredentialConsole({
+    store,
+    requestMetrics,
+    adminAuth: 'open',
+    cookieSecure: false,
+    publicBaseUrl: 'http://console.test',
+    usageMonitor: { snapshotForAccount: () => null, stop() {} },
+  });
+  const baseUrl = await listen(created.server);
+  t.after(() => new Promise((resolve) => created.server.close(resolve)));
+
+  const response = await fetch(`${baseUrl}/conversation-turns`);
+  assert.equal(response.status, 200);
+  const select = /<select name="account_id"[\s\S]*?<\/select>/.exec(await response.text())?.[0] ?? '';
+  assert.ok(select, 'the account filter is rendered');
+
+  assert.ok(select.includes(`value="${codex.id}"`), 'the Codex account is offered');
+  assert.match(select, /codex-shared-1 \(1\)/, 'and it is named, with its count');
+  assert.equal(
+    new RegExp(`>${codex.id}`).test(select),
+    false,
+    'the raw id is not what the operator reads',
+  );
+  assert.match(select, /claude-shared-1 \(4\)/, 'Claude accounts are unaffected');
+});
