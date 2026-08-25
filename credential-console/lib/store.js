@@ -237,6 +237,7 @@ export class CredentialStore {
       provider: account.provider,
       alias: account.alias,
       email_label: account.email_label,
+      group: account.group ?? null,
       status: account.status,
       created_at: account.created_at,
       expires_at: account.expires_at ?? null,
@@ -1089,19 +1090,64 @@ export class CredentialStore {
    * dashboard already shows them as invalid, and a bulk move must not silently
    * decide what a malformed row meant.
    */
-  devicesMatching({ accountId = null, memberLabel = null } = {}) {
+  devicesMatching({ accountId = null, memberLabel = null, group = null } = {}) {
     const wantAccount = typeof accountId === 'string' && accountId ? accountId : null;
     const wantMember = typeof memberLabel === 'string' && memberLabel ? memberLabel : null;
-    if (!wantAccount && !wantMember) return [];
+    const wantGroup = typeof group === 'string' && group ? group : null;
+    if (!wantAccount && !wantMember && !wantGroup) return [];
+    // A group names a set of accounts, so it resolves to the ids in it. A group
+    // nobody is in matches nothing rather than everything — "the group I meant is
+    // gone" must not read as "every device". The membership test below already
+    // gives that; the early return is only a short circuit.
+    const groupAccounts = wantGroup
+      ? new Set(this.state.accounts.filter((a) => a.group === wantGroup).map((a) => a.id))
+      : null;
+    if (groupAccounts && groupAccounts.size === 0) return [];
     return this.state.devices.filter((device) => {
       if (device.revoked_at) return false;
       if (wantMember && device.member_label !== wantMember) return false;
-      if (!wantAccount) return true;
+      if (!wantAccount && !groupAccounts) return true;
+      let selected;
       try {
-        return this.#deviceAccountPolicy(device).selectedAccountId === wantAccount;
+        selected = this.#deviceAccountPolicy(device).selectedAccountId;
       } catch {
         return false;
       }
+      if (wantAccount && selected !== wantAccount) return false;
+      if (groupAccounts && !groupAccounts.has(selected)) return false;
+      return true;
+    });
+  }
+
+  /** Every group currently naming at least one account, sorted. */
+  accountGroups() {
+    const groups = new Set();
+    for (const account of this.state.accounts) {
+      if (typeof account.group === 'string' && account.group) groups.add(account.group);
+    }
+    return [...groups].sort((a, b) => a.localeCompare(b));
+  }
+
+  /**
+   * Put an account in a group, or take it out of one with an empty value.
+   *
+   * A group is a label on the account, not a second kind of account: nothing
+   * about routing or credentials depends on it, which is why it can be changed
+   * freely and why an unknown group simply matches nothing.
+   */
+  async setAccountGroup(accountId, group) {
+    return this.serialized(async () => {
+      const account = this.accountById(accountId);
+      if (!account) throw new Error('account not found');
+      const normalized = String(group ?? '').trim();
+      if (normalized && !/^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/.test(normalized)) {
+        throw new Error('a group name must start alphanumeric and use letters, digits, space, dot, dash or underscore');
+      }
+      if (normalized) account.group = normalized;
+      else delete account.group;
+      this.audit('account_group_set', { account_id: accountId, group: normalized || null });
+      await this.persist();
+      return account;
     });
   }
 
@@ -1137,6 +1183,7 @@ export class CredentialStore {
   async bulkConfigureDeviceAccount({
     fromAccountId = null,
     memberLabel = null,
+    group = null,
     selectedAccountId,
     expectedCount = null,
     actor = null,
@@ -1154,13 +1201,13 @@ export class CredentialStore {
       }
       // Without a filter this would move the entire fleet. That is never what a
       // mis-click meant, so it is refused rather than guarded by the count alone.
-      if (!fromAccountId && !memberLabel) {
+      if (!fromAccountId && !memberLabel && !group) {
         throw storeError('a filter is required before moving anything', 'DEVICE_CONFIGURATION_INVALID');
       }
       const target = this.accountById(selectedAccountId);
       this.#assertSwitchableAccount(target);
 
-      const devices = this.devicesMatching({ accountId: fromAccountId, memberLabel });
+      const devices = this.devicesMatching({ accountId: fromAccountId, memberLabel, group });
       if (expectedCount !== null && devices.length !== expectedCount) {
         throw storeError(
           `the list changed: ${devices.length} devices are on that account now, not ${expectedCount}.`
