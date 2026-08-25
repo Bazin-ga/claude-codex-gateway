@@ -320,3 +320,58 @@ test('an unknown member in the URL is ignored rather than obeyed', async () => {
   assert.equal(html.includes('action="/devices/account"'), false, 'no bulk form for a filter that is not real');
   assert.match(html, /alice-laptop/, 'the unfiltered list is shown instead');
 });
+
+test('a Codex gateway credential is labelled Codex, not Claude Code', async () => {
+  const store = await newStore();
+  const codex = await store.addAccount({
+    provider: 'codex',
+    alias: 'codex-shared-1',
+    emailLabel: '',
+    external: { kind: 'codex-credential', home: '/var/lib/codex-credential' },
+  });
+  await store.issueDeviceCredential({
+    accountId: codex.id,
+    memberLabel: 'member@example.com',
+    deviceName: 'codex-laptop',
+  });
+
+  const html = render(store);
+  const row = /<tr[^>]*data-device-row[\s\S]*?<\/tr>/.exec(html)?.[0] ?? '';
+  assert.ok(row.includes('codex-laptop'), 'the row is rendered');
+  assert.match(row, /<td>Codex<\/td>/, 'the client it belongs to is named correctly');
+  assert.equal(row.includes('Claude Code'), false, 'the row used to say Claude Code for everything');
+});
+
+test('a Claude credential is still labelled Claude Code', async () => {
+  const { store } = await fixture();
+  const html = render(store);
+  const row = /<tr[^>]*data-device-row[\s\S]*?<\/tr>/.exec(html)?.[0] ?? '';
+  assert.match(row, /<td>Claude Code<\/td>/);
+});
+
+test('no switch form is offered when there is nowhere to switch to', async () => {
+  const store = await newStore();
+  const only = await claudeAccount(store, 'only-account');
+  await store.issueDeviceCredential({
+    accountId: only.id,
+    memberLabel: 'member@example.com',
+    deviceName: 'lonely-laptop',
+  });
+
+  const html = render(store);
+  assert.match(html, /Only one Claude account is registered/);
+  assert.equal(
+    html.includes('action="/devices/'),
+    true,
+    'the revoke form is still there',
+  );
+  const switchForms = html.match(/data-account-switch\b/g) ?? [];
+  assert.deepEqual(switchForms, [], 'a button whose only effect is a refusal is not offered');
+});
+
+test('the switch form returns as soon as there is a second account', async () => {
+  const { store } = await fixture();
+  const html = render(store);
+  assert.ok((html.match(/data-account-switch\b/g) ?? []).length > 0);
+  assert.equal(html.includes('Only one Claude account is registered'), false);
+});

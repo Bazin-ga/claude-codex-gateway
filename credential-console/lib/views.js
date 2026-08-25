@@ -1010,10 +1010,19 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   }
   const deviceProvider = accountForId(accounts, selection.selectedAccountId ?? selection.originalAccountId)
     ?.provider ?? 'claude';
-  const options = accountSelectionOptions(accounts, selection.selectedAccountId, deviceProvider);
-  if (!options) {
+  const candidates = accounts.filter((account) => account.provider === deviceProvider);
+  if (candidates.length === 0) {
     return '<div class="muted tiny" data-i18n="no-claude-accounts">No Claude accounts are registered.</div>';
   }
+  if (candidates.length === 1) {
+    // The only account it could switch to is the one it is on. Rendering the
+    // form anyway offers a button whose whole effect is nothing — and the store
+    // refuses a same-account switch, so pressing it would look like a failure.
+    return `<div class="muted tiny">${escapeHtml(
+      deviceProvider === 'codex' ? 'Only one Codex account is registered.' : 'Only one Claude account is registered.',
+    )}</div>`;
+  }
+  const options = accountSelectionOptions(accounts, selection.selectedAccountId, deviceProvider);
   return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/account" class="stack account-switch-form" data-account-switch data-device-id="${escapeHtml(device.id)}">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
     <label><span data-i18n="selected-account">Selected account</span>
@@ -1024,13 +1033,22 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   </form>`;
 }
 
-function claudeCredentialRow(device, accounts, csrf) {
+/**
+ * One console-issued credential. Named for the console, not for Claude: the
+ * same row now carries Codex gateway credentials too, and the provider is read
+ * off the account rather than assumed.
+ */
+function consoleCredentialRow(device, accounts, csrf) {
   const state = device.revoked_at ? 'revoked' : 'active';
   const selection = accountSelectionForDevice(device, accounts);
   const selectedAccount = selection.invalid ? null : selection.selectedAccount;
+  // Falls back to the original account so a row with a broken policy still says
+  // which client it belongs to instead of guessing "Claude Code".
+  const provider = accountForId(accounts, selection.selectedAccountId ?? selection.originalAccountId)
+    ?.provider ?? null;
   return `<tr data-credential-state="${state}" data-device-row="${escapeHtml(device.id)}" data-selected-account-id="${escapeHtml(selection.selectedAccountId ?? '')}">
     <td data-device-id="${escapeHtml(device.id)}"><strong>${escapeHtml(device.name)}</strong><div class="muted tiny">${escapeHtml(device.member_label || '—')}</div></td>
-    <td>Claude Code</td>
+    <td>${escapeHtml(provider === 'codex' ? 'Codex' : provider === 'claude' ? 'Claude Code' : 'Unknown')}</td>
     ${accountCell(selectedAccount, { selected: true })}
     <td>${credentialBadge(state)}</td>
     <td>${escapeHtml(dateText(device.last_seen_at))}</td>
@@ -1150,7 +1168,7 @@ function machineEntryView(entry, { accounts, csrf, machineOptions }) {
   const rows = [
     ...entry.devices.map((device) => ({
       revoked: Boolean(device.revoked_at),
-      html: claudeCredentialRow(device, accounts, csrf),
+      html: consoleCredentialRow(device, accounts, csrf),
     })),
     ...entry.codex.map((client) => ({
       revoked: client.revoked,
