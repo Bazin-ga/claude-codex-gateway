@@ -2698,3 +2698,55 @@ test('default 100k-session query stays on the summary index fast path', async (t
   assert.equal(result.items.length, 25);
   assert.ok(elapsed < 1_500, `summary query should stay below 1.5s (${elapsed.toFixed(1)}ms)`);
 });
+
+test('a Codex turn counts as consumption, so its tokens reach the totals', async (t) => {
+  // The consumption scope means "requests that actually spend model quota".
+  // It named the Claude inference path alone, so every Codex turn fell out of
+  // it: the rows were counted under `all` — requests and latency charted
+  // correctly — while their tokens never reached any total. On the production
+  // console that read as "Codex has no hourly token statistics".
+  const { store } = await newStore(t);
+  assert.equal(store.enqueueRequest(row({
+    startedAtMs: BASE_MS,
+    path: '/v1/messages',
+    usageState: 'complete',
+    inputTokens: 100,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 10,
+  })), true);
+  assert.equal(store.enqueueRequest(row({
+    startedAtMs: BASE_MS + 1,
+    path: '/responses',
+    usageState: 'complete',
+    inputTokens: 56,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 24,
+  })), true);
+  // Not an inference call: it must stay out of consumption, which is what the
+  // scope exists to express.
+  assert.equal(store.enqueueRequest(row({
+    startedAtMs: BASE_MS + 2,
+    path: '/v1/models',
+    usageState: 'complete',
+    inputTokens: 7,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 7,
+  })), true);
+  store.flush();
+
+  const consumption = store.queryTotals({ scope: 'consumption' });
+  assert.equal(consumption.requestCount, 2, 'both providers, not the catalogue call');
+  assert.equal(consumption.totalInputTokens, 156, 'Claude 100 + Codex 56');
+  assert.equal(consumption.totalOutputTokens, 34, 'Claude 10 + Codex 24');
+
+  const all = store.queryTotals({ scope: 'all' });
+  assert.equal(all.requestCount, 3, 'the catalogue call is still counted somewhere');
+
+  // And the same holds hour by hour, which is what the chart draws.
+  const hour = store.queryHourly({ scope: 'consumption' })[0];
+  assert.equal(hour.requestCount, 2);
+  assert.equal(hour.totalInputTokens, 156);
+});

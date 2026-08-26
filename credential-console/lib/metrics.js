@@ -960,6 +960,13 @@ function normalizeFilters(filters = {}) {
 function filterSql(filters) {
   // Keep this predicate fixed. Values are always bound, including the optional
   // filters; only the breakdown identifier is selected from a fixed allowlist.
+  //
+  // The `consumption` scope means "requests that actually spend model quota",
+  // as opposed to `/v1/models` and the like. It listed the Claude inference
+  // path alone, which silently excluded every Codex turn: those rows were
+  // counted under `all` — so requests and latency charted fine — while their
+  // tokens never reached any total. Both providers' inference paths belong
+  // here; `/responses` is the whole of the Codex proxy's allow-list.
   return `
     WHERE (? IS NULL OR started_at_ms >= ?)
       AND (? IS NULL OR started_at_ms < ?)
@@ -969,7 +976,7 @@ function filterSql(filters) {
       AND (? IS NULL OR member_label = ?)
       AND (? IS NULL OR account_id = ?)
       AND (? IS NULL OR model = ?)
-      AND (? = 'all' OR path = '/v1/messages')
+      AND (? = 'all' OR path IN ('/v1/messages', '/responses'))
   `;
 }
 

@@ -111,6 +111,34 @@ tr:last-child td { border-bottom: 0; }
 .credential-table-wrap { overflow-x: auto; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .machine-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; }
+/* The filter bar: one row on a wide screen, wrapping rather than scrolling.
+   a label is block with a bottom margin by default, which would stack three
+   controls down the page and push the machine list below the fold. */
+.machine-filter { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin: 0 0 14px; }
+.machine-filter label { margin-bottom: 0; flex: 1 1 200px; min-width: 0; }
+.bulk-switch { border: 1px solid var(--amber); background: #fff7e9; border-radius: 12px; padding: 14px; margin: 0 0 14px; }
+.bulk-switch label { margin-bottom: 0; }
+/* The registry sits above the list it explains, so it stays visually quieter
+   than a machine card. */
+.machine-group-registry { border: 1px dashed var(--line); border-radius: 12px; padding: 12px 14px; margin: 0 0 14px; background: #fbfcf9; }
+.machine-group-registry > summary { font-weight: 700; font-size: 13px; cursor: pointer; }
+.machine-group-registry > p { margin: 10px 0; }
+.machine-group-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+/* Rename and delete belong on one line per group; each is its own form, so
+   they are laid out here rather than by the .inline rule, which stretches them. */
+.machine-group-list > li { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+.machine-group-list > li > form { margin: 0; }
+.machine-group-list > li > form:first-child { flex: 1 1 220px; }
+.machine-group-list input { margin-top: 0; }
+.device-group-form { margin: 0 0 10px; }
+.device-group-form select[multiple] { padding: 6px; margin-top: 8px; }
+.device-group-form > details > summary { cursor: pointer; color: var(--muted); }
+.device-group-form > details > p { margin: 8px 0; }
+/* The membership, said in words rather than left to a listbox highlight. */
+.group-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.group-chip { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px;
+  background: var(--member-soft); color: var(--member); border: 1px solid var(--line); }
+button.tiny, .button.tiny { padding: 6px 10px; font-size: 12px; }
 .machine { min-width: 0; border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: #fbfcf9; }
 .machine-head { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 12px; }
 .machine-head > *, .machine-tags { min-width: 0; }
@@ -1048,16 +1076,25 @@ function deviceGroupControl(device, groupNames, csrf) {
   if (device.revoked_at) return '';
   if (!groupNames.length) return '';
   const current = new Set(device.groups ?? []);
-  return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/groups" class="stack device-group-form">
+  // The membership is stated in words above the control. A multi-select shows
+  // it only as a highlight, which is low contrast, differs between browsers,
+  // and is the one thing you actually want to read at a glance.
+  const chips = current.size
+    ? [...current].map((name) => `<span class="group-chip">${escapeHtml(name)}</span>`).join('')
+    : '<span class="muted tiny">No groups</span>';
+  return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/groups" class="device-group-form">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-    <label><span>Machine groups</span>
+    <div class="group-chips">${chips}</div>
+    <details>
+      <summary class="tiny">Change groups</summary>
       <select name="groups" multiple size="${Math.min(groupNames.length, 4)}" aria-label="Groups for ${escapeHtml(device.name)}">
         ${groupNames.map((name) => (
     `<option value="${escapeHtml(name)}"${current.has(name) ? ' selected' : ''}>${escapeHtml(name)}</option>`
   )).join('')}
       </select>
-    </label>
-    <button type="submit" class="secondary">Save groups</button>
+      <p class="muted tiny">Hold Ctrl (Cmd on a Mac) to pick more than one. Saving replaces the list above.</p>
+      <button type="submit" class="secondary tiny">Save groups</button>
+    </details>
   </form>`;
 }
 
