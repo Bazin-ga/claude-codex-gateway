@@ -1994,10 +1994,25 @@ function normalizeConversationSearch({
   const containsHan = HAN_PATTERN.test(query);
   const hasSearchPunctuation = /[^\p{L}\p{N}\s_-]/u.test(query);
   const hasSearchWhitespace = /\s/u.test(query);
-  const useTrigram = containsHan
-    && !hasSearchPunctuation
-    && !hasSearchWhitespace
-    && [...query].length >= 3;
+  // Substring search, for every script rather than only Han.
+  //
+  // The trigram index has always been here and in sync; only CJK queries were
+  // routed to it, so Latin text fell back to whole-token FTS. That made the box
+  // silently under-report — `python` matched 37 turns where 336 contain it,
+  // because `python3` and `/usr/bin/python` are different tokens — and made the
+  // count non-monotonic as you typed: `pyt` found 0, then `python` found 37, so
+  // a search that was narrowing appeared to find nothing and then something.
+  //
+  // The tokenizer indexes three-character sequences, so a term shorter than
+  // that cannot be matched by it; those still go to the token index, which is
+  // the only thing that can answer them at all.
+  const trigramTerms = hasSearchPunctuation || hasSearchWhitespace
+    ? literalTerms
+    : [query];
+  const useTrigram = trigramTerms.length > 0
+    && trigramTerms.every((term) => [...term].length >= 3);
+  // Han queries too short for the trigram index still fall back to a scan,
+  // because a token index cannot answer them either.
   const substringTerms = containsHan && !useTrigram
     ? query.split(/\s+/).filter(Boolean)
     : [];
@@ -2008,7 +2023,11 @@ function normalizeConversationSearch({
     ftsQuery,
     containsHan,
     shortHanQuery: containsHan && [...query].length < 3,
-    trigramQuery: useTrigram ? `"${query.replaceAll('"', '""')}"` : null,
+    // Each term is a quoted phrase, AND-ed: with the trigram tokenizer a quoted
+    // phrase matches a substring, which is what the box has always claimed to do.
+    trigramQuery: useTrigram
+      ? trigramTerms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' AND ')
+      : null,
     substringTerms,
     emptyLiteralQuery: query.length > 0 && literalTerms.length === 0,
     fromMs: normalizedFromMs,

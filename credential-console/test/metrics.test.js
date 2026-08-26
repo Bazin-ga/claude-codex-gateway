@@ -2750,3 +2750,52 @@ test('a Codex turn counts as consumption, so its tokens reach the totals', async
   assert.equal(hour.requestCount, 2);
   assert.equal(hour.totalInputTokens, 156);
 });
+
+test('search matches inside a word, and narrowing never widens the result', async (t) => {
+  // The box says "text in prompt or reply", and until now that was only true
+  // for CJK: Latin queries went to a whole-token index, so `python` matched
+  // turns containing exactly that token and missed `python3` and
+  // `/usr/bin/python`. On the production archive that hid 89% of the hits.
+  //
+  // Worse than missing them, it was not monotonic: `pyt` found nothing and
+  // `python` found some, so a search that was getting more specific appeared
+  // to go from no traffic to some. Someone stopping at `pyt` concludes there
+  // is none.
+  const { store } = await newStore(t);
+  const seed = (id, promptText) => {
+    assert.equal(store.enqueueCompletion({
+      metrics: row({ startedAtMs: BASE_MS + id }),
+      conversation: {
+        promptText,
+        promptBytes: Buffer.byteLength(promptText),
+        responseText: 'a reply',
+        responseState: 'complete',
+        responseBytes: 7,
+      },
+    }), true);
+  };
+  seed(1, 'run python3 for me');
+  seed(2, 'where is /usr/bin/python');
+  seed(3, 'a python script');
+  seed(4, 'nothing relevant here');
+  store.flush();
+
+  const count = (q) => store.searchConversations({ q, limit: 50 }).items.length;
+
+  assert.equal(count('python'), 3, 'every turn containing the word, not only the bare token');
+  assert.equal(count('python3'), 1);
+  assert.equal(count('pyth'), 3, 'a prefix of it finds the same three');
+  assert.equal(count('ython'), 3, 'and so does a fragment from the middle');
+
+  // Monotonic: each extra character can only narrow.
+  const steps = ['pyt', 'pyth', 'pytho', 'python', 'python3'].map(count);
+  for (let i = 1; i < steps.length; i += 1) {
+    assert.ok(steps[i] <= steps[i - 1], `"${steps}" grew at step ${i}`);
+  }
+  assert.equal(steps[0], 3, 'and the shortest usable fragment already finds them');
+
+  // Several terms still mean AND, each as a substring.
+  assert.equal(count('python script'), 1);
+  assert.equal(count('python nothing'), 0);
+  assert.equal(count('relevant'), 1, 'unrelated turns are not swept in');
+});
