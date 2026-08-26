@@ -2514,6 +2514,8 @@ function conversationFormField(name, value) {
 function conversationFormFields({
   q,
   period,
+  fromText = '',
+  toText = '',
   memberLabel,
   deviceId,
   accountId,
@@ -2526,6 +2528,8 @@ function conversationFormFields({
   return [
     conversationFormField('q', q),
     conversationFormField('period', period),
+    conversationFormField('from', fromText),
+    conversationFormField('to', toText),
     conversationFormField('member_label', memberLabel),
     conversationFormField('device_id', deviceId),
     conversationFormField('account_id', accountId),
@@ -2757,6 +2761,8 @@ export function conversationsView({
   q = '',
   beforeId = '',
   period = 'all',
+  fromText = '',
+  toText = '',
   memberLabel = '',
   deviceId = '',
   accountId = '',
@@ -2818,7 +2824,7 @@ export function conversationsView({
   const nextForm = envelope.nextBeforeId === null || envelope.nextBeforeId === undefined
     ? ''
     : `<form method="post" action="/conversation-turns" class="conversation-pagination-form" data-reset-scroll>
-        ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
+        ${conversationFormFields({ q: query, period: normalizedPeriod, fromText, toText, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
   const resultsSection = `
@@ -2857,7 +2863,9 @@ export function conversationsView({
             <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Text in prompt or reply" data-placeholder-en="Text in prompt or reply" data-placeholder-zh="已捕获 API 用户文本或回复">
           </label>
           <label><span data-i18n="conversation-filter-period-label">Period</span>
-            <select name="period" data-autoapply>${periodOptions}</select>
+            <select name="period" data-autoapply>${periodOptions}</select></label>
+          <label><span>From (UTC)</span><input type="datetime-local" name="from" value="${escapeHtml(fromText)}" data-autoapply></label>
+          <label><span>To (UTC)</span><input type="datetime-local" name="to" value="${escapeHtml(toText)}" data-autoapply>
           </label>
           <label><span data-i18n="conversation-filter-member-label">Member</span>
             <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
@@ -2970,6 +2978,8 @@ export function conversationSessionsView({
   nextBeforeActivityMs = null,
   q = '',
   period = 'all',
+  fromText = '',
+  toText = '',
   memberLabel = '',
   deviceId = '',
   accountId = '',
@@ -3035,7 +3045,7 @@ export function conversationSessionsView({
     || envelope.nextBeforeActivityMs === undefined
     ? ''
     : `<form method="post" action="/conversations" class="conversation-pagination-form" data-reset-scroll>
-        ${conversationFormFields({ q: query, period: normalizedPeriod, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId, beforeActivityMs: envelope.nextBeforeActivityMs })}
+        ${conversationFormFields({ q: query, period: normalizedPeriod, fromText, toText, memberLabel: normalizedMember, deviceId: normalizedDevice, accountId: normalizedAccount, model: normalizedModel, responseState: normalizedState, limit: normalizedLimit, beforeId: envelope.nextBeforeId, beforeActivityMs: envelope.nextBeforeActivityMs })}
         <button type="submit" data-i18n="conversation-next-page">Next page</button>
       </form>`;
   const itemsView = envelope.items.map(conversationSessionItemView).join('');
@@ -3094,6 +3104,8 @@ export function conversationSessionsView({
             <input name="q" value="${escapeHtml(query)}" maxlength="256" autocomplete="off" placeholder="Text in prompt or reply" data-placeholder-en="Text in prompt or reply" data-placeholder-zh="原始提交文字或最终回复">
           </label>
           <label><span data-i18n="conversation-filter-period-label">Period</span><select name="period" data-autoapply>${periodOptions}</select></label>
+          <label><span>From (UTC)</span><input type="datetime-local" name="from" value="${escapeHtml(fromText)}" data-autoapply></label>
+          <label><span>To (UTC)</span><input type="datetime-local" name="to" value="${escapeHtml(toText)}" data-autoapply></label>
           <label><span data-i18n="conversation-filter-member-label">Member</span>
             <input name="member_label" value="${escapeHtml(normalizedMember)}" list="conversation-member-facets" maxlength="160" autocomplete="off" placeholder="All members" data-placeholder-en="All members" data-placeholder-zh="全部成员">
             <datalist id="conversation-member-facets">${conversationFacetDatalist(facets.members, normalizedMember)}</datalist>

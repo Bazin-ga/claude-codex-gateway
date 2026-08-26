@@ -1105,14 +1105,39 @@ export async function createCredentialConsole(options = {}) {
     const invalidResponseState = requestedResponseState !== null
       && requestedResponseState !== ''
       && !allowedResponseStates.has(requestedResponseState);
+    // An absolute window, for the one question the relative periods cannot ask:
+    // "what happened yesterday between 14:00 and 18:00". The store has always
+    // accepted an arbitrary closed interval — normalizeConversationSearch
+    // validates both bounds and rejects from > to — and this route was throwing
+    // that away by pinning the upper bound to now.
+    const parseBound = (name) => {
+      const raw = url.searchParams.get(name);
+      if (raw === null || raw === '') return { value: null, invalid: false };
+      // `datetime-local` submits "2026-08-25T14:00" with no zone. Read it as UTC
+      // so a shared link means the same window to whoever opens it.
+      const parsed = Date.parse(/[Zz]|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : `${raw}Z`);
+      if (!Number.isFinite(parsed)) return { value: null, invalid: true };
+      return { value: parsed, invalid: false };
+    };
+    const fromParam = parseBound('from');
+    const toParam = parseBound('to');
+    const invalidWindow = fromParam.invalid || toParam.invalid
+      || (fromParam.value !== null && toParam.value !== null && fromParam.value > toParam.value);
+    const hasAbsoluteWindow = !invalidWindow && (fromParam.value !== null || toParam.value !== null);
     const hasExtendedFilters = url.searchParams.has('period')
+      || hasAbsoluteWindow
       || memberLabel !== null
       || deviceId !== null
       || accountId !== null
       || model !== null
       || responseState !== null;
     const now = Date.now();
-    const fromMs = period === 'all' ? null : now - Number(period) * 60 * 60 * 1000;
+    // An explicit window wins over the period preset; mixing them would leave
+    // the operator unable to tell which one the results came from.
+    const fromMs = hasAbsoluteWindow
+      ? fromParam.value
+      : (period === 'all' ? null : now - Number(period) * 60 * 60 * 1000);
+    const toMs = hasAbsoluteWindow ? toParam.value : null;
     const fallbackDevices = store.publicDevices().map((device) => ({
       value: device.id,
       label: device.name || device.id,
@@ -1139,7 +1164,8 @@ export async function createCredentialConsole(options = {}) {
       models: [],
       responseStates: [...allowedResponseStates].map((value) => ({ value, label: value })),
     };
-    if (invalidCursor || invalidPeriod || invalidLimit || invalidResponseState || invalidFilterLength) {
+    if (invalidCursor || invalidPeriod || invalidLimit || invalidResponseState
+      || invalidFilterLength || invalidWindow) {
       return {
         statusCode: 400,
         result: {
@@ -1215,9 +1241,9 @@ export async function createCredentialConsole(options = {}) {
       const searchOptions = { q, beforeId, limit };
       if (reliableRounds && beforeId !== null) searchOptions.beforeActivityMs = beforeActivityMs;
       if (hasExtendedFilters) {
-        if (fromMs !== null) {
-          searchOptions.fromMs = fromMs;
-          searchOptions.toMs = now;
+        if (fromMs !== null || toMs !== null) {
+          if (fromMs !== null) searchOptions.fromMs = fromMs;
+          searchOptions.toMs = toMs ?? now;
         }
         if (memberLabel !== null) searchOptions.memberLabel = memberLabel;
         if (deviceId !== null) searchOptions.deviceId = deviceId;
@@ -1232,9 +1258,9 @@ export async function createCredentialConsole(options = {}) {
       let facetSource = null;
       if (facetMethod && typeof requestMetrics?.[facetMethod] === 'function') {
         const facetOptions = { q };
-        if (fromMs !== null) {
-          facetOptions.fromMs = fromMs;
-          facetOptions.toMs = now;
+        if (fromMs !== null || toMs !== null) {
+          if (fromMs !== null) facetOptions.fromMs = fromMs;
+          facetOptions.toMs = toMs ?? now;
         }
         if (memberLabel !== null) facetOptions.memberLabel = memberLabel;
         if (deviceId !== null) facetOptions.deviceId = deviceId;
@@ -1305,6 +1331,8 @@ export async function createCredentialConsole(options = {}) {
         beforeActivityMs,
         limit,
         period,
+        fromText: url.searchParams.get('from') ?? '',
+        toText: url.searchParams.get('to') ?? '',
         memberLabel,
         deviceId,
         accountId,

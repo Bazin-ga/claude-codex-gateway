@@ -675,3 +675,61 @@ test('the account filter names a Codex account instead of showing its id', async
   );
   assert.match(select, /claude-shared-1 \(4\)/, 'Claude accounts are unaffected');
 });
+
+test('an absolute window can express a closed interval, which no period can', async (t) => {
+  // The period presets are all `now - N`, so "yesterday 14:00-18:00" — the
+  // question an incident review starts from — had no expression at all. The
+  // store has always accepted a closed interval; the route pinned the upper
+  // bound to now and threw that away.
+  const requestMetrics = conversationMetrics();
+  const seen = [];
+  const inner = requestMetrics.searchConversations.bind(requestMetrics);
+  requestMetrics.searchConversations = (options) => { seen.push(options); return inner(options); };
+  const app = await fixture({ requestMetrics });
+  t.after(() => app.close());
+
+  const from = '2026-08-21T00:00';
+  const to = '2026-08-21T23:59';
+  const response = await fetch(`${app.baseUrl}/conversation-turns?from=${from}&to=${to}`);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+
+  const options = seen.at(-1);
+  assert.equal(options.fromMs, Date.parse(`${from}Z`), 'the lower bound is read as UTC');
+  assert.equal(options.toMs, Date.parse(`${to}Z`), 'and so is the upper one, rather than becoming now');
+
+  // The values come back in the form, so the window survives a reload and
+  // pagination rather than being lost on the next click.
+  assert.match(html, new RegExp(`name="from" value="${from}"`));
+  assert.match(html, new RegExp(`name="to" value="${to}"`));
+});
+
+test('one bound alone is a half-open window', async (t) => {
+  const requestMetrics = conversationMetrics();
+  const seen = [];
+  const inner = requestMetrics.searchConversations.bind(requestMetrics);
+  requestMetrics.searchConversations = (options) => { seen.push(options); return inner(options); };
+  const app = await fixture({ requestMetrics });
+  t.after(() => app.close());
+
+  await fetch(`${app.baseUrl}/conversation-turns?from=2026-08-21T00:00`);
+  assert.equal(seen.at(-1).fromMs, Date.parse('2026-08-21T00:00Z'));
+  assert.ok(seen.at(-1).toMs >= Date.now() - 5000, 'an open end means up to now');
+
+  await fetch(`${app.baseUrl}/conversation-turns?to=2026-08-18T00:00`);
+  assert.equal(seen.at(-1).toMs, Date.parse('2026-08-18T00:00Z'));
+  assert.equal(seen.at(-1).fromMs, undefined, 'an open start means from the beginning');
+});
+
+test('a window that runs backwards is refused rather than quietly emptied', async (t) => {
+  const app = await fixture({ requestMetrics: conversationMetrics() });
+  t.after(() => app.close());
+  for (const query of [
+    'from=2026-08-21T23:59&to=2026-08-21T00:00',
+    'from=not-a-date',
+    'to=also-not-a-date',
+  ]) {
+    const response = await fetch(`${app.baseUrl}/conversation-turns?${query}`);
+    assert.equal(response.status, 400, query);
+  }
+});
