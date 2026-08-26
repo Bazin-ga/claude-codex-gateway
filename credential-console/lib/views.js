@@ -3653,9 +3653,11 @@ export function dashboardView({
               <h2><span data-i18n="machines">Machines</span> (${liveMachines.length})</h2>
               <div class="muted tiny" data-i18n="machines-intro">One row per machine, with every credential it holds underneath. A machine is identified by an opaque random handle — reported by its own agent, or minted here for one issuance when the machine has no agent to report one. It says nothing about who is using it, and the member label beside it is self-asserted and unverified.</div>
             </div></div>
-            <details class="machine-group-registry" data-persist-details="machine-groups">
+            <details class="machine-group-registry"${groupNames.length ? ' data-persist-details="machine-groups"' : ' open'}>
               <summary>Machine groups (${groupNames.length})</summary>
-              <p class="muted tiny">Names are created here once. Each machine then picks from this list, so a group is never two groups differing by a typo. Removing a name here takes it off every machine; nothing else about them changes.</p>
+              <p class="muted tiny">${groupNames.length
+    ? 'Names are created here once. Each machine then picks from this list, so a group is never two groups differing by a typo. Removing a name here takes it off every machine; nothing else about them changes.'
+    : 'Group machines so they can be switched to another account together. Create a name here and it appears on every machine below, and as a filter above. Nothing else about a machine changes.'}</p>
               <form method="post" action="/device-groups" class="inline">
                 <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
                 <input type="hidden" name="action" value="create">

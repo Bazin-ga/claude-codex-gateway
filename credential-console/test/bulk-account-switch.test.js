@@ -501,3 +501,24 @@ test('an unknown group in the URL falls back to the unfiltered list', async () =
   assert.equal(html.includes('action="/devices/account"'), false);
   assert.match(html, /laptop-c/);
 });
+
+test('with no groups yet, the way to make one is visible rather than folded away', async () => {
+  // The controls that use groups — the filter and the per-row picker — only
+  // appear once a group exists. If the one place that creates one is also
+  // collapsed, the feature is invisible until you already use it, which is how
+  // it shipped and why it looked like nothing had changed.
+  const { store } = await fixture();
+  const html = render(store, { deviceGroups: [] });
+  const registry = /<details class="machine-group-registry"[^>]*>/.exec(html)?.[0] ?? '';
+  assert.ok(registry, 'the registry is on the page');
+  assert.match(registry, /\bopen\b/, 'and open, because there is nothing else to find it by');
+  assert.match(html, /Group machines so they can be switched/, 'saying what it is for');
+});
+
+test('once groups exist the registry folds away and remembers that', async () => {
+  const { store } = await machineGroupFixture();
+  const html = render(store, { deviceGroups: store.deviceGroups() });
+  const registry = /<details class="machine-group-registry"[^>]*>/.exec(html)?.[0] ?? '';
+  assert.equal(/\bopen\b/.test(registry), false, 'it stops taking up room');
+  assert.match(registry, /data-persist-details="machine-groups"/, 'and remembers if reopened');
+});
