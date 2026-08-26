@@ -3325,7 +3325,6 @@ export function dashboardView({
   error = null,
   accountFilter = null,
   memberFilter = null,
-  groupFilter = null,
   completedDraft = null,
   credentialAlerts = null,
   now = Date.now(),
@@ -3397,12 +3396,7 @@ export function dashboardView({
       ?? null;
     return `
     <tr data-account-row="${escapeHtml(account.id)}">
-      <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(account.provider === 'claude' ? 'Claude Code' : 'Codex')} · ${escapeHtml(account.email_label || 'No email label')}</div>
-        ${account.provider === 'claude' ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/group" class="inline account-group-form">
-          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-          <input name="group" value="${escapeHtml(account.group ?? '')}" aria-label="Group for ${escapeHtml(account.alias)}" placeholder="no group" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._ -]{0,63}" list="account-group-names">
-          <button type="submit" class="secondary tiny">Set group</button>
-        </form>` : ''}</td>
+      <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(account.provider === 'claude' ? 'Claude Code' : 'Codex')} · ${escapeHtml(account.email_label || 'No email label')}</div></td>
       <td><div class="account-status-stack">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}</div>
         ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}
         <div class="muted tiny"><span data-i18n="devices">Devices</span>: <span data-account-device-count>${escapeHtml(account.active_devices ?? '—')}</span></div></td>
@@ -3454,33 +3448,20 @@ export function dashboardView({
     .filter((device) => !device.revoked_at && device.member_label)
     .map((device) => device.member_label))].sort((a, b) => a.localeCompare(b));
   const filterMember = memberLabels.includes(memberFilter) ? memberFilter : null;
-  const accountGroups = [...new Set(accounts
-    .filter((account) => account.provider === 'claude' && account.group)
-    .map((account) => account.group))].sort((a, b) => a.localeCompare(b));
-  const filterGroup = accountGroups.includes(groupFilter) ? groupFilter : null;
-  // A group names a set of accounts, so it narrows to the devices on any of
-  // them. An empty group matches nothing rather than everything.
-  const groupAccountIds = filterGroup
-    ? new Set(accounts.filter((account) => account.group === filterGroup).map((account) => account.id))
-    : null;
-  const anyFilter = Boolean(filterAccount || filterMember || filterGroup);
+  const anyFilter = Boolean(filterAccount || filterMember);
   // Both conditions apply together: "everyone under this GitHub account who is
   // currently on that Claude account" is the selection worth acting on.
   const matchedRows = (entry) => (entry.devices ?? []).filter((device) => {
     if (device.revoked_at) return false;
     if (filterMember && device.member_label !== filterMember) return false;
-    if (!filterAccount && !groupAccountIds) return true;
-    const selected = accountSelectionForDevice(device, accounts).selectedAccountId;
-    if (filterAccount && selected !== filterAccount.id) return false;
-    if (groupAccountIds && !groupAccountIds.has(selected)) return false;
-    return true;
+    if (!filterAccount) return true;
+    return accountSelectionForDevice(device, accounts).selectedAccountId === filterAccount.id;
   });
   const matchesFilter = (entry) => !anyFilter || matchedRows(entry).length > 0;
   const filteredCount = anyFilter
     ? inventory.reduce((total, entry) => total + matchedRows(entry).length, 0)
     : 0;
   const filterSummary = [
-    filterGroup ? `in group <strong>${escapeHtml(filterGroup)}</strong>` : null,
     filterAccount ? `on <strong>${escapeHtml(filterAccount.alias)}</strong>` : null,
     filterMember ? `for <strong>${escapeHtml(filterMember)}</strong>` : null,
   ].filter(Boolean).join(' ');
@@ -3566,9 +3547,6 @@ export function dashboardView({
           <h2 data-i18n="admin-heading">Accounts, devices, and exceptional enrollment</h2>
           <p class="muted" data-i18n="admin-intro">Use this area to add provider accounts once, inspect devices, and revoke access. Routine member setup happens above.</p>
         </div>
-        <datalist id="account-group-names">${accountGroups.map((name) => (
-          `<option value="${escapeHtml(name)}"></option>`
-        )).join('')}</datalist>
         <section class="grid">
           <article class="card summary"><span class="muted" data-i18n="accounts">Accounts</span><strong>${accounts.length}</strong></article>
           <article class="card summary"><span class="muted" data-i18n="healthy">Healthy</span><strong>${healthy}</strong></article>
@@ -3649,14 +3627,6 @@ export function dashboardView({
                   )).join('')}
                 </select>
               </label>
-              ${accountGroups.length ? `<label><span>Group</span>
-                <select name="group">
-                  <option value="">All groups</option>
-                  ${accountGroups.map((name) => (
-                    `<option value="${escapeHtml(name)}"${name === filterGroup ? ' selected' : ''}>${escapeHtml(name)}</option>`
-                  )).join('')}
-                </select>
-              </label>` : ''}
               <label><span>Member</span>
                 <select name="member">
                   <option value="">Everyone</option>
@@ -3671,7 +3641,6 @@ export function dashboardView({
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <input type="hidden" name="from_account_id" value="${escapeHtml(filterAccount?.id ?? '')}">
               <input type="hidden" name="member_label" value="${escapeHtml(filterMember ?? '')}">
-              <input type="hidden" name="group" value="${escapeHtml(filterGroup ?? '')}">
               <input type="hidden" name="expected_count" value="${filteredCount}">
               <div><strong>${filteredCount}</strong> active credential(s) ${filterSummary}.</div>
               <label><span>Move all of them to</span>

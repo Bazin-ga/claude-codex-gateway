@@ -191,7 +191,7 @@ test('the move is recorded in the audit log, one entry per device', async () => 
   }
 });
 
-function render(store, { accountFilter = null, memberFilter = null, groupFilter = null } = {}) {
+function render(store, { accountFilter = null, memberFilter = null } = {}) {
   return dashboardView({
     accounts: store.publicAccounts(),
     devices: store.publicDevices(),
@@ -200,7 +200,6 @@ function render(store, { accountFilter = null, memberFilter = null, groupFilter 
     adminIdentity: 'admin@example.com',
     accountFilter,
     memberFilter,
-    groupFilter,
   });
 }
 
@@ -375,114 +374,4 @@ test('the switch form returns as soon as there is a second account', async () =>
   const html = render(store);
   assert.ok((html.match(/data-account-switch\b/g) ?? []).length > 0);
   assert.equal(html.includes('Only one Claude account is registered'), false);
-});
-
-async function groupedFixture() {
-  const store = await newStore();
-  const a = await claudeAccount(store, 'team-a-1');
-  const b = await claudeAccount(store, 'team-a-2');
-  const spare = await claudeAccount(store, 'spare-pool');
-  await store.setAccountGroup(a.id, 'team-a');
-  await store.setAccountGroup(b.id, 'team-a');
-  const issue = async (accountId, name) => {
-    const { device: row } = await store.issueDeviceCredential({
-      accountId, memberLabel: 'member@example.com', deviceName: name,
-    });
-    return row;
-  };
-  return {
-    store, a, b, spare,
-    onA: await issue(a.id, 'laptop-a'),
-    onB: await issue(b.id, 'laptop-b'),
-    onSpare: await issue(spare.id, 'laptop-spare'),
-  };
-}
-
-test('a group selects every device on every account in it', async () => {
-  const { store, onA, onB, onSpare } = await groupedFixture();
-  const matched = store.devicesMatching({ group: 'team-a' }).map((row) => row.id);
-  assert.deepEqual(matched.sort(), [onA.id, onB.id].sort());
-  assert.equal(matched.includes(onSpare.id), false);
-  assert.deepEqual(store.accountGroups(), ['team-a']);
-});
-
-test('a whole group moves to one account in a single press', async () => {
-  const { store, spare, onA, onB, onSpare } = await groupedFixture();
-  const summary = await store.bulkConfigureDeviceAccount({
-    group: 'team-a',
-    selectedAccountId: spare.id,
-    expectedCount: 2,
-    actor: 'admin@example.com',
-  });
-  assert.deepEqual(summary.switched.sort(), [onA.id, onB.id].sort());
-  assert.equal(store.resolveDeviceAccount(onA.id).account.id, spare.id);
-  assert.equal(store.resolveDeviceAccount(onB.id).account.id, spare.id);
-  // The account outside the group is untouched.
-  assert.equal(store.resolveDeviceAccount(onSpare.id).account.id, spare.id);
-});
-
-test('a group nobody is in matches nothing, not everything', async () => {
-  const { store, spare } = await groupedFixture();
-  assert.deepEqual(store.devicesMatching({ group: 'no-such-group' }), []);
-  await assert.rejects(
-    store.bulkConfigureDeviceAccount({
-      group: 'no-such-group',
-      selectedAccountId: spare.id,
-      expectedCount: 3,
-      actor: 'admin@example.com',
-    }),
-    /the list changed: 0 devices/,
-    'a stale group name must not fall through to the whole fleet',
-  );
-});
-
-test('group and account filters narrow together', async () => {
-  const { store, a } = await groupedFixture();
-  assert.equal(store.devicesMatching({ group: 'team-a', accountId: a.id }).length, 1);
-  // An account outside the group yields nothing, rather than ignoring one side.
-  const { spare } = await groupedFixture();
-  assert.equal(store.devicesMatching({ group: 'team-a', accountId: spare.id }).length, 0);
-});
-
-test('a group can be renamed and removed', async () => {
-  const { store, a, b } = await groupedFixture();
-  await store.setAccountGroup(a.id, 'renamed');
-  assert.deepEqual(store.accountGroups(), ['renamed', 'team-a']);
-  await store.setAccountGroup(a.id, '');
-  await store.setAccountGroup(b.id, '');
-  assert.deepEqual(store.accountGroups(), []);
-  assert.equal(store.publicAccounts().every((account) => account.group === null), true);
-});
-
-test('a group name that could break the page is refused', async () => {
-  const { store, a } = await groupedFixture();
-  for (const bad of ['<script>', '-starts-with-dash', 'x'.repeat(65), 'has\nnewline']) {
-    await assert.rejects(() => store.setAccountGroup(a.id, bad), /group name/, JSON.stringify(bad));
-  }
-  assert.equal(store.accountById(a.id).group, 'team-a', 'the existing group survives a rejection');
-
-  // Surrounding whitespace is trimmed rather than refused: a name pasted with a
-  // stray space is the same group, and rejecting it would only be pedantic.
-  await store.setAccountGroup(a.id, '  team-a  ');
-  assert.equal(store.accountById(a.id).group, 'team-a');
-});
-
-test('the dashboard offers the group filter and the per-account editor', async () => {
-  const { store, a } = await groupedFixture();
-  const plain = render(store);
-  assert.match(plain, /<span>Group<\/span>/);
-  assert.match(plain, /<option value="team-a">team-a<\/option>/);
-  assert.match(plain, new RegExp(`action="/accounts/${a.id}/group"`), 'each account can be grouped');
-  assert.match(plain, /<datalist id="account-group-names">/, 'existing names are suggested, to avoid near-duplicates');
-
-  const filtered = render(store, { groupFilter: 'team-a' });
-  assert.match(filtered, /name="group" value="team-a"/, 'the bulk form carries the group');
-  assert.match(filtered, /<strong>2<\/strong> active credential\(s\) in group <strong>team-a<\/strong>/);
-});
-
-test('an unknown group in the URL falls back to the unfiltered list', async () => {
-  const { store } = await groupedFixture();
-  const html = render(store, { groupFilter: 'nope' });
-  assert.equal(html.includes('action="/devices/account"'), false);
-  assert.match(html, /laptop-a/);
 });

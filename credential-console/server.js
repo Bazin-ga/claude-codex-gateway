@@ -760,9 +760,6 @@ export async function createCredentialConsole(options = {}) {
         provider: account.provider,
         alias: account.alias,
         email_label: account.email_label,
-        // Carried through explicitly: this projection is an allow-list, so a
-        // field added to publicAccounts() is dropped here until it is named.
-        group: account.group ?? null,
         status: account.status,
         created_at: safeTimestamp(account.created_at),
         expires_at: safeTimestamp(account.expires_at),
@@ -1700,7 +1697,6 @@ export async function createCredentialConsole(options = {}) {
         // reload, the same way the conversation and metrics filters work.
         accountFilter: url.searchParams.get('account'),
         memberFilter: url.searchParams.get('member'),
-        groupFilter: url.searchParams.get('group'),
         completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
       }));
       return;
@@ -2159,29 +2155,6 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
-    const accountGroupParams = routeMatch(path, '/accounts/:id/group');
-    if (req.method === 'POST' && accountGroupParams) {
-      const session = requireSession(req, res);
-      if (!session) return;
-      const form = await readForm(req).catch(() => ({}));
-      if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
-        return;
-      }
-      try {
-        const account = await store.setAccountGroup(accountGroupParams.id, form.group);
-        log('account_group_set', {
-          account_id: account.id,
-          group: account.group ?? null,
-          actor: session.admin_identity ?? 'anonymous',
-        });
-        redirect(res, '/');
-      } catch (error) {
-        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
-      }
-      return;
-    }
-
     const codexPasteParams = routeMatch(path, '/accounts/:id/codex-authorization/paste');
     if (req.method === 'POST' && codexPasteParams) {
       const session = requireSession(req, res);
@@ -2349,7 +2322,6 @@ export async function createCredentialConsole(options = {}) {
         const summary = await store.bulkConfigureDeviceAccount({
           fromAccountId: fromAccountId || null,
           memberLabel: String(form.member_label ?? '') || null,
-          group: String(form.group ?? '') || null,
           selectedAccountId: String(form.selected_account_id ?? ''),
           expectedCount: Number.isSafeInteger(declared) && declared >= 0 ? declared : null,
           actor,
@@ -2358,7 +2330,6 @@ export async function createCredentialConsole(options = {}) {
         log('device_account_bulk_configured', {
           from_account_id: fromAccountId || null,
           member_label: String(form.member_label ?? '') || null,
-          group: String(form.group ?? '') || null,
           to_account_id: summary.targetAccountId,
           switched: summary.switched.length,
           skipped: summary.skipped.length,
@@ -2377,7 +2348,6 @@ export async function createCredentialConsole(options = {}) {
         const back = new URLSearchParams();
         if (fromAccountId) back.set('account', fromAccountId);
         if (form.member_label) back.set('member', String(form.member_label));
-        if (form.group) back.set('group', String(form.group));
         back.set('error', error.message);
         redirect(res, `/?${back}`);
       }

@@ -2936,32 +2936,3 @@ test('an unauthorized account row can be deleted from the console, a credentiale
     await app.close();
   }
 });
-
-test('an account group survives the dashboard projection and reaches the filter', async () => {
-  // The dashboard does not hand the view `publicAccounts()` directly; it
-  // re-projects onto an allow-list of fields. A field added to the store but
-  // not named there is dropped silently — which is exactly what happened to
-  // `group`, so the filter never appeared even though the value was stored.
-  const app = await fixture({ adminAuth: 'open' });
-  try {
-    const account = await app.store.addAccount({
-      provider: 'claude',
-      alias: 'grouped-account',
-      emailLabel: 'owner@example.com',
-      credential: { oauth_token: 'sk-ant-oat-example' },
-    });
-    await app.store.setAccountGroup(account.id, 'team-a');
-
-    const html = await (await fetch(`${app.baseUrl}/`)).text();
-    assert.match(html, /<span>Group<\/span>/, 'the group filter is offered');
-    assert.match(html, /<option value="team-a">team-a<\/option>/);
-    assert.match(
-      html,
-      new RegExp(`action="/accounts/${account.id}/group"`),
-      'and the account can be regrouped from here',
-    );
-    assert.match(html, /value="team-a"[^>]*aria-label="Group for grouped-account"/, 'showing its current group');
-  } finally {
-    await app.close();
-  }
-});
