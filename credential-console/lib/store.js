@@ -1089,19 +1089,129 @@ export class CredentialStore {
    * dashboard already shows them as invalid, and a bulk move must not silently
    * decide what a malformed row meant.
    */
-  devicesMatching({ accountId = null, memberLabel = null } = {}) {
+  devicesMatching({ accountId = null, memberLabel = null, group = null } = {}) {
     const wantAccount = typeof accountId === 'string' && accountId ? accountId : null;
     const wantMember = typeof memberLabel === 'string' && memberLabel ? memberLabel : null;
-    if (!wantAccount && !wantMember) return [];
+    const wantGroup = typeof group === 'string' && group ? group : null;
+    if (!wantAccount && !wantMember && !wantGroup) return [];
     return this.state.devices.filter((device) => {
       if (device.revoked_at) return false;
       if (wantMember && device.member_label !== wantMember) return false;
+      // A machine can be in several groups, so this asks whether it is in this
+      // one — not whether this one is its group.
+      if (wantGroup && !(Array.isArray(device.groups) && device.groups.includes(wantGroup))) return false;
       if (!wantAccount) return true;
       try {
         return this.#deviceAccountPolicy(device).selectedAccountId === wantAccount;
       } catch {
         return false;
       }
+    });
+  }
+
+  /**
+   * Machine groups.
+   *
+   * The label lives on the credential row for now, because that is the only
+   * thing this console can actually identify: every device on the production
+   * host reports no machine handle, so `machine_id` is null across the board and
+   * grouping by it would ship a feature nobody could use. When agents do report
+   * handles, these move to the machine and the credential rows inherit from it —
+   * which is why the registry is kept separate from the assignments, so only the
+   * assignment side has to change.
+   *
+   * The registry exists so a name is typed once. Assigning the tenth machine to
+   * a group should be a choice from a list, not the tenth chance to misspell it.
+   */
+  #groupRegistry() {
+    if (!Array.isArray(this.state.device_groups)) this.state.device_groups = [];
+    return this.state.device_groups;
+  }
+
+  deviceGroups() {
+    return [...this.#groupRegistry()].sort((a, b) => a.localeCompare(b));
+  }
+
+  #normalizedGroupName(name) {
+    const normalized = String(name ?? '').trim();
+    if (!normalized) throw new Error('a group name is required');
+    if (!/^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/.test(normalized)) {
+      throw new Error('a group name must start alphanumeric and use letters, digits, space, dot, dash or underscore');
+    }
+    return normalized;
+  }
+
+  async createDeviceGroup(name) {
+    return this.serialized(async () => {
+      const normalized = this.#normalizedGroupName(name);
+      const registry = this.#groupRegistry();
+      if (registry.includes(normalized)) throw new Error('that group already exists');
+      registry.push(normalized);
+      this.audit('device_group_created', { group: normalized });
+      await this.persist();
+      return normalized;
+    });
+  }
+
+  async renameDeviceGroup(from, to) {
+    return this.serialized(async () => {
+      const previous = String(from ?? '').trim();
+      const next = this.#normalizedGroupName(to);
+      const registry = this.#groupRegistry();
+      const index = registry.indexOf(previous);
+      if (index === -1) throw new Error('that group does not exist');
+      if (previous !== next && registry.includes(next)) throw new Error('that group already exists');
+      registry[index] = next;
+      // Assignments hold names, so a rename has to rewrite them. Doing it here,
+      // in the same transaction, is what keeps a rename from orphaning members.
+      for (const device of this.state.devices) {
+        if (!Array.isArray(device.groups)) continue;
+        device.groups = [...new Set(device.groups.map((g) => (g === previous ? next : g)))];
+      }
+      this.audit('device_group_renamed', { group: previous, renamed_to: next });
+      await this.persist();
+      return next;
+    });
+  }
+
+  async deleteDeviceGroup(name) {
+    return this.serialized(async () => {
+      const target = String(name ?? '').trim();
+      const registry = this.#groupRegistry();
+      const index = registry.indexOf(target);
+      if (index === -1) throw new Error('that group does not exist');
+      registry.splice(index, 1);
+      let removed = 0;
+      for (const device of this.state.devices) {
+        if (!Array.isArray(device.groups) || !device.groups.includes(target)) continue;
+        device.groups = device.groups.filter((g) => g !== target);
+        if (device.groups.length === 0) delete device.groups;
+        removed += 1;
+      }
+      this.audit('device_group_deleted', { group: target, members_released: removed });
+      await this.persist();
+      return { group: target, membersReleased: removed };
+    });
+  }
+
+  /** Replace a credential's groups outright; only registered names are accepted. */
+  async setDeviceGroups(deviceId, names) {
+    return this.serialized(async () => {
+      const device = this.state.devices.find((entry) => entry.id === deviceId);
+      if (!device) throw new Error('device not found');
+      if (device.revoked_at) throw new Error('device is revoked');
+      const registry = this.#groupRegistry();
+      const wanted = [...new Set((Array.isArray(names) ? names : [names])
+        .map((name) => String(name ?? '').trim())
+        .filter(Boolean))];
+      const unknown = wanted.filter((name) => !registry.includes(name));
+      // Silently dropping an unknown name would look like the assignment worked.
+      if (unknown.length) throw new Error(`no such group: ${unknown.join(', ')}`);
+      if (wanted.length) device.groups = wanted;
+      else delete device.groups;
+      this.audit('device_groups_set', { device_id: device.id, groups: wanted });
+      await this.persist();
+      return wanted;
     });
   }
 
@@ -1137,6 +1247,7 @@ export class CredentialStore {
   async bulkConfigureDeviceAccount({
     fromAccountId = null,
     memberLabel = null,
+    group = null,
     selectedAccountId,
     expectedCount = null,
     actor = null,
@@ -1154,13 +1265,13 @@ export class CredentialStore {
       }
       // Without a filter this would move the entire fleet. That is never what a
       // mis-click meant, so it is refused rather than guarded by the count alone.
-      if (!fromAccountId && !memberLabel) {
+      if (!fromAccountId && !memberLabel && !group) {
         throw storeError('a filter is required before moving anything', 'DEVICE_CONFIGURATION_INVALID');
       }
       const target = this.accountById(selectedAccountId);
       this.#assertSwitchableAccount(target);
 
-      const devices = this.devicesMatching({ accountId: fromAccountId, memberLabel });
+      const devices = this.devicesMatching({ accountId: fromAccountId, memberLabel, group });
       if (expectedCount !== null && devices.length !== expectedCount) {
         throw storeError(
           `the list changed: ${devices.length} devices are on that account now, not ${expectedCount}.`

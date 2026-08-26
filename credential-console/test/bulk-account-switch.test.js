@@ -191,7 +191,7 @@ test('the move is recorded in the audit log, one entry per device', async () => 
   }
 });
 
-function render(store, { accountFilter = null, memberFilter = null } = {}) {
+function render(store, { accountFilter = null, memberFilter = null, groupFilter = null, deviceGroups = [] } = {}) {
   return dashboardView({
     accounts: store.publicAccounts(),
     devices: store.publicDevices(),
@@ -200,6 +200,8 @@ function render(store, { accountFilter = null, memberFilter = null } = {}) {
     adminIdentity: 'admin@example.com',
     accountFilter,
     memberFilter,
+    groupFilter,
+    deviceGroups,
   });
 }
 
@@ -374,4 +376,128 @@ test('the switch form returns as soon as there is a second account', async () =>
   const html = render(store);
   assert.ok((html.match(/data-account-switch\b/g) ?? []).length > 0);
   assert.equal(html.includes('Only one Claude account is registered'), false);
+});
+
+async function machineGroupFixture() {
+  const store = await newStore();
+  const main = await claudeAccount(store, 'main-account');
+  const spare = await claudeAccount(store, 'spare-account');
+  const issue = async (name) => {
+    const { device: row } = await store.issueDeviceCredential({
+      accountId: main.id, memberLabel: 'member@example.com', deviceName: name,
+    });
+    return row;
+  };
+  const a = await issue('laptop-a');
+  const b = await issue('laptop-b');
+  const c = await issue('laptop-c');
+  await store.createDeviceGroup('team-a');
+  await store.createDeviceGroup('on-call');
+  await store.setDeviceGroups(a.id, ['team-a']);
+  await store.setDeviceGroups(b.id, ['team-a', 'on-call']);
+  return { store, main, spare, a, b, c };
+}
+
+test('a machine group selects its members, and a machine can be in several', async () => {
+  const { store, a, b, c } = await machineGroupFixture();
+  assert.deepEqual(
+    store.devicesMatching({ group: 'team-a' }).map((row) => row.id).sort(),
+    [a.id, b.id].sort(),
+  );
+  // b is in both; asking for either finds it.
+  assert.deepEqual(store.devicesMatching({ group: 'on-call' }).map((row) => row.id), [b.id]);
+  assert.equal(store.devicesMatching({ group: 'team-a' }).some((row) => row.id === c.id), false);
+});
+
+test('a whole group moves in one press, and combines with the other filters', async () => {
+  const { store, spare, a, b } = await machineGroupFixture();
+  const summary = await store.bulkConfigureDeviceAccount({
+    group: 'team-a',
+    selectedAccountId: spare.id,
+    expectedCount: 2,
+    actor: 'admin@example.com',
+  });
+  assert.deepEqual(summary.switched.sort(), [a.id, b.id].sort());
+  assert.equal(store.resolveDeviceAccount(a.id).account.id, spare.id);
+
+  // group + member narrow together
+  assert.equal(store.devicesMatching({ group: 'on-call', memberLabel: 'member@example.com' }).length, 1);
+  assert.equal(store.devicesMatching({ group: 'on-call', memberLabel: 'nobody@example.com' }).length, 0);
+});
+
+test('only registered names can be assigned', async () => {
+  const { store, c } = await machineGroupFixture();
+  await assert.rejects(
+    () => store.setDeviceGroups(c.id, ['team-a', 'invented']),
+    /no such group: invented/,
+    'silently dropping it would look like the assignment worked',
+  );
+  assert.equal(store.state.devices.find((row) => row.id === c.id).groups, undefined);
+});
+
+test('renaming a group carries its members with it', async () => {
+  const { store, a, b } = await machineGroupFixture();
+  await store.renameDeviceGroup('team-a', 'team-alpha');
+  assert.deepEqual(store.deviceGroups(), ['on-call', 'team-alpha']);
+  assert.deepEqual(
+    store.devicesMatching({ group: 'team-alpha' }).map((row) => row.id).sort(),
+    [a.id, b.id].sort(),
+  );
+  assert.deepEqual(store.devicesMatching({ group: 'team-a' }), [], 'the old name is gone');
+  // b keeps its other group.
+  assert.deepEqual(store.state.devices.find((row) => row.id === b.id).groups.sort(), ['on-call', 'team-alpha']);
+});
+
+test('deleting a group releases its members and leaves everything else alone', async () => {
+  const { store, b } = await machineGroupFixture();
+  const result = await store.deleteDeviceGroup('team-a');
+  assert.equal(result.membersReleased, 2);
+  assert.deepEqual(store.deviceGroups(), ['on-call']);
+  assert.deepEqual(store.state.devices.find((row) => row.id === b.id).groups, ['on-call']);
+  assert.deepEqual(store.devicesMatching({ group: 'team-a' }), []);
+});
+
+test('group names are validated, and duplicates refused', async () => {
+  const { store } = await machineGroupFixture();
+  for (const bad of ['<script>', '-dash-first', 'x'.repeat(65), '']) {
+    await assert.rejects(() => store.createDeviceGroup(bad), /group name/, JSON.stringify(bad));
+  }
+  await assert.rejects(() => store.createDeviceGroup('team-a'), /already exists/);
+  await assert.rejects(() => store.renameDeviceGroup('team-a', 'on-call'), /already exists/);
+  assert.deepEqual(store.deviceGroups(), ['on-call', 'team-a'], 'nothing changed');
+});
+
+test('a group with no members moves nothing rather than everything', async () => {
+  const { store, spare } = await machineGroupFixture();
+  await store.createDeviceGroup('empty-group');
+  assert.deepEqual(store.devicesMatching({ group: 'empty-group' }), []);
+  await assert.rejects(
+    store.bulkConfigureDeviceAccount({
+      group: 'empty-group', selectedAccountId: spare.id, expectedCount: 2, actor: 'a',
+    }),
+    /the list changed: 0 devices/,
+  );
+});
+
+test('the dashboard offers the registry, the per-row picker and the filter', async () => {
+  const { store, a } = await machineGroupFixture();
+  const groups = store.deviceGroups();
+  const plain = render(store, { deviceGroups: groups });
+
+  assert.match(plain, /<summary>Machine groups \(2\)<\/summary>/, 'names are managed in one place');
+  assert.match(plain, /action="\/device-groups"/);
+  assert.match(plain, new RegExp(`action="/devices/${a.id}/groups"`), 'each machine picks from the list');
+  assert.match(plain, /<select name="groups" multiple/, 'a list to choose from, not a box to type in');
+  assert.match(plain, /<span>Machine group<\/span>/, 'and the filter is offered');
+
+  const filtered = render(store, { deviceGroups: groups, groupFilter: 'team-a' });
+  assert.match(filtered, /name="group" value="team-a"/, 'the bulk form carries the group');
+  assert.match(filtered, /<strong>2<\/strong> active credential\(s\) in <strong>team-a<\/strong>/);
+});
+
+test('an unknown group in the URL falls back to the unfiltered list', async () => {
+  const { store } = await machineGroupFixture();
+  const html = render(store, { deviceGroups: store.deviceGroups(), groupFilter: 'nope' });
+  assert.equal(html.includes('action="/devices/account"'), false);
+  assert.match(html, /laptop-c/);
 });

@@ -1034,11 +1034,39 @@ function accountSwitchControl(device, selection, accounts, csrf) {
 }
 
 /**
+ * Which groups this machine is in.
+ *
+ * A list to pick from rather than a box to type in: a name is created once in
+ * the registry, and every machine after that chooses it. Typing it again is the
+ * chance to create `team-a ` beside `team-a` and wonder why the filter misses
+ * half the fleet.
+ *
+ * A plain multi-select so it works with no JavaScript, and because with a dozen
+ * groups across twenty rows, checkboxes would be several hundred controls.
+ */
+function deviceGroupControl(device, groupNames, csrf) {
+  if (device.revoked_at) return '';
+  if (!groupNames.length) return '';
+  const current = new Set(device.groups ?? []);
+  return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/groups" class="stack device-group-form">
+    <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+    <label><span>Machine groups</span>
+      <select name="groups" multiple size="${Math.min(groupNames.length, 4)}" aria-label="Groups for ${escapeHtml(device.name)}">
+        ${groupNames.map((name) => (
+    `<option value="${escapeHtml(name)}"${current.has(name) ? ' selected' : ''}>${escapeHtml(name)}</option>`
+  )).join('')}
+      </select>
+    </label>
+    <button type="submit" class="secondary">Save groups</button>
+  </form>`;
+}
+
+/**
  * One console-issued credential. Named for the console, not for Claude: the
  * same row now carries Codex gateway credentials too, and the provider is read
  * off the account rather than assumed.
  */
-function consoleCredentialRow(device, accounts, csrf) {
+function consoleCredentialRow(device, accounts, csrf, groupNames = []) {
   const state = device.revoked_at ? 'revoked' : 'active';
   const selection = accountSelectionForDevice(device, accounts);
   const selectedAccount = selection.invalid ? null : selection.selectedAccount;
@@ -1054,6 +1082,7 @@ function consoleCredentialRow(device, accounts, csrf) {
     <td>${escapeHtml(dateText(device.last_seen_at))}</td>
     <td><div class="stack">
       ${accountSelectionDetails(selection, accounts)}
+      ${deviceGroupControl(device, groupNames, csrf)}
       ${accountSwitchControl(device, selection, accounts, csrf)}
       ${device.revoked_at
       ? `<span class="muted tiny">${escapeHtml(dateText(device.revoked_at))}</span>`
@@ -1163,12 +1192,12 @@ function machineInventory({ machines, codexClients }) {
   }));
 }
 
-function machineEntryView(entry, { accounts, csrf, machineOptions }) {
+function machineEntryView(entry, { accounts, csrf, machineOptions, groupNames = [] }) {
   const accountFor = (id) => accounts.find((account) => account.id === id) ?? null;
   const rows = [
     ...entry.devices.map((device) => ({
       revoked: Boolean(device.revoked_at),
-      html: consoleCredentialRow(device, accounts, csrf),
+      html: consoleCredentialRow(device, accounts, csrf, groupNames),
     })),
     ...entry.codex.map((client) => ({
       revoked: client.revoked,
@@ -3325,6 +3354,8 @@ export function dashboardView({
   error = null,
   accountFilter = null,
   memberFilter = null,
+  groupFilter = null,
+  deviceGroups = [],
   completedDraft = null,
   credentialAlerts = null,
   now = Date.now(),
@@ -3436,7 +3467,8 @@ export function dashboardView({
   const machineOptions = inventory.filter((entry) => entry.machine_id).map((entry) => (
     `<option value="${escapeHtml(entry.machine_id)}">${escapeHtml(entry.names.join(', ') || entry.machine_id)} · ${escapeHtml(entry.machine_id)}</option>`
   )).join('');
-  const entryView = (entry) => machineEntryView(entry, { accounts, csrf, machineOptions });
+  const groupNames = Array.isArray(deviceGroups) ? deviceGroups : [];
+  const entryView = (entry) => machineEntryView(entry, { accounts, csrf, machineOptions, groupNames });
   // Filtering is judged on the *device* rows, not the machine: one machine can
   // hold Claude credentials on several accounts, so a machine is shown when any
   // of its rows matches, and the count below counts rows rather than machines.
@@ -3448,12 +3480,15 @@ export function dashboardView({
     .filter((device) => !device.revoked_at && device.member_label)
     .map((device) => device.member_label))].sort((a, b) => a.localeCompare(b));
   const filterMember = memberLabels.includes(memberFilter) ? memberFilter : null;
-  const anyFilter = Boolean(filterAccount || filterMember);
+  const filterGroup = groupNames.includes(groupFilter) ? groupFilter : null;
+  const anyFilter = Boolean(filterAccount || filterMember || filterGroup);
   // Both conditions apply together: "everyone under this GitHub account who is
   // currently on that Claude account" is the selection worth acting on.
   const matchedRows = (entry) => (entry.devices ?? []).filter((device) => {
     if (device.revoked_at) return false;
     if (filterMember && device.member_label !== filterMember) return false;
+    // Membership, not equality: a machine can be in more than one group.
+    if (filterGroup && !(device.groups ?? []).includes(filterGroup)) return false;
     if (!filterAccount) return true;
     return accountSelectionForDevice(device, accounts).selectedAccountId === filterAccount.id;
   });
@@ -3462,6 +3497,7 @@ export function dashboardView({
     ? inventory.reduce((total, entry) => total + matchedRows(entry).length, 0)
     : 0;
   const filterSummary = [
+    filterGroup ? `in <strong>${escapeHtml(filterGroup)}</strong>` : null,
     filterAccount ? `on <strong>${escapeHtml(filterAccount.alias)}</strong>` : null,
     filterMember ? `for <strong>${escapeHtml(filterMember)}</strong>` : null,
   ].filter(Boolean).join(' ');
@@ -3617,6 +3653,31 @@ export function dashboardView({
               <h2><span data-i18n="machines">Machines</span> (${liveMachines.length})</h2>
               <div class="muted tiny" data-i18n="machines-intro">One row per machine, with every credential it holds underneath. A machine is identified by an opaque random handle — reported by its own agent, or minted here for one issuance when the machine has no agent to report one. It says nothing about who is using it, and the member label beside it is self-asserted and unverified.</div>
             </div></div>
+            <details class="machine-group-registry" data-persist-details="machine-groups">
+              <summary>Machine groups (${groupNames.length})</summary>
+              <p class="muted tiny">Names are created here once. Each machine then picks from this list, so a group is never two groups differing by a typo. Removing a name here takes it off every machine; nothing else about them changes.</p>
+              <form method="post" action="/device-groups" class="inline">
+                <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+                <input type="hidden" name="action" value="create">
+                <input name="name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._ -]{0,63}" placeholder="new group name" aria-label="New machine group name">
+                <button type="submit" class="secondary">Create group</button>
+              </form>
+              ${groupNames.length ? `<ul class="machine-group-list">${groupNames.map((name) => `<li>
+                <form method="post" action="/device-groups" class="inline">
+                  <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+                  <input type="hidden" name="action" value="rename">
+                  <input type="hidden" name="group" value="${escapeHtml(name)}">
+                  <input name="name" value="${escapeHtml(name)}" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._ -]{0,63}" aria-label="Rename ${escapeHtml(name)}">
+                  <button type="submit" class="secondary tiny">Rename</button>
+                </form>
+                <form method="post" action="/device-groups" class="inline">
+                  <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+                  <input type="hidden" name="action" value="delete">
+                  <input type="hidden" name="group" value="${escapeHtml(name)}">
+                  <button type="submit" class="danger tiny">Delete</button>
+                </form>
+              </li>`).join('')}</ul>` : '<p class="muted tiny">No groups yet.</p>'}
+            </details>
             ${openMode ? '<div class="notice error open-banner" role="status" data-i18n="open-account-switch-warning">Open mode has no verified actor: anyone who can reach this console can switch any active device. The actor is recorded as anonymous; a member label is not an actor.</div>' : ''}
             ${switchableAccounts.length ? `<form method="get" action="/" class="machine-filter">
               <label><span>Claude account</span>
@@ -3627,6 +3688,14 @@ export function dashboardView({
                   )).join('')}
                 </select>
               </label>
+              ${groupNames.length ? `<label><span>Machine group</span>
+                <select name="group">
+                  <option value="">All machines</option>
+                  ${groupNames.map((name) => (
+                    `<option value="${escapeHtml(name)}"${name === filterGroup ? ' selected' : ''}>${escapeHtml(name)}</option>`
+                  )).join('')}
+                </select>
+              </label>` : ''}
               <label><span>Member</span>
                 <select name="member">
                   <option value="">Everyone</option>
@@ -3641,6 +3710,7 @@ export function dashboardView({
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <input type="hidden" name="from_account_id" value="${escapeHtml(filterAccount?.id ?? '')}">
               <input type="hidden" name="member_label" value="${escapeHtml(filterMember ?? '')}">
+              <input type="hidden" name="group" value="${escapeHtml(filterGroup ?? '')}">
               <input type="hidden" name="expected_count" value="${filteredCount}">
               <div><strong>${filteredCount}</strong> active credential(s) ${filterSummary}.</div>
               <label><span>Move all of them to</span>

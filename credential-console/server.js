@@ -17,6 +17,7 @@ import {
   sendHtml,
   sendJson,
   sendText,
+  readBody,
 } from './lib/http.js';
 import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
@@ -1684,6 +1685,7 @@ export async function createCredentialConsole(options = {}) {
         // why the flat list stopped being readable, and they are still the record
         // of what a machine used to hold.
         machines: store.publicMachines({ includeRevoked: true }),
+        deviceGroups: store.deviceGroups(),
         codexClients: codex.clients,
         codexUnavailable: codex.unavailable,
         csrf: session.csrf,
@@ -1697,6 +1699,7 @@ export async function createCredentialConsole(options = {}) {
         // reload, the same way the conversation and metrics filters work.
         accountFilter: url.searchParams.get('account'),
         memberFilter: url.searchParams.get('member'),
+        groupFilter: url.searchParams.get('group'),
         completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
       }));
       return;
@@ -2155,6 +2158,67 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    // The group registry: names are created, renamed and removed here so that
+    // assigning a machine is a choice from a list rather than retyping.
+    if (req.method === 'POST' && path === '/device-groups') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const actor = session.admin_identity ?? 'anonymous';
+      try {
+        const action = String(form.action ?? 'create');
+        if (action === 'rename') {
+          const renamed = await store.renameDeviceGroup(form.group, form.name);
+          log('device_group_renamed', { group: String(form.group ?? ''), renamed_to: renamed, actor });
+        } else if (action === 'delete') {
+          const result = await store.deleteDeviceGroup(form.group);
+          log('device_group_deleted', {
+            group: result.group,
+            members_released: result.membersReleased,
+            actor,
+          });
+        } else {
+          const created = await store.createDeviceGroup(form.name);
+          log('device_group_created', { group: created, actor });
+        }
+        redirect(res, '/');
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+
+    const deviceGroupsParams = routeMatch(path, '/devices/:id/groups');
+    if (req.method === 'POST' && deviceGroupsParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const body = await readBody(req).catch(() => '');
+      const form = Object.fromEntries(new URLSearchParams(body));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        // A multi-select repeats the field, which Object.fromEntries collapses
+        // to the last one; the raw parameters are the only complete answer.
+        const wanted = new URLSearchParams(body).getAll('groups');
+        const groups = await store.setDeviceGroups(deviceGroupsParams.id, wanted);
+        log('device_groups_set', {
+          device_id: deviceGroupsParams.id,
+          groups,
+          actor: session.admin_identity ?? 'anonymous',
+        });
+        redirect(res, '/');
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+
     const codexPasteParams = routeMatch(path, '/accounts/:id/codex-authorization/paste');
     if (req.method === 'POST' && codexPasteParams) {
       const session = requireSession(req, res);
@@ -2322,6 +2386,7 @@ export async function createCredentialConsole(options = {}) {
         const summary = await store.bulkConfigureDeviceAccount({
           fromAccountId: fromAccountId || null,
           memberLabel: String(form.member_label ?? '') || null,
+          group: String(form.group ?? '') || null,
           selectedAccountId: String(form.selected_account_id ?? ''),
           expectedCount: Number.isSafeInteger(declared) && declared >= 0 ? declared : null,
           actor,
@@ -2348,6 +2413,7 @@ export async function createCredentialConsole(options = {}) {
         const back = new URLSearchParams();
         if (fromAccountId) back.set('account', fromAccountId);
         if (form.member_label) back.set('member', String(form.member_label));
+        if (form.group) back.set('group', String(form.group));
         back.set('error', error.message);
         redirect(res, `/?${back}`);
       }
