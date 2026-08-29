@@ -147,7 +147,7 @@ test('conversation detail trusts persisted prompt provenance and keeps long text
   assert.match(html, /overflow-wrap: anywhere/);
 });
 
-test('conversation session list renders only hook-backed rounds and links legacy fragments separately', () => {
+test('conversation session list renders only hook-backed rounds and links captured turns separately', () => {
   const html = conversationSessionsView({
     openMode: true,
     q: '<script>query</script>',
@@ -189,14 +189,99 @@ test('conversation session list renders only hook-backed rounds and links legacy
   assert.match(html, /name="before_id" value="6"/);
   assert.match(html, /name="before_activity_ms" value="1786969800000"/);
   assert.match(html, /data-i18n="conversation-session-turn-count">Turns<\/span>: 3/);
-  assert.match(html, /data-i18n="conversation-legacy-fragments-notice"/);
-  assert.match(html, /href="\/conversation-turns"/);
+  assert.match(html, /data-i18n="conversation-captured-turns-notice"/);
+  assert.match(html, /href="\/conversation-turns\?q=%3Cscript%3Equery%3C%2Fscript%3E"/);
   assert.match(html, /data-prompt-source="claude_hook"/);
   assert.match(html, /data-prompt-suffix-omitted="false"/);
   assert.equal(html.includes('must-never-render-thread-key'), false);
   assert.equal(html.includes('must-never-render-session-id'), false);
   assert.equal(html.includes('<img src=x'), false);
   assert.equal(html.includes('<script>query</script>'), false);
+});
+
+function filteredSessions(overrides = {}) {
+  return conversationSessionsView({
+    q: 'needle',
+    period: '168',
+    memberLabel: 'alice',
+    deviceId: 'device-9',
+    accountId: 'codex-shared-1',
+    model: 'gpt-5',
+    responseState: 'pending',
+    result: {
+      totalMatches: 1,
+      legacyFragmentCount: 4,
+      facets: { members: [], devices: [], accounts: [], models: [], responseStates: [] },
+      items: [{
+        id: 7,
+        turnCount: 1,
+        firstPromptAtMs: Date.parse('2026-08-17T12:00:00Z'),
+        lastActivityAtMs: Date.parse('2026-08-17T12:30:00Z'),
+        deviceId: 'device-9',
+        memberLabel: 'alice',
+        accountAlias: 'account-safe',
+        model: 'gpt-5',
+        latestPromptText: 'exact latest prompt',
+        latestResponseText: 'exact latest response',
+        latestResponseState: 'complete',
+      }],
+      error: null,
+    },
+    ...overrides,
+  });
+}
+
+test('the captured-turns link carries the active rounds filters', () => {
+  // The link used to be bare, so narrowing the rounds list to one account and
+  // following it landed on the unfiltered turns page — the failure that made a
+  // Codex account, which produces no rounds at all, look like a broken feature.
+  const html = filteredSessions();
+  assert.match(
+    html,
+    /href="\/conversation-turns\?q=needle&amp;period=168&amp;member_label=alice&amp;device_id=device-9&amp;account_id=codex-shared-1&amp;model=gpt-5"/,
+  );
+  assert.match(html, /data-i18n="conversation-captured-turns-notice"/);
+  // `pending` is a round state; the turns route answers it with
+  // conversation_filter_invalid, so carrying it would trade the page for a 400.
+  assert.equal(html.includes('response_state=pending'), false);
+});
+
+test('the captured-turns link keeps a response state both conversation pages accept', () => {
+  assert.match(filteredSessions({ responseState: 'complete' }), /&amp;response_state=complete"/);
+  assert.match(
+    filteredSessions({ period: 'all', q: '', fromText: '2026-08-20T00:00', toText: '2026-08-21T00:00' }),
+    /href="\/conversation-turns\?from=2026-08-20T00%3A00&amp;to=2026-08-21T00%3A00[^"]*"/,
+  );
+});
+
+// The stylesheet names the class too, so an element check has to be anchored to
+// the rendered attribute rather than the bare class name.
+const TURNS_POINTER = 'class="notice conversation-legacy-notice conversation-turns-pointer"';
+
+test('an emptied filter promotes the captured-turns pointer out of the footnotes', () => {
+  const empty = { totalMatches: 0, legacyFragmentCount: 4, items: [], error: null };
+  const html = filteredSessions({ result: { ...empty, facets: {} } });
+  assert.match(html, /data-i18n="conversation-session-no-results"/);
+  assert.ok(html.includes(TURNS_POINTER));
+  assert.match(html, /data-i18n="conversation-captured-turns-filtered"/);
+  assert.match(html, /account_id=codex-shared-1/);
+  // Promoted, not duplicated: the footnote copy stands down while the pointer
+  // is answering the question, and the pointer sits after the collapsible
+  // filter panel rather than inside it.
+  assert.equal((html.match(/data-i18n="conversation-captured-turns-heading"/g) ?? []).length, 1);
+  assert.ok(html.indexOf(TURNS_POINTER) > html.indexOf('aria-labelledby="conversation-sessions-results-heading"'));
+  // The results region is what an in-place filter change re-renders, so the
+  // pointer has to live there or it never appears for a scripted browser.
+  assert.ok(filteredSessions({ fragment: true, result: { ...empty, facets: {} } }).includes(TURNS_POINTER));
+});
+
+test('an unfiltered empty rounds list keeps the hook-install card', () => {
+  const html = conversationSessionsView({
+    result: { totalMatches: 0, legacyFragmentCount: 4, items: [], facets: {}, error: null },
+  });
+  assert.match(html, /data-i18n="conversation-round-empty-heading"/);
+  assert.equal(html.includes(TURNS_POINTER), false);
+  assert.match(html, /data-i18n="conversation-captured-turns-heading"/);
 });
 
 test('conversation session detail renders a bounded forward timeline with explicit empty states', () => {
@@ -510,9 +595,10 @@ test('Chinese translations and operator documentation cover permanent captured-t
     'conversation-standalone-link',
     'conversation-round-privacy-heading',
     'conversation-round-privacy-notice',
-    'conversation-legacy-fragments-heading',
-    'conversation-legacy-fragments-notice',
-    'conversation-legacy-fragments-link',
+    'conversation-captured-turns-heading',
+    'conversation-captured-turns-notice',
+    'conversation-captured-turns-filtered',
+    'conversation-captured-turns-link',
     'conversation-round-empty-heading',
     'conversation-round-empty-copy',
     'conversation-round-install-hooks',

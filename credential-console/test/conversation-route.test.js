@@ -250,8 +250,8 @@ test('open conversation routes carry filter state in the URL', async () => {
     assert.match(listHtml, /data-i18n="conversation-round-dropped"/);
     assert.match(listHtml, /method="post" action="\/conversations"/);
     assert.match(listHtml, /href="\/conversations\/session\/7"/);
-    assert.match(listHtml, /data-i18n="conversation-legacy-fragments-notice"/);
-    assert.match(listHtml, /href="\/conversation-turns"/);
+    assert.match(listHtml, /data-i18n="conversation-captured-turns-notice"/);
+    assert.match(listHtml, /href="\/conversation-turns\?q=needle"/);
     assert.equal(listHtml.includes('<img src=x'), false);
     assert.equal(listHtml.includes('threadKey'), false);
     assert.equal(listHtml.includes('data-i18n="open-banner"'), true);
@@ -674,6 +674,39 @@ test('the account filter names a Codex account instead of showing its id', async
     'the raw id is not what the operator reads',
   );
   assert.match(select, /claude-shared-1 \(4\)/, 'Claude accounts are unaffected');
+});
+
+test('filtering rounds to an account with none hands the same filter to the turns page', async () => {
+  // Codex ships no Claude Code hook, so it writes no rounds at all and every
+  // Codex conversation exists only as a captured turn. Filtering this page by a
+  // Codex account is therefore always empty, and the useful thing the page can
+  // do is carry the filter onward instead of offering a bare, unfiltered link.
+  const metrics = conversationMetrics();
+  metrics.searchConversationRoundSessions = (options) => {
+    metrics.calls.searches.push(options);
+    return {
+      items: [],
+      nextBeforeId: null,
+      nextBeforeActivityMs: null,
+      legacyFragmentCount: 3,
+      totalMatches: 0,
+      error: null,
+    };
+  };
+  const app = await fixture({ requestMetrics: metrics });
+  try {
+    const response = await fetch(`${app.baseUrl}/conversations?account_id=codex-shared-1`);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.equal(metrics.calls.searches.at(-1).accountId, 'codex-shared-1');
+    assert.match(html, /data-i18n="conversation-session-no-results"/);
+    assert.match(html, /class="notice conversation-legacy-notice conversation-turns-pointer"/);
+    assert.match(html, /href="\/conversation-turns\?account_id=codex-shared-1"/);
+    assert.match(html, /data-i18n="conversation-captured-turns-notice"/);
+    assert.equal(html.includes('Legacy API fragments'), false);
+  } finally {
+    await app.close();
+  }
 });
 
 test('an absolute window can express a closed interval, which no period can', async (t) => {

@@ -516,6 +516,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .conversation-legacy-notice > div { min-width: 0; }
 .conversation-legacy-notice p { margin: 3px 0 0; }
 .conversation-legacy-notice .button { flex: 0 0 auto; }
+.conversation-turns-pointer { margin-top: 12px; border-color: var(--green); background: var(--card); }
 .conversation-detail-shell { width: min(100%, 900px); margin: 0 auto; }
 .conversation-detail-meta { display: flex; gap: 8px 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
 .conversation-detail-meta span { min-width: 0; overflow-wrap: anywhere; }
@@ -2923,13 +2924,75 @@ function conversationSessionSearchErrorView(error) {
   return '<div class="notice error" role="alert" data-i18n="conversation-session-search-error">Conversation search could not be completed.</div>';
 }
 
-function legacyFragmentsNotice(count) {
+// Both conversation collections are parsed by the same code in server.js, so a
+// filter set here can be handed to the turns route under the same parameter
+// names — with one exception. The two sides accept different response states:
+// a round is pending/failed, a captured turn is incomplete/truncated, and an
+// unknown value is answered with conversation_filter_invalid rather than being
+// ignored. Carrying a rounds-only state would therefore swap the turns page for
+// an error, so only the states both sides understand travel.
+const SHARED_CONVERSATION_RESPONSE_STATES = new Set(
+  CONVERSATION_RESPONSE_STATES.filter((state) => API_FRAGMENT_RESPONSE_STATES.includes(state)),
+);
+
+/**
+ * Builds the `/conversation-turns` href for a filter set already applied to the
+ * rounds page. The link this replaces was bare, so an operator who had narrowed
+ * the rounds list to one account and followed it landed on the unfiltered turns
+ * page and had to rebuild the filter by hand — or concluded the data was not
+ * there at all.
+ */
+function conversationTurnsHref({
+  q = '',
+  period = 'all',
+  fromText = '',
+  toText = '',
+  memberLabel = '',
+  deviceId = '',
+  accountId = '',
+  model = '',
+  responseState = '',
+} = {}) {
+  const params = new URLSearchParams();
+  const carry = (name, value) => {
+    const text = value === null || value === undefined ? '' : String(value);
+    if (text) params.set(name, text);
+  };
+  carry('q', q);
+  if (String(period ?? '') !== 'all') carry('period', period);
+  carry('from', fromText);
+  carry('to', toText);
+  carry('member_label', memberLabel);
+  carry('device_id', deviceId);
+  carry('account_id', accountId);
+  carry('model', model);
+  if (SHARED_CONVERSATION_RESPONSE_STATES.has(String(responseState ?? ''))) {
+    carry('response_state', responseState);
+  }
+  const query = params.toString();
+  return query ? `/conversation-turns?${query}` : '/conversation-turns';
+}
+
+/**
+ * Points at the turns archive from the rounds page. The copy used to call those
+ * rows legacy diagnostics, which stopped being true once Codex traffic started
+ * landing there: Codex ships no Claude Code hook, so it writes no rounds at all
+ * and every Codex conversation — current and ongoing — exists only as turns.
+ * An operator who read "legacy" reasonably concluded the feature was broken.
+ *
+ * `prominent` covers the case that produced that report: no rounds under an
+ * active filter. There the pointer is the answer to the question being asked
+ * rather than a footnote, so it renders even when the turn count is unknown.
+ */
+function capturedTurnsNotice({ count = null, href = '/conversation-turns', prominent = false } = {}) {
   const normalized = conversationCount(count);
-  if (!normalized) return '';
-  return `<div class="notice conversation-legacy-notice" role="note">
-    <div><strong data-i18n="conversation-legacy-fragments-heading">Legacy API fragments kept for diagnostics</strong>
-    <p><span data-i18n="conversation-legacy-fragments-notice">These older rows were captured from individual API requests. They are not user rounds and are never guessed into conversations.</span> <strong>${escapeHtml(String(normalized))}</strong></p></div>
-    <a class="button secondary" href="/conversation-turns" data-i18n="conversation-legacy-fragments-link">Open API fragment diagnostics</a>
+  if (!normalized && !prominent) return '';
+  const countView = normalized ? ` <strong>${escapeHtml(String(normalized))}</strong>` : '';
+  return `<div class="notice conversation-legacy-notice${prominent ? ' conversation-turns-pointer' : ''}" role="note">
+    <div><strong data-i18n="conversation-captured-turns-heading">Turns captured from API traffic</strong>
+    <p><span data-i18n="conversation-captured-turns-notice">These rows are captured from the proxied API traffic and include current conversations. Codex sends no Claude Code hooks, so a Codex conversation appears only here.</span>${countView}</p>
+    ${prominent ? '<p data-i18n="conversation-captured-turns-filtered">The filters on this page carry over, so the same search runs there.</p>' : ''}</div>
+    <a class="button${prominent ? '' : ' secondary'}" href="${escapeHtml(href)}" data-i18n="conversation-captured-turns-link">Open captured turns</a>
   </div>`;
 }
 
@@ -3065,12 +3128,32 @@ export function conversationSessionsView({
   const hasActiveFilters = Boolean(
     query
     || normalizedPeriod !== 'all'
+    || fromText
+    || toText
     || normalizedMember
     || normalizedDevice
     || normalizedAccount
     || normalizedModel
     || normalizedState,
   );
+  const turnsHref = conversationTurnsHref({
+    q: query,
+    period: normalizedPeriod,
+    fromText,
+    toText,
+    memberLabel: normalizedMember,
+    deviceId: normalizedDevice,
+    accountId: normalizedAccount,
+    model: normalizedModel,
+    responseState: normalizedState,
+  });
+  // Filtering to nothing is exactly where an operator gives up, and it is also
+  // the only place a Codex account can land: rounds hold no Codex rows at all.
+  // The pointer therefore moves into the results region — which is what a
+  // fragment refresh re-renders, so it survives a filter change made in place.
+  const turnsPointer = itemsView || !hasActiveFilters
+    ? ''
+    : capturedTurnsNotice({ count: legacyCount, href: turnsHref, prominent: true });
   const emptyRounds = `<div class="card conversation-round-empty">
     <h2 data-i18n="conversation-round-empty-heading">No reliable user rounds yet</h2>
     <p data-i18n="conversation-round-empty-copy">Reliable conversations begin when a Claude Code profile sends UserPromptSubmit and Stop hooks. Existing API fragments remain available only in diagnostics and are not guessed into conversations.</p>
@@ -3094,7 +3177,7 @@ export function conversationSessionsView({
           ${facetNotice}
           <div class="conversation-list" aria-live="polite">
             ${itemsView || (hasActiveFilters
-              ? '<p class="empty" data-i18n="conversation-session-no-results">No reliable conversations match these filters.</p>'
+              ? `<p class="empty" data-i18n="conversation-session-no-results">No reliable conversations match these filters.</p>${turnsPointer}`
               : emptyRounds)}
           </div>
           ${nextForm ? `<div class="conversation-pagination"><span class="muted tiny" data-i18n="conversation-session-pagination-hint">Conversations are ordered by latest hook activity, newest first.</span>${nextForm}</div>` : ''}
@@ -3107,7 +3190,7 @@ export function conversationSessionsView({
     <section class="stack">
       ${conversationPrivacyView(openMode, { reliable: true })}
       ${conversationSubnav('sessions')}
-      ${legacyFragmentsNotice(legacyCount)}
+      ${turnsPointer ? '' : capturedTurnsNotice({ count: legacyCount, href: turnsHref })}
       <div class="conversation-layout">
         <details class="conversation-filter-details" data-persist-details="session-filters" open>
           <summary data-i18n="conversation-filters-heading">Filters</summary>
