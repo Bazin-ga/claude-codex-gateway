@@ -39,14 +39,6 @@ function tokenValue(row, valueField, knownField) {
     : null;
 }
 
-function completeDeviceField(row, valueField, knownField) {
-  const value = integer(row?.[valueField], { nullable: true });
-  if (value === null) return null;
-  if (!Object.hasOwn(row ?? {}, knownField)) return value;
-  const requests = integer(row?.requestCount);
-  return requests > 0 && integer(row?.[knownField]) === requests ? value : null;
-}
-
 function safeSum(values) {
   let total = 0;
   let known = false;
@@ -59,17 +51,21 @@ function safeSum(values) {
   return known ? total : null;
 }
 
+// Device series are lower bounds, exactly like the summary cards, the hourly composition chart
+// and the account/model breakdowns: every known value counts, and a category is a gap only when
+// nothing about it is known. Requiring a whole device-hour to be free of unknown requests instead
+// discarded the known tokens of every hour that held even one of them, which silently erased the
+// busiest machines -- the more requests an hour holds, the likelier one of them is unknown.
 function deviceInput(row) {
-  const values = [
-    completeDeviceField(row, 'inputTokens', 'inputTokensKnownCount'),
-    completeDeviceField(row, 'cacheCreationInputTokens', 'cacheCreationInputTokensKnownCount'),
-    completeDeviceField(row, 'cacheReadInputTokens', 'cacheReadInputTokensKnownCount'),
-  ];
-  return values.every((value) => value !== null) ? safeSum(values) : null;
+  return safeSum([
+    tokenValue(row, 'inputTokens', 'inputTokensKnownCount'),
+    tokenValue(row, 'cacheCreationInputTokens', 'cacheCreationInputTokensKnownCount'),
+    tokenValue(row, 'cacheReadInputTokens', 'cacheReadInputTokensKnownCount'),
+  ]);
 }
 
 function deviceOutput(row) {
-  return completeDeviceField(row, 'outputTokens', 'outputTokensKnownCount');
+  return tokenValue(row, 'outputTokens', 'outputTokensKnownCount');
 }
 
 function bucketsFor(range, ...rowSets) {

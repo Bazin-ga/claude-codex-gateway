@@ -40,7 +40,7 @@ test('chart payload uses a real hourly axis and preserves unknown separately fro
   assert.equal(JSON.stringify(payload).includes('Infinity'), false);
 });
 
-test('device input series requires all three input categories and full known-count coverage', () => {
+test('device series count every known token and gap only a category nothing is known about', () => {
   const payload = buildMetricsChartPayload({
     range: { fromMs: hour, toMs: hour + 2 * 3600000, hours: 2 },
     deviceTokenComparison: {
@@ -81,11 +81,117 @@ test('device input series requires all three input categories and full known-cou
 
   assert.deepEqual(payload.devices.input[0].data, [[hour, 17], [hour + 3600000, null]]);
   assert.deepEqual(payload.devices.output[0].data, [[hour, 0], [hour + 3600000, null]]);
-  assert.deepEqual(payload.devices.input[1].data, [[hour, null], [hour + 3600000, null]]);
-  assert.deepEqual(payload.devices.output[1].data, [[hour, null], [hour + 3600000, null]]);
-  assert.equal(payload.devices.ranking[0].label, 'Complete device');
+  // A device-hour holding some unknown requests keeps the tokens that ARE known; it is a lower
+  // bound, not a hole. Discarding it is what erased the busiest machines from the ranking.
+  assert.deepEqual(payload.devices.input[1].data, [[hour, 17], [hour + 3600000, null]]);
+  assert.deepEqual(payload.devices.output[1].data, [[hour, 5], [hour + 3600000, null]]);
+  assert.equal(payload.devices.ranking[0].label, '<partial device>');
   assert.equal(payload.devices.ranking[0].input, 17);
-  assert.equal(payload.devices.ranking[0].output, 0);
+  assert.equal(payload.devices.ranking[0].output, 5);
+  assert.equal(payload.devices.ranking[1].label, 'Complete device');
+  assert.equal(payload.devices.ranking[1].input, 17);
+});
+
+test('a category with nothing known is skipped while its known siblings still count', () => {
+  const payload = buildMetricsChartPayload({
+    range: { fromMs: hour, toMs: hour + 3600000, hours: 1 },
+    deviceTokenComparison: {
+      devices: [{ deviceId: 'device', label: 'Device' }],
+      rows: [{
+        hourBucketMs: hour,
+        deviceId: 'device',
+        requestCount: 4,
+        inputTokens: 10,
+        inputTokensKnownCount: 0,
+        cacheCreationInputTokens: 3,
+        cacheCreationInputTokensKnownCount: 1,
+        cacheReadInputTokens: 4,
+        cacheReadInputTokensKnownCount: 2,
+        outputTokens: 7,
+        outputTokensKnownCount: 0,
+      }],
+    },
+  });
+
+  assert.deepEqual(payload.devices.input[0].data, [[hour, 7]]);
+  assert.deepEqual(payload.devices.output[0].data, [[hour, null]]);
+  assert.equal(payload.devices.ranking[0].input, 7);
+  assert.equal(payload.devices.ranking[0].output, null);
+});
+
+test('a device-hour with nothing known at all stays an unknown gap, never zero', () => {
+  const payload = buildMetricsChartPayload({
+    range: { fromMs: hour, toMs: hour + 3600000, hours: 1 },
+    deviceTokenComparison: {
+      devices: [{ deviceId: 'device', label: 'Device' }],
+      rows: [{
+        hourBucketMs: hour,
+        deviceId: 'device',
+        requestCount: 3,
+        inputTokens: 10,
+        inputTokensKnownCount: 0,
+        cacheCreationInputTokens: 3,
+        cacheCreationInputTokensKnownCount: 0,
+        cacheReadInputTokens: 4,
+        cacheReadInputTokensKnownCount: 0,
+        outputTokens: 7,
+        outputTokensKnownCount: 0,
+      }],
+    },
+  });
+
+  assert.deepEqual(payload.devices.input[0].data, [[hour, null]]);
+  assert.deepEqual(payload.devices.output[0].data, [[hour, null]]);
+  assert.equal(payload.devices.ranking[0].input, null);
+  assert.equal(payload.devices.ranking[0].output, null);
+});
+
+test('the busiest device outranks an idle one even when every busy hour holds unknown requests', () => {
+  // Shape observed in production: a machine with hundreds of requests per hour, a handful of them
+  // unknown, was ranked below an idle machine whose few hours happened to be free of unknowns.
+  const busyHours = 8;
+  const rows = [];
+  for (let index = 0; index < busyHours; index += 1) {
+    rows.push({
+      hourBucketMs: hour + index * 3600000,
+      deviceId: 'busy',
+      requestCount: 400,
+      inputTokens: 1_000,
+      inputTokensKnownCount: 380,
+      cacheCreationInputTokens: 5_000_000,
+      cacheCreationInputTokensKnownCount: 380,
+      cacheReadInputTokens: 100_000_000,
+      cacheReadInputTokensKnownCount: 380,
+      outputTokens: 400_000,
+      outputTokensKnownCount: 380,
+    });
+  }
+  rows.push({
+    hourBucketMs: hour,
+    deviceId: 'idle',
+    requestCount: 2,
+    inputTokens: 1_000,
+    inputTokensKnownCount: 2,
+    cacheCreationInputTokens: 2_000_000,
+    cacheCreationInputTokensKnownCount: 2,
+    cacheReadInputTokens: 70_000_000,
+    cacheReadInputTokensKnownCount: 2,
+    outputTokens: 100,
+    outputTokensKnownCount: 2,
+  });
+
+  const payload = buildMetricsChartPayload({
+    range: { fromMs: hour, toMs: hour + busyHours * 3600000, hours: busyHours },
+    deviceTokenComparison: {
+      devices: [{ deviceId: 'busy', label: 'Busy device' }, { deviceId: 'idle', label: 'Idle device' }],
+      rows,
+    },
+  });
+
+  assert.equal(payload.devices.ranking[0].label, 'Busy device');
+  assert.equal(payload.devices.ranking[0].input, busyHours * 105_001_000);
+  assert.equal(payload.devices.ranking[1].label, 'Idle device');
+  assert.equal(payload.devices.ranking[1].input, 72_001_000);
 });
 
 test('breakdowns are bounded, token-sorted lower bounds and overflow never becomes a number', () => {

@@ -1552,17 +1552,25 @@ function metricPolyline(rows, getter, maxValue, plot) {
   if (!rows.length) return '';
   const denominator = Math.max(rows.length - 1, 1);
   let open = false;
+  // The plot is 644 units wide, so a 720-hour range asks for more vertices than there are columns
+  // to draw them in. Emitting one vertex per pixel column keeps the shape and the gaps while
+  // bounding the path: eight devices over thirty days otherwise push this page past its size cap.
+  let lastColumn = null;
   return rows.map((row, index) => {
     const rawValue = getter(row);
     if (rawValue === null || rawValue === undefined || rawValue === '') {
       open = false;
+      lastColumn = null;
       return '';
     }
     const value = finiteMetricNumber(rawValue, { max: maxValue });
     const x = plot.left + (plot.width * index) / denominator;
     const y = plot.top + plot.height - (plot.height * value) / Math.max(maxValue, 1);
+    const column = Math.round(x);
+    if (open && column === lastColumn) return '';
     const command = open ? 'L' : 'M';
     open = true;
+    lastColumn = column;
     return `${command} ${metricSvgNumber(x)} ${metricSvgNumber(y)}`;
   }).filter(Boolean).join(' ');
 }
@@ -1849,22 +1857,27 @@ function normalizeDeviceComparison(input = {}) {
   };
 }
 
+// Keeps the server-rendered fallback chart on the same lower-bound footing as the payload in
+// lib/metrics-chart-data.js: every known category counts, and a point is a gap only when nothing
+// about the hour is known. Demanding that no request in the hour be unknown discarded whole hours
+// of real tokens, and did so hardest for the devices with the most requests per hour.
 function deviceComparisonSum(row, fields) {
   let sum = 0;
+  let known = false;
   for (const [field, knownField] of fields) {
-    const value = metricTokenNumber(row?.[field]);
-    if (!deviceComparisonFieldKnown(row, field, knownField)) return null;
-    sum += value;
+    if (!deviceComparisonFieldKnown(row, field, knownField)) continue;
+    known = true;
+    sum += metricTokenNumber(row?.[field]);
     if (!Number.isSafeInteger(sum)) return null;
   }
-  return sum;
+  return known ? sum : null;
 }
 
 function deviceComparisonFieldKnown(row, field, knownField) {
   const value = metricTokenNumber(row?.[field]);
   if (value === null) return false;
   if (!Object.hasOwn(row ?? {}, knownField)) return true;
-  return metricCount(row?.[knownField]) === metricCount(row?.requestCount);
+  return metricCount(row?.[knownField]) > 0;
 }
 
 function deviceComparisonInputSum(row) {
@@ -1967,7 +1980,7 @@ function deviceComparisonView(input) {
     id: 'metrics-device-input-comparison-chart',
     title: 'Hourly input-side known tokens by device',
     titleI18n: 'metrics-device-input-comparison-heading',
-    description: 'Each line is input plus cache creation plus cache read tokens only when all three categories are known; missing categories create a gap.',
+    description: 'Each line is a lower bound: the input, cache creation and cache read tokens that are known; an hour with none stays a gap.',
     descriptionI18n: 'metrics-device-input-comparison-description',
     emptyI18n: 'metrics-device-comparison-no-data',
     emptyText: 'No cross-device token comparison data is available.',
@@ -2047,7 +2060,7 @@ function deviceComparisonView(input) {
       <div class="metrics-chart-heading">
         <div>
           <h3 data-i18n="metrics-device-trend-heading">Hourly device trend</h3>
-          <p class="metrics-chart-copy" data-i18n="metrics-device-trend-description">Toggle between complete input-side known tokens and output tokens.</p>
+          <p class="metrics-chart-copy" data-i18n="metrics-device-trend-description">Toggle between input-side known tokens and output tokens.</p>
         </div>
         <div class="metrics-segmented" aria-label="Device token metric">
           <button type="button" class="active" data-device-metric="input" aria-pressed="true" data-i18n="metrics-device-toggle-input">Input side</button>

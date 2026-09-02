@@ -408,11 +408,15 @@ test('cross-device comparison is capped at eight, escapes labels, preserves unkn
   assert.match(html, /stroke-dasharray="8 5"/);
   const inputChart = html.match(/aria-labelledby="metrics-device-input-comparison-chart-title metrics-device-input-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
   const outputChart = html.match(/aria-labelledby="metrics-device-output-comparison-chart-title metrics-device-output-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
-  assert.match(inputChart, /class="metrics-line device-1"[^>]*d=""/);
+  // device-1 knows nothing about inputTokens but does know the two cache categories, so its point
+  // is the lower bound 1 + 2 = 3 rather than a discarded hour. device-2 has output as its only
+  // category and knows nothing about it, so that one is still a genuine gap.
+  assert.doesNotMatch(inputChart, /class="metrics-line device-1"[^>]*d=""/);
+  assert.match(inputChart, /class="metrics-point device-1"/);
+  assert.match(inputChart, /Device 1 · 2026-08-17 11:00Z · 3</);
   assert.match(outputChart, /class="metrics-line device-2"[^>]*d=""/);
   assert.match(inputChart, /class="metrics-point device-0"/);
   assert.match(outputChart, /class="metrics-point device-0"/);
-  assert.doesNotMatch(inputChart, /class="metrics-point device-1"/);
   assert.doesNotMatch(outputChart, /class="metrics-point device-2"/);
   assert.equal(html.includes('<img src=x onerror=alert(1)>'), false);
   assert.equal(html.includes('NaN'), false);
@@ -486,7 +490,7 @@ test('a sparse singleton remains visible when a long chart samples markers', () 
   assert.match(tokenChart, />Input tokens · [^<]+ · 17<\/title>/);
 });
 
-test('known counts prevent a lower-bound hour from becoming a complete chart point', () => {
+test('a partly known device-hour is plotted as a lower bound instead of being discarded', () => {
   const html = render({
     deviceTokenComparison: {
       devices: [{ deviceId: 'device-partial', label: 'Partial device' }],
@@ -509,11 +513,38 @@ test('known counts prevent a lower-bound hour from becoming a complete chart poi
   });
   const inputChart = html.match(/aria-labelledby="metrics-device-input-comparison-chart-title metrics-device-input-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
   const outputChart = html.match(/aria-labelledby="metrics-device-output-comparison-chart-title metrics-device-output-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
-  assert.doesNotMatch(inputChart, /metrics-line device-0/);
-  assert.doesNotMatch(outputChart, /metrics-line device-0/);
+  assert.match(inputChart, /metrics-line device-0/);
+  assert.match(outputChart, /metrics-line device-0/);
   assert.match(html, /data-i18n="metrics-device-comparison-partial"/);
   assert.match(html, /<td>10<\/td>/);
   assert.match(html, /<td>4<\/td>/);
+});
+
+test('a device-hour with nothing known is still left out of the fallback charts', () => {
+  const html = render({
+    deviceTokenComparison: {
+      devices: [{ deviceId: 'device-unknown', label: 'Unknown device' }],
+      rows: [{
+        hourBucketMs: HOURLY[0].hourBucketMs,
+        deviceId: 'device-unknown',
+        requestCount: 2,
+        inputTokens: 10,
+        inputTokensKnownCount: 0,
+        cacheCreationInputTokens: 2,
+        cacheCreationInputTokensKnownCount: 0,
+        cacheReadInputTokens: 3,
+        cacheReadInputTokensKnownCount: 0,
+        outputTokens: 4,
+        outputTokensKnownCount: 0,
+        usagePartialCount: 0,
+        usageUnavailableCount: 2,
+      }],
+    },
+  });
+  const inputChart = html.match(/aria-labelledby="metrics-device-input-comparison-chart-title metrics-device-input-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  const outputChart = html.match(/aria-labelledby="metrics-device-output-comparison-chart-title metrics-device-output-comparison-chart-description"[\s\S]*?<\/svg>/)?.[0] ?? '';
+  assert.doesNotMatch(inputChart, /metrics-line device-0/);
+  assert.doesNotMatch(outputChart, /metrics-line device-0/);
 });
 
 test('long chart series cap marker titles and bound raw hourly tables', () => {
@@ -535,9 +566,12 @@ test('long chart series cap marker titles and bound raw hourly tables', () => {
   }));
   const comparison = {
     devices: Array.from({ length: 8 }, (_, index) => ({ deviceId: `device-${index}`, label: `Device ${index}` })),
+    // requestCount has to be here: without it every device-hour used to fall through the old
+    // all-or-nothing predicate as a gap, so this size guard was measuring an empty chart.
     rows: Array.from({ length: 720 * 8 }, (_, index) => ({
       hourBucketMs: HOURLY[0].hourBucketMs + Math.floor(index / 8) * 3600000,
       deviceId: `device-${index % 8}`,
+      requestCount: 1,
       inputTokens: index + 1,
       cacheCreationInputTokens: index + 2,
       cacheReadInputTokens: index + 3,
