@@ -162,6 +162,42 @@ const translations = {
   'metrics-filter-account': '账号',
   'metrics-filter-model': '模型',
   'metrics-filter-hours': '时间范围',
+  'tab-docs': '文档与 API',
+  'docs-heading': '文档与 API',
+  'docs-intro': '这个控制台通过 HTTP 暴露了什么，以及自动生成的部署指引。写给人看，也写给被指向这套部署的助手看 —— 两者都不必把每个页面翻一遍才知道有哪些能力。',
+  'docs-base-heading': '基础地址',
+  'docs-base-note': '安装器会把这些地址写进每台设备。列在这里，便于配置或核对客户端，不用重新注册。',
+  'docs-base-claude': 'Claude 网关',
+  'docs-base-codex': 'Codex 网关',
+  'docs-api-method-heading': '方法',
+  'docs-api-path-heading': '路径',
+  'docs-api-purpose-heading': '作用',
+  'docs-api-group-data': '运行时网关 · 每设备令牌',
+  'docs-api-group-data-note': '设备令牌放在 x-api-key 或 Authorization: Bearer 里。控制台会剥掉它，在服务端换上服务商凭证；上游凭证不会到达设备。',
+  'docs-api-messages': 'Claude 补全，含流式。计量；若该 profile 装了对话 Hook，还会被采集。',
+  'docs-api-count-tokens': '在真正发送前计算一次请求的 token 数。',
+  'docs-api-models': '当前所挂 Claude 账号可用的模型列表。',
+  'docs-api-codex': 'Codex 单轮请求，供持有 Codex 网关令牌的设备使用。Codex 流量计量，但不作为对话采集。',
+  'docs-api-group-control': '设备自助 · 每设备令牌',
+  'docs-api-group-control-note': '设备只能读写自己那一行。这里没有任何路径能碰到别的设备，也没有任何路径会返回凭证。',
+  'docs-api-status': '本设备：当前账号、允许切换的账号范围、是否已被撤销。',
+  'docs-api-account': '在自己的允许范围内把本设备切到另一个账号。请求体：{"account_id": "..."}。',
+  'docs-api-hooks': 'Claude Code Hook 投递：一次用户提问或一条最终助手回复。可靠配对要求 Claude Code 2.1.196 及以上。',
+  'docs-api-group-console': '控制台读取 · 会话认证',
+  'docs-api-group-console-note': '与页面本身同一套认证 —— tailnet 身份，或 open 模式下不认证。这些不是令牌接口，控制面之外访问不到。',
+  'docs-api-chart-data': '用量图表背后的 JSON。接受与页面相同的筛选：hours、from、to、machine_id、member_label、account_id、model。',
+  'docs-api-onboarding': '下方那份生成的指引的 Markdown 原文。含端点、账号状态、客户端配置版本；不含任何令牌。',
+  'docs-api-group-open': '无需认证',
+  'docs-api-group-open-note': '任何能路由到监听端口的东西都能访问。',
+  'docs-api-health': '存活状态、管理端认证模式、客户端配置版本。不含账号或设备数据。',
+  'docs-no-admin-api-heading': '管理操作没有 API',
+  'docs-no-admin-api': '新增或删除账号、完成授权、签发注册码、撤销设备、在面板上给设备切账号、给机器分组 —— 全部是总览页上的 HTML 表单，由会话 Cookie 加 CSRF 令牌保护。没有 JSON 等价接口，也没有可持有的管理令牌。要自动化这个控制台的助手可以通读上面这些端点，但无法通过它们做管理。',
+  'docs-no-conversation-api': '对话归档同样只有页面：界面上有搜索、筛选和绝对时间窗，但背后没有查询接口。',
+  'metrics-filter-window-hint': '下方设定了明确起止时间时，此项不生效。',
+  'metrics-filter-from': '起（UTC）',
+  'metrics-filter-to': '止（UTC）',
+  'metrics-window-invalid': '这个时间窗读不出来，或者结束早于开始。已改用上面的预设区间。',
+  'metrics-window-clamped': '所选区间超过按小时绘图能覆盖的 30 天，起点已后移。',
   'metrics-all-machines': '全部机器',
   'metrics-all-members': '全部使用者',
   'metrics-all-accounts': '全部账号',
@@ -1180,7 +1216,7 @@ async function navigateTo(url, { push = true, samePage: samePageOverride = null 
   }
 }
 
-const TAB_HREF_BY_NAME = { overview: '/', metrics: '/metrics', conversations: '/conversations' };
+const TAB_HREF_BY_NAME = { overview: '/', metrics: '/metrics', conversations: '/conversations', docs: '/docs' };
 
 function markActiveTab(activeTab) {
   // The server names the section; the client does not infer it. /conversations

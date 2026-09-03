@@ -47,6 +47,7 @@ import { assertCodexSeedHomeWritable, seedCodexCredentialHome } from './lib/code
 import {
   claudeAuthorizationView,
   dashboardView,
+  docsView,
   codexDeviceConfiguredView,
   deviceConfiguredView,
   enrollmentCreatedView,
@@ -91,6 +92,10 @@ const SESSION_TTL_MS = 12 * 60 * 60_000;
 // not depend on someone authenticating first. The process is capped at 96 MB of
 // heap by the shipped unit; an unbounded map is an OOM plus a restart loop.
 const MAX_SESSIONS = 4_096;
+const HOUR_MS = 60 * 60_000;
+// Matches the hourly bucket ceiling in metrics-chart-data.js. A wider window does
+// not draw more of the range, it draws the same chart with holes in it.
+const METRICS_MAX_WINDOW_HOURS = 720;
 const METRICS_PAGE_CACHE_TTL_MS = 5_000;
 const MAX_METRICS_PAGE_CACHE_ENTRIES = 8;
 const MAX_METRICS_PAGE_CACHE_BYTES = 12 * 1024 * 1024;
@@ -206,6 +211,16 @@ function tailnetIdentity(req) {
   if (!loopback) return null;
   const login = req.headers['tailscale-user-login'];
   return typeof login === 'string' && login.trim() ? login.trim() : null;
+}
+
+// `datetime-local` submits "2026-08-25T14:00" with no zone. Read it as UTC so a
+// shared link means the same window to whoever opens it, on both the metrics and
+// the conversation pages.
+function parseUtcBound(raw) {
+  if (raw === null || raw === undefined || raw === '') return { value: null, invalid: false };
+  const parsed = Date.parse(/[Zz]|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : `${raw}Z`);
+  if (!Number.isFinite(parsed)) return { value: null, invalid: true };
+  return { value: parsed, invalid: false };
 }
 
 function routeMatch(path, pattern) {
@@ -816,9 +831,33 @@ export async function createCredentialConsole(options = {}) {
   function queryMetricsPage(url) {
     const allowedHours = new Set([24, 168, 720]);
     const requestedHours = Number(url.searchParams.get('hours'));
-    const hours = allowedHours.has(requestedHours) ? requestedHours : 24;
+    const presetHours = allowedHours.has(requestedHours) ? requestedHours : 24;
     const now = Date.now();
-    const fromMs = now - hours * 60 * 60_000;
+    // An absolute window, for the question no `now - N` preset can ask: "what did
+    // this account burn yesterday between 14:00 and 18:00". The metric store has
+    // always accepted an arbitrary closed interval; only this route threw that
+    // away by pinning the upper bound to now and deriving the lower from a preset.
+    const fromParam = parseUtcBound(url.searchParams.get('from'));
+    const toParam = parseUtcBound(url.searchParams.get('to'));
+    const fromText = String(url.searchParams.get('from') ?? '').slice(0, 32);
+    const toText = String(url.searchParams.get('to') ?? '').slice(0, 32);
+    const invalidWindow = fromParam.invalid || toParam.invalid
+      || (fromParam.value !== null && toParam.value !== null && fromParam.value > toParam.value);
+    // An explicit window wins over the preset rather than mixing with it, so the
+    // operator never has to work out which of the two produced the numbers.
+    const hasAbsoluteWindow = !invalidWindow && (fromParam.value !== null || toParam.value !== null);
+    const toMs = (hasAbsoluteWindow ? (toParam.value ?? now) : now) + 1;
+    const requestedFromMs = hasAbsoluteWindow
+      ? (fromParam.value ?? toMs - presetHours * HOUR_MS)
+      : toMs - presetHours * HOUR_MS;
+    // Past the bucket ceiling the hourly series stops covering the range and shows
+    // only the hours that happen to hold rows, which reads as missing traffic
+    // rather than as a range too wide to draw. Clamp the lower bound, and say so.
+    const clampedWindow = toMs - requestedFromMs > METRICS_MAX_WINDOW_HOURS * HOUR_MS;
+    const fromMs = clampedWindow ? toMs - METRICS_MAX_WINDOW_HOURS * HOUR_MS : requestedFromMs;
+    const hours = hasAbsoluteWindow
+      ? Math.max(1, Math.ceil((toMs - fromMs) / HOUR_MS))
+      : presetHours;
     const machineSelection = String(url.searchParams.get('machine_id') ?? '').slice(0, 256);
     const memberLabel = String(url.searchParams.get('member_label') ?? '').slice(0, 160);
     const accountId = String(url.searchParams.get('account_id') ?? '').slice(0, 128);
@@ -833,7 +872,7 @@ export async function createCredentialConsole(options = {}) {
 
     const filters = {
       fromMs,
-      toMs: now + 1,
+      toMs,
       ...(machineId ? { machineId } : {}),
       ...(deviceId ? { deviceId } : {}),
       ...(unattributedMachine ? { unattributedMachine: true } : {}),
@@ -842,7 +881,13 @@ export async function createCredentialConsole(options = {}) {
       ...(model ? { model } : {}),
     };
     const viewFilters = {
-      hours,
+      hours: presetHours,
+      spanHours: hours,
+      fromText,
+      toText,
+      hasAbsoluteWindow,
+      invalidWindow,
+      clampedWindow,
       machineId: unattributedMachine ? '' : machineSelection,
       unattributedMachine,
       memberLabel,
@@ -850,7 +895,7 @@ export async function createCredentialConsole(options = {}) {
       model,
     };
     const empty = {
-      range: { fromMs, toMs: now + 1, hours, timezone: 'UTC' },
+      range: { fromMs, toMs, hours, timezone: 'UTC' },
       filters: viewFilters,
       options: { machines: [], members: [], accounts: [], models: [] },
       totals: { all: 0, consumption: 0, success: 0, errors: 0 },
@@ -881,7 +926,7 @@ export async function createCredentialConsole(options = {}) {
       const consumptionTotals = requestMetrics.queryTotals({ ...filters, scope: 'consumption' });
       const hourly = requestMetrics.queryHourly({ ...filters, scope: 'all' });
       const tokenHourly = requestMetrics.queryHourly({ ...filters, scope: 'consumption' });
-      const dimensions = { fromMs, toMs: now + 1, scope: 'all' };
+      const dimensions = { fromMs, toMs, scope: 'all' };
       const deviceById = new Map(store.publicDevices().map((device) => [device.id, device]));
       const accountById = new Map(store.publicAccounts().map((account) => [account.id, account]));
       const machineRows = requestMetrics.queryBreakdown({ by: 'machine', ...dimensions });
@@ -916,7 +961,7 @@ export async function createCredentialConsole(options = {}) {
         try {
           const comparison = requestMetrics.queryDeviceTokenHourly({
             fromMs,
-            toMs: now + 1,
+            toMs,
             ...(memberLabel ? { memberLabel } : {}),
             ...(accountId ? { accountId } : {}),
             ...(model ? { model } : {}),
@@ -949,7 +994,7 @@ export async function createCredentialConsole(options = {}) {
         }
       }
       return {
-        range: { fromMs, toMs: now + 1, hours, timezone: 'UTC' },
+        range: { fromMs, toMs, hours, timezone: 'UTC' },
         filters: viewFilters,
         options: {
           machines: [
@@ -1010,6 +1055,9 @@ export async function createCredentialConsole(options = {}) {
     const hours = new Set([24, 168, 720]).has(requestedHours) ? requestedHours : 24;
     const cacheKey = JSON.stringify([
       hours,
+      // Two different absolute windows must not share one cached page.
+      String(url.searchParams.get('from') ?? '').slice(0, 32),
+      String(url.searchParams.get('to') ?? '').slice(0, 32),
       String(url.searchParams.get('machine_id') ?? '').slice(0, 256),
       String(url.searchParams.get('member_label') ?? '').slice(0, 160),
       String(url.searchParams.get('account_id') ?? '').slice(0, 128),
@@ -1110,17 +1158,8 @@ export async function createCredentialConsole(options = {}) {
     // accepted an arbitrary closed interval — normalizeConversationSearch
     // validates both bounds and rejects from > to — and this route was throwing
     // that away by pinning the upper bound to now.
-    const parseBound = (name) => {
-      const raw = url.searchParams.get(name);
-      if (raw === null || raw === '') return { value: null, invalid: false };
-      // `datetime-local` submits "2026-08-25T14:00" with no zone. Read it as UTC
-      // so a shared link means the same window to whoever opens it.
-      const parsed = Date.parse(/[Zz]|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : `${raw}Z`);
-      if (!Number.isFinite(parsed)) return { value: null, invalid: true };
-      return { value: parsed, invalid: false };
-    };
-    const fromParam = parseBound('from');
-    const toParam = parseBound('to');
+    const fromParam = parseUtcBound(url.searchParams.get('from'));
+    const toParam = parseUtcBound(url.searchParams.get('to'));
     const invalidWindow = fromParam.invalid || toParam.invalid
       || (fromParam.value !== null && toParam.value !== null && fromParam.value > toParam.value);
     const hasAbsoluteWindow = !invalidWindow && (fromParam.value !== null || toParam.value !== null);
@@ -1412,6 +1451,18 @@ export async function createCredentialConsole(options = {}) {
       }
       const page = metricsPage(url);
       sendJson(res, page.error || !page.metricsAvailable ? 503 : 200, buildMetricsChartPayload(page));
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/docs') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      sendHtml(res, 200, docsView({
+        onboardingUrl,
+        claudeGatewayUrl,
+        codexGatewayUrl,
+        openMode,
+      }));
       return;
     }
 

@@ -173,14 +173,14 @@ test('guide response marks live route as non-cacheable and nosniff', async (t) =
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
 });
 
-test('dashboard copy link reuses URL sanitization and hides unusable localhost fallbacks', async (t) => {
+test('docs copy link reuses URL sanitization and hides unusable localhost fallbacks', async (t) => {
   const passwordCanary = 'copy-link-password-canary';
   const queryCanary = 'copy-link-query-canary';
   const sanitized = await createHarness(t, {
     adminAuth: 'open',
     publicBaseUrl: `https://user:${passwordCanary}@configured-console.example/private?secret=${queryCanary}#fragment-canary`,
   });
-  const safeDashboard = await fetch(`${sanitized.baseUrl}/`);
+  const safeDashboard = await fetch(`${sanitized.baseUrl}/docs`);
   const safeHtml = await bodyOf(safeDashboard);
   assert.equal(safeDashboard.status, 200);
   assert.match(safeHtml, /https:\/\/configured-console\.example\/private\/onboarding\.md/);
@@ -195,7 +195,7 @@ test('dashboard copy link reuses URL sanitization and hides unusable localhost f
     adminAuth: 'open',
     publicBaseUrl: 'http://127.0.0.1:9080',
   });
-  const localDashboard = await fetch(`${localhost.baseUrl}/`);
+  const localDashboard = await fetch(`${localhost.baseUrl}/docs`);
   const localHtml = await bodyOf(localDashboard);
   assert.equal(localDashboard.status, 200);
   assert.equal(localHtml.includes('id="onboarding-guide-link"'), false);

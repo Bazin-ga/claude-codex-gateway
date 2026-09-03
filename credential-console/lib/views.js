@@ -1,6 +1,7 @@
 import { APP_ASSET_URL } from './app-asset.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
+import { sanitizeUrl } from './onboarding.js';
 import { derivePromptDisplay } from './prompt-display.js';
 import {
   buildClaudeConversationHookEndpoint,
@@ -302,6 +303,11 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .metrics-attribution-notice { margin: 0; }
 .metrics-attribution-notice p { margin: 0; }
 .metrics-dashboard { gap: 18px; }
+.docs-api-table code { font-size: 12px; }
+.docs-api-table td:nth-child(2) { white-space: nowrap; }
+.docs-api-method { font-weight: 800; color: var(--green-dark); }
+.docs-base-url { margin-top: 10px; }
+.docs-base-url pre { margin: 4px 0 0; }
 .metrics-page-hero { position: relative; overflow: hidden; display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; padding: 26px; border: 1px solid #cfd9d1; border-radius: 22px; background: linear-gradient(135deg, #fdfefa 0%, #edf5ef 56%, #e7eff4 100%); box-shadow: var(--shadow-soft); }
 .metrics-page-hero::after { content: ''; position: absolute; width: 260px; height: 260px; right: -110px; top: -150px; border-radius: 50%; background: rgba(0,114,178,.09); pointer-events: none; }
 .metrics-page-hero > * { position: relative; z-index: 1; min-width: 0; }
@@ -729,6 +735,7 @@ function layout(title, content, {
       <a href="/" data-i18n="tab-overview"${activeTab === 'overview' ? ' aria-current="page"' : ''}>Overview</a>
       <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
       <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
+      <a href="/docs" data-i18n="tab-docs"${activeTab === 'docs' ? ' aria-current="page"' : ''}>Docs &amp; API</a>
     </nav>` : ''}
     <div data-page-content data-active-tab="${escapeHtml(activeTab ?? '')}">${PAGE_CONTENT_START}${openMode ? openBanner : ''}
     ${content}${PAGE_CONTENT_END}</div>
@@ -2162,6 +2169,12 @@ export function metricsView({
   const hours = METRICS_HOUR_OPTIONS.some((option) => option.value === selectedHours)
     ? selectedHours
     : METRICS_HOUR_OPTIONS[0].value;
+  const fromText = String(filters.fromText ?? '');
+  const toText = String(filters.toText ?? '');
+  const hasAbsoluteWindow = Boolean(filters.hasAbsoluteWindow);
+  const invalidWindow = Boolean(filters.invalidWindow);
+  const clampedWindow = Boolean(filters.clampedWindow);
+  const spanHours = Number(filters.spanHours) || hours;
   const selectedMachine = String(filters.machineId ?? '');
   const selectedMember = String(filters.memberLabel ?? '');
   const selectedAccount = String(filters.accountId ?? '');
@@ -2235,6 +2248,14 @@ export function metricsView({
   const errorNotice = error
     ? `<div class="notice error" role="alert"><span data-i18n="metrics-error">The metrics page could not load its data.</span><br><span class="tiny">${escapeHtml(error)}</span></div>`
     : '';
+  // A rejected window silently falling back to the preset would answer a question
+  // the operator did not ask, with numbers that look like an answer to the one
+  // they did.
+  const windowNotice = invalidWindow
+    ? '<div class="notice error" role="alert" data-i18n="metrics-window-invalid">That time window could not be read, or it ends before it starts. Showing the period preset instead.</div>'
+    : (clampedWindow
+      ? `<div class="notice" role="status"><span data-i18n="metrics-window-clamped">The window was wider than the 30 days the hourly charts can draw, so it starts later than requested.</span> <strong>${escapeHtml(String(spanHours))}h</strong></div>`
+      : '');
   const hourOptions = METRICS_HOUR_OPTIONS.map((option) => metricOption(
     option.value,
     option.label,
@@ -2252,14 +2273,23 @@ export function metricsView({
     || normalizedTokenTotals.usageUnavailableCount > 0
     || normalizedTokenTotals.tokenTotalsOverflow;
   const chartParams = new URLSearchParams();
-  chartParams.set('hours', String(hours));
+  // Only the one that actually produced the rows travels to the chart endpoint,
+  // so the series can never disagree with the table above it.
+  if (hasAbsoluteWindow) {
+    if (fromText) chartParams.set('from', fromText);
+    if (toText) chartParams.set('to', toText);
+  } else {
+    chartParams.set('hours', String(hours));
+  }
   const effectiveMachine = unattributedMachine ? UNATTRIBUTED_MACHINE_VALUE : selectedMachine;
   if (effectiveMachine) chartParams.set('machine_id', effectiveMachine);
   if (selectedMember) chartParams.set('member_label', selectedMember);
   if (selectedAccount) chartParams.set('account_id', selectedAccount);
   if (selectedModel) chartParams.set('model', selectedModel);
   const metricsEndpoint = `/metrics/chart-data?${chartParams.toString()}`;
-  const rangeLabel = METRICS_HOUR_OPTIONS.find((option) => option.value === hours)?.label ?? `${hours} hours`;
+  const rangeLabel = hasAbsoluteWindow
+    ? `${fromText || '…'} → ${toText || 'now'}`
+    : (METRICS_HOUR_OPTIONS.find((option) => option.value === hours)?.label ?? `${hours} hours`);
   const accountFallback = metricsBreakdownFallback(
     accountTokenBreakdown,
     'metrics-breakdown-no-data',
@@ -2297,6 +2327,7 @@ export function metricsView({
       ${availabilityNotice}
       ${droppedNotice}
       ${errorNotice}
+      ${windowNotice}
       <header class="metrics-page-hero">
         <div>
           <div class="metrics-eyebrow"><span class="metrics-status-dot${coveragePartial ? ' partial' : ''}" aria-hidden="true"></span><span data-i18n="metrics-label">Usage intelligence</span></div>
@@ -2321,6 +2352,13 @@ export function metricsView({
           <h2 class="metrics-filter-heading" data-i18n="metrics-filter-heading">Filter usage</h2>
           <label><span data-i18n="metrics-filter-hours">Period</span>
             <select name="hours">${hourOptions}</select>
+            <p class="muted tiny" data-i18n="metrics-filter-window-hint">Ignored while an explicit window is set below.</p>
+          </label>
+          <label><span data-i18n="metrics-filter-from">From (UTC)</span>
+            <input type="datetime-local" name="from" value="${escapeHtml(fromText)}" data-autoapply>
+          </label>
+          <label><span data-i18n="metrics-filter-to">To (UTC)</span>
+            <input type="datetime-local" name="to" value="${escapeHtml(toText)}" data-autoapply>
           </label>
           <label><span data-i18n="metrics-filter-machine">Machine</span>
             <select name="machine_id">${metricMachineOptions(options.machines, selectedMachine, unattributedMachine)}</select>
@@ -3733,16 +3771,6 @@ export function dashboardView({
           <article class="card summary"><span class="muted" data-i18n="healthy">Healthy</span><strong>${healthy}</strong></article>
           <article class="card summary"><span class="muted" data-i18n="active-claude-credentials">Active Claude credentials</span><strong>${activeDevices.length}</strong></article>
           ${conversationHookUpgrade}
-          ${onboardingUrl ? `<article class="card">
-            <h2 data-i18n="ai-onboarding-guide">AI onboarding guide</h2>
-            <p class="muted" data-i18n="ai-onboarding-intro">This tailnet-internal Markdown is generated from current deployment state. It contains endpoints, account status, and the client config version, but never a token.</p>
-            ${openMode ? '<div class="notice error tiny" role="alert" data-i18n="open-onboarding-warning">Open mode: anyone who can reach this console can read this live guide and its deployment/account metadata. Keep this console private; member labels are unverified and do not identify the actor.</div>' : ''}
-            <pre id="onboarding-guide-link">${escapeHtml(onboardingUrl)}</pre>
-            <div class="setup-actions">
-              <button type="button" class="secondary" data-copy-target="onboarding-guide-link" data-i18n="copy-onboarding-link">Copy guide link</button>
-              <a class="button secondary" href="${escapeHtml(onboardingUrl)}" target="_blank" rel="noopener noreferrer" data-i18n="open-onboarding-guide">Open guide</a>
-            </div>
-          </article>` : ''}
           <article class="card">
             <div class="topbar"><div><h2 data-i18n="accounts">Accounts</h2><div class="muted tiny" data-i18n="upstream-secret-note">Provider tokens are encrypted and never displayed after submission. Exceptional one-time enrollment remains available per account.</div></div></div>
             <div class="table-wrap">
@@ -4466,4 +4494,124 @@ export function messageView(title, message, {
       </div>
     </section>
   `, { openMode });
+}
+
+// Every row is an endpoint that exists. The panel's own operations — adding an
+// account, revoking a device, moving a machine between accounts — are HTML forms
+// guarded by a session cookie and a CSRF token, with no JSON equivalent, so they
+// are named here as absent rather than left to be inferred from silence.
+const API_GROUPS = Object.freeze([
+  {
+    titleI18n: 'docs-api-group-data',
+    title: 'Runtime gateways · per-device token',
+    descriptionI18n: 'docs-api-group-data-note',
+    description: 'Send the device token as `x-api-key` or `Authorization: Bearer`. The console strips it and attaches the provider credential server-side; the upstream credential never reaches the device.',
+    rows: [
+      ['POST', '/claude/v1/messages', 'docs-api-messages', 'Claude completion, streaming included. Metered, and captured when the profile has conversation hooks installed.'],
+      ['POST', '/claude/v1/messages/count_tokens', 'docs-api-count-tokens', 'Token count for a request that has not been sent.'],
+      ['GET', '/claude/v1/models', 'docs-api-models', 'Models the attached Claude account can address.'],
+      ['POST', '/codex-api/responses', 'docs-api-codex', 'Codex turn, for a device holding a Codex gateway token. Codex traffic is metered but not captured as conversations.'],
+    ],
+  },
+  {
+    titleI18n: 'docs-api-group-control',
+    title: 'Device self-service · per-device token',
+    descriptionI18n: 'docs-api-group-control-note',
+    description: 'A device may read and change only its own row. There is no path here that reaches another device, and none that returns a credential.',
+    rows: [
+      ['GET', '/claude/control/v1/status', 'docs-api-status', 'This device: its account, the accounts it is allowed to switch between, and whether it is revoked.'],
+      ['POST', '/claude/control/v1/account', 'docs-api-account', 'Switch this device to another account inside its own allowlist. Body: {"account_id": "..."}.'],
+      ['POST', '/claude/control/v1/conversation-hooks', 'docs-api-hooks', 'Claude Code hook delivery: a submitted prompt or a final assistant message. Requires Claude Code 2.1.196 or newer for reliable pairing.'],
+    ],
+  },
+  {
+    titleI18n: 'docs-api-group-console',
+    title: 'Console reads · console session',
+    descriptionI18n: 'docs-api-group-console-note',
+    description: 'Same authentication as the pages themselves — a tailnet identity, or nothing at all in open mode. These are not token endpoints and are not reachable from outside the control plane.',
+    rows: [
+      ['GET', '/metrics/chart-data', 'docs-api-chart-data', 'JSON behind the usage charts. Takes the same filters as the page: hours, from, to, machine_id, member_label, account_id, model.'],
+      ['GET', '/onboarding.md', 'docs-api-onboarding', 'The generated guide below, as Markdown. Endpoints, account status and client config version; never a token.'],
+    ],
+  },
+  {
+    titleI18n: 'docs-api-group-open',
+    title: 'Unauthenticated',
+    descriptionI18n: 'docs-api-group-open-note',
+    description: 'Reachable by anything that can route to the listener.',
+    rows: [
+      ['GET', '/health', 'docs-api-health', 'Liveness, the admin authentication mode, and the client config version. No account or device data.'],
+    ],
+  },
+]);
+
+function apiGroupCard(group) {
+  const rows = group.rows.map(([method, path, i18n, description]) => `<tr>
+    <td><code class="docs-api-method">${escapeHtml(method)}</code></td>
+    <td><code>${escapeHtml(path)}</code></td>
+    <td data-i18n="${escapeHtml(i18n)}">${escapeHtml(description)}</td>
+  </tr>`).join('');
+  return `<article class="card">
+    <h2 data-i18n="${escapeHtml(group.titleI18n)}">${escapeHtml(group.title)}</h2>
+    <p class="muted tiny" data-i18n="${escapeHtml(group.descriptionI18n)}">${escapeHtml(group.description)}</p>
+    <div class="table-wrap">
+      <table class="docs-api-table">
+        <thead><tr>
+          <th scope="col" data-i18n="docs-api-method-heading">Method</th>
+          <th scope="col" data-i18n="docs-api-path-heading">Path</th>
+          <th scope="col" data-i18n="docs-api-purpose-heading">What it does</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  </article>`;
+}
+
+export function docsView({
+  onboardingUrl = null,
+  claudeGatewayUrl = null,
+  codexGatewayUrl = null,
+  openMode = false,
+} = {}) {
+  // Same rule as the generated guide: a configured base URL carrying credentials,
+  // a query or a fragment must not be reflected back out of the console, and a
+  // loopback fallback is not an address any member can use.
+  const baseRow = (labelI18n, label, value) => {
+    const safe = sanitizeUrl(value).url;
+    return safe
+      ? `<div class="docs-base-url"><span class="muted tiny" data-i18n="${escapeHtml(labelI18n)}">${escapeHtml(label)}</span><pre>${escapeHtml(safe)}</pre></div>`
+      : '';
+  };
+  return layout('Documentation', `
+    <section class="stack">
+      <header class="metrics-page-hero">
+        <div>
+        <h1 data-i18n="docs-heading">Documentation and API</h1>
+        <p class="muted" data-i18n="docs-intro">What this console exposes over HTTP, and the generated deployment guide. Written to be read either by a person or by an assistant being pointed at this deployment, so that neither has to open every page to find out what exists.</p>
+        </div>
+      </header>
+      <article class="card">
+        <h2 data-i18n="docs-base-heading">Base URLs</h2>
+        <p class="muted tiny" data-i18n="docs-base-note">Issued to each device by its installer. Shown here so a client can be configured, or checked, without re-enrolling.</p>
+        ${baseRow('docs-base-claude', 'Claude gateway', claudeGatewayUrl)}
+        ${baseRow('docs-base-codex', 'Codex gateway', codexGatewayUrl)}
+      </article>
+      ${API_GROUPS.map(apiGroupCard).join('')}
+      <article class="card">
+        <h2 data-i18n="docs-no-admin-api-heading">Administration has no API</h2>
+        <p data-i18n="docs-no-admin-api">Adding or deleting an account, authorizing one, issuing an enrolment, revoking a device, switching a device's account from the panel, grouping machines: all of it is an HTML form on the Overview page, guarded by a session cookie and a CSRF token. There is no JSON equivalent and no admin token to hold. An assistant automating this console can read through the endpoints above; it cannot administer it through them.</p>
+        <p class="muted tiny" data-i18n="docs-no-conversation-api">The conversation archive is likewise page-only: it has search, filters and an absolute time window in the UI, and no query endpoint behind them.</p>
+      </article>
+      ${onboardingUrl ? `<article class="card">
+        <h2 data-i18n="ai-onboarding-guide">AI onboarding guide</h2>
+        <p class="muted" data-i18n="ai-onboarding-intro">This tailnet-internal Markdown is generated from current deployment state. It contains endpoints, account status, and the client config version, but never a token.</p>
+        ${openMode ? '<div class="notice error tiny" role="alert" data-i18n="open-onboarding-warning">Open mode: anyone who can reach this console can read this live guide and its deployment/account metadata. Keep this console private; member labels are unverified and do not identify the actor.</div>' : ''}
+        <pre id="onboarding-guide-link">${escapeHtml(onboardingUrl)}</pre>
+        <div class="setup-actions">
+          <button type="button" class="secondary" data-copy-target="onboarding-guide-link" data-i18n="copy-onboarding-link">Copy guide link</button>
+          <a class="button secondary" href="${escapeHtml(onboardingUrl)}" target="_blank" rel="noopener noreferrer" data-i18n="open-onboarding-guide">Open guide</a>
+        </div>
+      </article>` : ''}
+    </section>
+  `, { openMode, activeTab: 'docs' });
 }

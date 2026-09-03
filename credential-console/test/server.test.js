@@ -2936,3 +2936,67 @@ test('an unauthorized account row can be deleted from the console, a credentiale
     await app.close();
   }
 });
+
+test('the metrics window can be given as absolute bounds, and says when it cannot', async (t) => {
+  const app = await fixture();
+  t.after(() => app.close());
+
+  const read = async (query) => {
+    const response = await fetch(`${app.baseUrl}/metrics${query}`, { headers: ADMIN });
+    assert.equal(response.status, 200);
+    return response.text();
+  };
+
+  const preset = await read('');
+  assert.match(preset, /name="from"/, 'the filter row offers an explicit window');
+  assert.match(preset, /chart-data\?hours=24/, 'no window means the preset drives the chart');
+
+  // An explicit window replaces the preset rather than mixing with it: the chart
+  // and the table have to be answering the same question.
+  const windowed = await read('?hours=720&from=2026-09-01T14:00&to=2026-09-01T18:00');
+  assert.match(windowed, /2026-09-01T14:00 → 2026-09-01T18:00/, 'the header names the window');
+  assert.doesNotMatch(windowed, /chart-data\?[^"]*hours=/, 'the preset does not also reach the chart');
+  assert.match(windowed, /chart-data\?from=2026-09-01T14%3A00/);
+
+  // A window that cannot be read must not silently answer the preset's question
+  // with numbers that look like an answer to the one that was asked.
+  const reversed = await read('?from=2026-09-02T18:00&to=2026-09-02T14:00');
+  assert.match(reversed, /metrics-window-invalid/, 'a backwards window is reported');
+  assert.match(reversed, /chart-data\?hours=24/, 'and the preset takes over');
+
+  const unparseable = await read('?from=yesterday');
+  assert.match(unparseable, /metrics-window-invalid/);
+
+  // Wider than the hourly charts can draw: clamped, and said so.
+  const tooWide = await read('?from=2025-01-01T00:00&to=2026-09-01T00:00');
+  assert.match(tooWide, /metrics-window-clamped/);
+});
+
+test('the docs tab carries the guide, and every endpoint it lists exists', async (t) => {
+  const app = await fixture();
+  t.after(() => app.close());
+
+  const docs = await fetch(`${app.baseUrl}/docs`, { headers: ADMIN });
+  assert.equal(docs.status, 200);
+  const body = await docs.text();
+  assert.match(body, /data-active-tab="docs"/);
+  assert.match(body, /href="\/docs" data-i18n="tab-docs"/, 'the tab bar offers it');
+
+  // The guide moved here from the dashboard; it must not be in both places, and
+  // must not have been dropped on the way.
+  assert.match(body, /ai-onboarding-guide/, 'the guide lives on the docs tab');
+  const dashboard = await fetch(`${app.baseUrl}/`, { headers: ADMIN });
+  assert.doesNotMatch(await dashboard.text(), /ai-onboarding-guide/, 'and no longer on the overview');
+
+  // A reference page that lists an endpoint nobody serves is worse than no page,
+  // because the reader — increasingly an assistant — has no way to tell. Every
+  // documented path is asked for here: it may refuse, it may not be missing.
+  const documented = [...body.matchAll(
+    /<code class="docs-api-method">([A-Z]+)<\/code>\s*<\/td>\s*<td><code>(\/[a-z0-9\/._-]+)<\/code>/g,
+  )].map((match) => ({ method: match[1], path: match[2] }));
+  assert.ok(documented.length >= 10, `expected the API table to list endpoints, saw ${documented.length}`);
+  for (const { method, path } of documented) {
+    const response = await fetch(`${app.baseUrl}${path}`, { method, headers: ADMIN });
+    assert.notEqual(response.status, 404, `${method} ${path} is documented but not routed`);
+  }
+});

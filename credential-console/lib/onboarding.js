@@ -50,7 +50,10 @@ function safeStatus(value) {
   return typeof value === 'string' && SAFE_STATUS.has(value) ? value : 'unavailable';
 }
 
-function sanitizeUrl(value) {
+// Exported so the docs page can show a base URL under exactly the same rule the
+// generated guide uses: no credentials, no query, no fragment, and nothing for a
+// loopback address a member could not reach anyway.
+export function sanitizeUrl(value) {
   if (typeof value !== 'string' || !value.trim() || /[\r\n`]/.test(value)) {
     return { url: null, state: 'unavailable' };
   }

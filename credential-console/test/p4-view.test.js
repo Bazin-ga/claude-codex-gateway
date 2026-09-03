@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { dashboardView } from '../lib/views.js';
+import { dashboardView, docsView } from '../lib/views.js';
 
 const CONSOLE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const REPOSITORY_ROOT = dirname(CONSOLE_ROOT);
@@ -18,21 +18,28 @@ const BASE = {
   onboardingUrl: 'https://private-console.example/onboarding.md',
 };
 
-test('dashboard renders a copyable private onboarding link with no public-guide route', () => {
-  const html = dashboardView(BASE);
+test('the docs tab renders a copyable private onboarding link with no public-guide route', () => {
+  const html = docsView(BASE);
   assert.match(html, /data-i18n="ai-onboarding-guide"/);
   assert.match(html, /data-i18n="ai-onboarding-intro"/);
   assert.match(html, /id="onboarding-guide-link">https:\/\/private-console\.example\/onboarding\.md<\/pre>/);
   assert.match(html, /data-copy-target="onboarding-guide-link" data-i18n="copy-onboarding-link"/);
   assert.match(html, /href="https:\/\/private-console\.example\/onboarding\.md" target="_blank" rel="noopener noreferrer" data-i18n="open-onboarding-guide"/);
   assert.equal((html.match(/href="[^"]*AI-ONBOARDING\.md/g) ?? []).length, 0);
+});
+
+// The reference table on the docs tab names the control endpoints on purpose.
+// The overview page is the one that must not grow a path to them.
+test('the overview page still exposes no enrolment, credential or control path', () => {
+  const html = dashboardView(BASE);
   assert.equal(html.includes('/enroll'), false);
   assert.equal(html.includes('/credential'), false);
   assert.equal(html.includes('/control/v1'), false);
+  assert.doesNotMatch(html, /data-i18n="ai-onboarding-guide"/, 'the guide moved to the docs tab');
 });
 
 test('open mode visibly warns that anyone reachable can read live onboarding metadata', () => {
-  const html = dashboardView({ ...BASE, openMode: true, adminIdentity: null });
+  const html = docsView({ ...BASE, openMode: true, adminIdentity: null });
   const warning = html.match(/<div class="notice error tiny"[^>]*data-i18n="open-onboarding-warning"[\s\S]*?<\/div>/)?.[0] ?? '';
   assert.match(warning, /anyone who can reach this console can read this live guide/i);
   assert.match(warning, /member labels are unverified/i);
@@ -41,7 +48,7 @@ test('open mode visibly warns that anyone reachable can read live onboarding met
 });
 
 test('onboarding URL is escaped in both copy text and link attributes', () => {
-  const html = dashboardView({
+  const html = docsView({
     ...BASE,
     onboardingUrl: 'https://private-console.example/onboarding.md?x="<script>alert(1)</script>',
   });

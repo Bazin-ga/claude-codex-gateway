@@ -79,7 +79,7 @@ async function withPage(viewport, fn) {
 
 describe('no page fits its content to a wider viewport than the phone has', async () => {
   await withPage({ width: 390, height: 844 }, async (page, baseUrl, errors) => {
-    for (const path of ['/', '/conversations', '/conversation-turns', '/metrics']) {
+    for (const path of ['/', '/conversations', '/conversation-turns', '/metrics', '/docs']) {
       await page.goto(baseUrl + path, { waitUntil: 'networkidle' });
       const width = await page.evaluate(() => document.documentElement.scrollWidth);
       assert.equal(width, 390, `${path} must not scroll sideways on a phone`);
@@ -90,7 +90,7 @@ describe('no page fits its content to a wider viewport than the phone has', asyn
 
 describe('every touch control clears the minimum target height', async () => {
   await withPage({ width: 390, height: 844 }, async (page, baseUrl) => {
-    for (const path of ['/', '/metrics', '/conversation-turns']) {
+    for (const path of ['/', '/metrics', '/conversation-turns', '/docs']) {
       await page.goto(baseUrl + path, { waitUntil: 'networkidle' });
       const small = await page.evaluate(() => Array.from(
         document.querySelectorAll('a.button, button, input, select, summary'),
@@ -205,6 +205,7 @@ describe('tab navigation replaces the page, not the document', async () => {
     for (const [href, expectedPath] of [
       ['/metrics', '/metrics'],
       ['/conversations', '/conversations'],
+      ['/docs', '/docs'],
       ['/', '/'],
     ]) {
       await page.click(`.page-tabs a[href="${href}"]`);
@@ -353,11 +354,20 @@ describe('filtering keeps your place; changing page does not', async () => {
     const before = await page.evaluate(() => Math.round(window.scrollY));
     assert.ok(before > 300, 'scrolled far enough for the test to mean something');
 
-    await page.click('.metrics-filters button[type="submit"]');
+    // Submitted through the form rather than by clicking Apply: a click scrolls
+    // the button into view first, and with the filter row near the top of the
+    // page that scroll is what set the offset — leaving the assertion below
+    // measuring Playwright rather than the console.
+    await page.evaluate(() => {
+      const form = document.querySelector('.metrics-filters');
+      form.requestSubmit(form.querySelector('button[type="submit"]'));
+    });
+    await page.waitForFunction(() => location.search.includes('hours='));
     await page.waitForFunction(() => !document.documentElement.hasAttribute('data-navigating'));
+    await page.waitForTimeout(120);
     const afterFilter = await page.evaluate(() => Math.round(window.scrollY));
     // Re-running a filter on the page you are reading is not a new page.
-    assert.ok(afterFilter > 0, `filtering jumped to the top (${before} -> ${afterFilter})`);
+    assert.equal(afterFilter, before, `filtering moved the page (${before} -> ${afterFilter})`);
 
     await page.evaluate(() => window.scrollTo(0, 700));
     await page.waitForTimeout(150);
