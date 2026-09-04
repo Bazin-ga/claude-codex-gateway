@@ -50,6 +50,8 @@ const translations = {
   'usage-reauthorize': '需要为该 Claude 账号重新授权一次，才能显示额度。',
   'usage-authorize-first': '完成该账号的授权后才能显示额度。',
   'usage-quota-hidden': '无法显示额度',
+  'machine-search': '搜索机器',
+  'machine-search-empty': '没有匹配的机器。',
   'usage-stale': '最新刷新失败，当前显示上一次成功结果。',
   'usage-unavailable': '当前暂时无法取得用量。',
   'action': '操作',
@@ -686,6 +688,33 @@ function translateElementsIn(root, selected) {
 }
 
 applyLanguage(storedLanguage());
+
+// Overview machine list: live keyword filter. The dropdowns above it narrow by a
+// single account / group / member and reload the page; this hides non-matching
+// machine cards as you type, matching against the flattened `data-search` string
+// (machine handle, device / codex names, member labels, account aliases). Bound
+// once on `document` so it survives the in-place re-render of boosted navigation.
+function applyMachineSearch(input) {
+  const query = input.value.trim().toLowerCase();
+  let anyVisible = false;
+  document.querySelectorAll('article.machine[data-search]').forEach((article) => {
+    const match = !query || (article.dataset.search || '').includes(query);
+    article.hidden = !match;
+    if (match) anyVisible = true;
+  });
+  // While searching, fold away a group section (unattributed / retired) whose
+  // machines all filtered out, so the page does not keep empty headers around.
+  document.querySelectorAll('.machine-group').forEach((group) => {
+    const hasVisible = Array.from(group.querySelectorAll('article.machine')).some((card) => !card.hidden);
+    group.hidden = Boolean(query) && !hasVisible;
+  });
+  const empty = document.querySelector('[data-machine-search-empty]');
+  if (empty) empty.hidden = !(query && !anyVisible);
+}
+document.addEventListener('input', (event) => {
+  const input = event.target.closest?.('[data-machine-search]');
+  if (input) applyMachineSearch(input);
+});
 
 function sessionStateGet(key) {
   try {
