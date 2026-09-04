@@ -1886,10 +1886,21 @@ export async function createCredentialConsole(options = {}) {
         return;
       }
       try {
+        const memberLabel = memberLabelFor(session, form);
+        // Optional machine handle. A member enrolling several accounts from one
+        // machine can type the same machine name each time to fold them into a
+        // single inventory row. Hashed to satisfy the machine-id pattern and
+        // scoped by member label, so two members' identical names never merge
+        // into one machine — the console still never guesses this on its own.
+        const machineName = String(form.machine ?? '').trim();
+        const machineId = machineName
+          ? createHash('sha256').update(`${memberLabel} ${machineName}`).digest('hex').slice(0, 40)
+          : null;
         const result = await store.issueDeviceCredential({
           accountId: String(form.account_id ?? ''),
-          memberLabel: memberLabelFor(session, form),
+          memberLabel,
           deviceName: String(form.device_name ?? '').trim(),
+          machineId,
         });
         sendHtml(res, 200, configuredDeviceView(result));
       } catch (error) {

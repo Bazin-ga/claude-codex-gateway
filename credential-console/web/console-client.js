@@ -49,6 +49,7 @@ const translations = {
   'usage-loading': '正在等待首次每小时用量刷新。',
   'usage-reauthorize': '需要为该 Claude 账号重新授权一次，才能显示额度。',
   'usage-authorize-first': '完成该账号的授权后才能显示额度。',
+  'usage-quota-hidden': '无法显示额度',
   'usage-stale': '最新刷新失败，当前显示上一次成功结果。',
   'usage-unavailable': '当前暂时无法取得用量。',
   'action': '操作',
