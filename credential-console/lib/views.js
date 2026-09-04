@@ -9,6 +9,11 @@ import {
   renderClaudeConversationHookUpdaterSource,
 } from './claude-conversation-hooks.js';
 import {
+  buildCodexConversationHookEndpoint,
+  CODEX_CONVERSATION_HOOK_CLIENT_FILENAME,
+  renderCodexConversationHookClientSource,
+} from './codex-conversation-hooks.js';
+import {
   CLAUDE_CLIENT_CONFIG_VERSION_KEY,
   CLIENT_CONFIG_VERSION,
   CODEX_UNIX_CLIENT_CONFIG_VERSION_FILE,
@@ -195,8 +200,10 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .quota-window > span, .quota-window > small { display: block; color: var(--muted); font-size: 11px; }
 .quota-window strong { display: block; margin: 3px 0; font-size: 15px; }
 .quota-meta { margin-top: 8px; color: var(--muted); font-size: 11px; }
-.quota-message { margin: 8px 0 0; color: var(--amber); font-size: 12px; line-height: 1.4; }
+.quota-message { margin: 8px 0 0; color: var(--amber); font-size: 12px; line-height: 1.4; display: flex; align-items: center; gap: 6px; }
 .quota-message.error { color: var(--red); background: transparent; border: 0; padding: 0; }
+.quota-help { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 50%; border: 1px solid currentColor; opacity: 0.7; font-size: 10px; line-height: 1; cursor: help; flex: 0 0 auto; }
+.quota-help:hover, .quota-help:focus { opacity: 1; outline: none; }
 .member-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end; margin-top: 18px; }
 .member-form.codex-form { grid-template-columns: 1fr auto; }
 .member-form.with-label { grid-template-columns: 1fr 1fr 1fr auto; }
@@ -890,9 +897,58 @@ const QUOTA_MESSAGES = {
   pending: '<div class="quota-message" data-i18n="usage-loading">Waiting for the first hourly usage refresh.</div>',
 };
 
+/**
+ * The concrete cause behind a usage state, phrased for a hover tooltip. Keyed off
+ * the fine-grained `last_error` the fetcher records, not just the coarse status,
+ * so an enterprise plan that simply does not report usage never reads as a
+ * transient outage. Bilingual because the native `title` attribute is not run
+ * through the client-side i18n text swap.
+ */
+function usageStatusTip(usage) {
+  const code = String(usage?.last_error ?? usage?.status ?? '');
+  switch (code) {
+    case 'reauthorization_required':
+      return '缺少 user:profile 权限（claude setup-token 生成的长期 token 不含该 scope），因此读不到额度；账号本身可正常使用。要显示额度，需账号拥有者通过控制台重新授权一次。 | Missing the user:profile scope (long-lived setup-token credentials omit it), so usage cannot be read; the account still works for inference. The owner must re-authorize once via the console to enable quota.';
+    case 'authorization_required':
+      return '该账号尚未完成授权，暂时无法读取额度。 | The account has not finished authorizing yet, so usage cannot be read.';
+    case 'usage_not_reported':
+      return '该订阅（企业 / 商业版）不提供消费级用量数据，属正常现象，账号可正常使用。 | This subscription (enterprise / business) does not report consumer usage windows. This is expected; the account works normally.';
+    case 'authentication_failed':
+      return '上游拒绝了该凭据（例如账号所属组织已禁用 OAuth，或 token 已被吊销）。该账号可能已不可用，请联系账号拥有者检查其组织的 OAuth / API 设置。 | The provider refused the credential (e.g. the account\'s organization has disabled OAuth, or the token was revoked). The account may be unusable — ask the owner to check their organization\'s OAuth / API policy.';
+    case 'credential_unavailable':
+      return '没有可用于查询额度的已发布凭据。 | No published credential is available to query usage with.';
+    default:
+      if (code.startsWith('upstream_')) {
+        const http = code.replace('upstream_', 'HTTP ');
+        return `用量服务返回错误（${http}），通常是临时的，稍后会自动重试。 | The usage service returned ${http}; usually transient and retried automatically.`;
+      }
+      return '暂时无法取得用量，通常是临时的，稍后会自动重试。 | Usage is temporarily unavailable; usually transient and retried automatically.';
+  }
+}
+
+/**
+ * Surface a compact status with the detail behind a hover tooltip: the panel
+ * stays scannable ("Unavailable") while the specific, per-account cause is one
+ * mouseover away.
+ */
+function usageMessage(usage) {
+  const status = usage ? usage.status : 'pending';
+  if (status === 'available') return '';
+  if (status === 'pending') return QUOTA_MESSAGES.pending;
+  // Compact, non-alarming label plus a "?" whose tooltip carries the specific,
+  // per-account cause. Deliberately NOT "Unavailable": the account itself is
+  // usually fine — it is only the quota reading that cannot be shown, and each
+  // reason differs, so the detail lives one hover away rather than on the label.
+  const help = `<span class="quota-help" tabindex="0" role="note" aria-label="details" title="${escapeHtml(usageStatusTip(usage))}">?</span>`;
+  if (status === 'stale') {
+    return `<div class="quota-message"><span data-i18n="usage-stale">Showing the last successful reading; the latest refresh failed.</span>${help}</div>`;
+  }
+  return `<div class="quota-message"><span data-i18n="usage-quota-hidden">Quota unavailable</span>${help}</div>`;
+}
+
 function accountUsageView(account, { showAccount = false } = {}) {
   const usage = account.usage;
-  const message = QUOTA_MESSAGES[usage ? usage.status : 'pending'] ?? '';
+  const message = usageMessage(usage);
   const updatedAt = usage?.fetched_at ?? usage?.attempted_at;
   return `<div class="quota-account">
     ${showAccount ? `<div class="quota-account-name"><strong>${escapeHtml(account.alias)}</strong>${usage?.plan_type ? `<span class="badge stored">${escapeHtml(usage.plan_type)}</span>` : ''}</div>` : ''}
@@ -3600,6 +3656,19 @@ export function dashboardView({
   }
   const codexAccounts = accounts.filter((account) => account.provider === 'codex');
   const primaryCodex = codexAccounts[0] ?? null;
+  // Every gateway-capable Codex account is offered on the panel, not just the
+  // first — a member picks one exactly as they do for Claude.
+  const codexGatewayAccounts = codexAccounts.filter((account) => (
+    account.external?.kind === 'codex-credential'
+    && ['stored', 'healthy'].includes(account.status)
+    && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
+  ));
+  const codexGatewayOptions = codexGatewayAccounts.map((account) => (
+    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
+  )).join('');
+  const codexUsage = codexGatewayAccounts.map((account) => accountUsageView(account, {
+    showAccount: codexGatewayAccounts.length > 1,
+  })).join('');
   const claudeUsage = selfServiceAccounts.map((account) => accountUsageView(account, {
     showAccount: selfServiceAccounts.length > 1,
   })).join('');
@@ -3731,29 +3800,38 @@ export function dashboardView({
             </div><p class="muted tiny" data-i18n="owner-add-once">An account owner adds it once below; every member can then self-serve.</p>`}
           </article>
           <article class="provider-card">
-            <div class="provider-title"><h2>Codex</h2>${primaryCodex ? statusBadge(primaryCodex.status) : statusBadge('login_required')}</div>
-            ${primaryCodex ? `<p><strong>${escapeHtml(primaryCodex.alias)}</strong></p>` : ''}
-            <p class="muted" data-i18n="codex-description">The refresh center rotates the master credential. Get a self-contained installer and independent device token that do not require tailnet access.</p>
-            ${primaryCodex ? `<div class="quota-list">${accountUsageView(primaryCodex)}</div>` : ''}
-            ${primaryCodex && codexSelfServiceReady ? `<form method="post" action="/codex/self-service" class="member-form codex-form${memberFormClass}" data-persist-draft="codex-self-service">
+            <div class="provider-title"><h2>Codex</h2>${codexGatewayAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
+            <p class="muted" data-i18n="codex-description">The refresh center holds each account's credential. Turns route through this console, which meters every device and records the conversation — the same as Claude.</p>
+            ${codexGatewayAccounts.length ? `<div class="quota-list">${codexUsage}</div>` : ''}
+            ${codexGatewayAccounts.length ? `<form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="codex-gateway-self-service">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <label><span data-i18n="team-account">Team account</span>
+                <select name="account_id" required data-draft-field>${codexGatewayOptions}</select>
+              </label>
+              ${memberLabelField}
+              <label><span data-i18n="machine-optional">Machine (optional)</span>
+                <input name="machine" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
+              </label>
+              <label><span data-i18n="device-name">Device name</span>
+                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
+              </label>
+              <div><button type="submit" data-i18n="get-codex-gateway">Get Codex setup</button></div>
+            </form>
+            <p class="muted tiny" data-i18n="codex-machine-hint">Enter the same Machine name each time to keep several Codex accounts on one computer in a single inventory row.</p>` : `<div class="member-form">
+              <label><span data-i18n="team-account">Team account</span><select disabled><option data-i18n="no-account">No account available</option></select></label>
+              <label><span data-i18n="device-name">Device name</span><input disabled data-placeholder-en="Available after account enrollment" data-placeholder-zh="账号录入后即可填写" placeholder="Available after account enrollment"></label>
+              <div><button type="button" disabled data-i18n="waiting-owner">Waiting for account owner</button></div>
+            </div><p class="muted tiny" data-i18n="owner-add-once">An account owner adds it once below; every member can then self-serve.</p>`}
+            ${codexSelfServiceReady && primaryCodex ? `<hr>
+            <h3 data-i18n="codex-dispenser-heading">Or pull a local credential (dispenser)</h3>
+            <p class="muted tiny">The dispenser installer pulls a credential and talks to chatgpt.com directly, so those turns are not metered here.</p>
+            <form method="post" action="/codex/self-service" class="member-form codex-form${memberFormClass}" data-persist-draft="codex-self-service">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               ${memberLabelField}
               <label><span data-i18n="device-name">Device name</span>
                 <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
               </label>
               <div><button type="submit" data-i18n="get-codex">Get Codex installer</button></div>
-            </form>` : '<div class="notice" data-i18n="codex-unavailable">Codex self-service enrollment is not configured yet. An administrator must connect dispenser enrollment.</div>'}
-            ${primaryCodex?.external?.kind === 'codex-credential' ? `<hr>
-            <h3>Or route turns through this console</h3>
-            <p class="muted tiny">The installer above pulls a credential and then talks to chatgpt.com directly, so those turns are not metered here. This alternative keeps the credential on the server and meters each device. It needs no dispenser enrollment, only an authorized account.</p>
-            <form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="codex-gateway-self-service">
-              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-              <input type="hidden" name="account_id" value="${escapeHtml(primaryCodex.id)}">
-              ${memberLabelField}
-              <label><span data-i18n="device-name">Device name</span>
-                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
-              </label>
-              <div><button type="submit">Get Codex gateway token</button></div>
             </form>` : ''}
           </article>
         </div>
@@ -4440,17 +4518,101 @@ export function codexDeviceConfiguredView({
 }) {
   const gateway = String(codexGatewayUrl ?? '').replace(/\/$/, '');
   const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
-  const configToml = `# ~/.codex/config.toml
-# model_provider is a top-level key. It must sit ABOVE every [table]; appending
-# this block to a config that already has one binds it into that table instead.
+  const tokenExport = `export ${tokenEnvVar}=${shellSingleQuote(token)}`;
+
+  let hookEndpoint = null;
+  try {
+    hookEndpoint = gateway ? buildCodexConversationHookEndpoint(gateway) : null;
+  } catch {
+    hookEndpoint = null;
+  }
+
+  // Without a configured gateway URL there is nothing to point Codex at, so fall
+  // back to the token-only view rather than emit a broken installer.
+  if (!hookEndpoint) {
+    return layout('Codex device configured', `
+    <section class="stack">
+      <div class="notice success">Device <strong>${escapeHtml(device.name)}</strong> is enrolled for <strong>${escapeHtml(account.alias)}</strong>.</div>
+      <h1>Copy this token now</h1>
+      <p class="muted">This device token is displayed once and cannot be recovered from the control plane. Re-enroll if it is lost.</p>
+      <pre id="codex-token">${escapeHtml(tokenExport)}</pre>
+      <div class="setup-actions">
+        <button type="button" class="secondary" data-copy-target="codex-token">Copy token</button>
+      </div>
+      <div class="notice error">The Codex gateway URL is not configured on this console (<code>CREDENTIAL_CONSOLE_CODEX_GATEWAY_URL</code>), so no client configuration can be generated. Ask an administrator to set it.</div>
+      <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+    </section>
+  `, { openMode, completedDraft: 'codex-gateway-self-service' });
+  }
+
+  const adapterBase64 = Buffer.from(renderCodexConversationHookClientSource(), 'utf8').toString('base64');
+
+  // One script: it writes an isolated CODEX_HOME (so the member's own ~/.codex is
+  // untouched), a mode-600 device token, the conversation-hook client, a
+  // config.toml that both routes turns through the gateway AND enables the
+  // capture hooks, and a launcher that runs Codex with hook trust pre-granted for
+  // this console-managed profile. Symmetric with the Claude launcher.
+  const unix = `#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_ROOT="$HOME/.config/claude-codex-gateway"
+CODEX_HOME_DIR="$CONFIG_ROOT/codex-${profile}-home"
+TOKEN_FILE="$CONFIG_ROOT/codex-${profile}.token"
+ADAPTER_FILE="$CONFIG_ROOT/${CODEX_CONVERSATION_HOOK_CLIENT_FILENAME}"
+LAUNCHER_FILE="$HOME/.local/bin/codex-${profile}"
+DEFAULT_LAUNCHER="$HOME/.local/bin/codex-gateway"
+NODE_BIN="$(command -v node || echo node)"
+
+install -d -m 700 "$CONFIG_ROOT" "$CODEX_HOME_DIR" "$HOME/.local/bin"
+umask 077
+
+printf '%s' ${shellSingleQuote(token)} > "$TOKEN_FILE"
+chmod 600 "$TOKEN_FILE"
+
+"$NODE_BIN" -e 'require("node:fs").writeFileSync(process.argv[1], Buffer.from(process.argv[2], "base64"))' \\
+  "$ADAPTER_FILE" ${shellSingleQuote(adapterBase64)}
+chmod 700 "$ADAPTER_FILE"
+
+cat > "$CODEX_HOME_DIR/config.toml" <<CONFIG
 model_provider = "gateway"
 
 [model_providers.gateway]
 name = "gateway"
 base_url = "${gateway}"
 wire_api = "responses"
-env_key = "${tokenEnvVar}"`;
-  const tokenExport = `export ${tokenEnvVar}=${shellSingleQuote(token)}`;
+env_key = "${tokenEnvVar}"
+
+[features]
+hooks = true
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "$NODE_BIN $ADAPTER_FILE ${hookEndpoint} $TOKEN_FILE"
+timeout = 8
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "$NODE_BIN $ADAPTER_FILE ${hookEndpoint} $TOKEN_FILE"
+timeout = 8
+CONFIG
+chmod 600 "$CODEX_HOME_DIR/config.toml"
+
+cat > "$LAUNCHER_FILE" <<'LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail
+PROFILE_ROOT="$HOME/.config/claude-codex-gateway"
+export CODEX_HOME="$PROFILE_ROOT/codex-${profile}-home"
+export ${tokenEnvVar}="$(cat "$PROFILE_ROOT/codex-${profile}.token")"
+exec codex --dangerously-bypass-hook-trust "$@"
+LAUNCHER
+chmod 700 "$LAUNCHER_FILE"
+ln -sfn "$LAUNCHER_FILE" "$DEFAULT_LAUNCHER"
+
+echo "Codex gateway profile '${profile}' installed. Start Codex with: codex-${profile}"
+`;
+
   return layout('Codex device configured', `
     <section class="stack">
       <div class="notice success">Device <strong>${escapeHtml(device.name)}</strong> is enrolled for <strong>${escapeHtml(account.alias)}</strong>.</div>
@@ -4461,20 +4623,21 @@ env_key = "${tokenEnvVar}"`;
       <div class="setup-actions">
         <button type="button" class="secondary" data-copy-target="codex-token">Copy token</button>
       </div>
-      <h2>2. Point the Codex CLI at the gateway</h2>
-      <pre id="codex-config">${escapeHtml(configToml)}</pre>
+      <h2>2. Install the gateway profile (routes turns and captures conversations)</h2>
+      <p class="muted">macOS and Linux. Writes an isolated <code>CODEX_HOME</code>, leaves your default <code>~/.codex</code> untouched, and installs a <code>codex-${escapeHtml(profile)}</code> launcher. Start Codex with that launcher.</p>
+      <pre id="codex-setup">${escapeHtml(unix)}</pre>
       <div class="setup-actions">
-        <button type="button" data-download-target="codex-config" data-download-name="codex-${escapeHtml(profile)}-config.toml">Download config.toml</button>
-        <button type="button" class="secondary" data-copy-target="codex-config">Copy configuration</button>
+        <button type="button" data-download-target="codex-setup" data-download-name="codex-${escapeHtml(profile)}-setup.sh">Download setup.sh</button>
+        <button type="button" class="secondary" data-copy-target="codex-setup">Copy setup script</button>
       </div>
-      <div class="notice">Turns now go through the console, which meters them per device. Nothing else is proxied, so a device holding no ChatGPT sign-in of its own loses the features that need one — <code>codex cloud</code>, plugin and app listings, and the quota figures in <code>codex /status</code>. Running a turn needs none of them.</div>
-      <div class="notice">On Windows PowerShell the token is set with <code>$env:${escapeHtml(tokenEnvVar)} = '&lt;token&gt;'</code>, not <code>export</code>.</div>
+      <div class="notice">Turns go through the console, which meters them per device and records the prompt and final response as a paired conversation round — the same as Claude. Needs Codex with hooks support (0.153+); the launcher runs Codex with hook trust pre-granted for this managed profile.</div>
+      <div class="notice">Nothing else is proxied, so a device holding no ChatGPT sign-in of its own loses features that need one — <code>codex cloud</code>, plugin and app listings, and the quota figures in <code>codex /status</code>. Running a turn needs none of them.</div>
+      <div class="notice">Windows is not covered by this installer yet. On Windows, set <code>$env:${escapeHtml(tokenEnvVar)}</code> and point Codex at <code>${escapeHtml(gateway)}</code> manually; conversation capture needs the hook block from the script above.</div>
       <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
     </section>
   `, { openMode, completedDraft: 'codex-gateway-self-service' });
 }
-
 export function messageView(title, message, {
   error = false,
   openMode = false,
