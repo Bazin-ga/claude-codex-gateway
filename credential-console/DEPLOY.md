@@ -338,6 +338,42 @@ the existing home. The console has no Codex account picker or multi-domain routi
 second domain separately. Once multiple profiles exist on a client, the profile timer refreshes all
 bound profiles without changing which profile is selected.
 
+## Codex gateway
+
+Everything above provisions the dispenser path: the installer pulls a credential and the client
+then talks to chatgpt.com directly, so the console sees the enrolment and nothing after it. The
+alternative keeps the credential on the server and routes each turn through the console, which is
+what meters Codex per device. It needs no dispenser enrolment, only an authorized Codex account,
+and the console offers it as its own self-service form.
+
+Two deployment steps gate it, and neither has a default. Skipping either leaves a deployment where
+the form still issues a device token and the device cannot use it:
+
+Publish the gateway prefix the same way `/claude` is published, on the same public Funnel port:
+
+```bash
+sudo tailscale funnel --bg --https=10000 --set-path=/codex-api http://127.0.0.1:9080/codex-api
+sudo tailscale funnel status
+```
+
+The `/codex-api` suffix on both sides is intentional, for the same reason it is on `/claude`.
+Behind a reverse proxy of your own, forward `/codex-api` to `127.0.0.1:9080` under the constraints
+in [Do not publish the complete console](#do-not-publish-the-complete-console), with response
+buffering off and no request body limit — a turn streams, and its request carries the whole
+conversation. The trust model is the one `/claude` already has: the device authenticates with its
+own token, the subscription credential is injected server-side and never reaches the client, and
+the console forwards exactly one upstream path, `/responses`.
+
+Then give the console the origin to hand out, and restart it:
+
+```dotenv
+CREDENTIAL_CONSOLE_CODEX_GATEWAY_URL=https://<console-host>.<your-tailnet>.ts.net:10000/codex-api
+```
+
+The value is what the self-service page writes into each device's `config.toml` as `base_url`, so
+it must be the address a member's machine can actually reach. Unset, the page renders an empty
+base URL and the generated profile cannot start.
+
 ## Tailscale
 
 Install Tailscale from its official repository, then join your tailnet with a stable
@@ -763,6 +799,7 @@ trap - EXIT
 ```bash
 curl -fsS https://<console-host>.<your-tailnet>.ts.net/health
 curl -i https://<console-host>.<your-tailnet>.ts.net:10000/claude/v1/models
+curl -i -X POST https://<console-host>.<your-tailnet>.ts.net:10000/codex-api/responses
 curl -k https://<server-public-ip>:8443/health
 sudo tailscale serve status
 sudo tailscale funnel status
@@ -783,7 +820,11 @@ Browser checks:
    Windows installers with the same per-device token;
 7. inspect the Codex installer and confirm it is self-contained and uses the public dispenser;
 8. from a device outside the tailnet, confirm `/claude/v1/models` answers 401 without a
-   device token and the Funnel root is not exposed;
+   device token and the Funnel root is not exposed. Where the Codex gateway is configured,
+   confirm `/codex-api/responses` answers 401 there too, and read that status precisely: 401 is
+   the mount answering and demanding a device token, 404 is the mount missing, which looks
+   identical to the feature not existing. Confirm the docs page shows a Codex gateway base URL
+   rather than an empty one;
 9. optionally generate a Claude enrollment link and redeem it once;
 10. confirm enrollment replay returns HTTP 410;
 11. revoke the device and confirm its next gateway request returns HTTP 401.
