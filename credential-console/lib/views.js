@@ -122,6 +122,11 @@ tr:last-child td { border-bottom: 0; }
    controls down the page and push the machine list below the fold. */
 .machine-filter { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin: 0 0 14px; }
 .machine-filter label { margin-bottom: 0; flex: 1 1 200px; min-width: 0; }
+.machine-search-bar { margin: 0 0 14px; }
+.machine-search-field { display: block; margin: 0; }
+.machine-search-field input[type="search"] { width: 100%; }
+.machine-search-empty { margin: 10px 0 0; }
+article.machine[hidden], .machine-group[hidden] { display: none; }
 .bulk-switch { border: 1px solid var(--amber); background: #fff7e9; border-radius: 12px; padding: 14px; margin: 0 0 14px; }
 .bulk-switch label { margin-bottom: 0; }
 /* The registry sits above the list it explains, so it stays visually quieter
@@ -1295,6 +1300,16 @@ function machineInventory({ machines, codexClients }) {
 
 function machineEntryView(entry, { accounts, csrf, machineOptions, groupNames = [] }) {
   const accountFor = (id) => accounts.find((account) => account.id === id) ?? null;
+  // Everything a person might type to find this machine, flattened and lowercased
+  // for the overview's client-side keyword filter: machine handle, every device /
+  // codex client name, every member label, and every account alias it holds.
+  const searchText = [
+    entry.machine_id,
+    ...(entry.names ?? []),
+    ...(entry.member_labels ?? []),
+    ...entry.devices.map((device) => accountFor(device.account_id)?.alias),
+    ...entry.codex.map((client) => accountFor(client.account_id)?.alias),
+  ].filter(Boolean).join(' ').toLowerCase();
   const rows = [
     ...entry.devices.map((device) => ({
       revoked: Boolean(device.revoked_at),
@@ -1337,7 +1352,7 @@ function machineEntryView(entry, { accounts, csrf, machineOptions, groupNames = 
     ? '<p class="muted tiny" data-i18n="codex-legacy-note">This Codex credential carries no machine handle: it was either enrolled before handles existed, in which case the agent on that machine reports one at its next enrollment, or minted by this console on a machine\'s behalf, in which case it never will — the generated installer runs pull.js, not enroll.js. The console reads the dispenser\'s registry and cannot write a handle into it either way.</p>'
     : '';
 
-  return `<article class="machine" data-machine-key="${escapeHtml(entry.key)}" data-machine-legacy="${entry.legacy}">
+  return `<article class="machine" data-machine-key="${escapeHtml(entry.key)}" data-machine-legacy="${entry.legacy}" data-search="${escapeHtml(searchText)}">
     <div class="machine-head">
       <div>
         <div class="machine-title">${entry.machine_id
@@ -3977,6 +3992,14 @@ export function dashboardView({
               <div class="muted tiny">Applies to whatever matches when you press it, and refuses if that is no longer ${filteredCount}. Rows already on the target, or that cannot move, are reported and left alone.</div>
             </form>` : `<div class="notice"><span>No active credential matches ${filterSummary}.</span></div>`) : ''}
             ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
+            ${liveMachines.length + unattributed.length + retiredMachines.length ? `<div class="machine-search-bar">
+              <label class="machine-search-field"><span data-i18n="machine-search">Search machines</span>
+                <input type="search" data-machine-search autocomplete="off" aria-label="Search machines"
+                  data-placeholder-en="alias · device · member · machine id" data-placeholder-zh="账号 · 设备 · 成员 · 机器 id"
+                  placeholder="alias · device · member · machine id">
+              </label>
+              <p class="empty machine-search-empty" data-machine-search-empty hidden data-i18n="machine-search-empty">No machine matches your search.</p>
+            </div>` : ''}
             <div class="machine-list">${liveMachines.map(entryView).join('')
               || '<p class="empty" data-i18n="no-machines">No machine holds a credential yet.</p>'}</div>
             ${unattributed.length ? `<section class="machine-group" data-unattributed-credentials="${unattributed.length}">
