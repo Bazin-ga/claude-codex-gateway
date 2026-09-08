@@ -222,7 +222,8 @@ name it explicitly. This makes the rollout additive and rollback-safe.
 **Default — the console writes nothing.** Leave both the managed root and
 `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` unset. The
 `auth.json` is rendered once with copy and download buttons, and the page prints the exact seed
-command to run on the refresh centre:
+command to run on the refresh centre. A read-only imported account uses its bound home in that
+command; the default below applies to an unbound account:
 
 ```bash
 sudo -u codex-refresh CODEX_CRED_HOME=/var/lib/codex-credential \

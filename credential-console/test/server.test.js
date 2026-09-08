@@ -1263,7 +1263,17 @@ test('an imported Codex home stays read-only when no writer mode is configured',
   const importedHome = await mkdtemp(join(tmpdir(), 'credential-console-readonly-import-'));
   const sentinel = join(importedHome, 'must-remain-read-only');
   await writeFile(sentinel, 'unchanged\n');
-  const app = await fixture({ adminAuth: 'open' });
+  const tokens = syntheticCodexTokens();
+  const app = await fixture({
+    adminAuth: 'open',
+    codex: {
+      codexOauthExchange: async () => ({
+        idToken: tokens.idToken,
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+      }),
+    },
+  });
   try {
     const account = await app.store.addAccount({
       provider: 'codex',
@@ -1275,6 +1285,7 @@ test('an imported Codex home stays read-only when no writer mode is configured',
     const html = await page.text();
     assert.match(html, /The console writes nothing/);
     assert.equal(html.includes(importedHome), false);
+    assert.equal(html.includes('name="credential_json"'), false);
     const started = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization/start`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1284,7 +1295,123 @@ test('an imported Codex home stays read-only when no writer mode is configured',
     const state = authorizeUrlFrom(await started.text()).searchParams.get('state');
     const flow = app.store.codexAuthorizationByState({ accountId: account.id, state });
     assert.equal(flow.seed_home, null);
+    const completed = await fetch(
+      `${app.baseUrl}/accounts/${account.id}/codex-authorization/complete`,
+      {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          csrf: csrfFrom(html),
+          authorization_code: `http://localhost:1455/auth/callback?code=browser-code&state=${state}`,
+        }),
+      },
+    );
+    assert.equal(completed.status, 200);
+    const completedHtml = await completed.text();
+    assert.match(completedHtml, /data-download-target="codex-auth-json"/);
+    assert.ok(completedHtml.includes(importedHome));
+    assert.equal(completedHtml.includes('/var/lib/codex-credential'), false);
     assert.equal(await readFile(sentinel, 'utf8'), 'unchanged\n');
+  } finally {
+    await app.close();
+  }
+});
+
+test('a Codex flow pinned by an older writer policy cannot seed a read-only import', async () => {
+  const importedHome = await mkdtemp(join(tmpdir(), 'credential-console-stale-writer-policy-'));
+  const sentinel = join(importedHome, 'must-remain-read-only');
+  await writeFile(sentinel, 'unchanged\n');
+  const exchanges = [];
+  const app = await fixture({
+    adminAuth: 'open',
+    codex: {
+      codexOauthExchange: async (request) => {
+        exchanges.push(request);
+        throw new Error('the exchange must never be reached');
+      },
+    },
+  });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-stale-writer-policy',
+      external: { kind: 'codex-credential', home: importedHome },
+    });
+    const page = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization`);
+    const cookie = cookieFrom(page);
+    const csrf = csrfFrom(await page.text());
+    const started = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization/start`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf }),
+    });
+    const state = authorizeUrlFrom(await started.text()).searchParams.get('state');
+
+    // 7050762 trusted every external binding as writable and could persist this
+    // target before the process was upgraded to the stricter writer policy.
+    const persistedFlow = app.store.state.oauth_flows.find((entry) => entry.account_id === account.id);
+    persistedFlow.seed_home = importedHome;
+
+    const completed = await fetch(
+      `${app.baseUrl}/accounts/${account.id}/codex-authorization/complete`,
+      {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          csrf,
+          authorization_code: `http://localhost:1455/auth/callback?code=stale-code&state=${state}`,
+        }),
+      },
+    );
+    assert.equal(completed.status, 400);
+    assert.match(await completed.text(), /destination is no longer permitted; start a fresh authorization/);
+    assert.deepEqual(exchanges, []);
+    assert.equal(await readFile(sentinel, 'utf8'), 'unchanged\n');
+    await assert.rejects(readFile(join(importedHome, 'secret', 'credential.json')), { code: 'ENOENT' });
+  } finally {
+    await app.close();
+  }
+});
+
+test('an unpinned Codex flow from an older process must be restarted before exchange', async () => {
+  const exchanges = [];
+  const app = await fixture({
+    adminAuth: 'open',
+    codex: {
+      codexOauthExchange: async (request) => {
+        exchanges.push(request);
+        throw new Error('the exchange must never be reached');
+      },
+    },
+  });
+  try {
+    const account = await app.store.addAccount({ provider: 'codex', alias: 'codex-unpinned-flow' });
+    const page = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization`);
+    const cookie = cookieFrom(page);
+    const csrf = csrfFrom(await page.text());
+    const started = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization/start`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf }),
+    });
+    const state = authorizeUrlFrom(await started.text()).searchParams.get('state');
+    const persistedFlow = app.store.state.oauth_flows.find((entry) => entry.account_id === account.id);
+    delete persistedFlow.seed_home;
+
+    const completed = await fetch(
+      `${app.baseUrl}/accounts/${account.id}/codex-authorization/complete`,
+      {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          csrf,
+          authorization_code: `http://localhost:1455/auth/callback?code=old-code&state=${state}`,
+        }),
+      },
+    );
+    assert.equal(completed.status, 400);
+    assert.match(await completed.text(), /session predates the current credential policy/);
+    assert.deepEqual(exchanges, []);
   } finally {
     await app.close();
   }

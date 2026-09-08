@@ -623,6 +623,12 @@ export async function createCredentialConsole(options = {}) {
     managedRoot: codexManagedRoot,
     legacySeedHome: legacyCodexSeedHome,
   });
+  const codexHandoffHomeFor = (account, attemptedHome = null) => resolvePath(
+    attemptedHome
+      ?? account?.external?.home
+      ?? legacyCodexSeedHome
+      ?? '/var/lib/codex-credential',
+  );
   const codexManagedRefresher = options.codexManagedRefresher === false
     ? null
     : (options.codexManagedRefresher ?? new CodexManagedDomainRefresher({
@@ -2188,11 +2194,21 @@ export async function createCredentialConsole(options = {}) {
         const flow = submitted.state
           ? store.codexAuthorizationByState({ accountId: account.id, state: submitted.state })
           : store.liveCodexAuthorization({ accountId: account.id });
-        // New sessions pin their destination. The fallback is only for a flow
-        // started by an older process immediately before a rolling upgrade.
-        const targetSeedHome = Object.hasOwn(flow, 'seed_home')
-          ? flow.seed_home
-          : codexSeedHomeFor(account);
+        // A destination is part of the authorization session's security
+        // boundary. Unpinned sessions predate that boundary and a pinned writer
+        // target must still be explicitly allowed by the current process before
+        // a single-use authorization code is exchanged.
+        if (!Object.hasOwn(flow, 'seed_home')) {
+          throw new Error('authorization session predates the current credential policy; start a fresh authorization');
+        }
+        const targetSeedHome = flow.seed_home ? resolvePath(flow.seed_home) : null;
+        const currentlyAllowedSeedHome = codexSeedHomeFor(account);
+        if (targetSeedHome && (
+          !currentlyAllowedSeedHome
+          || targetSeedHome !== resolvePath(currentlyAllowedSeedHome)
+        )) {
+          throw new Error('authorization destination is no longer permitted; start a fresh authorization');
+        }
         if (flow.initiated_by !== identity) {
           throw new Error('authorization must be completed by the same administrator who started it');
         }
@@ -2247,6 +2263,7 @@ export async function createCredentialConsole(options = {}) {
             : codexCredentialView({
               account,
               authJson: `${JSON.stringify(credential, null, 2)}\n`,
+              seedHome: codexHandoffHomeFor(account, targetSeedHome),
               error: `Nothing was written to ${targetSeedHome}: ${seedFailure.message}`,
               openMode,
             }));
@@ -2275,6 +2292,7 @@ export async function createCredentialConsole(options = {}) {
           sendHtml(res, 200, codexCredentialView({
             account,
             authJson: `${JSON.stringify(credential, null, 2)}\n`,
+            seedHome: codexHandoffHomeFor(account),
             openMode,
           }));
         }

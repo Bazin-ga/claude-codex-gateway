@@ -175,8 +175,11 @@ Codex home.
 
 **Both managed root and single seed home unset (default).** The console writes nothing. The
 finished `auth.json` is rendered once, with copy and download buttons and the exact `seed.js`
-command to run on the refresh centre. Leaving the page hides it permanently; there is no second
-render. This keeps the console's relationship with every `codex-credential` home read-only.
+command to run on the refresh centre. For a read-only imported account, that command names the
+account's bound home rather than the historical default, and the direct-paste form is hidden because
+the console has no write authority there. Leaving the page hides the credential permanently; there
+is no second render. This keeps the console's relationship with every `codex-credential` home
+read-only.
 
 **Legacy `CREDENTIAL_CONSOLE_CODEX_SEED_HOME=/var/lib/codex-credential`.** On completion the console
 writes the credential into that home itself, reusing the refresh centre's own `CredentialStore`
