@@ -1056,6 +1056,41 @@ test('a Codex device refuses an unbound or expired target without changing its s
   assert.equal(store.resolveDeviceAccount(issued.device.id).effective_account_id, first.id);
 });
 
+test('a managed refresh expiry is persisted without touching any provider credential', async () => {
+  const { home, store } = await newStore();
+  const codex = await store.addAccount({
+    provider: 'codex',
+    alias: 'codex-expiry-sync',
+    external: { kind: 'codex-credential', home: '/managed/codex-expiry-sync' },
+    expiresAt: '2026-09-09T00:00:00.000Z',
+  });
+  const claude = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-expiry-untouched',
+    credential: { oauth_token: 'claude-expiry-secret' },
+  });
+
+  assert.equal(await store.updateExternalAccountExpiry(
+    codex.id,
+    '2026-09-18T00:00:00.000Z',
+  ), true);
+  assert.equal(await store.updateExternalAccountExpiry(
+    codex.id,
+    '2026-09-18T00:00:00.000Z',
+  ), false);
+  const reopened = await new CredentialStore(home).init();
+  assert.equal(reopened.accountById(codex.id).expires_at, '2026-09-18T00:00:00.000Z');
+  assert.deepEqual(reopened.accountCredential(claude.id), { oauth_token: 'claude-expiry-secret' });
+  await assert.rejects(
+    store.updateExternalAccountExpiry(claude.id, '2026-09-18T00:00:00.000Z'),
+    /Codex external account was not found/,
+  );
+  await assert.rejects(
+    store.updateExternalAccountExpiry(codex.id, 'not-a-date'),
+    /expiry is invalid/,
+  );
+});
+
 test('legacy rows fallback only when both policy fields are absent and are not rewritten', async () => {
   const { home, store } = await newStore();
   const account = await store.addAccount({

@@ -216,7 +216,8 @@ credential until it nears expiry.
 
 Existing bound accounts always keep their current home and refresh service. In particular, enabling
 this setting does not read, write, move, or refresh `/var/lib/codex-credential` when that home is already
-bound to `codex-shared-1`. This makes the rollout additive and rollback-safe.
+bound to `codex-shared-1`; reauthorizing that legacy home requires the single-home writer setting to
+name it explicitly. This makes the rollout additive and rollback-safe.
 
 **Default — the console writes nothing.** Leave both the managed root and
 `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` unset. The

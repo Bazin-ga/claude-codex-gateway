@@ -163,8 +163,10 @@ for multi-account gateway use).** Every new account receives the stable home
 `<root>/<account-id>`. The authorization flow pins that exact destination before OpenAI is opened,
 the console seeds it atomically, and a six-hour in-process scheduler runs the existing refresh
 centre once per managed home. Existing imported/bound accounts always keep their original home and
-their existing timer; enabling this setting never moves or refreshes them. A newly authorized
-account therefore appears in the Codex gateway selector without creating a bespoke service.
+their existing timer; enabling this setting never moves or refreshes them. A bound home outside the
+managed root stays read-only unless the legacy single-home writer setting explicitly names that exact
+path. A newly authorized account therefore appears in the Codex gateway selector without creating a
+bespoke service.
 
 This mode intentionally keeps managed refresh tokens inside the console's existing mode-700 state
 tree. A console compromise can reach every managed Codex refresh token, so use it only when the
@@ -665,7 +667,7 @@ retain an emergency service-stop and provider-token revocation procedure.
 | `CREDENTIAL_CONSOLE_CODEX_CERT_PIN` | — | SHA-256 pin for the dispenser TLS certificate |
 | `CREDENTIAL_CONSOLE_CODEX_ENROLLMENT_KEY_FILE` | — | Mode-640 file containing the dispenser's mint-only enrollment key |
 | `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` | — | `codex-credential` home a completed Codex authorization writes into. Unset means show the `auth.json` once instead; setting it makes the console a **writer** of that home |
-| `CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT` | — | Root for isolated, automatically refreshed homes of newly authorized Codex gateway accounts. Existing account bindings take precedence |
+| `CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT` | — | Root for isolated, automatically refreshed homes of newly authorized Codex gateway accounts. Existing imports outside the root remain read-only |
 | `CREDENTIAL_CONSOLE_CODEX_MANAGED_REFRESH_INTERVAL_SECONDS` | `21600` | Interval for checking every console-managed Codex home; the refresh centre itself skips credentials that are not near expiry |
 | `CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS` | `3600000` | Provider quota refresh interval (minimum 60 seconds) |
 

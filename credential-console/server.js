@@ -90,7 +90,8 @@ const CODEX_ENROLLMENT_KEY_FILE = process.env.CREDENTIAL_CONSOLE_CODEX_ENROLLMEN
 // codex-credential home. See README "Codex account authorization".
 const CODEX_SEED_HOME = process.env.CREDENTIAL_CONSOLE_CODEX_SEED_HOME;
 // New web-authorized accounts receive one isolated home below this root. An
-// existing account binding always wins, so enabling it never moves legacy data.
+// existing binding never moves and stays read-only unless an explicit writer
+// mode covers that exact path.
 const CODEX_MANAGED_ROOT = process.env.CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT;
 const CODEX_MANAGED_REFRESH_INTERVAL_MS = Number(
   process.env.CREDENTIAL_CONSOLE_CODEX_MANAGED_REFRESH_INTERVAL_SECONDS ?? 6 * 60 * 60,
@@ -629,6 +630,9 @@ export async function createCredentialConsole(options = {}) {
       managedRoot: codexManagedRoot,
       intervalMs: options.codexManagedRefreshIntervalMs
         ?? CODEX_MANAGED_REFRESH_INTERVAL_MS,
+      recordExpiry: (accountId, expiresAt) => (
+        store.updateExternalAccountExpiry(accountId, expiresAt)
+      ),
       log,
     }));
   codexManagedRefresher?.start?.();

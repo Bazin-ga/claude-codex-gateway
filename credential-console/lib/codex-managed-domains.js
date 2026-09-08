@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -40,10 +41,11 @@ export function validateManagedCodexRoot(managedRoot, consoleHome) {
 /**
  * Pick the one credential home an account may write.
  *
- * An existing binding always wins, so enabling managed accounts cannot move or
- * overwrite a credential that is already live. New accounts use a stable path
- * below the managed root. The historical single-home setting remains the final
- * fallback for deployments that have not opted into managed accounts.
+ * An existing binding is writable only when an explicit writer mode covers its
+ * exact path, so a read-only import cannot silently become writable. New
+ * accounts use a stable path below the managed root. The historical single-home
+ * setting remains the final fallback for deployments that have not opted into
+ * managed accounts.
  */
 export function codexSeedHomeForAccount(account, {
   managedRoot = null,
@@ -51,7 +53,15 @@ export function codexSeedHomeForAccount(account, {
 } = {}) {
   if (!account || account.provider !== 'codex') return null;
   if (account.external?.kind === 'codex-credential' && account.external.home) {
-    return canonical(account.external.home);
+    const bound = canonical(account.external.home);
+    const managed = managedRoot && bound === managedHome(managedRoot, account.id);
+    const legacy = legacySeedHome && bound === canonical(legacySeedHome);
+    // An imported home is read-only unless an explicit writer mode covers that
+    // exact path. Merely having an external pointer must never grant write
+    // authority or turn a manual auth.json handoff into an in-place seed.
+    if (managed || legacy) return bound;
+    if (!managedRoot && legacySeedHome) return canonical(legacySeedHome);
+    return null;
   }
   return managedHome(managedRoot, account.id) ?? canonical(legacySeedHome);
 }
@@ -71,6 +81,12 @@ export async function refreshManagedCodexHome(home, {
     timeout: 5 * 60_000,
     maxBuffer: 1024 * 1024,
   });
+  const current = JSON.parse(await readFile(join(home, 'public', 'current.json'), 'utf8'));
+  const expiresAtMs = Date.parse(String(current?.expires_at ?? ''));
+  if (!Number.isFinite(expiresAtMs)) {
+    throw new Error('managed Codex refresh produced no valid published expiry');
+  }
+  return { expiresAt: new Date(expiresAtMs).toISOString() };
 }
 
 /**
@@ -84,6 +100,7 @@ export class CodexManagedDomainRefresher {
     managedRoot,
     intervalMs = DEFAULT_REFRESH_INTERVAL_MS,
     refreshHome = refreshManagedCodexHome,
+    recordExpiry = async () => {},
     log = () => {},
   }) {
     if (typeof accounts !== 'function') throw new Error('managed Codex accounts reader is required');
@@ -93,6 +110,7 @@ export class CodexManagedDomainRefresher {
       ? intervalMs
       : DEFAULT_REFRESH_INTERVAL_MS;
     this.refreshHome = refreshHome;
+    this.recordExpiry = recordExpiry;
     this.log = log;
     this.timer = null;
     this.startupTimer = null;
@@ -140,7 +158,8 @@ export class CodexManagedDomainRefresher {
     for (const account of Array.isArray(accounts) ? accounts : []) {
       if (!isManagedCodexHome(account, this.managedRoot)) continue;
       try {
-        await this.refreshHome(canonical(account.external.home), account);
+        const result = await this.refreshHome(canonical(account.external.home), account);
+        if (result?.expiresAt) await this.recordExpiry(account.id, result.expiresAt);
         refreshed.push(account.id);
         this.log('codex_managed_refresh_completed', { account_id: account.id });
       } catch (error) {

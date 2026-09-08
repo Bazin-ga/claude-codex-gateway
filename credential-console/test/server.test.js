@@ -1227,12 +1227,11 @@ test('an unwritable seed home is refused before an authorization is spent on it'
   }
 });
 
-test('a bound Codex account reauthorizes its own home instead of the legacy seed home', async () => {
-  const seedHome = await mkdtemp(join(tmpdir(), 'credential-console-seed-elsewhere-'));
+test('a bound Codex account reauthorizes the explicitly configured writer home', async () => {
   const otherHome = await mkdtemp(join(tmpdir(), 'credential-console-other-home-'));
   const app = await fixture({
     adminAuth: 'open',
-    codex: { codexSeedHome: seedHome },
+    codex: { codexSeedHome: otherHome },
   });
   try {
     const account = await app.store.addAccount({
@@ -1252,10 +1251,40 @@ test('a bound Codex account reauthorizes its own home instead of the legacy seed
     assert.equal(started.status, 200);
     const startedHtml = await started.text();
     assert.ok(startedHtml.includes(otherHome));
-    assert.equal(startedHtml.includes(seedHome), false);
     const state = authorizeUrlFrom(startedHtml).searchParams.get('state');
     const flow = app.store.codexAuthorizationByState({ accountId: account.id, state });
     assert.equal(flow.seed_home, otherHome);
+  } finally {
+    await app.close();
+  }
+});
+
+test('an imported Codex home stays read-only when no writer mode is configured', async () => {
+  const importedHome = await mkdtemp(join(tmpdir(), 'credential-console-readonly-import-'));
+  const sentinel = join(importedHome, 'must-remain-read-only');
+  await writeFile(sentinel, 'unchanged\n');
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-readonly-import',
+      external: { kind: 'codex-credential', home: importedHome },
+    });
+    const page = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization`);
+    const cookie = cookieFrom(page);
+    const html = await page.text();
+    assert.match(html, /The console writes nothing/);
+    assert.equal(html.includes(importedHome), false);
+    const started = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization/start`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf: csrfFrom(html) }),
+    });
+    assert.equal(started.status, 200);
+    const state = authorizeUrlFrom(await started.text()).searchParams.get('state');
+    const flow = app.store.codexAuthorizationByState({ accountId: account.id, state });
+    assert.equal(flow.seed_home, null);
+    assert.equal(await readFile(sentinel, 'utf8'), 'unchanged\n');
   } finally {
     await app.close();
   }

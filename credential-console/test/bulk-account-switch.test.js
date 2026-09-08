@@ -298,6 +298,28 @@ test('the dashboard offers Codex accounts on a Codex gateway device switch', asy
   assert.equal(bulk.includes('claude'), false);
 });
 
+test('an unavailable current Codex account keeps a visible recovery switch', async () => {
+  const store = await newStore();
+  const expired = await codexAccount(store, 'codex-expired-current');
+  const healthy = await codexAccount(store, 'codex-healthy-target');
+  const row = await device(store, expired.id, 'codex-recovery-device');
+  store.accountById(expired.id).expires_at = '2020-01-01T00:00:00.000Z';
+  const html = render(store, { accountFilter: expired.id });
+  const marker = `data-device-row="${row.id}"`;
+  const start = html.indexOf(marker);
+  const deviceHtml = html.slice(start, html.indexOf('</tr>', start));
+
+  assert.match(deviceHtml, /data-account-switch/);
+  assert.match(deviceHtml, new RegExp(`value='${expired.id}'[^>]* selected`));
+  assert.ok(deviceHtml.includes(healthy.id));
+  const bulkStart = html.indexOf('action="/devices/account"');
+  assert.notEqual(bulkStart, -1);
+  const bulk = html.slice(bulkStart, html.indexOf('</form>', bulkStart));
+  assert.ok(bulk.includes(healthy.id));
+  const destinations = bulk.match(/<select name="selected_account_id"[^>]*>([\s\S]*?)<\/select>/)?.[1] ?? '';
+  assert.equal(destinations.includes(expired.id), false);
+});
+
 test('a filter that matches nothing says so instead of showing an empty form', async () => {
   const { store, to } = await fixture();
   const html = render(store, { accountFilter: to.id });
@@ -424,7 +446,7 @@ test('no switch form is offered when there is nowhere to switch to', async () =>
   });
 
   const html = render(store);
-  assert.match(html, /Only one Claude account is registered/);
+  assert.match(html, /No other usable Claude account is available/);
   assert.equal(
     html.includes('action="/devices/'),
     true,
@@ -438,7 +460,7 @@ test('the switch form returns as soon as there is a second account', async () =>
   const { store } = await fixture();
   const html = render(store);
   assert.ok((html.match(/data-account-switch\b/g) ?? []).length > 0);
-  assert.equal(html.includes('Only one Claude account is registered'), false);
+  assert.equal(html.includes('No other usable Claude account is available'), false);
 });
 
 async function machineGroupFixture() {

@@ -19,15 +19,26 @@ function account(id, extra = {}) {
   return { id, provider: 'codex', alias: id, ...extra };
 }
 
-test('a bound Codex account keeps its existing home when managed accounts are enabled', () => {
+test('a bound Codex account keeps its existing home only when explicit writer mode covers it', () => {
   const existing = account('codex-existing', {
     external: { kind: 'codex-credential', home: '/var/lib/codex-credential' },
   });
   assert.equal(codexSeedHomeForAccount(existing, {
     managedRoot: root,
-    legacySeedHome: '/legacy/ignored',
+    legacySeedHome: '/var/lib/codex-credential',
   }), '/var/lib/codex-credential');
   assert.equal(isManagedCodexHome(existing, root), false);
+});
+
+test('an imported home stays read-only when no explicit writer mode covers it', () => {
+  const imported = account('codex-imported', {
+    external: { kind: 'codex-credential', home: '/var/lib/imported-codex' },
+  });
+  assert.equal(codexSeedHomeForAccount(imported), null);
+  assert.equal(codexSeedHomeForAccount(imported, { managedRoot: root }), null);
+  assert.equal(codexSeedHomeForAccount(imported, {
+    legacySeedHome: '/var/lib/different-home',
+  }), '/var/lib/different-home');
 });
 
 test('each new Codex account receives a stable distinct managed home', () => {
@@ -89,6 +100,7 @@ test('the managed refresher never touches legacy, imported, Claude, or unbound a
     accounts: () => accounts,
     managedRoot: root,
     refreshHome: async (home, selected) => calls.push([home, selected.id]),
+    recordExpiry: async () => { throw new Error('no expiry returned, so this must not run'); },
     log: (event, detail) => logs.push([event, detail]),
   });
 
@@ -112,6 +124,22 @@ test('one managed refresh failure does not stop the remaining accounts', async (
   assert.deepEqual(await refresher.runNow(), { refreshed: ['second'], failed: ['first'] });
 });
 
+test('the managed refresher persists each refreshed published expiry', async () => {
+  const managed = account('expiry', {
+    external: { kind: 'codex-credential', home: join(root, 'expiry') },
+  });
+  const recorded = [];
+  const refresher = new CodexManagedDomainRefresher({
+    accounts: () => [managed],
+    managedRoot: root,
+    refreshHome: async () => ({ expiresAt: '2030-01-02T03:04:05.000Z' }),
+    recordExpiry: async (id, expiresAt) => recorded.push([id, expiresAt]),
+  });
+
+  assert.deepEqual(await refresher.runNow(), { refreshed: ['expiry'], failed: [] });
+  assert.deepEqual(recorded, [['expiry', '2030-01-02T03:04:05.000Z']]);
+});
+
 test('the managed refresher runs the real expiry-aware refresh entrypoint', async () => {
   const home = await mkdtemp(join(tmpdir(), 'codex-managed-refresh-'));
   const tokens = syntheticCodexTokens({ lifetimeSeconds: 10 * 24 * 60 * 60 });
@@ -128,9 +156,10 @@ test('the managed refresher runs the real expiry-aware refresh entrypoint', asyn
   const credentialPath = join(home, 'secret', 'credential.json');
   const before = await readFile(credentialPath);
 
-  await refreshManagedCodexHome(home);
+  const refreshed = await refreshManagedCodexHome(home);
 
   assert.deepEqual(await readFile(credentialPath), before, 'a fresh token must not rotate');
+  assert.equal(refreshed.expiresAt, tokens.expiresAt);
   const health = JSON.parse(await readFile(join(home, 'public', 'health.json'), 'utf8'));
   assert.equal(health.last_outcome, 'fresh');
 });

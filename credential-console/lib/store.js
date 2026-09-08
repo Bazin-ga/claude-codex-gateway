@@ -885,6 +885,23 @@ export class CredentialStore {
     });
   }
 
+  async updateExternalAccountExpiry(id, expiresAt) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account || account.provider !== 'codex'
+        || account.external?.kind !== 'codex-credential') {
+        throw new Error('Codex external account was not found');
+      }
+      const parsed = Date.parse(String(expiresAt ?? ''));
+      if (!Number.isFinite(parsed)) throw new Error('Codex external account expiry is invalid');
+      const normalized = new Date(parsed).toISOString();
+      if (account.expires_at === normalized) return false;
+      account.expires_at = normalized;
+      await this.persist();
+      return true;
+    });
+  }
+
   async updateAccountEmailLabel(id, emailLabel) {
     return this.serialized(async () => {
       const account = this.accountById(id);

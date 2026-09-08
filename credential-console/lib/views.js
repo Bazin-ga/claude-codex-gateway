@@ -1116,23 +1116,29 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   }
   const deviceProvider = accountForId(accounts, selection.selectedAccountId ?? selection.originalAccountId)
     ?.provider ?? 'claude';
-  const candidates = accounts.filter((account) => (
+  const providerAccounts = accounts.filter((account) => account.provider === deviceProvider);
+  const destinations = providerAccounts.filter((account) => (
     account.provider === deviceProvider
     && accountCanReceiveDevice(account)
   ));
-  if (candidates.length === 0) {
+  if (providerAccounts.length === 0) {
     return `<div class="muted tiny">No ${escapeHtml(
       deviceProvider === 'codex' ? 'Codex' : 'Claude',
     )} accounts are registered.</div>`;
   }
-  if (candidates.length === 1) {
-    // The only account it could switch to is the one it is on. Rendering the
-    // form anyway offers a button whose whole effect is nothing — and the store
-    // refuses a same-account switch, so pressing it would look like a failure.
-    return `<div class="muted tiny">${escapeHtml(
-      deviceProvider === 'codex' ? 'Only one Codex account is registered.' : 'Only one Claude account is registered.',
-    )}</div>`;
+  const alternatives = destinations.filter((account) => account.id !== selection.selectedAccountId);
+  if (alternatives.length === 0) {
+    return `<div class="muted tiny">No other usable ${escapeHtml(
+      deviceProvider === 'codex' ? 'Codex' : 'Claude',
+    )} account is available.</div>`;
   }
+  // Keep an unavailable current account visible as the selected option while
+  // offering only usable destinations. Removing it makes a recovery switch
+  // look like an unexplained preselection of the healthy account.
+  const current = accountForId(providerAccounts, selection.selectedAccountId);
+  const candidates = [current, ...destinations]
+    .filter(Boolean)
+    .filter((account, index, list) => list.findIndex((entry) => entry.id === account.id) === index);
   const options = accountSelectionOptions(candidates, selection.selectedAccountId, deviceProvider);
   return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/account" class="stack account-switch-form" data-account-switch data-device-id="${escapeHtml(device.id)}">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
@@ -3753,10 +3759,9 @@ export function dashboardView({
   // Filtering is judged on the *device* rows, not the machine: one machine can
   // hold Claude credentials on several accounts, so a machine is shown when any
   // of its rows matches, and the count below counts rows rather than machines.
-  const switchableAccounts = accounts.filter((account) => (
-    accountCanReceiveDevice(account)
-  ));
-  const filterAccount = switchableAccounts.find((account) => account.id === accountFilter) ?? null;
+  const filterAccounts = accounts.filter((account) => ['claude', 'codex'].includes(account.provider));
+  const destinationAccounts = filterAccounts.filter(accountCanReceiveDevice);
+  const filterAccount = filterAccounts.find((account) => account.id === accountFilter) ?? null;
   const memberLabels = [...new Set(devices
     .filter((device) => !device.revoked_at && device.member_label)
     .map((device) => device.member_label))].sort((a, b) => a.localeCompare(b));
@@ -3782,6 +3787,10 @@ export function dashboardView({
     filterAccount ? `on <strong>${escapeHtml(filterAccount.alias)}</strong>` : null,
     filterMember ? `for <strong>${escapeHtml(filterMember)}</strong>` : null,
   ].filter(Boolean).join(' ');
+  const bulkTargetAccounts = destinationAccounts.filter((account) => (
+    account.id !== filterAccount?.id
+    && (!filterAccount || account.provider === filterAccount.provider)
+  ));
 
   const liveMachines = inventory.filter((entry) => entry.active > 0 && !entry.legacy && matchesFilter(entry));
   // Kept in a group of their own rather than mixed in among machines: an issuance
@@ -3961,11 +3970,11 @@ export function dashboardView({
               </li>`).join('')}</ul>` : '<p class="muted tiny">No groups yet.</p>'}
             </details>
             ${openMode ? '<div class="notice error open-banner" role="status" data-i18n="open-account-switch-warning">Open mode has no verified actor: anyone who can reach this console can switch any active device. The actor is recorded as anonymous; a member label is not an actor.</div>' : ''}
-            ${switchableAccounts.length ? `<form method="get" action="/" class="machine-filter">
+            ${filterAccounts.length ? `<form method="get" action="/" class="machine-filter">
               <label><span>Provider account</span>
                 <select name="account">
                   <option value="">All accounts</option>
-                  ${switchableAccounts.map((account) => (
+                  ${filterAccounts.map((account) => (
                     `<option value="${escapeHtml(account.id)}"${account.id === filterAccount?.id ? ' selected' : ''}>${escapeHtml(account.alias)}</option>`
                   )).join('')}
                 </select>
@@ -3988,7 +3997,7 @@ export function dashboardView({
               </label>
               <noscript><button type="submit">Apply</button></noscript>
             </form>` : ''}
-            ${anyFilter ? (filteredCount ? `<form method="post" action="/devices/account" class="bulk-switch stack">
+            ${anyFilter ? (filteredCount && bulkTargetAccounts.length ? `<form method="post" action="/devices/account" class="bulk-switch stack">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <input type="hidden" name="from_account_id" value="${escapeHtml(filterAccount?.id ?? '')}">
               <input type="hidden" name="member_label" value="${escapeHtml(filterMember ?? '')}">
@@ -3997,17 +4006,16 @@ export function dashboardView({
               <div><strong>${filteredCount}</strong> active credential(s) ${filterSummary}.</div>
               <label><span>Move all of them to</span>
                 <select name="selected_account_id" required>
-                  ${switchableAccounts.filter((account) => (
-                    account.id !== filterAccount?.id
-                    && (!filterAccount || account.provider === filterAccount.provider)
-                  )).map((account) => (
+                  ${bulkTargetAccounts.map((account) => (
                     `<option value="${escapeHtml(account.id)}">${escapeHtml(accountDisplayLabel(account))}</option>`
                   )).join('')}
                 </select>
               </label>
               <button type="submit" class="danger">Switch all ${filteredCount}</button>
               <div class="muted tiny">Applies to whatever matches when you press it, and refuses if that is no longer ${filteredCount}. Rows already on the target, or that cannot move, are reported and left alone.</div>
-            </form>` : `<div class="notice"><span>No active credential matches ${filterSummary}.</span></div>`) : ''}
+            </form>` : `<div class="notice"><span>${filteredCount
+    ? `No other usable provider account is available for ${filterSummary}.`
+    : `No active credential matches ${filterSummary}.`}</span></div>`) : ''}
             ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
             ${liveMachines.length + unattributed.length + retiredMachines.length ? `<div class="machine-search-bar">
               <label class="machine-search-field"><span data-i18n="machine-search">Search machines</span>
