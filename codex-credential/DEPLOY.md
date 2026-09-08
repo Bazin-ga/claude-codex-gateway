@@ -24,8 +24,10 @@ sudo useradd --system --home /var/lib/codex-credential --gid codex-credential \
 sudo install -d -o codex-refresh -g codex-credential -m 0750 /var/lib/codex-credential
 sudo install -d -o codex-refresh -g codex-credential -m 0700 /var/lib/codex-credential/secret
 sudo install -d -o codex-refresh -g codex-credential -m 0750 /var/lib/codex-credential/public
+sudo install -d -o codex-dispenser -g codex-credential -m 0750 \
+  /var/lib/codex-credential/clients
 sudo install -d -o codex-dispenser -g codex-credential -m 0700 \
-  /var/lib/codex-credential/{clients,tls}
+  /var/lib/codex-credential/tls
 sudo git clone https://github.com/Bazin-ga/claude-codex-gateway /opt/claude-codex-gateway
 export CODEX_CRED_HOME=/var/lib/codex-credential
 cd /opt/claude-codex-gateway/codex-credential
@@ -119,6 +121,9 @@ The refresh center and dispenser deliberately use different Unix users. Only
 access-token file but cannot traverse the refresh-token directory. The shipped dispenser unit
 adds `InaccessiblePaths=/var/lib/codex-credential/secret` and mounts the rest of the data
 directory read-only apart from `clients/`, which enrollment must write.
+The registry directory is group-traversable and `clients.json` is group-readable so the credential
+console can inventory machines; it contains token digests, never bearer tokens. TLS material and
+the enrollment-key digest remain mode-600 inside the dispenser-owned tree.
 
 Confirm that the manual service run above reached the configured alert receiver
 before relying on the timer. Without a working receiver, a broken refresh chain

@@ -47,7 +47,10 @@ sudo install -d -o root -g root -m 0755 /var/www/letsencrypt
 
 If importing a Codex credential home on the same host, grant read-only access to its public
 credential metadata **and to `clients/`** through the systemd unit's
-`SupplementaryGroups=codex-credential`. The shipped unit lists both under `ReadOnlyPaths=`.
+`SupplementaryGroups=codex-credential`. The shipped unit lists both under `ReadOnlyPaths=`. Current
+dispenser releases keep `clients/` at mode 0750 and `clients.json` at mode 0640, and repair older
+0700/0600 registries when the dispenser starts; restart the dispenser once when upgrading such an
+installation.
 
 `clients/clients.json` is the dispenser's machine registry, and it is the only record that a Codex
 machine exists — those machines enrol against the dispenser and never contact the console. Without

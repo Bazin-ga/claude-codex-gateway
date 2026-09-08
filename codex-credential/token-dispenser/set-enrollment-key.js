@@ -47,7 +47,7 @@ async function load() {
 }
 
 async function save(record) {
-  await mkdir(join(HOME, 'clients'), { recursive: true, mode: 0o700 });
+  await mkdir(join(HOME, 'clients'), { recursive: true, mode: 0o750 });
   await writeFileAtomic(ENROLLMENT_PATH, `${JSON.stringify(record, null, 2)}\n`);
 }
 

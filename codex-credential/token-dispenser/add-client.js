@@ -13,12 +13,14 @@
  */
 
 import { randomBytes, createHash } from 'node:crypto';
-import { mkdir, readFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { writeFileAtomic } from '../refresh-center/lib/credential-store.js';
 
 const HOME = process.env.CODEX_CRED_HOME ?? '/var/lib/codex-credential';
 const CLIENTS_PATH = join(HOME, 'clients', 'clients.json');
+const CLIENTS_DIRECTORY_MODE = 0o750;
+const CLIENTS_FILE_MODE = 0o640;
 
 async function load() {
   try {
@@ -30,8 +32,10 @@ async function load() {
 }
 
 async function save(db) {
-  await mkdir(join(HOME, 'clients'), { recursive: true, mode: 0o700 });
-  await writeFileAtomic(CLIENTS_PATH, `${JSON.stringify(db, null, 2)}\n`);
+  const directory = join(HOME, 'clients');
+  await mkdir(directory, { recursive: true, mode: CLIENTS_DIRECTORY_MODE });
+  await chmod(directory, CLIENTS_DIRECTORY_MODE);
+  await writeFileAtomic(CLIENTS_PATH, `${JSON.stringify(db, null, 2)}\n`, CLIENTS_FILE_MODE);
 }
 
 async function main() {

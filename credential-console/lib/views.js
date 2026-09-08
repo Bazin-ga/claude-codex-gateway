@@ -4149,7 +4149,7 @@ export function codexAuthorizationView({
             <button type="submit" data-i18n="codex-paste-submit">Store this credential</button>
           </form>
           <div class="notice error" data-i18n="codex-paste-warning">Paste the auth.json from the login itself, not one taken off a client machine — a distributed copy carries a deliberately invalid refresh_token and would leave the refresh centre unable to renew anything. Clear the clipboard afterwards.</div>
-        ` : '<div class="notice" data-i18n="codex-paste-readonly">This account is a read-only import. Use the one-time auth.json handoff after authorization; this console cannot paste a credential into its home.</div>'}
+        ` : '<div class="notice" data-i18n="codex-paste-readonly">This console has no write authority for this account. Use the one-time auth.json handoff after authorization; a credential cannot be pasted here.</div>'}
         <div class="notice" data-i18n="codex-auth-security">The authorization session is single-use, expires in 15 minutes, and is replaced when a new one starts. A pasted address is checked against the state this console issued; a bare code carries no state and relies on PKCE and there being exactly one live session. The PKCE verifier is encrypted at rest and the resulting credential is never written to state.json, the audit log, or a log line.</div>
         <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
       </div>
