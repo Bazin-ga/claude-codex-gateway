@@ -45,10 +45,11 @@ For multiple Codex accounts, each account keeps an independent credential home,
 refresh process, dispenser and certificate. Clients install them as isolated
 `CODEX_HOME` profiles; selection affects the next `codex-gateway` process and
 does not overwrite the default `~/.codex` login or hot-switch a running session.
-The profile substrate supports several domains, but one `credential-console`
-process currently has one global Codex dispenser configuration and no Codex
-account picker; a second real account therefore needs a separately configured
-domain until the control plane gains multi-domain routing.
+The direct-credential profile substrate supports several domains, while one
+`credential-console` process still has one global Codex dispenser configuration.
+The gateway path can instead own isolated per-account homes below one managed
+root and switch a device's next turn between allowed Codex accounts without
+changing its launcher or touching the default login.
 
 `credential-console` keeps Claude OAuth tokens encrypted at rest and never lets them leave the
 host. Devices authenticate to a gateway with a per-device token; the gateway strips that token

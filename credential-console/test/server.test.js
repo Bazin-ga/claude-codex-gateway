@@ -26,6 +26,7 @@ async function fixture({
   codex = {},
   claudeOauthExchange,
   cookieSecure = false,
+  home: fixtureHome,
   maxSessions,
   metricsChartRateLimit,
   usageSnapshot = () => null,
@@ -55,7 +56,7 @@ async function fixture({
   });
   const upstreamUrl = await listen(upstream);
 
-  const home = await mkdtemp(join(tmpdir(), 'credential-console-server-'));
+  const home = fixtureHome ?? await mkdtemp(join(tmpdir(), 'credential-console-server-'));
   const store = await new CredentialStore(home, { allowKeyInit: true }).init();
   const usageMonitor = {
     snapshotForAccount: (accountId) => usageSnapshot(store.accountById(accountId)),
@@ -71,6 +72,7 @@ async function fixture({
     ...(metricsChartRateLimit === undefined ? {} : { metricsChartRateLimit }),
     publicBaseUrl: 'http://credential-console.test',
     claudeUpstreamBaseUrl: upstreamUrl,
+    codexUpstreamBaseUrl: upstreamUrl,
     ...(claudeOauthExchange ? { claudeOauthExchange } : {}),
     ...codex,
   });
@@ -341,11 +343,11 @@ test('open mode self-serves a Codex installer keyed to the self-asserted member 
     const cookie = cookieFrom(dashboardResponse);
     const dashboard = await dashboardResponse.text();
     assert.match(dashboard, /Get Codex installer/);
-    // Every self-service form carries the label; the admin enrollment form has
-    // its own. Three of them now: Claude, the Codex installer, and the Codex
-    // gateway token.
-    assert.match(dashboard, /Get Codex gateway token/);
-    assert.equal((dashboard.match(/name="member_label" required pattern=/g) ?? []).length, 3);
+    // Every available self-service form carries the label. This imported Codex
+    // home is deliberately missing, so the gateway form fails closed while the
+    // independently configured dispenser installer remains available.
+    assert.doesNotMatch(dashboard, /Get Codex setup/);
+    assert.equal((dashboard.match(/name="member_label" required pattern=/g) ?? []).length, 2);
     const csrf = csrfFrom(dashboard);
 
     const missingLabel = await fetch(`${app.baseUrl}/codex/self-service`, {
@@ -1008,6 +1010,98 @@ test('a configured seed home receives the credential and publishes it without th
   }
 });
 
+test('managed Codex accounts seed distinct homes without touching the legacy account', async () => {
+  const consoleHome = await mkdtemp(join(tmpdir(), 'credential-console-managed-home-'));
+  const managedRoot = join(consoleHome, 'codex-accounts');
+  const legacyHome = await mkdtemp(join(tmpdir(), 'credential-console-legacy-home-'));
+  const sentinelPath = join(legacyHome, 'legacy-account.must-not-change');
+  await writeFile(sentinelPath, 'original credential domain\n');
+  const tokens = syntheticCodexTokens({ email: 'second@example.com' });
+  const app = await fixture({
+    adminAuth: 'open',
+    home: consoleHome,
+    codex: {
+      codexSeedHome: legacyHome,
+      codexManagedRoot: managedRoot,
+      // The refresher itself has focused unit coverage. Avoid launching a child
+      // process while this route test is still asserting the seed transaction.
+      codexManagedRefresher: false,
+      codexOauthExchange: async () => ({
+        idToken: tokens.idToken,
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+      }),
+    },
+  });
+  try {
+    const legacy = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-existing',
+      external: { kind: 'codex-credential', home: legacyHome },
+    });
+    const second = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-second',
+      emailLabel: 'second@example.com',
+    });
+    const expectedHome = join(managedRoot, second.id);
+
+    const page = await fetch(`${app.baseUrl}/accounts/${second.id}/codex-authorization`);
+    const cookie = cookieFrom(page);
+    const pageHtml = await page.text();
+    const csrf = csrfFrom(pageHtml);
+    assert.ok(pageHtml.includes(expectedHome));
+    assert.equal(pageHtml.includes(legacyHome), false);
+
+    const started = await fetch(`${app.baseUrl}/accounts/${second.id}/codex-authorization/start`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf }),
+    });
+    assert.equal(started.status, 200);
+    const state = authorizeUrlFrom(await started.text()).searchParams.get('state');
+    const flow = app.store.codexAuthorizationByState({ accountId: second.id, state });
+    assert.equal(flow.seed_home, expectedHome);
+
+    const completed = await fetch(
+      `${app.baseUrl}/accounts/${second.id}/codex-authorization/complete`,
+      {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          csrf,
+          authorization_code: `http://localhost:1455/auth/callback?code=managed-code&state=${state}`,
+        }),
+      },
+    );
+    assert.equal(completed.status, 200);
+    assert.equal(second.external.home, expectedHome);
+    assert.equal(legacy.external.home, legacyHome);
+    assert.equal(await readFile(sentinelPath, 'utf8'), 'original credential domain\n');
+
+    const managedCredential = JSON.parse(
+      await readFile(join(expectedHome, 'secret', 'credential.json'), 'utf8'),
+    );
+    assert.equal(managedCredential.tokens.refresh_token, tokens.refreshToken);
+    const managedPublic = JSON.parse(
+      await readFile(join(expectedHome, 'public', 'current.json'), 'utf8'),
+    );
+    assert.equal(managedPublic.access_token, tokens.accessToken);
+    assert.equal('refresh_token' in managedPublic, false);
+
+    const third = await app.store.addAccount({ provider: 'codex', alias: 'codex-third' });
+    const thirdPage = await fetch(
+      `${app.baseUrl}/accounts/${third.id}/codex-authorization`,
+      { headers: { Cookie: cookie } },
+    );
+    const thirdHtml = await thirdPage.text();
+    assert.ok(thirdHtml.includes(join(managedRoot, third.id)));
+    assert.equal(thirdHtml.includes(expectedHome), false);
+  } finally {
+    await app.close();
+  }
+});
+
 test('a seed that fails after the credential lands still binds the home to that account', async () => {
   const seedHome = await mkdtemp(join(tmpdir(), 'credential-console-seed-partial-'));
   const tokens = syntheticCodexTokens();
@@ -1133,7 +1227,7 @@ test('an unwritable seed home is refused before an authorization is spent on it'
   }
 });
 
-test('a Codex account bound to another home is refused before a session is opened', async () => {
+test('a bound Codex account reauthorizes its own home instead of the legacy seed home', async () => {
   const seedHome = await mkdtemp(join(tmpdir(), 'credential-console-seed-elsewhere-'));
   const otherHome = await mkdtemp(join(tmpdir(), 'credential-console-other-home-'));
   const app = await fixture({
@@ -1150,17 +1244,18 @@ test('a Codex account bound to another home is refused before a session is opene
     const cookie = cookieFrom(page);
     const csrf = csrfFrom(await page.text());
 
-    const refused = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization/start`, {
+    const started = await fetch(`${app.baseUrl}/accounts/${account.id}/codex-authorization/start`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ csrf }),
     });
-    assert.equal(refused.status, 400);
-    assert.match(await refused.text(), /codex-imported-1 holds its credential in .*, not the configured seed home/);
-    // Refused before anything was opened: the dashboard would otherwise read this
-    // row's health from a home nobody is writing.
-    assert.equal(app.store.pendingCodexAuthorization({ accountId: account.id }), null);
-    assert.equal(app.store.state.oauth_flows.length, 0);
+    assert.equal(started.status, 200);
+    const startedHtml = await started.text();
+    assert.ok(startedHtml.includes(otherHome));
+    assert.equal(startedHtml.includes(seedHome), false);
+    const state = authorizeUrlFrom(startedHtml).searchParams.get('state');
+    const flow = app.store.codexAuthorizationByState({ accountId: account.id, state });
+    assert.equal(flow.seed_home, otherHome);
   } finally {
     await app.close();
   }
@@ -2352,6 +2447,100 @@ test('P3 console and machine API switch only the authenticated device from the n
   }
 });
 
+test('a Codex gateway device switches accounts and the next turn uses only the selected home', async () => {
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const firstHome = await mkdtemp(join(tmpdir(), 'codex-switch-first-'));
+    const secondHome = await mkdtemp(join(tmpdir(), 'codex-switch-second-'));
+    const writePublished = async (home, accessToken, accountId) => {
+      await mkdir(join(home, 'public'), { recursive: true });
+      await writeFile(join(home, 'public', 'current.json'), JSON.stringify({
+        access_token: accessToken,
+        account_id: accountId,
+        expires_at: '2099-01-01T00:00:00.000Z',
+      }));
+    };
+    await writePublished(firstHome, 'codex-first-upstream-token', 'provider-first');
+    await writePublished(secondHome, 'codex-second-upstream-token', 'provider-second');
+    const first = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-route-first',
+      external: { kind: 'codex-credential', home: firstHome },
+    });
+    const second = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-route-second',
+      external: { kind: 'codex-credential', home: secondHome },
+    });
+    const pending = await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-route-pending',
+    });
+    const claude = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'claude-route-untouched',
+      credential: { oauth_token: 'claude-route-token' },
+    });
+    const issued = await app.store.issueDeviceCredential({
+      accountId: first.id,
+      memberLabel: 'codex-member',
+      deviceName: 'codex-switch-machine',
+    });
+
+    const dashboard = await fetch(`${app.baseUrl}/`);
+    const cookie = cookieFrom(dashboard);
+    const dashboardHtml = await dashboard.text();
+    const csrf = csrfFrom(dashboardHtml);
+    const switched = await fetch(`${app.baseUrl}/devices/${issued.device.id}/account`, {
+      method: 'POST',
+      headers: {
+        Cookie: cookie,
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Credential-Console-Async': 'account-switch',
+      },
+      body: new URLSearchParams({ csrf, selected_account_id: second.id }),
+    });
+    assert.equal(switched.status, 200);
+    const result = await switched.json();
+    assert.equal(result.account.id, second.id);
+    assert.deepEqual(result.account_options.map(({ id }) => id), [first.id, second.id]);
+    assert.equal(JSON.stringify(result).includes(pending.id), false);
+    assert.equal(JSON.stringify(result).includes(claude.id), false);
+    assert.deepEqual(app.store.accountCredential(claude.id), { oauth_token: 'claude-route-token' });
+
+    const turn = async (marker) => {
+      const response = await fetch(`${app.baseUrl}/codex-api/responses`, {
+        method: 'POST',
+        headers: {
+          'X-Api-Key': issued.token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ model: 'gpt-test', input: marker }),
+      });
+      assert.equal(response.status, 200);
+      await response.arrayBuffer();
+      return app.upstreamRequests.at(-1);
+    };
+    assert.equal((await turn('through-second')).authorization, 'Bearer codex-second-upstream-token');
+
+    const switchedBack = await fetch(`${app.baseUrl}/claude/control/v1/account`, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': issued.token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ account_id: first.id }),
+    });
+    assert.equal(switchedBack.status, 200);
+    assert.equal((await switchedBack.json()).account_id, first.id);
+    assert.equal((await turn('through-first')).authorization, 'Bearer codex-first-upstream-token');
+    assert.equal(app.store.deviceByToken(issued.token).id, issued.device.id);
+  } finally {
+    await app.close();
+  }
+});
+
 test('public Claude gateway rate-limits repeated authentication failures by source IP', async () => {
   const app = await fixture();
   try {
@@ -2412,7 +2601,8 @@ test('a Codex account awaiting authorization renders as pending, not as a red fa
   try {
     await app.store.addAccount({ provider: 'codex', alias: 'codex-shared-1' });
     const dashboard = await (await fetch(`${app.baseUrl}/`)).text();
-    assert.match(dashboard, /data-i18n="usage-authorize-first"/);
+    assert.match(dashboard, /data-i18n="usage-quota-hidden"/);
+    assert.match(dashboard, /The account has not finished authorizing yet/);
     assert.equal(dashboard.includes('quota-message error'), false);
   } finally {
     await app.close();

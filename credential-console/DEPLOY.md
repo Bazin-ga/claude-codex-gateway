@@ -200,7 +200,26 @@ design — that is where the authorization code appears, and the page says so.
 
 Decide first where the finished credential should land.
 
-**Default — the console writes nothing.** Leave `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` unset. The
+**Managed multi-account gateway — recommended.** Add one setting:
+
+```dotenv
+CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT=/var/lib/credential-console/codex-accounts
+```
+
+New Codex accounts then receive one isolated home at `<root>/<account-id>`. The console already owns
+`/var/lib/credential-console`, and the shipped unit already grants that tree read/write access, so no
+systemd hardening override or cross-user ACL is required. The OAuth session pins its destination before
+the OpenAI page opens; completion seeds that exact home with the refresh centre's atomic store. The
+console checks every managed home every six hours using the existing refresh entrypoint (override with
+`CREDENTIAL_CONSOLE_CODEX_MANAGED_REFRESH_INTERVAL_SECONDS`). The refresh entrypoint itself skips a
+credential until it nears expiry.
+
+Existing bound accounts always keep their current home and refresh service. In particular, enabling
+this setting does not read, write, move, or refresh `/var/lib/codex-credential` when that home is already
+bound to `codex-shared-1`. This makes the rollout additive and rollback-safe.
+
+**Default — the console writes nothing.** Leave both the managed root and
+`CREDENTIAL_CONSOLE_CODEX_SEED_HOME` unset. The
 `auth.json` is rendered once with copy and download buttons, and the page prints the exact seed
 command to run on the refresh centre:
 
@@ -214,7 +233,7 @@ Leaving or reloading the page hides the credential permanently; there is no seco
 preserves the read-only import boundary above: the console never touches
 `/var/lib/codex-credential/secret`.
 
-**Opt-in — the console seeds the home directly.** This needs three changes, not one. The shipped
+**Legacy single-home opt-in — the console seeds one home directly.** This needs three changes, not one. The shipped
 unit deliberately walls the console off from that home, so the variable alone does nothing but
 produce a refusal.
 
@@ -329,14 +348,16 @@ generated self-contained installers call `/credential` over the public internet 
 certificate pin. They carry only their per-device token and do not fetch source files from the
 private console.
 
-Generated installers now use profile mode. They write the account into an isolated client
+Generated dispenser installers use profile mode. They write the account into an isolated client
 `CODEX_HOME`, install `codex-gateway` and an account-fixed launcher, and leave the member's default
 `~/.codex` untouched. Selection affects the next new process only. This deployment still has one
 configured Codex dispenser; adding a real second account requires a second independent credential
 home, refresh process, dispenser endpoint, certificate and enrollment-key file. Never seed it into
-the existing home. The console has no Codex account picker or multi-domain routing yet; install the
-second domain separately. Once multiple profiles exist on a client, the profile timer refreshes all
-bound profiles without changing which profile is selected.
+the existing home. The direct-dispenser form still has one global domain, so install a second direct
+domain separately. The `/codex-api` gateway form does render every usable Codex account and supports
+server-side switching: the machine keeps one gateway token and its next turn uses the selected account.
+Once multiple direct profiles exist on a client, the profile timer refreshes all bound profiles without
+changing which profile is selected.
 
 ## Codex gateway
 

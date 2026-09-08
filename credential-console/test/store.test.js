@@ -957,6 +957,105 @@ test('P3 policy fields are additive and switching is isolated to the exact devic
   assert.equal(JSON.stringify(failure).includes('p3-primary-token'), false);
 });
 
+test('Codex gateway devices switch between isolated accounts without changing Claude credentials', async () => {
+  const { store } = await newStore();
+  const first = await store.addAccount({
+    provider: 'codex',
+    alias: 'codex-switch-first',
+    external: { kind: 'codex-credential', home: '/managed/codex-switch-first' },
+  });
+  const second = await store.addAccount({
+    provider: 'codex',
+    alias: 'codex-switch-second',
+    external: { kind: 'codex-credential', home: '/managed/codex-switch-second' },
+  });
+  const claude = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-untouched',
+    credential: { oauth_token: 'claude-credential-must-not-change' },
+  });
+  const issued = await store.issueDeviceCredential({
+    accountId: first.id,
+    memberLabel: 'codex-member',
+    deviceName: 'codex-machine',
+  });
+
+  const configured = await store.configureDeviceAccount({
+    deviceId: issued.device.id,
+    selectedAccountId: second.id,
+    actor: 'console-admin',
+  });
+  assert.deepEqual(configured.allowed_account_ids, [first.id, second.id]);
+  assert.equal(configured.effective_account_id, second.id);
+  assert.equal(configured.account.provider, 'codex');
+  assert.equal(configured.account.has_credential, true);
+
+  const firstAgain = await store.switchDeviceAccount({
+    deviceId: issued.device.id,
+    selectedAccountId: first.id,
+    actorDeviceId: issued.device.id,
+  });
+  assert.equal(firstAgain.effective_account_id, first.id);
+  const secondAgain = await store.switchDeviceAccount({
+    deviceId: issued.device.id,
+    selectedAccountId: second.id,
+    actorDeviceId: issued.device.id,
+  });
+  assert.equal(secondAgain.effective_account_id, second.id);
+  assert.deepEqual(store.accountCredential(claude.id), {
+    oauth_token: 'claude-credential-must-not-change',
+  });
+
+  await assert.rejects(
+    store.configureDeviceAccount({
+      deviceId: issued.device.id,
+      selectedAccountId: claude.id,
+      actor: 'console-admin',
+    }),
+    /different provider/,
+  );
+  assert.equal(store.resolveDeviceAccount(issued.device.id).effective_account_id, second.id);
+});
+
+test('a Codex device refuses an unbound or expired target without changing its selection', async () => {
+  const { store } = await newStore();
+  const first = await store.addAccount({
+    provider: 'codex',
+    alias: 'codex-available',
+    external: { kind: 'codex-credential', home: '/managed/codex-available' },
+  });
+  const pending = await store.addAccount({ provider: 'codex', alias: 'codex-pending' });
+  const expired = await store.addAccount({
+    provider: 'codex',
+    alias: 'codex-expired',
+    external: { kind: 'codex-credential', home: '/managed/codex-expired' },
+    expiresAt: '2020-01-01T00:00:00.000Z',
+  });
+  const issued = await store.issueDeviceCredential({
+    accountId: first.id,
+    memberLabel: 'codex-member',
+    deviceName: 'codex-device',
+  });
+  await assert.rejects(
+    store.configureDeviceAccount({
+      deviceId: issued.device.id,
+      selectedAccountId: pending.id,
+      actor: 'console-admin',
+    }),
+    (error) => error.code === 'ACCOUNT_UNAVAILABLE' && /managed credential home/.test(error.message),
+  );
+  assert.equal(store.resolveDeviceAccount(issued.device.id).effective_account_id, first.id);
+  await assert.rejects(
+    store.configureDeviceAccount({
+      deviceId: issued.device.id,
+      selectedAccountId: expired.id,
+      actor: 'console-admin',
+    }),
+    (error) => error.code === 'ACCOUNT_UNAVAILABLE' && /expired/.test(error.message),
+  );
+  assert.equal(store.resolveDeviceAccount(issued.device.id).effective_account_id, first.id);
+});
+
 test('legacy rows fallback only when both policy fields are absent and are not rewritten', async () => {
   const { home, store } = await newStore();
   const account = await store.addAccount({

@@ -1100,6 +1100,15 @@ function accountSelectionDetails(selection, accounts) {
   </div>`;
 }
 
+function accountCanReceiveDevice(account) {
+  if (!account || !['claude', 'codex'].includes(account.provider)) return false;
+  if (account.status === 'disabled') return false;
+  if (account.expires_at && Date.parse(account.expires_at) <= Date.now()) return false;
+  if (account.provider === 'claude') return true;
+  return account.external?.kind === 'codex-credential'
+    && ['stored', 'healthy'].includes(account.status);
+}
+
 function accountSwitchControl(device, selection, accounts, csrf) {
   if (device.revoked_at) return '';
   if (selection.invalid) {
@@ -1107,9 +1116,14 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   }
   const deviceProvider = accountForId(accounts, selection.selectedAccountId ?? selection.originalAccountId)
     ?.provider ?? 'claude';
-  const candidates = accounts.filter((account) => account.provider === deviceProvider);
+  const candidates = accounts.filter((account) => (
+    account.provider === deviceProvider
+    && accountCanReceiveDevice(account)
+  ));
   if (candidates.length === 0) {
-    return '<div class="muted tiny" data-i18n="no-claude-accounts">No Claude accounts are registered.</div>';
+    return `<div class="muted tiny">No ${escapeHtml(
+      deviceProvider === 'codex' ? 'Codex' : 'Claude',
+    )} accounts are registered.</div>`;
   }
   if (candidates.length === 1) {
     // The only account it could switch to is the one it is on. Rendering the
@@ -1119,7 +1133,7 @@ function accountSwitchControl(device, selection, accounts, csrf) {
       deviceProvider === 'codex' ? 'Only one Codex account is registered.' : 'Only one Claude account is registered.',
     )}</div>`;
   }
-  const options = accountSelectionOptions(accounts, selection.selectedAccountId, deviceProvider);
+  const options = accountSelectionOptions(candidates, selection.selectedAccountId, deviceProvider);
   return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/account" class="stack account-switch-form" data-account-switch data-device-id="${escapeHtml(device.id)}">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
     <label><span data-i18n="selected-account">Selected account</span>
@@ -3740,7 +3754,7 @@ export function dashboardView({
   // hold Claude credentials on several accounts, so a machine is shown when any
   // of its rows matches, and the count below counts rows rather than machines.
   const switchableAccounts = accounts.filter((account) => (
-    account.provider === 'claude' && account.status !== 'disabled'
+    accountCanReceiveDevice(account)
   ));
   const filterAccount = switchableAccounts.find((account) => account.id === accountFilter) ?? null;
   const memberLabels = [...new Set(devices
@@ -3750,7 +3764,7 @@ export function dashboardView({
   const filterGroup = groupNames.includes(groupFilter) ? groupFilter : null;
   const anyFilter = Boolean(filterAccount || filterMember || filterGroup);
   // Both conditions apply together: "everyone under this GitHub account who is
-  // currently on that Claude account" is the selection worth acting on.
+  // currently on that provider account" is the selection worth acting on.
   const matchedRows = (entry) => (entry.devices ?? []).filter((device) => {
     if (device.revoked_at) return false;
     if (filterMember && device.member_label !== filterMember) return false;
@@ -3948,7 +3962,7 @@ export function dashboardView({
             </details>
             ${openMode ? '<div class="notice error open-banner" role="status" data-i18n="open-account-switch-warning">Open mode has no verified actor: anyone who can reach this console can switch any active device. The actor is recorded as anonymous; a member label is not an actor.</div>' : ''}
             ${switchableAccounts.length ? `<form method="get" action="/" class="machine-filter">
-              <label><span>Claude account</span>
+              <label><span>Provider account</span>
                 <select name="account">
                   <option value="">All accounts</option>
                   ${switchableAccounts.map((account) => (
@@ -3983,7 +3997,10 @@ export function dashboardView({
               <div><strong>${filteredCount}</strong> active credential(s) ${filterSummary}.</div>
               <label><span>Move all of them to</span>
                 <select name="selected_account_id" required>
-                  ${switchableAccounts.filter((account) => account.id !== filterAccount?.id).map((account) => (
+                  ${switchableAccounts.filter((account) => (
+                    account.id !== filterAccount?.id
+                    && (!filterAccount || account.provider === filterAccount.provider)
+                  )).map((account) => (
                     `<option value="${escapeHtml(account.id)}">${escapeHtml(accountDisplayLabel(account))}</option>`
                   )).join('')}
                 </select>

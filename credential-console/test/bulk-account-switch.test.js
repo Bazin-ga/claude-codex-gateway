@@ -20,6 +20,14 @@ async function claudeAccount(store, alias) {
   });
 }
 
+async function codexAccount(store, alias) {
+  return store.addAccount({
+    provider: 'codex',
+    alias,
+    external: { kind: 'codex-credential', home: `/managed/${alias}` },
+  });
+}
+
 async function device(store, accountId, name) {
   const { device: row } = await store.issueDeviceCredential({
     accountId,
@@ -58,6 +66,39 @@ test('every credential on one account moves to another in a single call', async 
   for (const row of devices) {
     assert.equal(store.resolveDeviceAccount(row.id).account.id, to.id);
   }
+});
+
+test('Codex gateway credentials bulk-switch only between Codex accounts', async () => {
+  const store = await newStore();
+  const from = await codexAccount(store, 'codex-a');
+  const to = await codexAccount(store, 'codex-b');
+  const claude = await claudeAccount(store, 'claude-untouched');
+  const first = await device(store, from.id, 'codex-laptop-1');
+  const second = await device(store, from.id, 'codex-laptop-2');
+
+  const summary = await store.bulkConfigureDeviceAccount({
+    fromAccountId: from.id,
+    selectedAccountId: to.id,
+    expectedCount: 2,
+    actor: 'admin@example.com',
+  });
+  assert.deepEqual(summary.switched.sort(), [first.id, second.id].sort());
+  assert.equal(store.devicesOnAccount(from.id).length, 0);
+  assert.equal(store.devicesOnAccount(to.id).length, 2);
+  assert.deepEqual(store.accountCredential(claude.id), {
+    oauth_token: 'sk-ant-oat-claude-untouched',
+  });
+
+  await assert.rejects(
+    store.bulkConfigureDeviceAccount({
+      fromAccountId: to.id,
+      selectedAccountId: claude.id,
+      expectedCount: 2,
+      actor: 'admin@example.com',
+    }),
+    /different provider|gateway account/,
+  );
+  assert.equal(store.devicesOnAccount(to.id).length, 2);
 });
 
 test('the move survives a reopen, so it was persisted once and completely', async () => {
@@ -114,7 +155,6 @@ test('a target that cannot hold devices is refused before anything moves', async
     provider: 'codex',
     alias: 'codex-1',
     emailLabel: '',
-    external: { kind: 'codex-credential', home: '/var/lib/codex-credential' },
   });
   const noCredential = await store.addAccount({
     provider: 'claude',
@@ -123,7 +163,7 @@ test('a target that cannot hold devices is refused before anything moves', async
   });
 
   for (const [target, expected] of [
-    [codex.id, /not a Claude account/],
+    [codex.id, /no managed credential home/],
     [noCredential.id, /no stored credential/],
     ['does-not-exist', /target account not found/],
     [from.id, /the target account is the one being moved from/],
@@ -205,10 +245,10 @@ function render(store, { accountFilter = null, memberFilter = null, groupFilter 
   });
 }
 
-test('the dashboard offers a Claude account filter', async () => {
+test('the dashboard offers a provider account filter', async () => {
   const { store, from, to } = await fixture();
   const html = render(store);
-  assert.match(html, /<span>Claude account<\/span>/);
+  assert.match(html, /<span>Provider account<\/span>/);
   assert.match(html, /<span>Member<\/span>/);
   assert.match(html, /<option value="">All accounts<\/option>/);
   assert.ok(html.includes(from.alias) && html.includes(to.alias));
@@ -233,6 +273,29 @@ test('filtering shows the count and a bulk form aimed at the other accounts', as
     false,
     'moving an account to itself is not offered',
   );
+});
+
+test('the dashboard offers Codex accounts on a Codex gateway device switch', async () => {
+  const store = await newStore();
+  const first = await codexAccount(store, 'codex-ui-first');
+  const second = await codexAccount(store, 'codex-ui-second');
+  const pending = await store.addAccount({ provider: 'codex', alias: 'codex-ui-pending' });
+  const row = await device(store, first.id, 'codex-ui-device');
+  const html = render(store, { accountFilter: first.id });
+
+  const marker = `data-device-row="${row.id}"`;
+  const start = html.indexOf(marker);
+  assert.notEqual(start, -1);
+  const deviceHtml = html.slice(start, html.indexOf('</tr>', start));
+  assert.match(deviceHtml, /data-account-switch/);
+  assert.ok(deviceHtml.includes(first.id));
+  assert.ok(deviceHtml.includes(second.id));
+  assert.equal(deviceHtml.includes(pending.id), false);
+  assert.match(deviceHtml, /Codex/);
+
+  const bulk = html.slice(html.indexOf('action="/devices/account"'), html.indexOf('Switch all 1'));
+  assert.ok(bulk.includes(second.id));
+  assert.equal(bulk.includes('claude'), false);
 });
 
 test('a filter that matches nothing says so instead of showing an empty form', async () => {

@@ -32,8 +32,10 @@ a platform-specific agent installer without receiving the shared enrollment key.
 
 A Codex account can also be authorized from the console itself, so the ChatGPT subscription
 credential no longer has to be produced by a `codex login` on some other machine and carried
-over by hand. That import boundary stays read-only unless
-`CREDENTIAL_CONSOLE_CODEX_SEED_HOME` is set — see
+over by hand. Existing imported homes stay where they are. A deployment can opt
+new accounts into isolated console-managed homes with
+`CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT`, or retain the historical single-home
+handoff with `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` — see
 [Codex account authorization](#codex-account-authorization).
 
 ## Status
@@ -154,20 +156,35 @@ paste box on the page, so the same code can be submitted again. **Start a fresh 
 supersedes it and invalidates the code already in hand; press it only after the session expires
 or the code is genuinely gone.
 
-Where the credential goes depends on one variable, and the two options trade off differently:
+Where the credential goes depends on the account binding and deployment mode:
 
-**`CREDENTIAL_CONSOLE_CODEX_SEED_HOME` unset (default).** The console writes nothing. The
+**`CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT=/var/lib/credential-console/codex-accounts` (recommended
+for multi-account gateway use).** Every new account receives the stable home
+`<root>/<account-id>`. The authorization flow pins that exact destination before OpenAI is opened,
+the console seeds it atomically, and a six-hour in-process scheduler runs the existing refresh
+centre once per managed home. Existing imported/bound accounts always keep their original home and
+their existing timer; enabling this setting never moves or refreshes them. A newly authorized
+account therefore appears in the Codex gateway selector without creating a bespoke service.
+
+This mode intentionally keeps managed refresh tokens inside the console's existing mode-700 state
+tree. A console compromise can reach every managed Codex refresh token, so use it only when the
+console and those accounts are one trust domain. It does not alter Claude credentials or the legacy
+Codex home.
+
+**Both managed root and single seed home unset (default).** The console writes nothing. The
 finished `auth.json` is rendered once, with copy and download buttons and the exact `seed.js`
 command to run on the refresh centre. Leaving the page hides it permanently; there is no second
 render. This keeps the console's relationship with every `codex-credential` home read-only.
 
-**`CREDENTIAL_CONSOLE_CODEX_SEED_HOME=/var/lib/codex-credential`.** On completion the console
+**Legacy `CREDENTIAL_CONSOLE_CODEX_SEED_HOME=/var/lib/codex-credential`.** On completion the console
 writes the credential into that home itself, reusing the refresh centre's own `CredentialStore`
 and `expiryOf` — the same atomic write, the same generation retention, the same `public/` publish
 step, and the same operation lock that `seed.js` takes. If that lock is held, the write stops with
 `is busy, so nothing was written` rather than racing a refresh that may already have spent the
 single-use token. The credential is never displayed. One home holds one credential, so an
 authorization that would seed a home another account already holds is refused before it starts.
+When both settings exist, a bound account still uses its bound home, a new account uses the managed
+root, and this single home remains only the compatibility fallback.
 
 > **This contradicts the read-only import boundary described above and elsewhere in this
 > README.** With the variable set, the console process needs write access to `secret/` in that
@@ -258,15 +275,17 @@ contains only the newly minted device token, dispenser endpoint, and TLS certifi
 agent still requires the member machine to reach `chatgpt.com/backend-api/`; credentials do not
 replace network egress.
 
-Codex profile selection applies to the next newly started process, not an already-running
+Dispenser profile selection applies to the next newly started process, not an already-running
 session. Every real Codex account must still have its own independent credential home,
 refresh-center, dispenser endpoint and certificate; a second account must never be seeded into
 the first account's home.
 
-This console process currently accepts only one global Codex dispenser/certificate/enrollment-key
-configuration and does not render a Codex account picker. The generated client profile is therefore
-for that one configured domain. Multi-domain control-plane routing remains separate work even though
-the client-side profile store can safely hold several independently installed domains.
+This console process still accepts only one global Codex dispenser/certificate/enrollment-key
+configuration. The generated direct-credential profile is therefore for that one configured domain;
+additional direct dispensers remain separate deployments. The `/codex-api` gateway path is different:
+it renders every usable Codex account, issues an account-bound device token, and lets an administrator
+or that device switch among allowed Codex accounts without changing the machine's launcher. The next
+turn uses only the selected account; it never falls back across accounts.
 
 ## Routing Codex turns through the gateway
 
@@ -604,6 +623,9 @@ the synchronous command hook may nevertheless add bounded delay while that failu
   reads or writes the refresh token stored in a `codex-credential` home — it does still hold a
   newly authorized refresh token in memory for the length of one request and render it to the
   operator once.
+- Setting `CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT` makes the console the owner and refresher of every
+  Codex home below that root. Exact `<root>/<account-id>` matching prevents an imported or legacy home
+  from being swept into the managed refresher.
 - Device bearer tokens are stored only as SHA-256 digests and compared in constant time.
 - Codex enrollment uses the dispenser's mint-only shared key on the server side. The key cannot
   read the current Codex credential, and each minted token is independently revocable.
@@ -643,6 +665,8 @@ retain an emergency service-stop and provider-token revocation procedure.
 | `CREDENTIAL_CONSOLE_CODEX_CERT_PIN` | — | SHA-256 pin for the dispenser TLS certificate |
 | `CREDENTIAL_CONSOLE_CODEX_ENROLLMENT_KEY_FILE` | — | Mode-640 file containing the dispenser's mint-only enrollment key |
 | `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` | — | `codex-credential` home a completed Codex authorization writes into. Unset means show the `auth.json` once instead; setting it makes the console a **writer** of that home |
+| `CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT` | — | Root for isolated, automatically refreshed homes of newly authorized Codex gateway accounts. Existing account bindings take precedence |
+| `CREDENTIAL_CONSOLE_CODEX_MANAGED_REFRESH_INTERVAL_SECONDS` | `21600` | Interval for checking every console-managed Codex home; the refresh centre itself skips credentials that are not near expiry |
 | `CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS` | `3600000` | Provider quota refresh interval (minimum 60 seconds) |
 
 Quota polling calls the read-only provider endpoints used behind Claude Code and Codex status
@@ -709,7 +733,8 @@ The import stores only the external home path. At dashboard render time the serv
 files out of that home, both read-only: `public/current.json` for the credential's expiry, and
 `clients/clients.json` for the machine inventory — `token_sha256` is dropped at the read
 boundary, so no bearer digest reaches a rendered page. It never writes either, and has no
-access to `secret/` unless `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` names that home — see
+access to `secret/` unless `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` names that home. Homes below
+`CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT` are instead owned and refreshed by the console — see
 [Codex account authorization](#codex-account-authorization).
 
 ### Credential health and alert semantics

@@ -252,7 +252,7 @@ test('explicit policy must retain the immutable original account', () => {
   assert.doesNotMatch(row, /\/account"/);
 });
 
-test('revoked and Codex rows do not render account switching controls', () => {
+test('revoked rows and a Codex row with no second usable account do not render switching controls', () => {
   const html = render();
   const revoked = deviceRow(html, REVOKED.id);
   assert.doesNotMatch(revoked, /\/account"/);
