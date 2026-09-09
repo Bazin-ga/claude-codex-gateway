@@ -51,11 +51,15 @@ import {
 export const CODEX_PROXY_PREFIX = '/codex-api';
 
 /**
- * Only the inference endpoint. The Codex CLI also talks to plugins, analytics
- * and an apps MCP server, but those are reached through `chatgpt_base_url` and
- * have no business borrowing a shared subscription credential through here.
+ * The inference endpoint plus the model catalog the Codex CLI reads from its
+ * configured provider base URL. Plugins, analytics and the apps MCP server are
+ * reached through `chatgpt_base_url` and have no business borrowing a shared
+ * subscription credential through here.
  */
-const ALLOWED_PATHS = new Set(['/responses']);
+const ALLOWED_REQUESTS = new Map([
+  ['/responses', 'POST'],
+  ['/models', 'GET'],
+]);
 
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = 10 * 60_000;
@@ -71,6 +75,7 @@ function forwardHeaders(headers) {
     'accept-encoding',
     'content-length',
     'content-type',
+    'if-none-match',
     'openai-beta',
     'originator',
     // Observed on a real codex-cli request. These are hyphenated: an earlier
@@ -100,9 +105,11 @@ function responseHeaders(headers) {
   const allowed = [
     'content-encoding',
     'content-type',
+    'etag',
     'request-id',
     'retry-after',
     'x-request-id',
+    'x-oai-request-id',
     // The client's own quota display and back-off depend on these. Stripping
     // them leaves `codex /status` permanently blank and denies the CLI the one
     // signal that tells it a rate limit was reached rather than a request
@@ -249,11 +256,20 @@ export async function handleCodexProxy(req, res, {
     sendJson(res, 403, errorBody('permission_error', 'account unavailable'));
     return;
   }
-  if (!ALLOWED_PATHS.has(upstreamPath)) {
+  const allowedMethod = ALLOWED_REQUESTS.get(upstreamPath);
+  if (!allowedMethod) {
     recordRejected(404);
     sendJson(res, 404, errorBody('not_found_error', 'unsupported gateway path'));
     return;
   }
+  if (req.method !== allowedMethod) {
+    recordRejected(405);
+    sendJson(res, 405, errorBody('invalid_request_error', 'method not allowed'), {
+      Allow: allowedMethod,
+    });
+    return;
+  }
+  const inferenceRequest = upstreamPath === '/responses';
 
   let credential;
   try {
@@ -354,7 +370,8 @@ export async function handleCodexProxy(req, res, {
 
   const startedAtMs = now();
   const startedAtMonotonic = performance.now();
-  const capturePrompt = typeof requestMetrics?.enqueueCompletion === 'function';
+  const capturePrompt = inferenceRequest
+    && typeof requestMetrics?.enqueueCompletion === 'function';
   const requestMetadata = metadataTeeFactory({
     capturePrompt,
     // Only pay the buffering cost where a prompt can actually be extracted.
@@ -487,7 +504,7 @@ export async function handleCodexProxy(req, res, {
       // written with null tokens and usage_state 'unavailable'. Fall back to
       // the parser's own sniffing, which reads the first bytes and yields
       // 'unavailable' harmlessly for anything it cannot make sense of.
-      const responseFormat = status >= 200 && status < 400
+      const responseFormat = inferenceRequest && status >= 200 && status < 400
         ? (responseUsageFormat(upstreamRes.headers['content-type']) ?? 'auto')
         : null;
       const observers = [];

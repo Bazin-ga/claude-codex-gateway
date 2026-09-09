@@ -2679,6 +2679,17 @@ test('a Codex gateway device switches accounts and the next turn uses only the s
       return app.upstreamRequests.at(-1);
     };
     assert.equal((await turn('through-second')).authorization, 'Bearer codex-second-upstream-token');
+    const models = await fetch(`${app.baseUrl}/codex-api/models?client_version=0.153.2`, {
+      headers: { 'X-Api-Key': issued.token },
+    });
+    assert.equal(models.status, 200);
+    await models.arrayBuffer();
+    assert.equal(app.upstreamRequests.at(-1).url, '/models?client_version=0.153.2');
+    assert.equal(
+      app.upstreamRequests.at(-1).authorization,
+      'Bearer codex-second-upstream-token',
+      'the model catalog follows the same selected account as inference',
+    );
 
     const switchedBack = await fetch(`${app.baseUrl}/claude/control/v1/account`, {
       method: 'POST',

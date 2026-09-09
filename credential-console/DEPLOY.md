@@ -388,7 +388,8 @@ in [Do not publish the complete console](#do-not-publish-the-complete-console), 
 buffering off and no request body limit — a turn streams, and its request carries the whole
 conversation. The trust model is the one `/claude` already has: the device authenticates with its
 own token, the subscription credential is injected server-side and never reaches the client, and
-the console forwards exactly one upstream path, `/responses`.
+the console forwards exactly two upstream paths: `POST /responses` for inference and `GET /models`
+for the Codex CLI's provider model catalog.
 
 Then give the console the origin to hand out, and restart it:
 
@@ -825,6 +826,7 @@ trap - EXIT
 ```bash
 curl -fsS https://<console-host>.<your-tailnet>.ts.net/health
 curl -i https://<console-host>.<your-tailnet>.ts.net:10000/claude/v1/models
+curl -i https://<console-host>.<your-tailnet>.ts.net:10000/codex-api/models
 curl -i -X POST https://<console-host>.<your-tailnet>.ts.net:10000/codex-api/responses
 curl -k https://<server-public-ip>:8443/health
 sudo tailscale serve status
