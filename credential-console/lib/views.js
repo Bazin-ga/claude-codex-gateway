@@ -4560,7 +4560,7 @@ Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
  * `model_provider` rather than `chatgpt_base_url`: the CLI sends plugin,
  * analytics and apps traffic to the latter, none of which this gateway proxies
  * or should proxy. Overriding only the provider leaves that traffic on its
- * normal path and routes just the turns.
+ * normal path and routes inference plus the provider model catalog.
  *
  * `env_key`, not `requires_openai_auth`: the latter makes the CLI authenticate
  * with the ChatGPT token from its own `auth.json`, which this gateway would
