@@ -322,9 +322,9 @@ with `CODEX_GATEWAY_TOKEN` set to the device token. Two details are easy to get 
   source was confirmed.
 - **`model_provider`, not `chatgpt_base_url`.** The CLI sends plugin, analytics and apps traffic to
   the latter; none of that belongs on a shared subscription credential. Overriding only the
-  provider routes just the turns. `/codex-api` proxies `/responses` and nothing else, so a device
-  with no ChatGPT sign-in of its own loses `codex cloud`, plugin listings and the `codex /status`
-  quota figures — none of which a turn needs.
+  provider routes inference plus the provider's model catalog. `/codex-api` proxies `POST
+  /responses` and `GET /models`; a device token cannot reach plugins, analytics, apps, or the
+  control plane.
 
 The proxy reads the *published* credential — the same refresh-token-free file every enrolled
 machine already pulls, and the one `usage.js` reads for quota. It holds exactly what a client

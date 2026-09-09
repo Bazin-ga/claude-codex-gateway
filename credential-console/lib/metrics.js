@@ -966,7 +966,7 @@ function filterSql(filters) {
   // path alone, which silently excluded every Codex turn: those rows were
   // counted under `all` — so requests and latency charted fine — while their
   // tokens never reached any total. Both providers' inference paths belong
-  // here; `/responses` is the whole of the Codex proxy's allow-list.
+  // here; the Codex proxy's `/models` helper remains outside consumption.
   return `
     WHERE (? IS NULL OR started_at_ms >= ?)
       AND (? IS NULL OR started_at_ms < ?)

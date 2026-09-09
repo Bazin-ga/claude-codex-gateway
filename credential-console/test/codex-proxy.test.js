@@ -153,6 +153,12 @@ function post(url, body, headers = {}, signal = undefined) {
   });
 }
 
+function getModels(url, query = '', headers = {}) {
+  return fetch(`${url}/codex-api/models${query}`, {
+    headers: { 'x-api-key': DEVICE_TOKEN, ...headers },
+  });
+}
+
 test('a device token is exchanged for the subscription credential', async (t) => {
   const home = await credentialHome(t);
   const seen = {};
@@ -371,7 +377,42 @@ test('a Claude account cannot be spent through the Codex route', async (t) => {
   assert.equal(upstreamCalls, 0);
 });
 
-test('only the inference endpoint is reachable', async (t) => {
+test('the selected account also serves the Codex model catalog', async (t) => {
+  const home = await credentialHome(t, {
+    accessToken: 'selected-account-access-token',
+    accountId: 'selected-chatgpt-account',
+  });
+  const seen = {};
+  const models = JSON.stringify({ models: [{ slug: 'gpt-5.6-sol' }] });
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home, { alias: 'selected-full-quota-account' })),
+    upstreamHandler: (req, res) => {
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        etag: '"model-catalog-v1"',
+        'x-oai-request-id': 'models-request-1',
+      });
+      res.end(models);
+    },
+    seen,
+  });
+
+  const response = await getModels(proxyUrl, '?client_version=0.153.2', {
+    'if-none-match': '"model-catalog-v0"',
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), models);
+  assert.equal(seen.method, 'GET');
+  assert.equal(seen.url, '/models?client_version=0.153.2');
+  assert.equal(seen.headers.authorization, 'Bearer selected-account-access-token');
+  assert.equal(seen.headers['chatgpt-account-id'], 'selected-chatgpt-account');
+  assert.equal(seen.headers['if-none-match'], '"model-catalog-v0"');
+  assert.equal(response.headers.get('etag'), '"model-catalog-v1"');
+  assert.equal(response.headers.get('x-oai-request-id'), 'models-request-1');
+});
+
+test('only the Codex inference and model-catalog endpoints are reachable', async (t) => {
   const home = await credentialHome(t);
   let upstreamCalls = 0;
   const { proxyUrl } = await startHarness(t, {
@@ -388,6 +429,30 @@ test('only the inference endpoint is reachable', async (t) => {
     assert.equal(response.status, 404, `${path} is not proxied`);
   }
   assert.equal(upstreamCalls, 0, 'no unlisted path reached the upstream');
+});
+
+test('each Codex gateway endpoint enforces its wire method', async (t) => {
+  const home = await credentialHome(t);
+  let upstreamCalls = 0;
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => { upstreamCalls += 1; res.writeHead(200).end(); },
+  });
+
+  const wrongModels = await fetch(`${proxyUrl}/codex-api/models`, {
+    method: 'POST',
+    headers: { 'x-api-key': DEVICE_TOKEN, 'content-type': 'application/json' },
+    body: '{}',
+  });
+  const wrongResponses = await fetch(`${proxyUrl}/codex-api/responses`, {
+    headers: { 'x-api-key': DEVICE_TOKEN },
+  });
+
+  assert.equal(wrongModels.status, 405);
+  assert.equal(wrongModels.headers.get('allow'), 'GET');
+  assert.equal(wrongResponses.status, 405);
+  assert.equal(wrongResponses.headers.get('allow'), 'POST');
+  assert.equal(upstreamCalls, 0);
 });
 
 test('an expired credential is reported here rather than as an opaque upstream failure', async (t) => {

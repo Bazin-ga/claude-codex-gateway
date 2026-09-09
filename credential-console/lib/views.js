@@ -4560,7 +4560,7 @@ Remove-Item Env:CLAUDE_CODE_OAUTH_TOKEN -ErrorAction SilentlyContinue
  * `model_provider` rather than `chatgpt_base_url`: the CLI sends plugin,
  * analytics and apps traffic to the latter, none of which this gateway proxies
  * or should proxy. Overriding only the provider leaves that traffic on its
- * normal path and routes just the turns.
+ * normal path and routes inference plus the provider model catalog.
  *
  * `env_key`, not `requires_openai_auth`: the latter makes the CLI authenticate
  * with the ChatGPT token from its own `auth.json`, which this gateway would
@@ -4687,7 +4687,7 @@ echo "Codex gateway profile '${profile}' installed. Start Codex with: codex-${pr
         <button type="button" class="secondary" data-copy-target="codex-setup">Copy setup script</button>
       </div>
       <div class="notice">Turns go through the console, which meters them per device and records the prompt and final response as a paired conversation round — the same as Claude. Needs Codex with hooks support (0.153+); the launcher runs Codex with hook trust pre-granted for this managed profile.</div>
-      <div class="notice">Nothing else is proxied, so a device holding no ChatGPT sign-in of its own loses features that need one — <code>codex cloud</code>, plugin and app listings, and the quota figures in <code>codex /status</code>. Running a turn needs none of them.</div>
+      <div class="notice">Only inference and the provider model catalog are proxied. A device holding no ChatGPT sign-in of its own still loses <code>codex cloud</code> plus plugin and app listings. Quota figures update from the selected account's response headers after its next completed turn.</div>
       <div class="notice">Windows is not covered by this installer yet. On Windows, set <code>$env:${escapeHtml(tokenEnvVar)}</code> and point Codex at <code>${escapeHtml(gateway)}</code> manually; conversation capture needs the hook block from the script above.</div>
       <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
       <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
@@ -4729,7 +4729,8 @@ const API_GROUPS = Object.freeze([
       ['POST', '/claude/v1/messages', 'docs-api-messages', 'Claude completion, streaming included. Metered, and captured when the profile has conversation hooks installed.'],
       ['POST', '/claude/v1/messages/count_tokens', 'docs-api-count-tokens', 'Token count for a request that has not been sent.'],
       ['GET', '/claude/v1/models', 'docs-api-models', 'Models the attached Claude account can address.'],
-      ['POST', '/codex-api/responses', 'docs-api-codex', 'Codex turn, for a device holding a Codex gateway token. Codex traffic is metered but not captured as conversations.'],
+      ['GET', '/codex-api/models', 'docs-api-codex-models', 'Models available to the currently selected Codex account.'],
+      ['POST', '/codex-api/responses', 'docs-api-codex', 'Codex turn for a device holding a Codex gateway token. Metered; installed hooks pair the prompt and final response as a conversation round.'],
     ],
   },
   {
