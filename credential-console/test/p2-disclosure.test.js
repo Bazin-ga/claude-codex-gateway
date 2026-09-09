@@ -185,6 +185,8 @@ test('real server announces metadata and conversation disclosure before listenin
       'CREDENTIAL_CONSOLE_CODEX_CERT_PIN',
       'CREDENTIAL_CONSOLE_CODEX_ENROLLMENT_KEY_FILE',
       'CREDENTIAL_CONSOLE_CODEX_SEED_HOME',
+      'CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT',
+      'CREDENTIAL_CONSOLE_CODEX_MANAGED_REFRESH_INTERVAL_SECONDS',
     ]) delete env[name];
 
     child = spawn(process.execPath, ['--no-warnings', 'server.js'], {

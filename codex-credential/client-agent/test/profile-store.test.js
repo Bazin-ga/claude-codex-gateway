@@ -149,6 +149,10 @@ test('a failed atomic replacement leaves the previous selection and no temp file
   await store.bindDigest('two', createHash('sha256').update('acct@example.test').digest('hex'));
   const failing = new ProfileStore({
     root,
+    // Keep the second reader on the fixture's clock. Otherwise this test starts
+    // failing at the auth-expiry guard as wall time advances and never reaches
+    // the atomic rename fault it claims to exercise.
+    clock: () => new Date('2026-08-17T12:00:00.000Z'),
     random: () => 'failtest',
     failureHooks: {
       'atomic.beforeRename': () => { throw new Error('rename deliberately failed'); },

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
-import { handle } from '../server.js';
+import { handle, prepareClientsRegistry } from '../server.js';
 
 const ENROLLMENT_KEY = 'shared-enrollment-key-long-enough';
 
@@ -130,6 +130,23 @@ test('enrollment mints a token that then authenticates, and never returns a cred
   const used = await request(paths, `Bearer ${response.body.token}`, 'e-6');
   assert.equal(used.status, 200);
   assert.equal(used.body.access_token, 'access-only');
+  assert.equal((await stat(path.dirname(paths.clientsPath))).mode & 0o777, 0o750);
+  assert.equal((await stat(paths.clientsPath)).mode & 0o777, 0o640);
+});
+
+test('startup repairs an existing machine registry for read-only group inventory', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-dispenser-registry-mode-'));
+  const directory = path.join(root, 'clients');
+  const clientsPath = path.join(directory, 'clients.json');
+  await mkdir(directory, { mode: 0o700 });
+  await writeFile(clientsPath, '{"clients":[]}\n', { mode: 0o600 });
+  await chmod(directory, 0o700);
+  await chmod(clientsPath, 0o600);
+
+  await prepareClientsRegistry(clientsPath);
+
+  assert.equal((await stat(directory)).mode & 0o777, 0o750);
+  assert.equal((await stat(clientsPath)).mode & 0o777, 0o640);
 });
 
 test('re-enrolling a name revokes that name previous token', async () => {

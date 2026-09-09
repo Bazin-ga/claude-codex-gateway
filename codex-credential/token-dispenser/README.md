@@ -113,7 +113,9 @@ node server.js                      # install/ has a systemd unit
 | `CODEX_CRED_TLS_CERT` / `_KEY` | `$CODEX_CRED_HOME/tls/server.{crt,key}` | TLS material |
 
 Client tokens are stored as SHA-256 digests and compared in constant time, so a
-leaked `clients.json` yields nothing usable. Zero dependencies.
+leaked `clients.json` yields nothing usable. The dispenser keeps that registry at mode 0640 inside
+a mode-0750 `clients/` directory so a local credential console in the `codex-credential` group can
+inventory machines without write access; enrollment secrets remain mode 0600. Zero dependencies.
 
 ## Status
 

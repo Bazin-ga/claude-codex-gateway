@@ -520,14 +520,20 @@ export class CredentialStore {
 
   #assertSwitchableAccount(account) {
     if (!account) throw storeError('target account not found', 'DEVICE_CONFIGURATION_INVALID');
-    if (account.provider !== 'claude') {
-      throw storeError('target account is not a Claude account', 'DEVICE_CONFIGURATION_INVALID');
+    if (!['claude', 'codex'].includes(account.provider)) {
+      throw storeError('target account is not a gateway account', 'DEVICE_CONFIGURATION_INVALID');
     }
-    if (!account.credential) throw storeError('target account has no stored credential', 'ACCOUNT_UNAVAILABLE');
     if (account.status === 'disabled') throw storeError('target account is disabled', 'ACCOUNT_UNAVAILABLE');
     if (account.expires_at && Date.parse(account.expires_at) <= Date.now()) {
       throw storeError('target account credential is expired', 'ACCOUNT_UNAVAILABLE');
     }
+    if (account.provider === 'codex') {
+      if (account.external?.kind !== 'codex-credential' || !account.external.home) {
+        throw storeError('target account has no managed credential home', 'ACCOUNT_UNAVAILABLE');
+      }
+      return;
+    }
+    if (!account.credential) throw storeError('target account has no stored credential', 'ACCOUNT_UNAVAILABLE');
     try {
       if (!this.accountCredential(account.id)?.oauth_token) {
         throw storeError('target account has no stored credential', 'ACCOUNT_UNAVAILABLE');
@@ -585,7 +591,9 @@ export class CredentialStore {
         provider: account.provider,
         status: account.status,
         expires_at: account.expires_at ?? null,
-        has_credential: Boolean(account.credential),
+        has_credential: account.provider === 'claude'
+          ? Boolean(account.credential)
+          : account.external?.kind === 'codex-credential' && Boolean(account.external.home),
       },
     };
   }
@@ -610,12 +618,18 @@ export class CredentialStore {
         }
         const account = this.accountById(selectedAccountId);
         if (!account) throw storeError('target account not found', 'DEVICE_CONFIGURATION_INVALID');
-        if (account.provider !== 'claude') {
-          throw storeError('target account is not a Claude account', 'DEVICE_CONFIGURATION_INVALID');
+        if (!['claude', 'codex'].includes(account.provider)) {
+          throw storeError('target account is not a gateway account', 'DEVICE_CONFIGURATION_INVALID');
         }
+        // Unlike Claude, an unbound Codex row has no encrypted credential in
+        // this store that could become usable later on the same route. Selecting
+        // it would cut the device over to a guaranteed 503, so refuse before the
+        // policy changes. Claude keeps its historical pre-authorization policy
+        // workflow unchanged.
+        if (account.provider === 'codex') this.#assertSwitchableAccount(account);
         const policy = this.#deviceAccountPolicy(device);
-        // Refuse before touching the row, not after. Appending a Claude account
-        // to a Codex device's allowlist makes it mixed, and the mutation below
+        // Refuse before touching the row, not after. Appending another provider
+        // to this device's allowlist makes it mixed, and the mutation below
         // is persisted before anything revalidates it: a crash between that
         // write and the rollback would leave a device that no longer resolves
         // and that this very method can no longer repair, since it reads the
@@ -871,6 +885,23 @@ export class CredentialStore {
     });
   }
 
+  async updateExternalAccountExpiry(id, expiresAt) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account || account.provider !== 'codex'
+        || account.external?.kind !== 'codex-credential') {
+        throw new Error('Codex external account was not found');
+      }
+      const parsed = Date.parse(String(expiresAt ?? ''));
+      if (!Number.isFinite(parsed)) throw new Error('Codex external account expiry is invalid');
+      const normalized = new Date(parsed).toISOString();
+      if (account.expires_at === normalized) return false;
+      account.expires_at = normalized;
+      await this.persist();
+      return true;
+    });
+  }
+
   async updateAccountEmailLabel(id, emailLabel) {
     return this.serialized(async () => {
       const account = this.accountById(id);
@@ -974,7 +1005,14 @@ export class CredentialStore {
     });
   }
 
-  async beginCodexAuthorization({ accountId, verifier, state, initiatedBy, ttlMinutes = 15 }) {
+  async beginCodexAuthorization({
+    accountId,
+    verifier,
+    state,
+    initiatedBy,
+    seedHome = null,
+    ttlMinutes = 15,
+  }) {
     return this.serialized(async () => {
       const account = this.accountById(accountId);
       if (!account) throw new Error('account not found');
@@ -987,6 +1025,10 @@ export class CredentialStore {
         ttlMinutes,
         event: 'codex_authorization_started',
       });
+      // Pin the destination to this OAuth session. A service restart or config
+      // change between Start and Complete must never redirect a single-use code
+      // into a different account's credential home.
+      flow.seed_home = seedHome ? resolve(seedHome) : null;
       await this.persist();
       return { ...flow, verifier: undefined, state_sha256: undefined };
     });
@@ -1270,6 +1312,13 @@ export class CredentialStore {
       }
       const target = this.accountById(selectedAccountId);
       this.#assertSwitchableAccount(target);
+      const source = fromAccountId ? this.accountById(fromAccountId) : null;
+      if (source && source.provider !== target.provider) {
+        throw storeError(
+          'source and target accounts use different providers',
+          'DEVICE_CONFIGURATION_INVALID',
+        );
+      }
 
       const devices = this.devicesMatching({ accountId: fromAccountId, memberLabel, group });
       if (expectedCount !== null && devices.length !== expectedCount) {

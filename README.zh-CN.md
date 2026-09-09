@@ -38,8 +38,9 @@ distribution centre）。
 多个 Codex 账号分别使用独立的凭证目录、刷新进程、dispenser 与证书。客户端把它们安装成
 隔离的 `CODEX_HOME` profile；选择只影响下一次新启动的 `codex-gateway` 进程，不覆盖默认
 `~/.codex` 登录，也不会热切已经运行的会话。
-profile 底层可以同时保存多个域，但当前一个 `credential-console` 进程只有一套全局 Codex
-dispenser 配置，也没有 Codex 账号选择器；在控制面支持多域路由前，第二个真实账号仍需单独配置域。
+直连凭据 profile 底层可以同时保存多个域，而一个 `credential-console` 进程仍只有一套全局
+Codex dispenser 配置。网关路径则可以在一个托管根目录下维护按账号隔离的凭据目录，并让同一设备的
+下一次请求在被允许的 Codex 账号之间切换，无需改启动器，也不会触碰默认登录。
 
 `credential-console` 把 Claude OAuth token 加密存放在磁盘上（encrypted at rest），并且不让
 它们离开这台主机。设备用每设备独立的 token 向网关认证；网关剥掉该 token，再向上游附上服务商

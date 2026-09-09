@@ -12,7 +12,7 @@
  */
 
 import { createServer } from 'node:https';
-import { mkdir, readFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile } from 'node:fs/promises';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -27,6 +27,8 @@ const TLS_KEY = process.env.CODEX_CRED_TLS_KEY ?? join(HOME, 'tls', 'server.key'
 const PUBLIC_PATH = join(HOME, 'public', 'current.json');
 const CLIENTS_PATH = join(HOME, 'clients', 'clients.json');
 const ENROLLMENT_PATH = join(HOME, 'clients', 'enrollment.json');
+const CLIENTS_DIRECTORY_MODE = 0o750;
+const CLIENTS_FILE_MODE = 0o640;
 
 /** Per-IP request budget. This endpoint is on the public internet. */
 const RATE_LIMIT = { windowMs: 60_000, max: 30 };
@@ -87,6 +89,22 @@ function serialized(task) {
   const run = writeQueue.then(task, task);
   writeQueue = run.then(() => {}, () => {});
   return run;
+}
+
+/**
+ * The console inventories machines through this registry, as a read-only member
+ * of the codex-credential group. Keep the token digests away from everyone else
+ * while repairing older 0700/0600 deployments at startup.
+ */
+export async function prepareClientsRegistry(clientsPath = CLIENTS_PATH) {
+  const directory = dirname(clientsPath);
+  await mkdir(directory, { recursive: true, mode: CLIENTS_DIRECTORY_MODE });
+  await chmod(directory, CLIENTS_DIRECTORY_MODE);
+  try {
+    await chmod(clientsPath, CLIENTS_FILE_MODE);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
 }
 
 function log(event, detail = {}) {
@@ -352,8 +370,8 @@ export async function handleEnroll(req, res, { clientsPath, enrollmentPath, ip }
       enrolled: true,
     });
 
-    await mkdir(dirname(clientsPath), { recursive: true, mode: 0o700 });
-    await writeFileAtomic(clientsPath, `${JSON.stringify(db, null, 2)}\n`);
+    await prepareClientsRegistry(clientsPath);
+    await writeFileAtomic(clientsPath, `${JSON.stringify(db, null, 2)}\n`, CLIENTS_FILE_MODE);
     log('enrolled', {
       name,
       ip,
@@ -461,6 +479,7 @@ export async function handle(req, res, {
 }
 
 async function main() {
+  await prepareClientsRegistry();
   const [cert, key] = await Promise.all([readFile(TLS_CERT), readFile(TLS_KEY)]);
 
   const server = createServer({ cert, key, minVersion: 'TLSv1.2' }, (req, res) => {

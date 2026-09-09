@@ -1100,6 +1100,15 @@ function accountSelectionDetails(selection, accounts) {
   </div>`;
 }
 
+function accountCanReceiveDevice(account) {
+  if (!account || !['claude', 'codex'].includes(account.provider)) return false;
+  if (account.status === 'disabled') return false;
+  if (account.expires_at && Date.parse(account.expires_at) <= Date.now()) return false;
+  if (account.provider === 'claude') return true;
+  return account.external?.kind === 'codex-credential'
+    && ['stored', 'healthy'].includes(account.status);
+}
+
 function accountSwitchControl(device, selection, accounts, csrf) {
   if (device.revoked_at) return '';
   if (selection.invalid) {
@@ -1107,19 +1116,30 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   }
   const deviceProvider = accountForId(accounts, selection.selectedAccountId ?? selection.originalAccountId)
     ?.provider ?? 'claude';
-  const candidates = accounts.filter((account) => account.provider === deviceProvider);
-  if (candidates.length === 0) {
-    return '<div class="muted tiny" data-i18n="no-claude-accounts">No Claude accounts are registered.</div>';
+  const providerAccounts = accounts.filter((account) => account.provider === deviceProvider);
+  const destinations = providerAccounts.filter((account) => (
+    account.provider === deviceProvider
+    && accountCanReceiveDevice(account)
+  ));
+  if (providerAccounts.length === 0) {
+    return `<div class="muted tiny">No ${escapeHtml(
+      deviceProvider === 'codex' ? 'Codex' : 'Claude',
+    )} accounts are registered.</div>`;
   }
-  if (candidates.length === 1) {
-    // The only account it could switch to is the one it is on. Rendering the
-    // form anyway offers a button whose whole effect is nothing — and the store
-    // refuses a same-account switch, so pressing it would look like a failure.
-    return `<div class="muted tiny">${escapeHtml(
-      deviceProvider === 'codex' ? 'Only one Codex account is registered.' : 'Only one Claude account is registered.',
-    )}</div>`;
+  const alternatives = destinations.filter((account) => account.id !== selection.selectedAccountId);
+  if (alternatives.length === 0) {
+    return `<div class="muted tiny">No other usable ${escapeHtml(
+      deviceProvider === 'codex' ? 'Codex' : 'Claude',
+    )} account is available.</div>`;
   }
-  const options = accountSelectionOptions(accounts, selection.selectedAccountId, deviceProvider);
+  // Keep an unavailable current account visible as the selected option while
+  // offering only usable destinations. Removing it makes a recovery switch
+  // look like an unexplained preselection of the healthy account.
+  const current = accountForId(providerAccounts, selection.selectedAccountId);
+  const candidates = [current, ...destinations]
+    .filter(Boolean)
+    .filter((account, index, list) => list.findIndex((entry) => entry.id === account.id) === index);
+  const options = accountSelectionOptions(candidates, selection.selectedAccountId, deviceProvider);
   return `<form method="post" action="/devices/${encodeURIComponent(device.id)}/account" class="stack account-switch-form" data-account-switch data-device-id="${escapeHtml(device.id)}">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
     <label><span data-i18n="selected-account">Selected account</span>
@@ -3739,10 +3759,9 @@ export function dashboardView({
   // Filtering is judged on the *device* rows, not the machine: one machine can
   // hold Claude credentials on several accounts, so a machine is shown when any
   // of its rows matches, and the count below counts rows rather than machines.
-  const switchableAccounts = accounts.filter((account) => (
-    account.provider === 'claude' && account.status !== 'disabled'
-  ));
-  const filterAccount = switchableAccounts.find((account) => account.id === accountFilter) ?? null;
+  const filterAccounts = accounts.filter((account) => ['claude', 'codex'].includes(account.provider));
+  const destinationAccounts = filterAccounts.filter(accountCanReceiveDevice);
+  const filterAccount = filterAccounts.find((account) => account.id === accountFilter) ?? null;
   const memberLabels = [...new Set(devices
     .filter((device) => !device.revoked_at && device.member_label)
     .map((device) => device.member_label))].sort((a, b) => a.localeCompare(b));
@@ -3750,7 +3769,7 @@ export function dashboardView({
   const filterGroup = groupNames.includes(groupFilter) ? groupFilter : null;
   const anyFilter = Boolean(filterAccount || filterMember || filterGroup);
   // Both conditions apply together: "everyone under this GitHub account who is
-  // currently on that Claude account" is the selection worth acting on.
+  // currently on that provider account" is the selection worth acting on.
   const matchedRows = (entry) => (entry.devices ?? []).filter((device) => {
     if (device.revoked_at) return false;
     if (filterMember && device.member_label !== filterMember) return false;
@@ -3768,6 +3787,10 @@ export function dashboardView({
     filterAccount ? `on <strong>${escapeHtml(filterAccount.alias)}</strong>` : null,
     filterMember ? `for <strong>${escapeHtml(filterMember)}</strong>` : null,
   ].filter(Boolean).join(' ');
+  const bulkTargetAccounts = destinationAccounts.filter((account) => (
+    account.id !== filterAccount?.id
+    && (!filterAccount || account.provider === filterAccount.provider)
+  ));
 
   const liveMachines = inventory.filter((entry) => entry.active > 0 && !entry.legacy && matchesFilter(entry));
   // Kept in a group of their own rather than mixed in among machines: an issuance
@@ -3947,11 +3970,11 @@ export function dashboardView({
               </li>`).join('')}</ul>` : '<p class="muted tiny">No groups yet.</p>'}
             </details>
             ${openMode ? '<div class="notice error open-banner" role="status" data-i18n="open-account-switch-warning">Open mode has no verified actor: anyone who can reach this console can switch any active device. The actor is recorded as anonymous; a member label is not an actor.</div>' : ''}
-            ${switchableAccounts.length ? `<form method="get" action="/" class="machine-filter">
-              <label><span>Claude account</span>
+            ${filterAccounts.length ? `<form method="get" action="/" class="machine-filter">
+              <label><span>Provider account</span>
                 <select name="account">
                   <option value="">All accounts</option>
-                  ${switchableAccounts.map((account) => (
+                  ${filterAccounts.map((account) => (
                     `<option value="${escapeHtml(account.id)}"${account.id === filterAccount?.id ? ' selected' : ''}>${escapeHtml(account.alias)}</option>`
                   )).join('')}
                 </select>
@@ -3974,7 +3997,7 @@ export function dashboardView({
               </label>
               <noscript><button type="submit">Apply</button></noscript>
             </form>` : ''}
-            ${anyFilter ? (filteredCount ? `<form method="post" action="/devices/account" class="bulk-switch stack">
+            ${anyFilter ? (filteredCount && bulkTargetAccounts.length ? `<form method="post" action="/devices/account" class="bulk-switch stack">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <input type="hidden" name="from_account_id" value="${escapeHtml(filterAccount?.id ?? '')}">
               <input type="hidden" name="member_label" value="${escapeHtml(filterMember ?? '')}">
@@ -3983,14 +4006,16 @@ export function dashboardView({
               <div><strong>${filteredCount}</strong> active credential(s) ${filterSummary}.</div>
               <label><span>Move all of them to</span>
                 <select name="selected_account_id" required>
-                  ${switchableAccounts.filter((account) => account.id !== filterAccount?.id).map((account) => (
+                  ${bulkTargetAccounts.map((account) => (
                     `<option value="${escapeHtml(account.id)}">${escapeHtml(accountDisplayLabel(account))}</option>`
                   )).join('')}
                 </select>
               </label>
               <button type="submit" class="danger">Switch all ${filteredCount}</button>
               <div class="muted tiny">Applies to whatever matches when you press it, and refuses if that is no longer ${filteredCount}. Rows already on the target, or that cannot move, are reported and left alone.</div>
-            </form>` : `<div class="notice"><span>No active credential matches ${filterSummary}.</span></div>`) : ''}
+            </form>` : `<div class="notice"><span>${filteredCount
+    ? `No other usable provider account is available for ${filterSummary}.`
+    : `No active credential matches ${filterSummary}.`}</span></div>`) : ''}
             ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
             ${liveMachines.length + unattributed.length + retiredMachines.length ? `<div class="machine-search-bar">
               <label class="machine-search-field"><span data-i18n="machine-search">Search machines</span>
@@ -4112,17 +4137,19 @@ export function codexAuthorizationView({
             <button type="submit" data-i18n="complete-authorization">Complete authorization</button>
           </form>
         ` : ''}
-        <hr>
-        <h2 data-i18n="codex-paste-heading">Or paste an existing auth.json</h2>
-        <p class="muted tiny" data-i18n="codex-paste-intro">For when the redirect cannot be completed — a quarantined refresh chain, a browser that cannot reach this console, or a credential minted on another machine. This writes the credential straight into the credential home and clears any refresh quarantine, exactly as a fresh authorization would. Unlike the flow above there is no 15-minute window and no code to spend, so a mistake costs nothing but a retry.</p>
-        <form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-authorization/paste" class="stack" autocomplete="off">
-          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-          <label><span data-i18n="codex-paste-label">Contents of ~/.codex/auth.json</span>
-            <textarea name="credential_json" required minlength="8" spellcheck="false" autocomplete="off" placeholder='{"OPENAI_API_KEY":null,"tokens":{"id_token":"...","access_token":"...","refresh_token":"...","account_id":"..."}}'></textarea>
-          </label>
-          <button type="submit" data-i18n="codex-paste-submit">Store this credential</button>
-        </form>
-        <div class="notice error" data-i18n="codex-paste-warning">Paste the auth.json from the login itself, not one taken off a client machine — a distributed copy carries a deliberately invalid refresh_token and would leave the refresh centre unable to renew anything. Clear the clipboard afterwards.</div>
+        ${seedHome ? `
+          <hr>
+          <h2 data-i18n="codex-paste-heading">Or paste an existing auth.json</h2>
+          <p class="muted tiny" data-i18n="codex-paste-intro">For when the redirect cannot be completed — a quarantined refresh chain, a browser that cannot reach this console, or a credential minted on another machine. This writes the credential straight into the credential home and clears any refresh quarantine, exactly as a fresh authorization would. Unlike the flow above there is no 15-minute window and no code to spend, so a mistake costs nothing but a retry.</p>
+          <form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-authorization/paste" class="stack" autocomplete="off">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+            <label><span data-i18n="codex-paste-label">Contents of ~/.codex/auth.json</span>
+              <textarea name="credential_json" required minlength="8" spellcheck="false" autocomplete="off" placeholder='{"OPENAI_API_KEY":null,"tokens":{"id_token":"...","access_token":"...","refresh_token":"...","account_id":"..."}}'></textarea>
+            </label>
+            <button type="submit" data-i18n="codex-paste-submit">Store this credential</button>
+          </form>
+          <div class="notice error" data-i18n="codex-paste-warning">Paste the auth.json from the login itself, not one taken off a client machine — a distributed copy carries a deliberately invalid refresh_token and would leave the refresh centre unable to renew anything. Clear the clipboard afterwards.</div>
+        ` : '<div class="notice" data-i18n="codex-paste-readonly">This console has no write authority for this account. Use the one-time auth.json handoff after authorization; a credential cannot be pasted here.</div>'}
         <div class="notice" data-i18n="codex-auth-security">The authorization session is single-use, expires in 15 minutes, and is replaced when a new one starts. A pasted address is checked against the state this console issued; a bare code carries no state and relies on PKCE and there being exactly one live session. The PKCE verifier is encrypted at rest and the resulting credential is never written to state.json, the audit log, or a log line.</div>
         <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
       </div>
@@ -4130,10 +4157,16 @@ export function codexAuthorizationView({
   `, { openMode });
 }
 
-export function codexCredentialView({ account, authJson, error = null, openMode = false }) {
+export function codexCredentialView({
+  account,
+  authJson,
+  seedHome = '/var/lib/codex-credential',
+  error = null,
+  openMode = false,
+}) {
   const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
   const filename = `codex-auth-${profile}.json`;
-  const seedCommand = `sudo -u codex-refresh CODEX_CRED_HOME=/var/lib/codex-credential node /opt/claude-codex-gateway/codex-credential/refresh-center/seed.js ./${filename}`;
+  const seedCommand = `sudo -u codex-refresh CODEX_CRED_HOME=${shellSingleQuote(seedHome)} node /opt/claude-codex-gateway/codex-credential/refresh-center/seed.js ./${filename}`;
   return layout('Codex credential ready', `
     <section class="card stack">
       ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}

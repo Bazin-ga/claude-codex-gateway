@@ -45,6 +45,11 @@ import {
 } from './lib/codex-oauth.js';
 import { assertCodexSeedHomeWritable, seedCodexCredentialHome } from './lib/codex-seed.js';
 import {
+  CodexManagedDomainRefresher,
+  codexSeedHomeForAccount,
+  validateManagedCodexRoot,
+} from './lib/codex-managed-domains.js';
+import {
   claudeAuthorizationView,
   dashboardView,
   docsView,
@@ -84,6 +89,13 @@ const CODEX_ENROLLMENT_KEY_FILE = process.env.CREDENTIAL_CONSOLE_CODEX_ENROLLMEN
 // Setting this elevates the console from read-only importer to writer of that
 // codex-credential home. See README "Codex account authorization".
 const CODEX_SEED_HOME = process.env.CREDENTIAL_CONSOLE_CODEX_SEED_HOME;
+// New web-authorized accounts receive one isolated home below this root. An
+// existing binding never moves and stays read-only unless an explicit writer
+// mode covers that exact path.
+const CODEX_MANAGED_ROOT = process.env.CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT;
+const CODEX_MANAGED_REFRESH_INTERVAL_MS = Number(
+  process.env.CREDENTIAL_CONSOLE_CODEX_MANAGED_REFRESH_INTERVAL_SECONDS ?? 6 * 60 * 60,
+) * 1_000;
 const USAGE_REFRESH_INTERVAL_MS = Number(
   process.env.CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS ?? 60 * 60_000,
 );
@@ -601,7 +613,35 @@ export async function createCredentialConsole(options = {}) {
   // Canonical from here on, so it compares equal to the `resolve()`d home that
   // `cli.js import-codex` records against an account.
   const configuredSeedHome = options.codexSeedHome ?? CODEX_SEED_HOME ?? null;
-  const codexSeedHome = configuredSeedHome ? resolvePath(configuredSeedHome) : null;
+  const legacyCodexSeedHome = configuredSeedHome ? resolvePath(configuredSeedHome) : null;
+  const configuredManagedRoot = options.codexManagedRoot ?? CODEX_MANAGED_ROOT ?? null;
+  const codexManagedRoot = validateManagedCodexRoot(
+    configuredManagedRoot ? resolvePath(configuredManagedRoot) : null,
+    options.home ?? store.home ?? HOME,
+  );
+  const codexSeedHomeFor = (account) => codexSeedHomeForAccount(account, {
+    managedRoot: codexManagedRoot,
+    legacySeedHome: legacyCodexSeedHome,
+  });
+  const codexHandoffHomeFor = (account, attemptedHome = null) => resolvePath(
+    attemptedHome
+      ?? account?.external?.home
+      ?? legacyCodexSeedHome
+      ?? '/var/lib/codex-credential',
+  );
+  const codexManagedRefresher = options.codexManagedRefresher === false
+    ? null
+    : (options.codexManagedRefresher ?? new CodexManagedDomainRefresher({
+      accounts: () => store.state.accounts,
+      managedRoot: codexManagedRoot,
+      intervalMs: options.codexManagedRefreshIntervalMs
+        ?? CODEX_MANAGED_REFRESH_INTERVAL_MS,
+      recordExpiry: (accountId, expiresAt) => (
+        store.updateExternalAccountExpiry(accountId, expiresAt)
+      ),
+      log,
+    }));
+  codexManagedRefresher?.start?.();
   const claudeOauthExchange = options.claudeOauthExchange ?? exchangeClaudeAuthorization;
   const codexOauthExchange = options.codexOauthExchange ?? exchangeCodexAuthorization;
   const codexSelfServiceReady = Boolean(codexEndpoint && codexCertPin && codexEnrollmentKey);
@@ -2076,7 +2116,7 @@ export async function createCredentialConsole(options = {}) {
         account,
         csrf: session.csrf,
         ownerPageUrl: `${publicBaseUrl.replace(/\/$/, '')}/accounts/${encodeURIComponent(account.id)}/codex-authorization`,
-        seedHome: codexSeedHome,
+        seedHome: codexSeedHomeFor(account),
         openMode,
         ...(pending ? { authorization: { expires_at: pending.expires_at } } : {}),
         ...extra,
@@ -2113,18 +2153,20 @@ export async function createCredentialConsole(options = {}) {
       }
       const account = codexAccountOr404(codexAuthorizationStartParams.id);
       if (!account) return;
+      const targetSeedHome = codexSeedHomeFor(account);
       try {
-        store.assertCodexSeedHome({ accountId: account.id, seedHome: codexSeedHome });
+        store.assertCodexSeedHome({ accountId: account.id, seedHome: targetSeedHome });
         // Refuse an unwritable seed home here, where nothing has been spent yet.
         // Discovering it after the exchange costs a browser login that cannot be
         // replayed, because the authorization code is single-use upstream.
-        if (codexSeedHome) await assertCodexSeedHomeWritable(codexSeedHome);
+        if (targetSeedHome) await assertCodexSeedHomeWritable(targetSeedHome);
         const request = createCodexAuthorizationRequest();
         const flow = await store.beginCodexAuthorization({
           accountId: account.id,
           verifier: request.verifier,
           state: request.state,
           initiatedBy: session.admin_identity ?? 'administrator',
+          seedHome: targetSeedHome,
         });
         sendHtml(res, 200, codexAuthorizationPage(account, session, {
           authorization: { url: request.url, expires_at: flow.expires_at },
@@ -2152,6 +2194,21 @@ export async function createCredentialConsole(options = {}) {
         const flow = submitted.state
           ? store.codexAuthorizationByState({ accountId: account.id, state: submitted.state })
           : store.liveCodexAuthorization({ accountId: account.id });
+        // A destination is part of the authorization session's security
+        // boundary. Unpinned sessions predate that boundary and a pinned writer
+        // target must still be explicitly allowed by the current process before
+        // a single-use authorization code is exchanged.
+        if (!Object.hasOwn(flow, 'seed_home')) {
+          throw new Error('authorization session predates the current credential policy; start a fresh authorization');
+        }
+        const targetSeedHome = flow.seed_home ? resolvePath(flow.seed_home) : null;
+        const currentlyAllowedSeedHome = codexSeedHomeFor(account);
+        if (targetSeedHome && (
+          !currentlyAllowedSeedHome
+          || targetSeedHome !== resolvePath(currentlyAllowedSeedHome)
+        )) {
+          throw new Error('authorization destination is no longer permitted; start a fresh authorization');
+        }
         if (flow.initiated_by !== identity) {
           throw new Error('authorization must be completed by the same administrator who started it');
         }
@@ -2171,10 +2228,10 @@ export async function createCredentialConsole(options = {}) {
         // authorize into it and overwrite a live credential.
         let seeded = null;
         let seedFailure = null;
-        if (codexSeedHome) {
+        if (targetSeedHome) {
           try {
-            store.assertCodexSeedHome({ accountId: account.id, seedHome: codexSeedHome });
-            seeded = await seedCodexCredentialHome(codexSeedHome, credential);
+            store.assertCodexSeedHome({ accountId: account.id, seedHome: targetSeedHome });
+            seeded = await seedCodexCredentialHome(targetSeedHome, credential);
           } catch (error) {
             seedFailure = error;
             if (error.progress?.wroteCredential) seeded = error.progress;
@@ -2182,14 +2239,14 @@ export async function createCredentialConsole(options = {}) {
         }
         await store.completeCodexAuthorization({
           flowId: flow.id,
-          seededHome: seeded ? codexSeedHome : null,
+          seededHome: seeded ? targetSeedHome : null,
           expiresAt: seeded?.expiresAt ?? null,
         });
         if (seedFailure) {
           log('codex_account_seed_failed', {
             account_id: account.id,
             account_alias: account.alias,
-            seeded_home: codexSeedHome,
+            seeded_home: targetSeedHome,
             wrote_credential: Boolean(seeded),
             identity,
             error: seedFailure.message,
@@ -2206,7 +2263,8 @@ export async function createCredentialConsole(options = {}) {
             : codexCredentialView({
               account,
               authJson: `${JSON.stringify(credential, null, 2)}\n`,
-              error: `Nothing was written to ${codexSeedHome}: ${seedFailure.message}`,
+              seedHome: codexHandoffHomeFor(account, targetSeedHome),
+              error: `Nothing was written to ${targetSeedHome}: ${seedFailure.message}`,
               openMode,
             }));
           return;
@@ -2216,10 +2274,11 @@ export async function createCredentialConsole(options = {}) {
           account_alias: account.alias,
           email: authorized.email,
           plan: authorized.planType,
-          seeded_home: codexSeedHome,
+          seeded_home: targetSeedHome,
           identity,
         });
         if (seeded) {
+          codexManagedRefresher?.runNow?.().catch(() => {});
           sendHtml(res, 200, messageView(
             'Codex account authorized',
             `The credential was written to ${seeded.home} and is not shown here.`,
@@ -2233,6 +2292,7 @@ export async function createCredentialConsole(options = {}) {
           sendHtml(res, 200, codexCredentialView({
             account,
             authJson: `${JSON.stringify(credential, null, 2)}\n`,
+            seedHome: codexHandoffHomeFor(account),
             openMode,
           }));
         }
@@ -2323,8 +2383,9 @@ export async function createCredentialConsole(options = {}) {
       const account = codexAccountOr404(codexPasteParams.id);
       if (!account) return;
       const identity = session.admin_identity ?? 'administrator';
+      const targetSeedHome = codexSeedHomeFor(account);
       try {
-        if (!codexSeedHome) {
+        if (!targetSeedHome) {
           throw new Error('no Codex credential home is configured, so there is nowhere to write this');
         }
         const { credential, identity: authorized } = parseCodexAuthJson(form.credential_json);
@@ -2332,11 +2393,11 @@ export async function createCredentialConsole(options = {}) {
         if (expectedEmail && String(authorized.email ?? '').trim().toLowerCase() !== expectedEmail) {
           throw new Error(`the pasted credential belongs to a different account than ${expectedEmail}`);
         }
-        store.assertCodexSeedHome({ accountId: account.id, seedHome: codexSeedHome });
-        const seeded = await seedCodexCredentialHome(codexSeedHome, credential);
+        store.assertCodexSeedHome({ accountId: account.id, seedHome: targetSeedHome });
+        const seeded = await seedCodexCredentialHome(targetSeedHome, credential);
         await store.recordCodexSeed({
           accountId: account.id,
-          seededHome: codexSeedHome,
+          seededHome: targetSeedHome,
           expiresAt: seeded?.expiresAt ?? null,
           actor: identity,
         });
@@ -2345,7 +2406,7 @@ export async function createCredentialConsole(options = {}) {
           account_alias: account.alias,
           email: authorized.email,
           plan: authorized.planType,
-          seeded_home: codexSeedHome,
+          seeded_home: targetSeedHome,
           identity,
         });
         sendHtml(res, 200, messageView(
@@ -2353,6 +2414,7 @@ export async function createCredentialConsole(options = {}) {
           `The credential was written to ${seeded.home} and is not shown here. Any refresh quarantine on that home has been cleared.`,
           { openMode, detail: `${account.alias} → ${seeded.home}` },
         ));
+        codexManagedRefresher?.runNow?.().catch(() => {});
       } catch (error) {
         // The message is shape-only by construction, so it is safe to render and
         // to log. The credential itself is never in either.
@@ -2537,8 +2599,14 @@ export async function createCredentialConsole(options = {}) {
           actor,
         });
         if (asyncJson) {
+          const provider = summary.account.provider;
           const accountOptions = store.publicAccounts()
-            .filter((account) => account.provider === 'claude')
+            .filter((account) => (
+              account.provider === provider
+              && account.status !== 'disabled'
+              && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
+              && (provider !== 'codex' || account.external?.kind === 'codex-credential')
+            ))
             .map((account) => ({
               id: account.id,
               alias: account.alias,
@@ -2661,6 +2729,7 @@ export async function createCredentialConsole(options = {}) {
   server.once('close', () => {
     clearInterval(cleanupTimer);
     usageMonitor.stop?.();
+    codexManagedRefresher?.stop?.();
     try {
       const closing = requestMetrics?.close?.();
       if (closing && typeof closing.then === 'function') {
