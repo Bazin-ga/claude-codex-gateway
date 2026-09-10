@@ -4661,7 +4661,7 @@ set -euo pipefail
 PROFILE_ROOT="$HOME/.config/claude-codex-gateway"
 export CODEX_HOME="$PROFILE_ROOT/codex-${profile}-home"
 export ${tokenEnvVar}="$(cat "$PROFILE_ROOT/codex-${profile}.token")"
-exec codex --dangerously-bypass-hook-trust "$@"
+exec "$HOME/.local/bin/codex" --dangerously-bypass-hook-trust "$@"
 LAUNCHER
 chmod 700 "$LAUNCHER_FILE"
 ln -sfn "$LAUNCHER_FILE" "$DEFAULT_LAUNCHER"

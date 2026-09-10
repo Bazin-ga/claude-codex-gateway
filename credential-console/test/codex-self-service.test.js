@@ -136,6 +136,8 @@ test('the Codex setup page configures the CLI to send the device token', () => {
   assert.match(copied, /wire_api = "responses"/);
   assert.match(copied, /env_key = "CODEX_GATEWAY_TOKEN"/);
   assert.match(copied, /export CODEX_GATEWAY_TOKEN='sk-ant-api03-EXAMPLE-DEVICE-TOKEN'/);
+  assert.match(copied, /exec "\$HOME\/\.local\/bin\/codex" --dangerously-bypass-hook-trust/, 'the launcher works without a shell-initialised PATH');
+  assert.equal(copied.includes('exec codex --dangerously-bypass-hook-trust'), false);
   // requires_openai_auth would make the CLI send its own ChatGPT token, which
   // the gateway rejects by design.
   assert.equal(html.includes('requires_openai_auth'), false);
