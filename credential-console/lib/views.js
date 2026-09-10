@@ -4617,7 +4617,18 @@ TOKEN_FILE="$CONFIG_ROOT/codex-${profile}.token"
 ADAPTER_FILE="$CONFIG_ROOT/${CODEX_CONVERSATION_HOOK_CLIENT_FILENAME}"
 LAUNCHER_FILE="$HOME/.local/bin/codex-${profile}"
 DEFAULT_LAUNCHER="$HOME/.local/bin/codex-gateway"
-NODE_BIN="$(command -v node || echo node)"
+NODE_BIN="$(command -v node || true)"
+CODEX_BIN="$(command -v codex || true)"
+
+if [ -z "$NODE_BIN" ] || [ "\${NODE_BIN#/}" = "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
+  echo "node: NOT INSTALLED or not available as an absolute executable path" >&2
+  exit 1
+fi
+if [ -z "$CODEX_BIN" ] || [ "\${CODEX_BIN#/}" = "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
+  echo "codex: NOT INSTALLED or not available as an absolute executable path" >&2
+  echo "Install it first with: npm install -g @openai/codex" >&2
+  exit 1
+fi
 
 install -d -m 700 "$CONFIG_ROOT" "$CODEX_HOME_DIR" "$HOME/.local/bin"
 umask 077
@@ -4655,13 +4666,14 @@ timeout = 8
 CONFIG
 chmod 600 "$CODEX_HOME_DIR/config.toml"
 
-cat > "$LAUNCHER_FILE" <<'LAUNCHER'
+cat > "$LAUNCHER_FILE" <<LAUNCHER
 #!/usr/bin/env bash
 set -euo pipefail
-PROFILE_ROOT="$HOME/.config/claude-codex-gateway"
-export CODEX_HOME="$PROFILE_ROOT/codex-${profile}-home"
-export ${tokenEnvVar}="$(cat "$PROFILE_ROOT/codex-${profile}.token")"
-exec codex --dangerously-bypass-hook-trust "$@"
+PROFILE_ROOT="\\$HOME/.config/claude-codex-gateway"
+export CODEX_HOME="\\$PROFILE_ROOT/codex-${profile}-home"
+export ${tokenEnvVar}="\\$(cat "\\$PROFILE_ROOT/codex-${profile}.token")"
+export PATH=$(printf '%q' "\${CODEX_BIN%/*}:\${NODE_BIN%/*}"):"\\$PATH"
+exec $(printf '%q' "$CODEX_BIN") --dangerously-bypass-hook-trust "\\$@"
 LAUNCHER
 chmod 700 "$LAUNCHER_FILE"
 ln -sfn "$LAUNCHER_FILE" "$DEFAULT_LAUNCHER"
