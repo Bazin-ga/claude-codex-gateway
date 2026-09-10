@@ -25,6 +25,8 @@ import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
+import { queryMetricsDataset } from './lib/metrics-page-query.js';
+import { MetricsQueryService } from './lib/metrics-query-service.js';
 import { CLIENT_CONFIG_VERSION } from './lib/client-config-version.js';
 import { buildOnboardingGuideUrl, buildOnboardingMarkdown } from './lib/onboarding.js';
 import { UsageMonitor } from './lib/usage.js';
@@ -101,14 +103,18 @@ const USAGE_REFRESH_INTERVAL_MS = Number(
 );
 const SESSION_TTL_MS = 12 * 60 * 60_000;
 // Open mode mints a session for any visitor, so the map needs a ceiling that does
-// not depend on someone authenticating first. The process is capped at 96 MB of
-// heap by the shipped unit; an unbounded map is an OOM plus a restart loop.
+// not depend on someone authenticating first. The main isolate is capped at 96
+// MB of old-space; an unbounded map is an OOM plus a restart loop.
 const MAX_SESSIONS = 4_096;
 const HOUR_MS = 60 * 60_000;
 // Matches the hourly bucket ceiling in metrics-chart-data.js. A wider window does
 // not draw more of the range, it draws the same chart with holes in it.
 const METRICS_MAX_WINDOW_HOURS = 720;
-const METRICS_PAGE_CACHE_TTL_MS = 5_000;
+// The chart bundle loads after the HTML. Five seconds regularly expired before
+// a remote browser could ask for chart-data, especially after a cold read, and
+// forced the same aggregates to run twice. One minute still keeps an
+// operational dashboard fresh while spanning the complete page-load handshake.
+const METRICS_PAGE_CACHE_TTL_MS = 60_000;
 const MAX_METRICS_PAGE_CACHE_ENTRIES = 8;
 const MAX_METRICS_PAGE_CACHE_BYTES = 12 * 1024 * 1024;
 const METRICS_CHART_RATE_WINDOW_MS = 60_000;
@@ -572,6 +578,7 @@ export async function createCredentialConsole(options = {}) {
       });
     }
   }
+  let metricsQueryService = options.metricsQueryService ?? null;
   const usageMonitor = options.usageMonitor ?? await new UsageMonitor({
     store,
     home: options.home ?? store.home ?? HOME,
@@ -581,7 +588,15 @@ export async function createCredentialConsole(options = {}) {
   }).init();
   const sessions = new Map();
   const metricsPageCache = new Map();
+  const metricsPageInFlight = new Map();
   let metricsPageCacheBytes = 0;
+  const metricsPageClock = typeof options.metricsPageClock === 'function'
+    ? options.metricsPageClock
+    : Date.now;
+  const metricsPageCacheTtlMs = Number.isFinite(Number(options.metricsPageCacheTtlMs))
+    && Number(options.metricsPageCacheTtlMs) >= 0
+    ? Number(options.metricsPageCacheTtlMs)
+    : METRICS_PAGE_CACHE_TTL_MS;
   const metricsChartRate = new Map();
   const publicBaseUrl = options.publicBaseUrl ?? PUBLIC_BASE_URL;
   const onboardingUrl = buildOnboardingGuideUrl(publicBaseUrl);
@@ -663,6 +678,23 @@ export async function createCredentialConsole(options = {}) {
   if (!['tailscale', 'open'].includes(adminAuth)) {
     throw new Error('CREDENTIAL_CONSOLE_ADMIN_AUTH must be tailscale or open');
   }
+  const enableMetricsQueryWorker = options.enableMetricsQueryWorker
+    ?? !Object.hasOwn(options, 'store');
+  if (enableMetricsQueryWorker
+    && !Object.hasOwn(options, 'metricsQueryService')
+    && requestMetrics instanceof MetricsStore
+    && requestMetrics.dbPath) {
+    try {
+      metricsQueryService = await new MetricsQueryService({
+        dbPath: requestMetrics.dbPath,
+      }).init();
+    } catch (error) {
+      metricsQueryService = null;
+      log('metrics_query_worker_init_failed', {
+        code: error?.code ?? error?.name ?? 'unknown',
+      });
+    }
+  }
   // Open mode has no login, so every rendered page has to say so.
   const openMode = adminAuth === 'open';
   // Both providers issue the same kind of device token but need different client
@@ -684,7 +716,7 @@ export async function createCredentialConsole(options = {}) {
       if (session.expires_at <= now) sessions.delete(token);
     }
     for (const [key, entry] of metricsPageCache) {
-      if (now - entry.createdAtMs > METRICS_PAGE_CACHE_TTL_MS) deleteMetricsPageCache(key);
+      if (now - entry.createdAtMs > metricsPageCacheTtlMs) deleteMetricsPageCache(key);
     }
     for (const [key, entry] of metricsChartRate) {
       if (now - entry.sinceMs > METRICS_CHART_RATE_WINDOW_MS) metricsChartRate.delete(key);
@@ -868,7 +900,7 @@ export async function createCredentialConsole(options = {}) {
     return known;
   }
 
-  function queryMetricsPage(url) {
+  async function queryMetricsPage(url) {
     const allowedHours = new Set([24, 168, 720]);
     const requestedHours = Number(url.searchParams.get('hours'));
     const presetHours = allowedHours.has(requestedHours) ? requestedHours : 24;
@@ -962,34 +994,27 @@ export async function createCredentialConsole(options = {}) {
       // A dashboard read may flush one queued batch: this is outside every
       // proxy completion callback, so request delivery never waits on SQLite.
       requestMetrics.flush?.();
-      const allTotals = requestMetrics.queryTotals({ ...filters, scope: 'all' });
-      const consumptionTotals = requestMetrics.queryTotals({ ...filters, scope: 'consumption' });
-      const hourly = requestMetrics.queryHourly({ ...filters, scope: 'all' });
-      const tokenHourly = requestMetrics.queryHourly({ ...filters, scope: 'consumption' });
-      const dimensions = { fromMs, toMs, scope: 'all' };
+      const dataset = metricsQueryService
+        ? await metricsQueryService.query(filters)
+        : queryMetricsDataset(requestMetrics, filters);
+      const {
+        allTotals,
+        consumptionTotals,
+        hourly,
+        tokenHourly,
+        machineRows,
+        deviceRows,
+        memberRows,
+        accountRows,
+        modelRows,
+      } = dataset;
       const deviceById = new Map(store.publicDevices().map((device) => [device.id, device]));
       const accountById = new Map(store.publicAccounts().map((account) => [account.id, account]));
-      const machineRows = requestMetrics.queryBreakdown({ by: 'machine', ...dimensions });
-      const deviceRows = requestMetrics.queryBreakdown({ by: 'device', ...dimensions });
-      const memberRows = requestMetrics.queryBreakdown({ by: 'member', ...dimensions });
-      const accountRows = requestMetrics.queryBreakdown({ by: 'account', ...dimensions });
-      const modelRows = requestMetrics.queryBreakdown({ by: 'model', ...dimensions });
-      const tokenBreakdown = typeof requestMetrics.queryTokenBreakdown === 'function'
-        ? requestMetrics.queryTokenBreakdown.bind(requestMetrics)
-        : requestMetrics.queryBreakdown.bind(requestMetrics);
-      const accountTokenBreakdown = tokenBreakdown({
-        by: 'account',
-        ...filters,
-        scope: 'consumption',
-      }).map((row) => ({
+      const accountTokenBreakdown = dataset.accountTokenBreakdown.map((row) => ({
         ...row,
         label: accountById.get(row.groupValue)?.alias ?? row.groupValue ?? 'Unattributed',
       }));
-      const modelTokenBreakdown = tokenBreakdown({
-        by: 'model',
-        ...filters,
-        scope: 'consumption',
-      }).map((row) => ({
+      const modelTokenBreakdown = dataset.modelTokenBreakdown.map((row) => ({
         ...row,
         label: row.groupValue ?? 'Unattributed',
       }));
@@ -997,42 +1022,31 @@ export async function createCredentialConsole(options = {}) {
         devices: [], rows: [], truncated: false, devicesTruncated: false, hoursTruncated: false,
         unavailableDeviceCount: 0,
       };
-      if (typeof requestMetrics.queryDeviceTokenHourly === 'function') {
-        try {
-          const comparison = requestMetrics.queryDeviceTokenHourly({
-            fromMs,
-            toMs,
-            ...(memberLabel ? { memberLabel } : {}),
-            ...(accountId ? { accountId } : {}),
-            ...(model ? { model } : {}),
-          });
-          deviceTokenComparison = {
-            devices: (Array.isArray(comparison?.devices) ? comparison.devices : []).map((device) => {
-              const publicDevice = deviceById.get(device.deviceId);
-              return {
-                ...device,
-                value: device.deviceId,
-                name: publicDevice?.name ?? null,
-                revoked: Boolean(publicDevice?.revoked_at),
-                label: publicDevice?.name
-                  ? `${publicDevice.name} · ${device.memberLabel ?? device.deviceId}${publicDevice.revoked_at ? ' · revoked' : ''}`
-                  : (device.memberLabel ?? device.deviceId),
-              };
-            }),
-            rows: Array.isArray(comparison?.rows) ? comparison.rows : [],
-            truncated: comparison?.truncated === true,
-            devicesTruncated: comparison?.devicesTruncated === true,
-            hoursTruncated: comparison?.hoursTruncated === true,
-            unavailableDeviceCount: Number.isSafeInteger(comparison?.unavailableDeviceCount)
-              ? comparison.unavailableDeviceCount
-              : 0,
-          };
-        } catch (comparisonError) {
-          log('metrics_device_comparison_failed', {
-            code: comparisonError?.code ?? comparisonError?.name ?? 'unknown',
-          });
-        }
+      if (dataset.deviceComparisonError) {
+        log('metrics_device_comparison_failed', { code: dataset.deviceComparisonError });
       }
+      const comparison = dataset.deviceTokenComparison;
+      deviceTokenComparison = {
+        devices: (Array.isArray(comparison?.devices) ? comparison.devices : []).map((device) => {
+          const publicDevice = deviceById.get(device.deviceId);
+          return {
+            ...device,
+            value: device.deviceId,
+            name: publicDevice?.name ?? null,
+            revoked: Boolean(publicDevice?.revoked_at),
+            label: publicDevice?.name
+              ? `${publicDevice.name} · ${device.memberLabel ?? device.deviceId}${publicDevice.revoked_at ? ' · revoked' : ''}`
+              : (device.memberLabel ?? device.deviceId),
+          };
+        }),
+        rows: Array.isArray(comparison?.rows) ? comparison.rows : [],
+        truncated: comparison?.truncated === true,
+        devicesTruncated: comparison?.devicesTruncated === true,
+        hoursTruncated: comparison?.hoursTruncated === true,
+        unavailableDeviceCount: Number.isSafeInteger(comparison?.unavailableDeviceCount)
+          ? comparison.unavailableDeviceCount
+          : 0,
+      };
       return {
         range: { fromMs, toMs, hours, timezone: 'UTC' },
         filters: viewFilters,
@@ -1090,7 +1104,7 @@ export async function createCredentialConsole(options = {}) {
     }
   }
 
-  function metricsPage(url) {
+  async function metricsPage(url) {
     const requestedHours = Number(url.searchParams.get('hours'));
     const hours = new Set([24, 168, 720]).has(requestedHours) ? requestedHours : 24;
     const cacheKey = JSON.stringify([
@@ -1103,33 +1117,47 @@ export async function createCredentialConsole(options = {}) {
       String(url.searchParams.get('account_id') ?? '').slice(0, 128),
       String(url.searchParams.get('model') ?? '').slice(0, 256),
     ]);
-    const now = Date.now();
+    const now = metricsPageClock();
     const cached = metricsPageCache.get(cacheKey);
-    if (cached && now - cached.createdAtMs <= METRICS_PAGE_CACHE_TTL_MS) {
+    if (cached && now - cached.createdAtMs <= metricsPageCacheTtlMs) {
       metricsPageCache.delete(cacheKey);
       metricsPageCache.set(cacheKey, cached);
       return cached.page;
     }
     if (cached) deleteMetricsPageCache(cacheKey);
-    const page = queryMetricsPage(url);
-    let bytes = MAX_METRICS_PAGE_CACHE_BYTES + 1;
+    const inFlight = metricsPageInFlight.get(cacheKey);
+    if (inFlight) return inFlight;
+    const pending = (async () => {
+      const page = await queryMetricsPage(url);
+      let bytes = MAX_METRICS_PAGE_CACHE_BYTES + 1;
+      try {
+        bytes = Buffer.byteLength(JSON.stringify(page), 'utf8');
+      } catch {
+        // A query result that cannot be measured is still safe to render once,
+        // but it must never enter a memory cache with an unknown cost.
+      }
+      while (metricsPageCache.size >= MAX_METRICS_PAGE_CACHE_ENTRIES
+        || (metricsPageCache.size > 0
+          && metricsPageCacheBytes + bytes > MAX_METRICS_PAGE_CACHE_BYTES)) {
+        const oldest = metricsPageCache.keys().next().value;
+        if (oldest === undefined) break;
+        deleteMetricsPageCache(oldest);
+      }
+      if (bytes <= MAX_METRICS_PAGE_CACHE_BYTES) {
+        // Freshness begins after the expensive read. A query slower than its TTL
+        // must not be inserted already stale and immediately repeated by the
+        // chart-data request.
+        metricsPageCache.set(cacheKey, { createdAtMs: metricsPageClock(), page, bytes });
+        metricsPageCacheBytes += bytes;
+      }
+      return page;
+    })();
+    metricsPageInFlight.set(cacheKey, pending);
     try {
-      bytes = Buffer.byteLength(JSON.stringify(page), 'utf8');
-    } catch {
-      // A query result that cannot be measured is still safe to render once,
-      // but it must never enter a memory cache with an unknown cost.
+      return await pending;
+    } finally {
+      if (metricsPageInFlight.get(cacheKey) === pending) metricsPageInFlight.delete(cacheKey);
     }
-    while (metricsPageCache.size >= MAX_METRICS_PAGE_CACHE_ENTRIES
-      || (metricsPageCache.size > 0 && metricsPageCacheBytes + bytes > MAX_METRICS_PAGE_CACHE_BYTES)) {
-      const oldest = metricsPageCache.keys().next().value;
-      if (oldest === undefined) break;
-      deleteMetricsPageCache(oldest);
-    }
-    if (bytes <= MAX_METRICS_PAGE_CACHE_BYTES) {
-      metricsPageCache.set(cacheKey, { createdAtMs: now, page, bytes });
-      metricsPageCacheBytes += bytes;
-    }
-    return page;
   }
 
   function conversationSearchPage(url, { mode = 'rounds' } = {}) {
@@ -1489,7 +1517,7 @@ export async function createCredentialConsole(options = {}) {
         sendJson(res, 429, { error: 'metrics_chart_rate_limited' }, { 'Retry-After': '60' });
         return;
       }
-      const page = metricsPage(url);
+      const page = await metricsPage(url);
       sendJson(res, page.error || !page.metricsAvailable ? 503 : 200, buildMetricsChartPayload(page));
       return;
     }
@@ -1517,8 +1545,9 @@ export async function createCredentialConsole(options = {}) {
         ), { 'Retry-After': '60' });
         return;
       }
+      const page = await metricsPage(url);
       sendHtml(res, 200, metricsView({
-        ...metricsPage(url),
+        ...page,
         openMode,
         metricsAsset: metricsAsset ? {
           url: metricsAsset.url,
@@ -2731,6 +2760,16 @@ export async function createCredentialConsole(options = {}) {
     usageMonitor.stop?.();
     codexManagedRefresher?.stop?.();
     try {
+      const closing = metricsQueryService?.close?.();
+      if (closing && typeof closing.then === 'function') {
+        closing.catch((error) => log('metrics_query_worker_close_failed', {
+          code: error?.code ?? error?.name ?? 'unknown',
+        }));
+      }
+    } catch (error) {
+      log('metrics_query_worker_close_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+    }
+    try {
       const closing = requestMetrics?.close?.();
       if (closing && typeof closing.then === 'function') {
         closing.catch((error) => log('metrics_close_failed', {
@@ -2748,6 +2787,7 @@ export async function createCredentialConsole(options = {}) {
     handler,
     usageMonitor,
     requestMetrics,
+    metricsQueryService,
     metricsInitFailed,
     sessionCount: () => sessions.size,
   };

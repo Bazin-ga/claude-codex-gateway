@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { CredentialStore } from '../lib/store.js';
+import { queryMetricsDataset } from '../lib/metrics-page-query.js';
 import { CredentialStore as CodexCredentialStore } from '../../codex-credential/refresh-center/lib/credential-store.js';
 import { CODEX_AGENT_ASSETS, createCredentialConsole } from '../server.js';
 import { syntheticCodexTokens } from './codex-token-fixture.js';
@@ -29,6 +30,9 @@ async function fixture({
   home: fixtureHome,
   maxSessions,
   metricsChartRateLimit,
+  metricsPageCacheTtlMs,
+  metricsPageClock,
+  metricsQueryService = false,
   usageSnapshot = () => null,
 } = {}) {
   const upstreamRequests = [];
@@ -70,6 +74,9 @@ async function fixture({
     cookieSecure,
     ...(maxSessions === undefined ? {} : { maxSessions }),
     ...(metricsChartRateLimit === undefined ? {} : { metricsChartRateLimit }),
+    ...(metricsPageCacheTtlMs === undefined ? {} : { metricsPageCacheTtlMs }),
+    ...(metricsPageClock === undefined ? {} : { metricsPageClock }),
+    metricsQueryService,
     publicBaseUrl: 'http://credential-console.test',
     claudeUpstreamBaseUrl: upstreamUrl,
     codexUpstreamBaseUrl: upstreamUrl,
@@ -457,6 +464,7 @@ test('an unset CREDENTIAL_CONSOLE_ADMIN_AUTH defaults to tailscale, not open', a
     const { server } = await createCredentialConsole({
       store,
       usageMonitor: { snapshotForAccount: () => null, refreshAccount: async () => null, stop() {} },
+      metricsQueryService: false,
       cookieSecure: false,
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -2047,7 +2055,12 @@ test('rejects CSRF bypass and unsupported gateway paths', async () => {
 });
 
 test('request metrics page attributes the device label and excludes count_tokens from consumption', async () => {
-  const app = await fixture({ adminAuth: 'open' });
+  let metricsCacheNow = 1_700_000_000_000;
+  const app = await fixture({
+    adminAuth: 'open',
+    metricsPageCacheTtlMs: 5_000,
+    metricsPageClock: () => metricsCacheNow,
+  });
   try {
     const account = await app.store.addAccount({
       provider: 'claude',
@@ -2107,6 +2120,10 @@ test('request metrics page attributes the device label and excludes count_tokens
     const queryTotals = app.requestMetrics.queryTotals.bind(app.requestMetrics);
     app.requestMetrics.queryTotals = (...args) => {
       queryTotalsCalls += 1;
+      // Reproduce a production-sized cold page whose two total queries alone
+      // exceed the old five-second TTL. Cache freshness must begin after the
+      // whole aggregate set, or chart-data immediately repeats it.
+      metricsCacheNow += 3_000;
       return queryTotals(...args);
     };
     const metrics = await fetch(
@@ -2187,6 +2204,52 @@ test('request metrics page attributes the device label and excludes count_tokens
     assert.equal(persisted.includes(issued.token), false);
     assert.equal(persisted.includes('metrics-provider-token'), false);
   } finally {
+    await app.close();
+  }
+});
+
+test('an in-flight metrics query does not block health and is shared by HTML and chart-data', async () => {
+  let releaseQuery;
+  const gate = new Promise((resolve) => { releaseQuery = resolve; });
+  let queryCalls = 0;
+  let requestMetrics;
+  const metricsQueryService = {
+    async query(filters) {
+      queryCalls += 1;
+      await gate;
+      return queryMetricsDataset(requestMetrics, filters);
+    },
+    close() {},
+  };
+  const app = await fixture({ adminAuth: 'open', metricsQueryService });
+  requestMetrics = app.requestMetrics;
+  try {
+    const metricsRequest = fetch(`${app.baseUrl}/metrics?hours=24`);
+    for (let attempt = 0; attempt < 100 && queryCalls === 0; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(queryCalls, 1, 'HTML started one worker query');
+
+    const chartRequest = fetch(`${app.baseUrl}/metrics/chart-data?hours=24`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(queryCalls, 1, 'chart-data shares the same in-flight query');
+
+    const health = await Promise.race([
+      fetch(`${app.baseUrl}/health`),
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('health was blocked by metrics query')),
+        250,
+      )),
+    ]);
+    assert.equal(health.status, 200, 'the gateway event loop stays responsive');
+
+    releaseQuery();
+    const [metrics, chart] = await Promise.all([metricsRequest, chartRequest]);
+    assert.equal(metrics.status, 200);
+    assert.equal(chart.status, 200);
+    assert.equal(queryCalls, 1);
+  } finally {
+    releaseQuery();
     await app.close();
   }
 });

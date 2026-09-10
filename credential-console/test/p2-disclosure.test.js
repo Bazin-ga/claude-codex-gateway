@@ -100,10 +100,13 @@ test('console runtime and deployment docs pin Node, warning suppression, and met
   assert.match(files.service, /^Environment=PATH=\/usr\/local\/bin:\/usr\/bin:\/bin$/m);
   assert.match(files.service, /^ExecStartPre=.*process\.versions\.node.*major<22/m);
   assert.match(files.service, /^ExecStart=.*node\s+--no-warnings\s+.*credential-console\/server\.js$/m);
+  assert.match(files.service, /^MemoryMax=256M$/m);
   assert.match(files.gitignore, /^metrics\.sqlite$/m);
   assert.match(files.gitignore, /^metrics\.sqlite-wal$/m);
   assert.match(files.gitignore, /^metrics\.sqlite-shm$/m);
   assert.match(files.contributing, /Node ≥ 22\.5/);
+  assert.match(files.consoleReadme, /one-minute LRU query cache/i);
+  assert.match(files.consoleReadme, /read-only worker\s+thread/i);
 
   const snapshot = sectionBetween(
     files.deploy,

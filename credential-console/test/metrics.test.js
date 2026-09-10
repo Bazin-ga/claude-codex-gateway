@@ -12,6 +12,7 @@ import {
   METRICS_FILENAME,
   METRICS_SCHEMA_VERSION,
   MetricsStore,
+  requestMetricsFilterPlan,
 } from '../lib/metrics.js';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -252,6 +253,54 @@ test('initializes a private WAL/NORMAL database with schema version and indexes'
     'request_metrics_started_idx',
   ]);
   assert.equal(store.db.isOpen, true);
+});
+
+test('metrics filters keep values bound and let SQLite use the time-range index', async (t) => {
+  const { store } = await newStore(t);
+  const hostile = "alice' OR 1=1 --";
+  const filter = requestMetricsFilterPlan({
+    fromMs: BASE_MS,
+    toMs: BASE_MS + HOUR_MS,
+    memberLabel: hostile,
+    scope: 'all',
+  });
+  assert.equal(filter.sql.includes(hostile), false, 'external values never enter SQL text');
+  assert.deepEqual(filter.params, [BASE_MS, BASE_MS + HOUR_MS, hostile]);
+  assert.doesNotMatch(filter.sql, /\? IS NULL OR/);
+
+  const timeOnly = requestMetricsFilterPlan({
+    fromMs: BASE_MS,
+    toMs: BASE_MS + HOUR_MS,
+    scope: 'all',
+  });
+  const plan = store.db.prepare(
+    `EXPLAIN QUERY PLAN SELECT COUNT(*) FROM request_metrics ${timeOnly.sql}`,
+  ).all(...timeOnly.params).map((row) => String(row.detail));
+  assert.equal(
+    plan.some((detail) => detail.includes('request_metrics_started_idx')),
+    true,
+    `expected time index in query plan: ${plan.join(' | ')}`,
+  );
+});
+
+test('a read-only metrics store queries without modifying the database', async (t) => {
+  const { dbPath, store } = await newStore(t);
+  assert.equal(store.enqueueRequest(row()), true);
+  assert.equal(store.flush().written, 1);
+  store.checkpoint();
+  const before = await readFile(dbPath);
+
+  const reader = await new MetricsStore({ dbPath, readOnly: true }).init();
+  t.after(() => reader.close());
+  assert.equal(reader.queryTotals({ scope: 'all' }).requestCount, 1);
+  assert.throws(
+    () => reader.db.exec('DELETE FROM request_metrics'),
+    /readonly|read-only/i,
+  );
+  assert.throws(() => reader.checkpoint(), /read-only metrics store cannot checkpoint/);
+  reader.close();
+
+  assert.deepEqual(await readFile(dbPath), before);
 });
 
 test('migrates a v1 database in place and keeps old rows readable', async (t) => {

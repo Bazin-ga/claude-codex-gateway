@@ -9,6 +9,12 @@ simply unavailable when the Codex credential home is on a different machine.
 built-in `node:sqlite` module. The shipped service suppresses Node 22's known experimental-module
 warning; it does not suppress application errors.
 
+The shipped service allows 256 MiB for the 96 MiB main isolate plus a separately bounded read-only
+metrics-query worker. Keep that ceiling when installing the unit: moving dashboard aggregates off
+the main event loop prevents a cold metrics read from stalling inference, while the worker limit
+prevents a pathological chart from growing without bound. Reducing the old 160 MiB ceiling back in
+place can make systemd kill the otherwise healthy service when the worker starts.
+
 Hook-enabled Claude Code profiles permanently store exact Claude user-submitted prompts and final visible
 assistant responses as paired schema-5 conversation rounds. Legacy P6 rows remain immutable in a separate
 API-fragment diagnostic archive; each is one provider request and may contain wrappers, reminders, or tool-loop
@@ -882,6 +888,9 @@ Browser checks:
     overflow, filters collapse only on narrow screens, `ResizeObserver` resizes every chart, raw tables
     remain horizontally scrollable, and `/metrics/chart-data` contains aggregates but no prompt,
     response, provider credential, or device bearer value;
+17c. on a production-sized metrics copy, confirm `EXPLAIN QUERY PLAN` uses the request time index,
+    HTML plus immediate `chart-data` performs one aggregate set, and concurrent `/health` plus
+    authenticated inference remain responsive while a metrics query is running;
 18. confirm the token page states that it covers Claude gateway traffic only, excludes Codex, and
     keeps the metrics-page body-free and open-mode visibility notices.
 19. install the token-free conversation-hook updater for one test Claude profile and confirm

@@ -958,40 +958,48 @@ function normalizeFilters(filters = {}) {
 }
 
 function filterSql(filters) {
-  // Keep this predicate fixed. Values are always bound, including the optional
-  // filters; only the breakdown identifier is selected from a fixed allowlist.
-  //
-  // The `consumption` scope means "requests that actually spend model quota",
-  // as opposed to `/v1/models` and the like. It listed the Claude inference
-  // path alone, which silently excluded every Codex turn: those rows were
-  // counted under `all` — so requests and latency charted fine — while their
-  // tokens never reached any total. Both providers' inference paths belong
-  // here; the Codex proxy's `/models` helper remains outside consumption.
-  return `
-    WHERE (? IS NULL OR started_at_ms >= ?)
-      AND (? IS NULL OR started_at_ms < ?)
-      AND (? IS NULL OR machine_id = ?)
-      AND (? IS NULL OR device_id = ?)
-      AND (? = 0 OR machine_id IS NULL)
-      AND (? IS NULL OR member_label = ?)
-      AND (? IS NULL OR account_id = ?)
-      AND (? IS NULL OR model = ?)
-      AND (? = 'all' OR path IN ('/v1/messages', '/responses'))
-  `;
+  return buildFilter(filters).sql;
 }
 
 function filterParams(filters) {
-  return [
-    filters.fromMs, filters.fromMs,
-    filters.toMs, filters.toMs,
-    filters.machineId, filters.machineId,
-    filters.deviceId, filters.deviceId,
-    filters.unattributedMachine,
-    filters.memberLabel, filters.memberLabel,
-    filters.accountId, filters.accountId,
-    filters.model, filters.model,
-    filters.scope,
-  ];
+  return buildFilter(filters).params;
+}
+
+/**
+ * Build only from fixed internal column names while keeping every external
+ * value bound. The former `(? IS NULL OR column = ?)` shape looked convenient,
+ * but SQLite could not specialize it for the bound values and therefore
+ * scanned the entire request table even for a 24-hour indexed range.
+ */
+function buildFilter(filters) {
+  const clauses = [];
+  const params = [];
+  const add = (sql, value) => {
+    clauses.push(sql);
+    params.push(value);
+  };
+  if (filters.fromMs !== null) add('started_at_ms >= ?', filters.fromMs);
+  if (filters.toMs !== null) add('started_at_ms < ?', filters.toMs);
+  if (filters.machineId !== null) add('machine_id = ?', filters.machineId);
+  if (filters.deviceId !== null) add('device_id = ?', filters.deviceId);
+  if (filters.unattributedMachine === 1) clauses.push('machine_id IS NULL');
+  if (filters.memberLabel !== null) add('member_label = ?', filters.memberLabel);
+  if (filters.accountId !== null) add('account_id = ?', filters.accountId);
+  if (filters.model !== null) add('model = ?', filters.model);
+  // The consumption scope means requests that actually spend model quota.
+  // Both providers' inference paths belong here; catalog and token-count
+  // helpers remain outside it.
+  if (filters.scope === 'consumption') {
+    clauses.push("path IN ('/v1/messages', '/responses')");
+  }
+  return {
+    sql: clauses.length ? `WHERE ${clauses.join('\n      AND ')}` : '',
+    params,
+  };
+}
+
+export function requestMetricsFilterPlan(filters = {}) {
+  return buildFilter(normalizeFilters(filters));
 }
 
 function normalizeDeviceTokenFilters(filters = {}) {
@@ -2470,6 +2478,7 @@ export class MetricsStore {
     maxQueue = DEFAULT_MAX_QUEUE,
     maxConversationQueueItems = DEFAULT_MAX_CONVERSATION_QUEUE_ITEMS,
     maxConversationQueueBytes = DEFAULT_MAX_CONVERSATION_QUEUE_BYTES,
+    readOnly = false,
     clock = Date.now,
     log = () => {},
   } = {}) {
@@ -2490,6 +2499,7 @@ export class MetricsStore {
       && maxConversationQueueBytes > 0
       ? Math.min(maxConversationQueueBytes, DEFAULT_MAX_CONVERSATION_QUEUE_BYTES)
       : DEFAULT_MAX_CONVERSATION_QUEUE_BYTES;
+    this.readOnly = readOnly === true;
     this.clock = typeof clock === 'function' ? clock : Date.now;
     this.log = typeof log === 'function' ? log : () => {};
     this.db = null;
@@ -2589,6 +2599,36 @@ export class MetricsStore {
     if (this.closed) throw new Error('metrics store is closed');
     if (!this.home && !this.dbPath) throw new Error('metrics home or dbPath is required');
     if (!this.dbPath) throw new Error('metrics dbPath is required');
+
+    if (this.readOnly) {
+      const existing = await stat(this.dbPath);
+      if (!existing.isFile() || existing.size === 0) {
+        throw new Error('read-only metrics database is empty or is not a regular file');
+      }
+      try {
+        this.db = new DatabaseSync(this.dbPath, { readOnly: true, timeout: SQLITE_TIMEOUT_MS });
+        this.db.exec('PRAGMA query_only = ON');
+        this.db.exec(`PRAGMA busy_timeout = ${SQLITE_TIMEOUT_MS}`);
+        const schemaMeta = this.db.prepare(
+          'SELECT schema_version FROM schema_meta WHERE singleton = 1',
+        ).get();
+        if (schemaMeta?.schema_version !== METRICS_SCHEMA_VERSION) {
+          throw new Error(
+            `read-only metrics schema_version ${schemaMeta?.schema_version ?? 'missing'} is not supported`,
+          );
+        }
+        this.initialized = true;
+        return this;
+      } catch (error) {
+        try {
+          if (this.db?.isOpen) this.db.close();
+        } catch {
+          // Preserve the initialization error.
+        }
+        this.db = null;
+        throw error;
+      }
+    }
 
     if (this.home) {
       await mkdir(this.home, { recursive: true, mode: 0o700 });
@@ -4725,6 +4765,7 @@ export class MetricsStore {
 
   checkpoint() {
     this.#assertOpen();
+    if (this.readOnly) throw new Error('read-only metrics store cannot checkpoint');
     const result = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
     if (!result || result.busy !== 0) {
       const error = new Error(`metrics WAL checkpoint is busy (${result?.busy ?? 'unknown'})`);
@@ -4741,6 +4782,7 @@ export class MetricsStore {
   close({ checkpoint = true } = {}) {
     if (this.closed || this.closing) return { written: 0, dropped: 0, failed: 0 };
     this.closing = true;
+    if (this.readOnly) checkpoint = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
 

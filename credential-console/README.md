@@ -417,8 +417,13 @@ must not be used for accountability or billing. Codex traffic is not covered by 
 Chart data is fetched from the session-protected, same-origin `/metrics/chart-data` endpoint. Its
 bounded columnar payload contains only aggregate counts, timestamps, and already-visible labels; it
 never includes prompt/response text, provider credentials, device bearer tokens, or conversation
-content. HTML and its immediate chart-data fetch share a five-second LRU query cache bounded by both
-eight entries and 12 MiB; all metrics reads are additionally bounded to 120 requests per minute per
+content. HTML and its immediate chart-data fetch share a one-minute LRU query cache whose freshness
+starts after the query completes, bounded by both eight entries and 12 MiB. Identical concurrent
+reads share one in-flight query. Production runs the aggregate set in a bounded, read-only worker
+thread so a large SQLite scan cannot block Claude/Codex proxy sockets on the main event loop. Filter
+SQL includes only the active fixed-column predicates (all values remain bound parameters), allowing
+SQLite to use the time/dimension indexes instead of scanning the lifetime table. All metrics reads
+are additionally bounded to 120 requests per minute per
 tailnet identity (or globally in open mode). The ECharts bundle is content-hashed, SRI-pinned, served with an immutable cache policy, and
 does not use a CDN. Rebuild and verify it with:
 

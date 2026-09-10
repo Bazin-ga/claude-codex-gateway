@@ -9,7 +9,7 @@
     "check:metrics-assets": "node scripts/build-metrics-assets.mjs --check",
     "start": "node --no-warnings server.js",
     "test": "node --no-warnings --test --test-timeout=60000",
-    "check": "node --no-warnings --check server.js && node --no-warnings --check cli.js && node --no-warnings --check web/metrics-echarts.entry.js && npm run check:metrics-assets"
+    "check": "node --no-warnings --check server.js && node --no-warnings --check cli.js && node --no-warnings --check lib/metrics-page-query.js && node --no-warnings --check lib/metrics-query-service.js && node --no-warnings --check lib/metrics-query-worker.js && node --no-warnings --check web/metrics-echarts.entry.js && npm run check:metrics-assets"
   },
   "engines": {
     "node": ">=22.5.0"
