@@ -10,7 +10,7 @@ import {
   fetchCodexUsage,
 } from '../lib/usage.js';
 
-test('normalizes Claude five-hour and weekly remaining quota', async () => {
+test('normalizes Claude five-hour, weekly, and Fable-scoped remaining quota', async () => {
   const requests = [];
   const usage = await fetchClaudeUsage({
     oauthToken: 'sk-ant-oat01-secret',
@@ -19,6 +19,14 @@ test('normalizes Claude five-hour and weekly remaining quota', async () => {
       return new Response(JSON.stringify({
         five_hour: { utilization: 41.5, resets_at: '2026-08-05T16:00:00Z' },
         seven_day: { utilization: 9, resets_at: '2026-08-08T16:00:00Z' },
+        limits: [
+          {
+            kind: 'weekly_scoped',
+            percent: 27.5,
+            resets_at: '2026-08-08T16:00:00Z',
+            scope: { model: { display_name: 'Fable' } },
+          },
+        ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     },
   });
@@ -31,7 +39,26 @@ test('normalizes Claude five-hour and weekly remaining quota', async () => {
   })), [
     { kind: 'five_hour', remaining: 58.5 },
     { kind: 'weekly', remaining: 91 },
+    { kind: 'fable_weekly', remaining: 72.5 },
   ]);
+});
+
+test('does not mistake another weekly model scope for Fable quota', async () => {
+  const usage = await fetchClaudeUsage({
+    oauthToken: 'sk-ant-oat01-secret',
+    fetchImpl: async () => new Response(JSON.stringify({
+      five_hour: { utilization: 10, resets_at: null },
+      seven_day: { utilization: 20, resets_at: null },
+      limits: [{
+        kind: 'weekly_scoped',
+        percent: 80,
+        resets_at: null,
+        scope: { model: { display_name: 'Opus' } },
+      }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  });
+
+  assert.equal(usage.windows.some((window) => window.kind === 'fable_weekly'), false);
 });
 
 test('classifies a Claude usage-scope rejection as reauthorization required', async () => {

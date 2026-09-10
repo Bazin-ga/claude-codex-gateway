@@ -127,6 +127,7 @@ test('tailnet identity mode has no sign-in and binds sessions to the user', asyn
       windows: [
         { kind: 'five_hour', remaining_percent: 75, resets_at: '2026-08-05T16:00:00.000Z' },
         { kind: 'weekly', remaining_percent: 60, resets_at: '2026-08-08T16:00:00.000Z' },
+        { kind: 'fable_weekly', remaining_percent: 72.5, resets_at: '2026-08-08T16:00:00.000Z' },
       ],
     }),
   });
@@ -150,6 +151,8 @@ test('tailnet identity mode has no sign-in and binds sessions to the user', asyn
     assert.match(firstHtml, /Get Claude Code setup/);
     assert.match(firstHtml, /Remaining<\/span> 75%/);
     assert.match(firstHtml, /Remaining<\/span> 60%/);
+    assert.match(firstHtml, /class="quota-meta">[\s\S]*data-i18n="usage-updated"[\s\S]*class="quota-fable"/);
+    assert.match(firstHtml, /data-i18n="usage-fable-remaining">Fable quota remaining<\/span> 72\.5%/);
     assert.equal(firstHtml.includes('Administrator password'), false);
     assert.equal(firstHtml.includes('Sign out'), false);
 

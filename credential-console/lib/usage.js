@@ -85,9 +85,14 @@ export async function fetchClaudeUsage({ oauthToken, fetchImpl = fetch }) {
     signal: AbortSignal.timeout(15_000),
   });
   const body = await responseJson(response, 'claude');
+  const fableWeekly = Array.isArray(body.limits)
+    ? body.limits.find((limit) => limit?.kind === 'weekly_scoped'
+      && /^fable(?:\s|$)/i.test(String(limit?.scope?.model?.display_name ?? '').trim()))
+    : null;
   const windows = [
     normalizedWindow('five_hour', body.five_hour?.utilization, body.five_hour?.resets_at),
     normalizedWindow('weekly', body.seven_day?.utilization, body.seven_day?.resets_at),
+    normalizedWindow('fable_weekly', fableWeekly?.percent, fableWeekly?.resets_at),
   ].filter(Boolean);
   if (!windows.length) throw new UsageFetchError('usage_not_reported');
   return {
