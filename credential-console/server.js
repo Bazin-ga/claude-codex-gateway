@@ -579,6 +579,7 @@ export async function createCredentialConsole(options = {}) {
     }
   }
   let metricsQueryService = options.metricsQueryService ?? null;
+  let metricsQueryWorkerInitError = null;
   const usageMonitor = options.usageMonitor ?? await new UsageMonitor({
     store,
     home: options.home ?? store.home ?? HOME,
@@ -690,6 +691,7 @@ export async function createCredentialConsole(options = {}) {
       }).init();
     } catch (error) {
       metricsQueryService = null;
+      metricsQueryWorkerInitError = error;
       log('metrics_query_worker_init_failed', {
         code: error?.code ?? error?.name ?? 'unknown',
       });
@@ -994,9 +996,16 @@ export async function createCredentialConsole(options = {}) {
       // A dashboard read may flush one queued batch: this is outside every
       // proxy completion callback, so request delivery never waits on SQLite.
       requestMetrics.flush?.();
-      const dataset = metricsQueryService
-        ? await metricsQueryService.query(filters)
-        : queryMetricsDataset(requestMetrics, filters);
+      let dataset;
+      if (metricsQueryService) {
+        dataset = await metricsQueryService.query(filters);
+      } else if (enableMetricsQueryWorker) {
+        const error = new Error('metrics query worker is unavailable');
+        error.code = metricsQueryWorkerInitError?.code ?? 'METRICS_QUERY_WORKER_UNAVAILABLE';
+        throw error;
+      } else {
+        dataset = queryMetricsDataset(requestMetrics, filters);
+      }
       const {
         allTotals,
         consumptionTotals,

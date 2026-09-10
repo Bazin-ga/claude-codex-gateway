@@ -107,3 +107,25 @@ test('the console enables its read-only metrics worker by default', async (t) =>
   const chart = await fetch(`${baseUrl}/metrics/chart-data?hours=24`);
   assert.equal(chart.status, 200);
 });
+
+test('an unavailable production worker fails metrics closed without taking down health', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'metrics-query-unavailable-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const created = await createCredentialConsole({
+    store,
+    adminAuth: 'open',
+    cookieSecure: false,
+    enableMetricsQueryWorker: true,
+    metricsQueryService: null,
+    usageMonitor: { snapshotForAccount: () => null, stop() {} },
+  });
+  await new Promise((resolve) => created.server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    if (created.server.listening) {
+      await new Promise((resolve) => created.server.close(resolve));
+    }
+  });
+  const baseUrl = `http://127.0.0.1:${created.server.address().port}`;
+  assert.equal((await fetch(`${baseUrl}/health`)).status, 200);
+  assert.equal((await fetch(`${baseUrl}/metrics/chart-data?hours=24`)).status, 503);
+});
