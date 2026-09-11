@@ -205,7 +205,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .quota-window > span, .quota-window > small { display: block; color: var(--muted); font-size: 11px; }
 .quota-window strong { display: block; margin: 3px 0; font-size: 15px; }
 .quota-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin-top: 8px; color: var(--muted); font-size: 11px; }
-.quota-fable { margin-left: auto; }
+.quota-fable, .quota-reset-credits { margin-left: auto; }
 .quota-message { margin: 8px 0 0; color: var(--amber); font-size: 12px; line-height: 1.4; display: flex; align-items: center; gap: 6px; }
 .quota-message.error { color: var(--red); background: transparent; border: 0; padding: 0; }
 .quota-help { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 50%; border: 1px solid currentColor; opacity: 0.7; font-size: 10px; line-height: 1; cursor: help; flex: 0 0 auto; }
@@ -957,12 +957,23 @@ function accountUsageView(account, { showAccount = false } = {}) {
   const message = usageMessage(usage);
   const updatedAt = usage?.fetched_at ?? usage?.attempted_at;
   const fableWeekly = usage?.windows?.find((entry) => entry.kind === 'fable_weekly');
+  // Only a stock worth acting on earns a line. Zero is the ordinary state of a
+  // Codex account, and printing "Reset credits 0" on every card would spend the
+  // one right-hand slot saying nothing — the same slot the Fable line holds on
+  // the Claude side, which is why the two never need to share it: fable_weekly
+  // is Claude-only and reset credits are Codex-only.
+  const resetCredits = Number.isInteger(usage?.reset_credits) && usage.reset_credits > 0
+    ? usage.reset_credits
+    : null;
   const quotaMeta = [
     updatedAt
       ? `<span><span data-i18n="usage-updated">Updated</span> ${escapeHtml(dateText(updatedAt))}</span>`
       : '',
     fableWeekly
       ? `<span class="quota-fable"><span data-i18n="usage-fable-remaining">Fable quota remaining</span> ${escapeHtml(fableWeekly.remaining_percent)}%</span>`
+      : '',
+    resetCredits
+      ? `<span class="quota-reset-credits"><span data-i18n="usage-reset-credits">Reset credits left</span> ${escapeHtml(String(resetCredits))}</span>`
       : '',
   ].filter(Boolean).join('');
   return `<div class="quota-account">

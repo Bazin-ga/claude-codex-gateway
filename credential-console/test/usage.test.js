@@ -94,6 +94,30 @@ test('maps Codex windows by duration instead of assuming primary means five hour
   assert.equal(usage.windows.length, 1);
   assert.equal(usage.windows[0].kind, 'weekly');
   assert.equal(usage.windows[0].remaining_percent, 91);
+  // The field is absent on plans that do not report it. Null, not zero: the
+  // panel must be able to tell "holds none" from "did not say".
+  assert.equal(usage.reset_credits, null);
+});
+
+test('Codex reset credits report the stock held, not what is spendable right now', async () => {
+  const usage = await fetchCodexUsage({
+    accessToken: 'codex-secret',
+    accountId: 'account-1',
+    fetchImpl: async () => new Response(JSON.stringify({
+      plan_type: 'pro',
+      rate_limit: {
+        primary_window: { used_percent: 44, limit_window_seconds: 604800, reset_at: 1789713572 },
+        secondary_window: null,
+      },
+      // Two credits held; none applicable, because the account is under its
+      // limit and there is nothing to reset. Reporting the applicable count
+      // would show "no credits" on an account holding two, for as long as it
+      // stays healthy.
+      rate_limit_reset_credits: { available_count: 2, applicable_available_count: 0 },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  });
+
+  assert.equal(usage.reset_credits, 2);
 });
 
 test('hourly monitor caches only normalized usage metadata', async () => {

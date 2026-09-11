@@ -46,6 +46,7 @@ const translations = {
   'usage-resets': '重置于',
   'usage-updated': '更新于',
   'usage-fable-remaining': 'Fable 额度剩余',
+  'usage-reset-credits': '重置卡剩余',
   'usage-not-reported': '上游未提供',
   'usage-loading': '正在等待首次每小时用量刷新。',
   'usage-reauthorize': '需要为该 Claude 账号重新授权一次，才能显示额度。',

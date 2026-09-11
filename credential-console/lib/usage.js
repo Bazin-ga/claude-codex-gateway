@@ -135,8 +135,28 @@ export async function fetchCodexUsage({ accessToken, accountId, fetchImpl = fetc
     status: 'available',
     fetched_at: new Date().toISOString(),
     plan_type: typeof body.plan_type === 'string' ? body.plan_type : null,
+    reset_credits: resetCreditCount(body.rate_limit_reset_credits),
     windows,
   };
+}
+
+/**
+ * The account's stock of rate-limit reset credits, which ride along on the same
+ * response as the windows — no second upstream call, no second thing to fail.
+ *
+ * `available_count`, deliberately not `applicable_available_count`: the latter
+ * counts only what may be spent against the CURRENT limit state, so it is 0
+ * whenever the account is not actually rate-limited. That is most of the time,
+ * and an account holding three credits would read as holding none exactly while
+ * everything is fine.
+ *
+ * Absent on responses that predate the field and on plans that do not report it;
+ * null then, so the panel omits the line rather than claiming a zero balance.
+ */
+function resetCreditCount(credits) {
+  const count = Number(credits?.available_count);
+  if (!Number.isFinite(count) || count < 0) return null;
+  return Math.trunc(count);
 }
 
 async function writeAtomic(path, content) {

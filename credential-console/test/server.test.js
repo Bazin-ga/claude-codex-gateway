@@ -2842,6 +2842,68 @@ test('a Codex account awaiting authorization renders as pending, not as a red fa
   }
 });
 
+// Reset credits differ per account, and a member picking one wants to know which
+// card still has a reset behind it before they burn the window. Same slot the
+// Fable line holds on the Claude card: bottom-right of the account's quota block.
+test('a Codex account carrying reset credits shows the balance on its card', async () => {
+  const app = await fixture({
+    adminAuth: 'open',
+    usageSnapshot: (account) => (account.provider === 'codex'
+      ? {
+        provider: 'codex',
+        status: 'available',
+        fetched_at: '2026-09-11T12:00:00.000Z',
+        plan_type: 'pro',
+        reset_credits: 2,
+        windows: [{ kind: 'weekly', remaining_percent: 56, resets_at: '2026-09-18T12:00:00.000Z' }],
+      }
+      : null),
+  });
+  try {
+    await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-shared-1',
+      external: { kind: 'codex-credential', home: '/var/lib/codex-credential' },
+    });
+    const dashboard = await (await fetch(`${app.baseUrl}/`)).text();
+    assert.match(dashboard, /class="quota-meta">[\s\S]*data-i18n="usage-updated"[\s\S]*class="quota-reset-credits"/);
+    assert.match(dashboard, /data-i18n="usage-reset-credits">Reset credits left<\/span> 2/);
+  } finally {
+    await app.close();
+  }
+});
+
+// Zero is the ordinary state, and "Reset credits left 0" on every Codex card
+// would crowd out the line the moment it has something to say.
+test('a Codex account with no reset credits prints no balance line', async () => {
+  const app = await fixture({
+    adminAuth: 'open',
+    usageSnapshot: (account) => (account.provider === 'codex'
+      ? {
+        provider: 'codex',
+        status: 'available',
+        fetched_at: '2026-09-11T12:00:00.000Z',
+        plan_type: 'pro',
+        reset_credits: 0,
+        windows: [{ kind: 'weekly', remaining_percent: 56, resets_at: '2026-09-18T12:00:00.000Z' }],
+      }
+      : null),
+  });
+  try {
+    await app.store.addAccount({
+      provider: 'codex',
+      alias: 'codex-shared-1',
+      external: { kind: 'codex-credential', home: '/var/lib/codex-credential' },
+    });
+    const dashboard = await (await fetch(`${app.baseUrl}/`)).text();
+    // Not the bare class name: it also appears in the inline stylesheet, which
+    // is served whether or not any card uses it.
+    assert.equal(dashboard.includes('data-i18n="usage-reset-credits"'), false);
+  } finally {
+    await app.close();
+  }
+});
+
 // The generated installer is self-contained: it base64-embeds the agent, then
 // execs install.sh. An asset install.sh runs but the manifest omits does not
 // fail loudly — install.sh reports success and the machine is simply left
