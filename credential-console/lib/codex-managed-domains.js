@@ -90,9 +90,39 @@ export async function refreshManagedCodexHome(home, {
 }
 
 /**
- * Refresh only credentials created below the managed root. Imported/legacy
+ * The expiry a credential home currently publishes, for a home this console
+ * does not refresh.
+ *
+ * Reading is not refreshing. The scheduler below deliberately never runs the
+ * refresh entrypoint against an imported or legacy home, because an external
+ * timer already owns it — but the console still needs to know when that owner
+ * last rotated the credential, and current.json is the file that says so. It is
+ * the same file `externalAccountStatus` already treats as authoritative for the
+ * dashboard, read the same read-only way.
+ */
+export async function readPublishedCodexExpiry(home, { readFileImpl = readFile } = {}) {
+  const current = JSON.parse(await readFileImpl(join(home, 'public', 'current.json'), 'utf8'));
+  const expiresAtMs = Date.parse(String(current?.expires_at ?? ''));
+  if (!Number.isFinite(expiresAtMs)) return null;
+  return new Date(expiresAtMs).toISOString();
+}
+
+/**
+ * Refresh only credentials created below the managed root — imported/legacy
  * homes keep their existing timers, which prevents enabling this scheduler from
- * ever racing the refresh process that already owns codex-shared-1.
+ * ever racing the refresh process that already owns codex-shared-1 — but mirror
+ * the published expiry of *every* Codex credential home.
+ *
+ * The two halves exist because the console's copy of a Codex account's expiry
+ * is a cache of somebody else's fact, and before the mirror it was a cache only
+ * half of the accounts ever got to fill. A managed home records its expiry as a
+ * by-product of the refresh above; an externally refreshed home recorded it
+ * once, at bind time, and then never again. That stale copy is not cosmetic:
+ * `#assertSwitchableAccount` and `issueDeviceCredential` both gate on it, so an
+ * account whose credential was perfectly valid became impossible to switch a
+ * device onto, or enrol a new device against, some days after its last rotation
+ * — while the dashboard, which reads current.json, went on offering it as a
+ * healthy choice. That split is what made the failure look arbitrary.
  */
 export class CodexManagedDomainRefresher {
   constructor({
@@ -100,6 +130,7 @@ export class CodexManagedDomainRefresher {
     managedRoot,
     intervalMs = DEFAULT_REFRESH_INTERVAL_MS,
     refreshHome = refreshManagedCodexHome,
+    readPublishedExpiry = readPublishedCodexExpiry,
     recordExpiry = async () => {},
     log = () => {},
   }) {
@@ -110,6 +141,7 @@ export class CodexManagedDomainRefresher {
       ? intervalMs
       : DEFAULT_REFRESH_INTERVAL_MS;
     this.refreshHome = refreshHome;
+    this.readPublishedExpiry = readPublishedExpiry;
     this.recordExpiry = recordExpiry;
     this.log = log;
     this.timer = null;
@@ -117,8 +149,11 @@ export class CodexManagedDomainRefresher {
     this.running = null;
   }
 
+  // Not gated on a managed root any more: with no managed root there is nothing
+  // to refresh, but the expiry mirror is exactly as necessary — more so, since
+  // every Codex account on such a deployment is externally refreshed.
   start() {
-    if (!this.managedRoot || this.timer) return;
+    if (this.timer) return;
     this.timer = setInterval(() => {
       this.runNow().catch(() => {});
     }, this.intervalMs);
@@ -141,7 +176,6 @@ export class CodexManagedDomainRefresher {
   }
 
   async runNow() {
-    if (!this.managedRoot) return { refreshed: [], failed: [] };
     if (this.running) return this.running;
     this.running = this.#run();
     try {
@@ -154,22 +188,51 @@ export class CodexManagedDomainRefresher {
   async #run() {
     const refreshed = [];
     const failed = [];
+    const mirrored = [];
     const accounts = this.accounts();
     for (const account of Array.isArray(accounts) ? accounts : []) {
-      if (!isManagedCodexHome(account, this.managedRoot)) continue;
+      // The provider check is not redundant with the pointer check: a Claude
+      // account may carry a stray codex-credential external pointer, and
+      // isManagedCodexHome used to be the only thing rejecting it.
+      if (account?.provider !== 'codex') continue;
+      if (account.external?.kind !== 'codex-credential' || !account.external.home) continue;
+      const home = canonical(account.external.home);
+      if (isManagedCodexHome(account, this.managedRoot)) {
+        try {
+          const result = await this.refreshHome(home, account);
+          if (result?.expiresAt) await this.recordExpiry(account.id, result.expiresAt);
+          refreshed.push(account.id);
+          this.log('codex_managed_refresh_completed', { account_id: account.id });
+        } catch (error) {
+          failed.push(account.id);
+          this.log('codex_managed_refresh_failed', {
+            account_id: account.id,
+            code: error?.code ?? error?.name ?? 'unknown',
+          });
+        }
+        continue;
+      }
+      // An unreadable or malformed current.json is not this scheduler's problem
+      // to solve — the credential-alert panel already reports a home it cannot
+      // read. Leaving the previous value in place is the conservative outcome:
+      // it is what the console believed a moment ago.
       try {
-        const result = await this.refreshHome(canonical(account.external.home), account);
-        if (result?.expiresAt) await this.recordExpiry(account.id, result.expiresAt);
-        refreshed.push(account.id);
-        this.log('codex_managed_refresh_completed', { account_id: account.id });
+        const expiresAt = await this.readPublishedExpiry(home, account);
+        if (!expiresAt) continue;
+        if (await this.recordExpiry(account.id, expiresAt)) {
+          mirrored.push(account.id);
+          this.log('codex_published_expiry_recorded', {
+            account_id: account.id,
+            expires_at: expiresAt,
+          });
+        }
       } catch (error) {
-        failed.push(account.id);
-        this.log('codex_managed_refresh_failed', {
+        this.log('codex_published_expiry_read_failed', {
           account_id: account.id,
           code: error?.code ?? error?.name ?? 'unknown',
         });
       }
     }
-    return { refreshed, failed };
+    return { refreshed, failed, mirrored };
   }
 }
