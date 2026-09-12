@@ -206,3 +206,48 @@ test('a Bedrock account shows no quota window', async (t) => {
   assert.equal(html.includes('data-i18n="usage-loading"'), false);
   assert.equal(html.includes('data-i18n="usage-quota-hidden"'), false);
 });
+
+// A Bedrock row is `stored` from the moment it exists, so without this it would
+// offer no delete control and refuse deletion anyway: one mistyped model id
+// would be permanent. The Claude rule it inherited exists for credentials the
+// operator cannot recreate, and a pasted AWS key is not one of those.
+test('a Bedrock account can be corrected by deleting and re-registering it', async (t) => {
+  const store = await newStore(t);
+  const typo = await store.addAccount(bedrockInput({
+    alias: 'bedrock-typo',
+    bedrock: { region: 'us-west-2', modelId: 'us.openai.gpt-6-astrA-wrong' },
+  }));
+
+  await store.deleteAccount(typo.id);
+  assert.equal(store.accountById(typo.id), null);
+
+  const fixed = await store.addAccount(bedrockInput({ alias: 'bedrock-typo' }));
+  assert.equal(fixed.bedrock.model_id, MODEL_ID);
+});
+
+// Deleting the row must not strand a device that is still pointed at it.
+test('a Bedrock account with an active device is still refused deletion', async (t) => {
+  const store = await newStore(t);
+  const account = await store.addAccount(bedrockInput());
+  await store.issueDeviceCredential({
+    accountId: account.id,
+    memberLabel: 'member@example.com',
+    deviceName: 'laptop',
+  });
+
+  await assert.rejects(store.deleteAccount(account.id), /active device/);
+});
+
+// A Claude account holding a real OAuth token stays undeletable: that rule is
+// the reason this one had to be narrowed rather than dropped.
+test('a Claude account holding a stored credential is still undeletable', async (t) => {
+  const store = await newStore(t);
+  const claude = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-1',
+    emailLabel: 'owner@example.com',
+    credential: { oauth_token: 'sk-ant-oat01-test' },
+  });
+
+  await assert.rejects(store.deleteAccount(claude.id), /cannot be deleted/);
+});

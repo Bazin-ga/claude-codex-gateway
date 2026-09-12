@@ -3791,7 +3791,7 @@ export function dashboardView({
           <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>
           ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}
         </div>`}
-        ${account.status === 'login_required' && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
+        ${(account.status === 'login_required' || account.provider === 'bedrock') && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
           <button class="danger" type="submit" data-i18n="delete-account">Delete account</button>
         </form>` : ''}

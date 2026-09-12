@@ -859,7 +859,13 @@ export class CredentialStore {
     return this.serialized(async () => {
       const account = this.accountById(id);
       if (!account) throw new Error('account not found');
-      if (account.credential) {
+      // The rule above is about credentials the operator could not recreate: a
+      // Claude OAuth token needs the account owner to sit down and authorize
+      // again. A Bedrock key does not — the operator pasted it in from the AWS
+      // console and can paste it again. Applying the Claude rule to it made a
+      // mistyped region or model id permanent, since the row is `stored` from
+      // the moment it exists and so never offers the delete control either.
+      if (account.credential && account.provider !== 'bedrock') {
         throw new Error('account holds a stored credential and cannot be deleted');
       }
       if (account.external) {
