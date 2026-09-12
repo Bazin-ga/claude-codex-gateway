@@ -56,6 +56,7 @@ import {
   claudeAuthorizationView,
   dashboardView,
   docsView,
+  bedrockDeviceConfiguredView,
   codexDeviceConfiguredView,
   deviceConfiguredView,
   enrollmentCreatedView,

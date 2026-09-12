@@ -3485,3 +3485,49 @@ test('the docs tab carries the guide, and every endpoint it lists exists', async
     assert.notEqual(response.status, 404, `${method} ${path} is documented but not routed`);
   }
 });
+
+// The whole self-service round trip for a Bedrock account, through the real
+// server. Written because the first version of this feature shipped a
+// `configuredDeviceView` that named `bedrockDeviceConfiguredView` without
+// importing it: every unit test passed, the store created the device, and the
+// member got a redirect carrying a ReferenceError instead of their token —
+// with the device already enrolled and its token lost. Nothing below the route
+// level could have caught that.
+test('a Bedrock member self-serves a token and the page tells them how to use it', async () => {
+  const app = await fixture({ adminAuth: 'open' });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'bedrock',
+      alias: 'bedrock-astra-1',
+      emailLabel: '',
+      credential: { api_key: 'ABSK-synthetic' },
+      bedrock: { region: 'us-west-2', modelId: 'us.openai.gpt-6-astra' },
+    });
+
+    const page = await fetch(`${app.baseUrl}/`);
+    const cookie = cookieFrom(page);
+    const html = await page.text();
+    assert.match(html, /data-i18n="bedrock-description"/);
+
+    const response = await fetch(`${app.baseUrl}/self-service`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        csrf: csrfFrom(html),
+        account_id: account.id,
+        member_label: 'member',
+        device_name: 'laptop',
+      }),
+      redirect: 'manual',
+    });
+    assert.equal(response.status, 200, 'a redirect here means the handler threw');
+    const configured = await response.text();
+    assert.match(configured, /BEDROCK_GATEWAY_TOKEN=/);
+    assert.match(configured, /\/model\/us\.openai\.gpt-6-astra\/converse/);
+    // The example must not teach the member to write the one call that is refused.
+    assert.equal(configured.includes('/converse-stream"'), false);
+    assert.match(configured, /may only invoke/);
+  } finally {
+    await app.close();
+  }
+});
