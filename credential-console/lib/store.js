@@ -42,6 +42,29 @@ export const CLAUDE_PROMPT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{
 export const PROMPT_KEY_VERSION = 1;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
+/**
+ * Every provider a device credential can be issued against.
+ *
+ * One list rather than the seven copies of `['claude', 'codex']` this replaces.
+ * Those copies were spread over the store and the views, and each one is a
+ * place where an unlisted provider silently becomes invisible rather than
+ * loudly unsupported — a device whose account is not in the list is rendered as
+ * misconfigured, and the remedy offered is the one action that would be
+ * refused. Adding the third provider by editing seven literals was how that
+ * would have happened.
+ */
+export const GATEWAY_PROVIDERS = Object.freeze(['claude', 'codex', 'bedrock']);
+
+/**
+ * A Bedrock account is pinned to exactly one region and one model.
+ *
+ * Not a convenience: the API key the console holds is an account-wide bearer,
+ * so the pin is the only thing standing between a device token and every model
+ * in the account. The proxy refuses any other model rather than forwarding it.
+ */
+const BEDROCK_REGION_PATTERN = /^[a-z]{2}(?:-[a-z]+)+-\d{1,2}$/;
+const BEDROCK_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -244,6 +267,7 @@ export class CredentialStore {
       last_failure_at: account.last_failure_at ?? null,
       last_failure: account.last_failure ?? null,
       external: account.external ? { kind: account.external.kind } : null,
+      bedrock: account.bedrock ? { ...account.bedrock } : null,
       active_devices: this.state.devices.filter((device) => {
         if (device.revoked_at) return false;
         try {
@@ -380,7 +404,7 @@ export class CredentialStore {
           'DEVICE_CONFIGURATION_INVALID',
         );
       }
-      if (!['claude', 'codex'].includes(account.provider)) {
+      if (!GATEWAY_PROVIDERS.includes(account.provider)) {
         throw storeError(
           `device account policy account ${id} is not a gateway account`,
           'DEVICE_CONFIGURATION_INVALID',
@@ -520,7 +544,7 @@ export class CredentialStore {
 
   #assertSwitchableAccount(account) {
     if (!account) throw storeError('target account not found', 'DEVICE_CONFIGURATION_INVALID');
-    if (!['claude', 'codex'].includes(account.provider)) {
+    if (!GATEWAY_PROVIDERS.includes(account.provider)) {
       throw storeError('target account is not a gateway account', 'DEVICE_CONFIGURATION_INVALID');
     }
     if (account.status === 'disabled') throw storeError('target account is disabled', 'ACCOUNT_UNAVAILABLE');
@@ -533,9 +557,18 @@ export class CredentialStore {
       }
       return;
     }
+    // Bedrock holds a static key here, like Claude, but under its own field and
+    // with the region/model pin the proxy enforces. A row missing the pin is
+    // unusable in a way the proxy could not report legibly, so it is refused
+    // here instead.
+    const credentialField = account.provider === 'bedrock' ? 'api_key' : 'oauth_token';
+    if (account.provider === 'bedrock'
+      && (!account.bedrock?.region || !account.bedrock?.model_id)) {
+      throw storeError('target account has no region and model pin', 'ACCOUNT_UNAVAILABLE');
+    }
     if (!account.credential) throw storeError('target account has no stored credential', 'ACCOUNT_UNAVAILABLE');
     try {
-      if (!this.accountCredential(account.id)?.oauth_token) {
+      if (!this.accountCredential(account.id)?.[credentialField]) {
         throw storeError('target account has no stored credential', 'ACCOUNT_UNAVAILABLE');
       }
     } catch (error) {
@@ -591,9 +624,9 @@ export class CredentialStore {
         provider: account.provider,
         status: account.status,
         expires_at: account.expires_at ?? null,
-        has_credential: account.provider === 'claude'
-          ? Boolean(account.credential)
-          : account.external?.kind === 'codex-credential' && Boolean(account.external.home),
+        has_credential: account.provider === 'codex'
+          ? account.external?.kind === 'codex-credential' && Boolean(account.external.home)
+          : Boolean(account.credential),
       },
     };
   }
@@ -618,15 +651,15 @@ export class CredentialStore {
         }
         const account = this.accountById(selectedAccountId);
         if (!account) throw storeError('target account not found', 'DEVICE_CONFIGURATION_INVALID');
-        if (!['claude', 'codex'].includes(account.provider)) {
+        if (!GATEWAY_PROVIDERS.includes(account.provider)) {
           throw storeError('target account is not a gateway account', 'DEVICE_CONFIGURATION_INVALID');
         }
-        // Unlike Claude, an unbound Codex row has no encrypted credential in
-        // this store that could become usable later on the same route. Selecting
-        // it would cut the device over to a guaranteed 503, so refuse before the
+        // Unlike Claude, an unbound Codex or Bedrock row has nothing in this
+        // store that could become usable later on the same route. Selecting one
+        // would cut the device over to a guaranteed 503, so refuse before the
         // policy changes. Claude keeps its historical pre-authorization policy
         // workflow unchanged.
-        if (account.provider === 'codex') this.#assertSwitchableAccount(account);
+        if (account.provider !== 'claude') this.#assertSwitchableAccount(account);
         const policy = this.#deviceAccountPolicy(device);
         // Refuse before touching the row, not after. Appending another provider
         // to this device's allowlist makes it mixed, and the mutation below
@@ -761,14 +794,29 @@ export class CredentialStore {
     credential = null,
     expiresAt = null,
     external = null,
+    bedrock = null,
   }) {
     return this.serialized(async () => {
-      if (!['claude', 'codex'].includes(provider)) throw new Error('unsupported provider');
+      if (!GATEWAY_PROVIDERS.includes(provider)) throw new Error('unsupported provider');
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/.test(alias)) {
         throw new Error('alias must match [A-Za-z0-9][A-Za-z0-9._-]{1,63}');
       }
       if (this.state.accounts.some((entry) => entry.alias === alias)) {
         throw new Error('account alias already exists');
+      }
+      // Validated here rather than at the proxy: the pin is what bounds an
+      // account-wide bearer key to one model, and a row that reaches the proxy
+      // without it has already been offered to members as a usable account.
+      let bedrockPin = null;
+      if (provider === 'bedrock') {
+        const region = String(bedrock?.region ?? '').trim();
+        const modelId = String(bedrock?.modelId ?? bedrock?.model_id ?? '').trim();
+        if (!BEDROCK_REGION_PATTERN.test(region)) throw new Error('a valid AWS region is required');
+        if (!BEDROCK_MODEL_ID_PATTERN.test(modelId)) throw new Error('a valid Bedrock model id is required');
+        if (!credential?.api_key) throw new Error('a Bedrock API key is required');
+        bedrockPin = { region, model_id: modelId };
+      } else if (bedrock) {
+        throw new Error('region and model pin are only meaningful for a Bedrock account');
       }
       const id = randomToken(12);
       const account = {
@@ -783,6 +831,11 @@ export class CredentialStore {
           ? { credential: encryptJson(this.masterKey, credential, `account:${id}:credential:v1`) }
           : {}),
         ...(external ? { external } : {}),
+        // Region and model id are not secret and must stay readable without the
+        // master key: the proxy compares the requested model against them on
+        // every turn, and an operator has to be able to see what a row is
+        // pinned to. Only the key itself goes through encryptJson above.
+        ...(bedrockPin ? { bedrock: bedrockPin } : {}),
       };
       this.state.accounts.push(account);
       this.audit('account_added', { account_id: id, provider, alias });
@@ -1545,9 +1598,11 @@ export class CredentialStore {
       // a pointer to the home the refresh centre publishes into. Demanding
       // `credential` of both made Codex permanently unissuable, which is what
       // left the Codex gateway route unreachable in practice.
-      const usable = account.provider === 'claude'
-        ? Boolean(account.credential)
-        : account.provider === 'codex' && account.external?.kind === 'codex-credential';
+      const usable = account.provider === 'codex'
+        ? account.external?.kind === 'codex-credential'
+        : Boolean(account.credential)
+          && (account.provider !== 'bedrock'
+            || Boolean(account.bedrock?.region && account.bedrock?.model_id));
       if (!usable) {
         throw new Error('account is not available for gateway self-service');
       }

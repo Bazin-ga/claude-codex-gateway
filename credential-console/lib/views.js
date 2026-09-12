@@ -1,4 +1,5 @@
 import { APP_ASSET_URL } from './app-asset.js';
+import { GATEWAY_PROVIDERS } from './store.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { sanitizeUrl } from './onboarding.js';
@@ -850,7 +851,7 @@ function credentialAlertSummaryView(accounts, alerts) {
   const liveRole = alerts?.criticalCount ? 'alert' : 'status';
   const liveMode = alerts?.criticalCount ? 'assertive' : 'polite';
   const items = summary.map((alert) => {
-    const provider = alert.provider === 'codex' ? 'Codex' : 'Claude Code';
+    const provider = providerLabel(alert.provider);
     return `<li class="credential-alert-item">
       <div><strong>${escapeHtml(alert.alias || provider)}</strong><div class="muted tiny">${escapeHtml(provider)}</div>
         <div class="credential-alert-label" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>
@@ -953,6 +954,16 @@ function usageMessage(usage) {
 }
 
 function accountUsageView(account, { showAccount = false } = {}) {
+  // Bedrock has no quota window to report — it is billed per token, not against
+  // a rolling allowance. Saying so is the accurate answer; falling through
+  // would render "Quota unavailable", which claims a reading failed when there
+  // was never a reading to take.
+  if (account.provider === 'bedrock') {
+    return `<div class="quota-account">
+      ${showAccount ? `<div class="quota-account-name"><strong>${escapeHtml(account.alias)}</strong></div>` : ''}
+      <div class="quota-message"><span data-i18n="usage-per-token">Billed per token; no quota window</span></div>
+    </div>`;
+  }
   const usage = account.usage;
   const message = usageMessage(usage);
   const updatedAt = usage?.fetched_at ?? usage?.attempted_at;
@@ -1054,7 +1065,7 @@ function accountSelectionForDevice(device, accounts) {
   // action the store refuses.
   const gatewayProvider = new Map(
     accounts
-      .filter((account) => ['claude', 'codex'].includes(account.provider))
+      .filter((account) => GATEWAY_PROVIDERS.includes(account.provider))
       .map((account) => [account.id, account.provider]),
   );
   const allowedProviders = new Set(
@@ -1122,12 +1133,29 @@ function accountSelectionDetails(selection, accounts) {
 }
 
 function accountCanReceiveDevice(account) {
-  if (!account || !['claude', 'codex'].includes(account.provider)) return false;
+  if (!account || !GATEWAY_PROVIDERS.includes(account.provider)) return false;
   if (account.status === 'disabled') return false;
   if (account.expires_at && Date.parse(account.expires_at) <= Date.now()) return false;
   if (account.provider === 'claude') return true;
+  // A Bedrock key never expires and is present from the moment the row exists,
+  // so the only question is whether the row carries the pin the proxy enforces.
+  if (account.provider === 'bedrock') {
+    return Boolean(account.bedrock?.region && account.bedrock?.model_id)
+      && ['stored', 'healthy'].includes(account.status);
+  }
   return account.external?.kind === 'codex-credential'
     && ['stored', 'healthy'].includes(account.status);
+}
+
+/**
+ * One place that turns a provider id into something a person reads, so a new
+ * provider cannot show up as "Codex" in the row that forgot about it.
+ */
+function providerLabel(provider) {
+  if (provider === 'claude') return 'Claude Code';
+  if (provider === 'codex') return 'Codex';
+  if (provider === 'bedrock') return 'AWS Bedrock';
+  return 'Unknown';
 }
 
 function accountSwitchControl(device, selection, accounts, csrf) {
@@ -1223,7 +1251,7 @@ function consoleCredentialRow(device, accounts, csrf, groupNames = []) {
     ?.provider ?? null;
   return `<tr data-credential-state="${state}" data-device-row="${escapeHtml(device.id)}" data-selected-account-id="${escapeHtml(selection.selectedAccountId ?? '')}">
     <td data-device-id="${escapeHtml(device.id)}"><strong>${escapeHtml(device.name)}</strong><div class="muted tiny">${escapeHtml(device.member_label || '—')}</div></td>
-    <td>${escapeHtml(provider === 'codex' ? 'Codex' : provider === 'claude' ? 'Claude Code' : 'Unknown')}</td>
+    <td>${escapeHtml(providerLabel(provider))}</td>
     ${accountCell(selectedAccount, { selected: true })}
     <td>${credentialBadge(state)}</td>
     <td>${escapeHtml(dateText(device.last_seen_at))}</td>
@@ -3722,6 +3750,15 @@ export function dashboardView({
   const codexGatewayOptions = codexGatewayAccounts.map((account) => (
     `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
   )).join('');
+  // The whole Bedrock surface is derived from this list, so a console with no
+  // Bedrock account registered renders exactly what it rendered before — the
+  // card, the self-service form and the admin form all disappear together.
+  // That is the configuration gate: state, not an environment variable.
+  const bedrockAccounts = accounts.filter((account) => account.provider === 'bedrock');
+  const bedrockUsableAccounts = bedrockAccounts.filter(accountCanReceiveDevice);
+  const bedrockOptions = bedrockUsableAccounts.map((account) => (
+    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)} · ${escapeHtml(account.bedrock?.model_id ?? '')}</option>`
+  )).join('');
   const codexUsage = codexGatewayAccounts.map((account) => accountUsageView(account, {
     showAccount: codexGatewayAccounts.length > 1,
   })).join('');
@@ -3735,7 +3772,7 @@ export function dashboardView({
       ?? null;
     return `
     <tr data-account-row="${escapeHtml(account.id)}">
-      <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(account.provider === 'claude' ? 'Claude Code' : 'Codex')} · ${escapeHtml(account.email_label || 'No email label')}</div></td>
+      <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(providerLabel(account.provider))} · ${escapeHtml(account.email_label || 'No email label')}</div></td>
       <td><div class="account-status-stack">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}</div>
         ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}
         <div class="muted tiny"><span data-i18n="devices">Devices</span>: <span data-account-device-count>${escapeHtml(account.active_devices ?? '—')}</span></div></td>
@@ -3780,7 +3817,7 @@ export function dashboardView({
   // Filtering is judged on the *device* rows, not the machine: one machine can
   // hold Claude credentials on several accounts, so a machine is shown when any
   // of its rows matches, and the count below counts rows rather than machines.
-  const filterAccounts = accounts.filter((account) => ['claude', 'codex'].includes(account.provider));
+  const filterAccounts = accounts.filter((account) => GATEWAY_PROVIDERS.includes(account.provider));
   const destinationAccounts = filterAccounts.filter(accountCanReceiveDevice);
   const filterAccount = filterAccounts.find((account) => account.id === accountFilter) ?? null;
   const memberLabels = [...new Set(devices
@@ -3893,6 +3930,25 @@ export function dashboardView({
               <div><button type="submit" data-i18n="get-codex">Get Codex installer</button></div>
             </form>` : ''}
           </article>
+          ${bedrockAccounts.length ? `<article class="provider-card">
+            <div class="provider-title"><h2>AWS Bedrock</h2>${bedrockUsableAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
+            <p class="muted" data-i18n="bedrock-description">A device token in, one metered Converse turn out. The AWS key stays on this server; each account is pinned to one region and one model.</p>
+            ${bedrockUsableAccounts.length ? `<form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="bedrock-self-service">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <label><span data-i18n="team-account">Team account</span>
+                <select name="account_id" required data-draft-field>${bedrockOptions}</select>
+              </label>
+              ${memberLabelField}
+              <label><span data-i18n="device-name">Device name</span>
+                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
+              </label>
+              <div><button type="submit" data-i18n="get-bedrock">Get Bedrock token</button></div>
+            </form>
+            <p class="muted tiny" data-i18n="bedrock-scope-note">Only non-streaming <code>/converse</code> is proxied, and prompts are not archived on this path — per-turn token counts only.</p>` : `<div class="member-form">
+              <label><span data-i18n="team-account">Team account</span><select disabled><option data-i18n="no-account">No account available</option></select></label>
+              <div><button type="button" disabled data-i18n="waiting-owner">Waiting for account owner</button></div>
+            </div><p class="muted tiny" data-i18n="bedrock-unpinned">A registered Bedrock account needs a region, a model id and a key before it can be used.</p>`}
+          </article>` : ''}
         </div>
         ${openMode ? '<p class="muted tiny" data-i18n="member-label-note">Nobody checks the label. It only keeps two members\' device names apart.</p>' : ''}
       </section>` : ''}
@@ -3944,6 +4000,27 @@ export function dashboardView({
               </label>
               <label><span data-i18n="account-email-optional">Account email label (optional, checked at authorization)</span>
                 <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160" data-draft-field>
+              </label>
+              <button type="submit" data-i18n="register-account">Register account</button>
+            </form>
+          </article>
+          <article class="card split">
+            <h2 data-i18n="add-bedrock-heading">Add an AWS Bedrock account</h2>
+            <div class="notice"><span data-i18n="add-bedrock-help">The only provider whose key is pasted rather than authorized: a Bedrock API key is issued in the AWS console, so there is no OAuth round trip to make. It is encrypted on submission and never shown again. Registering the first one makes the Bedrock panel appear for members.</span></div>
+            <form method="post" action="/accounts" class="stack" autocomplete="off">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <input type="hidden" name="provider" value="bedrock">
+              <label><span data-i18n="account-alias">Account alias</span>
+                <input name="alias" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,63}" placeholder="bedrock-astra-1">
+              </label>
+              <label><span data-i18n="bedrock-region">AWS region</span>
+                <input name="region" required pattern="[a-z]{2}(-[a-z]+)+-[0-9]{1,2}" placeholder="us-west-2">
+              </label>
+              <label><span data-i18n="bedrock-model-id">Model id (this account may invoke only this one)</span>
+                <input name="model_id" required pattern="[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" placeholder="us.openai.gpt-6-astra">
+              </label>
+              <label><span data-i18n="bedrock-api-key">Bedrock API key</span>
+                <input name="api_key" type="password" required autocomplete="off" maxlength="4096">
               </label>
               <button type="submit" data-i18n="register-account">Register account</button>
             </form>
@@ -4227,7 +4304,7 @@ export function enrollmentView({ account, memberLabel, code, error = null, openM
   return layout('Enroll device', `
     <section class="login">
       <div class="card stack">
-        <div><span class="badge stored">${escapeHtml(account.provider === 'claude' ? 'Claude Code' : 'Codex')}</span></div>
+        <div><span class="badge stored">${escapeHtml(providerLabel(account.provider))}</span></div>
         <h1 data-i18n="enroll-heading">Enroll a device</h1>
         <p>Account: <strong>${escapeHtml(account.alias)}</strong><br>Member: <strong>${escapeHtml(memberLabel || 'Unlabelled member')}</strong></p>
         ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
@@ -4727,6 +4804,56 @@ echo "Codex gateway profile '${profile}' installed. Start Codex with: codex-${pr
     </section>
   `, { openMode, completedDraft: 'codex-gateway-self-service' });
 }
+
+/**
+ * The Bedrock counterpart, and the shortest of the three because there is no
+ * client to configure.
+ *
+ * Claude gets a launcher and Codex gets a config block; both exist because a
+ * specific CLI has to be talked into using the gateway. A Bedrock member has no
+ * such CLI in the picture — they hold a base URL and a bearer token and call
+ * Converse from whatever they are writing. So this page hands over exactly
+ * those two things plus one runnable example, and does not pretend to install
+ * anything.
+ *
+ * The example is non-streaming for the same reason the proxy is: a
+ * `converse-stream` call would be refused, and showing it here would teach the
+ * member to write the one request that cannot work.
+ */
+export function bedrockDeviceConfiguredView({
+  account, device, token, bedrockGatewayUrl, openMode = false,
+}) {
+  const gateway = String(bedrockGatewayUrl ?? '').replace(/\/$/, '');
+  const modelId = account.bedrock?.model_id ?? '';
+  const tokenExport = `export BEDROCK_GATEWAY_TOKEN=${shellSingleQuote(token)}`;
+  const example = `curl -sS "${gateway}/model/${encodeURIComponent(modelId)}/converse" \\
+  -H "Authorization: Bearer $BEDROCK_GATEWAY_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"messages":[{"role":"user","content":[{"text":"hello"}]}],"inferenceConfig":{"maxTokens":64}}'`;
+  return layout('Bedrock device configured', `
+    <section class="stack">
+      <div class="notice success">Device <strong>${escapeHtml(device.name)}</strong> is enrolled for <strong>${escapeHtml(account.alias)}</strong>.</div>
+      <h1>Copy this token now</h1>
+      <p class="muted">This device token is displayed once and cannot be recovered from the control plane. Re-enroll if it is lost.</p>
+      <pre id="bedrock-token">${escapeHtml(tokenExport)}</pre>
+      <div class="setup-actions">
+        <button type="button" class="secondary" data-copy-target="bedrock-token">Copy token</button>
+      </div>
+      ${gateway ? `<h2>Call it</h2>
+      <pre id="bedrock-example">${escapeHtml(example)}</pre>
+      <div class="setup-actions">
+        <button type="button" class="secondary" data-copy-target="bedrock-example">Copy example</button>
+      </div>
+      <div class="notice">This account may only invoke <code>${escapeHtml(modelId)}</code> in <code>${escapeHtml(account.bedrock?.region ?? '')}</code>. Any other model is refused here, because the AWS key behind this gateway is account-wide.</div>
+      <div class="notice">Only non-streaming <code>/converse</code> is proxied. <code>/converse-stream</code> is refused: its turns cannot be metered yet, and an unmetered turn would be recorded as zero tokens.</div>
+      <div class="notice">Prompts and responses are <strong>not</strong> archived on this path — only per-turn token counts, the same as Codex traffic.</div>`
+    : '<div class="notice error">The Bedrock gateway URL is not configured on this console, so no client configuration can be generated. Ask an administrator to set it.</div>'}
+      <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
+      <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+    </section>
+  `, { openMode, completedDraft: 'bedrock-self-service' });
+}
+
 export function messageView(title, message, {
   error = false,
   openMode = false,

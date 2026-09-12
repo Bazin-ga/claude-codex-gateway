@@ -23,6 +23,7 @@ import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
+import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
 import { queryMetricsDataset } from './lib/metrics-page-query.js';
@@ -702,9 +703,17 @@ export async function createCredentialConsole(options = {}) {
   // Both providers issue the same kind of device token but need different client
   // instructions; handing a Codex enrollee the Claude launcher would be
   // confidently wrong.
-  const configuredDeviceView = (result) => (result.account?.provider === 'codex'
-    ? codexDeviceConfiguredView({ ...result, codexGatewayUrl, openMode })
-    : deviceConfiguredView({ ...result, claudeGatewayUrl, openMode }));
+  const bedrockGatewayUrl = options.bedrockGatewayUrl
+    ?? `${publicBaseUrl.replace(/\/$/, '')}${BEDROCK_PROXY_PREFIX}`;
+  const configuredDeviceView = (result) => {
+    if (result.account?.provider === 'codex') {
+      return codexDeviceConfiguredView({ ...result, codexGatewayUrl, openMode });
+    }
+    if (result.account?.provider === 'bedrock') {
+      return bedrockDeviceConfiguredView({ ...result, bedrockGatewayUrl, openMode });
+    }
+    return deviceConfiguredView({ ...result, claudeGatewayUrl, openMode });
+  };
   const deleteMetricsPageCache = (key) => {
     const entry = metricsPageCache.get(key);
     if (!entry) return false;
@@ -1493,6 +1502,19 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    // No configuration gate here on purpose: the route is inert without a
+    // Bedrock account, because the proxy resolves the device's account first
+    // and refuses anything that is not one. A console with no Bedrock account
+    // registered — every deployment until one is — behaves exactly as before.
+    if (path.startsWith(`${BEDROCK_PROXY_PREFIX}/`)) {
+      await handleBedrockProxy(req, res, {
+        store,
+        upstreamBaseUrl: options.bedrockUpstreamBaseUrl,
+        requestMetrics,
+      });
+      return;
+    }
+
     if (path === '/onboarding.md') {
       if (req.method !== 'GET') {
         sendText(
@@ -1997,21 +2019,40 @@ export async function createCredentialConsole(options = {}) {
       }
       try {
         const provider = String(form.provider ?? '');
-        if (!['claude', 'codex'].includes(provider)) {
-          throw new Error('only Claude and Codex accounts can be added in the web UI');
+        if (!['claude', 'codex', 'bedrock'].includes(provider)) {
+          throw new Error('only Claude, Codex and Bedrock accounts can be added in the web UI');
         }
         const emailLabel = String(form.email_label ?? '').trim().toLowerCase();
         // Claude matches this email against the authorized account before storing
-        // a token, so it is mandatory there. Codex treats it as an optional check.
+        // a token, so it is mandatory there. Codex treats it as an optional check,
+        // and Bedrock has no owner to match — its key belongs to an AWS account,
+        // not to a person who can be asked to authorize.
         if (emailLabel || provider === 'claude') {
           if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailLabel)) {
             throw new Error('a valid account owner email is required');
           }
         }
+        // Bedrock is the one provider whose credential arrives here rather than
+        // through an OAuth round trip, because there is no round trip to make:
+        // the key is issued in the AWS console and pasted once. It is encrypted
+        // before it is stored and is never rendered back.
+        const bedrock = provider === 'bedrock'
+          ? {
+            region: String(form.region ?? '').trim(),
+            modelId: String(form.model_id ?? '').trim(),
+          }
+          : null;
+        const credential = provider === 'bedrock'
+          ? { api_key: String(form.api_key ?? '').trim() }
+          : null;
+        if (provider === 'bedrock' && !credential.api_key) {
+          throw new Error('a Bedrock API key is required');
+        }
         await store.addAccount({
           provider,
           alias: String(form.alias ?? '').trim(),
           emailLabel,
+          ...(bedrock ? { bedrock, credential } : {}),
         });
         redirect(res, `/?draft_completed=${encodeURIComponent(`register-${provider}-account`)}`);
       } catch (error) {

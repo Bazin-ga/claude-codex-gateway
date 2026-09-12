@@ -257,6 +257,14 @@ export class UsageMonitor {
   }
 
   async #refreshAccount(account) {
+    // Bedrock reports no quota to poll: it is billed per token rather than
+    // against a rolling window. Leaving it out of the loop entirely, rather
+    // than letting it fall through to `unsupported_provider`, keeps it from
+    // logging an hourly refresh failure for a call that should never be made.
+    if (account.provider === 'bedrock') {
+      this.snapshots.delete(account.id);
+      return;
+    }
     const previous = this.snapshots.get(account.id) ?? null;
     try {
       let snapshot;
