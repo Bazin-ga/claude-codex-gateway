@@ -3508,6 +3508,15 @@ test('a Bedrock member self-serves a token and the page tells them how to use it
     const cookie = cookieFrom(page);
     const html = await page.text();
     assert.match(html, /data-i18n="bedrock-description"/);
+    // Not just "the card is on the page": the card renders either way. What
+    // matters is that the account reached it intact enough to be selectable.
+    // The server re-projects accounts through an allow-list before the view
+    // sees them, and the first version dropped the region/model pin there --
+    // so the panel rendered, judged the account unusable, and told members to
+    // wait for an owner who had already registered it.
+    assert.match(html, new RegExp(`<option value="${account.id}">bedrock-astra-1`));
+    assert.match(html, /data-i18n="get-bedrock"/);
+    assert.equal(html.includes('data-i18n="bedrock-unpinned"'), false);
 
     const response = await fetch(`${app.baseUrl}/self-service`, {
       method: 'POST',

@@ -866,6 +866,12 @@ export async function createCredentialConsole(options = {}) {
         last_success_at: safeTimestamp(account.last_success_at),
         last_failure_at: safeTimestamp(account.last_failure_at),
         external: account.external ? { kind: account.external.kind } : null,
+        // Region and model id, not the key. This projection is an allow-list,
+        // so anything omitted simply disappears before the page sees it: with
+        // the pin missing the dashboard judged every Bedrock account unusable
+        // and told members to wait for an account owner who had already
+        // registered it.
+        bedrock: account.bedrock ? { ...account.bedrock } : null,
         active_devices: account.active_devices,
       };
       return {
