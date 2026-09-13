@@ -32,6 +32,7 @@ import { CLIENT_CONFIG_VERSION } from './lib/client-config-version.js';
 import { buildOnboardingGuideUrl, buildOnboardingMarkdown } from './lib/onboarding.js';
 import { UsageMonitor } from './lib/usage.js';
 import { safeTimestamp } from './lib/credential-alerts.js';
+import { externalAccountStatus } from './lib/external-account-status.js';
 import { buildMetricsChartPayload } from './lib/metrics-chart-data.js';
 import {
   createClaudeAuthorizationRequest,
@@ -263,155 +264,10 @@ function expectsAsyncJson(req, operation) {
   ));
 }
 
-const SAFE_HEALTH_OUTCOMES = new Set([
-  'fresh', 'refreshed', 'recovered', 'refreshing', 'quarantined',
-  'pre_mint_rejected', 'timeout', 'persist_failed', 'publish_failed',
-  'unreadable', 'unhandled', 'operation_blocked',
-]);
-const SAFE_HEALTH_FAILURE_CLASSES = new Set([
-  'quarantine',
-  'provider_rejected',
-  'persist_failed',
-  'publish_failed',
-  'unreadable',
-  'unhandled',
-  'operation_blocked',
-  'configuration_invalid',
-  'timeout',
-]);
-
-function metadataObject(value) {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
-}
-
-function nonEmptyMetadata(value) {
-  return typeof value === 'string' && value.trim().length > 0;
-}
-
-function optionalHealthTimestamp(value) {
-  if (value === undefined || value === null || value === '') return null;
-  return safeTimestamp(value);
-}
-
-function optionalHealthNumber(value, { integer = false, nonNegative = false } = {}) {
-  if (value === undefined || value === null || value === '') return null;
-  const number = Number(value);
-  if (!Number.isFinite(number)) return null;
-  if (integer && !Number.isInteger(number)) return null;
-  if (nonNegative && number < 0) return null;
-  return number;
-}
-
-function sanitizeHealthSnapshot(raw) {
-  const source = metadataObject(raw);
-  if (!source || source.version !== 1) return null;
-  const timestampFields = [
-    'updated_at',
-    'last_cycle_started_at',
-    'last_cycle_finished_at',
-    'last_success_at',
-    'last_refresh_at',
-    'last_failure_at',
-  ];
-  const timestamps = Object.fromEntries(timestampFields.map((field) => [
-    field,
-    optionalHealthTimestamp(source[field]),
-  ]));
-  // A present malformed timestamp is a malformed health snapshot. Missing
-  // optional canaries remain null and are intentionally harmless.
-  if (timestampFields.some((field) => (
-    source[field] !== undefined
-      && source[field] !== null
-      && source[field] !== ''
-      && timestamps[field] === null
-  ))) return null;
-
-  const expected = optionalHealthNumber(source.expected_interval_seconds, {
-    integer: true,
-    nonNegative: true,
-  });
-  if (source.expected_interval_seconds !== undefined
-    && source.expected_interval_seconds !== null
-    && source.expected_interval_seconds !== ''
-    && (expected === null || expected <= 0 || expected > 30 * 24 * 60 * 60)) return null;
-  const consecutive = optionalHealthNumber(source.consecutive_failures, {
-    integer: true,
-    nonNegative: true,
-  });
-  if (source.consecutive_failures !== undefined
-    && source.consecutive_failures !== null
-    && source.consecutive_failures !== ''
-    && consecutive === null) return null;
-
-  let lastOutcome = null;
-  if (source.last_outcome !== undefined && source.last_outcome !== null && source.last_outcome !== '') {
-    if (typeof source.last_outcome !== 'string') return null;
-    lastOutcome = source.last_outcome.toLowerCase();
-    if (!SAFE_HEALTH_OUTCOMES.has(lastOutcome)) return null;
-  }
-  let failureClass = null;
-  if (source.failure_class !== undefined && source.failure_class !== null && source.failure_class !== '') {
-    if (typeof source.failure_class !== 'string') return null;
-    failureClass = source.failure_class.toLowerCase();
-    if (!SAFE_HEALTH_FAILURE_CLASSES.has(failureClass)) return null;
-  }
-
-  const quarantineSource = source.quarantine;
-  let quarantine = { present: false, since: null };
-  if (quarantineSource !== undefined && quarantineSource !== null) {
-    const value = metadataObject(quarantineSource);
-    if (!value || typeof value.present !== 'boolean') return null;
-    const since = optionalHealthTimestamp(value.since);
-    if (value.since !== undefined && value.since !== null && value.since !== '' && since === null) return null;
-    quarantine = { present: value.present, since: value.present ? since : null };
-  }
-
-  let access = null;
-  if (source.access !== undefined && source.access !== null) {
-    const value = metadataObject(source.access);
-    if (!value || typeof value.present !== 'boolean' || typeof value.valid !== 'boolean') return null;
-    const expiresAt = optionalHealthTimestamp(value.expires_at);
-    if (value.expires_at !== undefined && value.expires_at !== null && value.expires_at !== '' && expiresAt === null) return null;
-    const remaining = optionalHealthNumber(value.remaining_seconds, {
-      integer: true,
-      nonNegative: true,
-    });
-    if (value.remaining_seconds !== undefined && value.remaining_seconds !== null && value.remaining_seconds !== '' && remaining === null) return null;
-    access = {
-      present: value.present,
-      valid: value.valid,
-      expires_at: expiresAt,
-      remaining_seconds: remaining,
-    };
-  }
-
-  return {
-    version: 1,
-    ...timestamps,
-    expected_interval_seconds: expected,
-    last_outcome: lastOutcome,
-    failure_class: failureClass,
-    consecutive_failures: consecutive,
-    quarantine,
-    access,
-  };
-}
-
-async function readPublicJson(path) {
-  let body;
-  try {
-    body = await readFile(path, 'utf8');
-  } catch (error) {
-    // Keep filesystem details (including paths and permission messages) inside
-    // the server log boundary. The dashboard only needs a stable category.
-    return { status: error?.code === 'ENOENT' ? 'missing' : 'unavailable', value: null };
-  }
-  try {
-    return { status: 'ok', value: JSON.parse(body) };
-  } catch {
-    return { status: 'invalid', value: null };
-  }
-}
+// Moved to lib/external-account-status.js so the Store's account-switch guard
+// can read the same sanitized surface; re-exported here because this module
+// has always been its public entry point.
+export { externalAccountStatus };
 
 async function loadMetricsAsset() {
   const manifest = JSON.parse(await readFile(METRICS_ASSET_MANIFEST, 'utf8'));
@@ -437,74 +293,6 @@ async function loadMetricsAsset() {
   return { ...manifest, body };
 }
 
-/**
- * Read the two public Codex metadata files without ever returning their
- * credential values. current.json is authoritative for expiry; health.json is
- * an observability snapshot and is sanitized field-by-field before it reaches
- * the classifier or a view.
- */
-export async function externalAccountStatus(account, { now = Date.now() } = {}) {
-  if (account?.external?.kind !== 'codex-credential') return {};
-  const parsedNow = typeof now === 'number' && Number.isFinite(now)
-    ? now
-    : Date.parse(String(now ?? ''));
-  const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
-  const home = account.external.home;
-  const currentRead = await readPublicJson(`${home}/public/current.json`);
-  const healthRead = await readPublicJson(`${home}/public/health.json`);
-  const health = healthRead.status === 'ok' ? sanitizeHealthSnapshot(healthRead.value) : null;
-  const healthStatus = healthRead.status === 'ok'
-    ? (health ? 'ok' : 'invalid')
-    : healthRead.status;
-
-  let currentStatus;
-  let expiresAt = null;
-  if (currentRead.status !== 'ok') {
-    currentStatus = currentRead.status === 'missing' ? 'unavailable' : currentRead.status;
-  } else {
-    const current = metadataObject(currentRead.value);
-    const currentExpiresAt = safeTimestamp(current?.expires_at);
-    const valid = current
-      && nonEmptyMetadata(current.access_token)
-      && nonEmptyMetadata(current.account_id)
-      && currentExpiresAt !== null;
-    if (!valid) currentStatus = 'invalid';
-    else {
-      expiresAt = currentExpiresAt;
-      currentStatus = Date.parse(currentExpiresAt) <= nowMs ? 'expired' : 'healthy';
-    }
-  }
-
-  let clientCount = null;
-  const clientsRead = await readPublicJson(`${home}/clients/clients.json`);
-  if (clientsRead.status === 'ok') {
-    const clients = metadataObject(clientsRead.value)?.clients;
-    if (Array.isArray(clients)) {
-      clientCount = clients.filter((client) => metadataObject(client) && !client.revoked).length;
-    }
-  }
-
-  return {
-    status: currentStatus,
-    current_status: currentStatus,
-    external_status: currentStatus,
-    current_read_status: currentRead.status,
-    health_read_status: healthStatus,
-    refresh_health: health,
-    health_status: healthStatus,
-    expires_at: expiresAt,
-    active_devices: clientCount,
-    refresh_health_status: healthStatus,
-    health_read_status: healthStatus,
-    // Only timestamps and fixed enums leave this function. In particular there
-    // is no access token, account id, exception text, or filesystem path here.
-    ...(health ? {
-      last_success_at: health.last_success_at,
-      last_refresh_at: health.last_refresh_at,
-      last_failure_at: health.last_failure_at,
-    } : {}),
-  };
-}
 
 /**
  * The Codex machines a dispenser knows about, read out of the credential home
