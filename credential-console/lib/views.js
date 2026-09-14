@@ -3840,6 +3840,12 @@ export function dashboardView({
   const filteredCount = anyFilter
     ? inventory.reduce((total, entry) => total + matchedRows(entry).length, 0)
     : 0;
+  const matchedProviders = new Set(inventory
+    .flatMap((entry) => matchedRows(entry))
+    .map((device) => accountSelectionForDevice(device, accounts).selectedAccount?.provider)
+    .filter(Boolean));
+  const matchedProvider = matchedProviders.size === 1 ? [...matchedProviders][0] : null;
+  const bulkProviderAmbiguous = filteredCount > 0 && matchedProvider === null;
   const filterSummary = [
     filterGroup ? `in <strong>${escapeHtml(filterGroup)}</strong>` : null,
     filterAccount ? `on <strong>${escapeHtml(filterAccount.alias)}</strong>` : null,
@@ -3847,7 +3853,7 @@ export function dashboardView({
   ].filter(Boolean).join(' ');
   const bulkTargetAccounts = destinationAccounts.filter((account) => (
     account.id !== filterAccount?.id
-    && (!filterAccount || account.provider === filterAccount.provider)
+    && account.provider === (filterAccount?.provider ?? matchedProvider)
   ));
 
   const liveMachines = inventory.filter((entry) => entry.active > 0 && !entry.legacy && matchesFilter(entry));
@@ -4112,7 +4118,9 @@ export function dashboardView({
               <button type="submit" class="danger">Switch all ${filteredCount}</button>
               <div class="muted tiny">Applies to whatever matches when you press it, and refuses if that is no longer ${filteredCount}. Rows already on the target, or that cannot move, are reported and left alone.</div>
             </form>` : `<div class="notice"><span>${filteredCount
-    ? `No other usable provider account is available for ${filterSummary}.`
+    ? (bulkProviderAmbiguous
+      ? 'The selection spans multiple or unknown providers. Add a Provider account filter before switching.'
+      : `No other usable provider account is available for ${filterSummary}.`)
     : `No active credential matches ${filterSummary}.`}</span></div>`) : ''}
             ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
             ${liveMachines.length + unattributed.length + retiredMachines.length ? `<div class="machine-search-bar">
