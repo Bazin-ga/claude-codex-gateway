@@ -401,6 +401,58 @@ test('the member dropdown lists each active member once, sorted', async () => {
   assert.match(html, /<strong>2<\/strong> active credential\(s\) for <strong>alice@github<\/strong>/);
 });
 
+test('a member-only bulk form offers accounts for the matched provider only', async () => {
+  const store = await newStore();
+  const claudeA = await claudeAccount(store, 'claude-a');
+  const claudeB = await claudeAccount(store, 'claude-b');
+  const codexA = await codexAccount(store, 'codex-a');
+  const codexB = await codexAccount(store, 'codex-b');
+  await store.issueDeviceCredential({
+    accountId: claudeA.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-laptop',
+  });
+  await store.issueDeviceCredential({
+    accountId: claudeB.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-desktop',
+  });
+  await store.issueDeviceCredential({
+    accountId: codexA.id,
+    memberLabel: 'bob@github',
+    deviceName: 'bob-codex',
+  });
+
+  const html = render(store, { memberFilter: 'alice@github' });
+  const bulkStart = html.indexOf('action="/devices/account"');
+  assert.notEqual(bulkStart, -1);
+  const bulk = html.slice(bulkStart, html.indexOf('</form>', bulkStart));
+  assert.ok(bulk.includes(claudeA.id));
+  assert.ok(bulk.includes(claudeB.id));
+  assert.equal(bulk.includes(codexA.id), false);
+  assert.equal(bulk.includes(codexB.id), false);
+});
+
+test('a member selection spanning providers requires a provider-account filter', async () => {
+  const store = await newStore();
+  const claude = await claudeAccount(store, 'claude-a');
+  const codex = await codexAccount(store, 'codex-a');
+  await store.issueDeviceCredential({
+    accountId: claude.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-claude',
+  });
+  await store.issueDeviceCredential({
+    accountId: codex.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-codex',
+  });
+
+  const html = render(store, { memberFilter: 'alice@github' });
+  assert.equal(html.includes('action="/devices/account"'), false);
+  assert.match(html, /selection spans multiple or unknown providers/);
+});
+
 test('an unknown member in the URL is ignored rather than obeyed', async () => {
   const { store } = await mixedFixture();
   const html = render(store, { memberFilter: 'nobody@github' });
