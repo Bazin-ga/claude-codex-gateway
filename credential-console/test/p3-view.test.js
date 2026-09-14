@@ -97,8 +97,9 @@ const INVALID_UNATTRIBUTED = activeDevice({
   },
 });
 
-function render({ openMode = true, completedDraft = null } = {}) {
+function render({ openMode = true, completedDraft = null, providerFilter = null } = {}) {
   return dashboardView({
+    providerFilter,
     accounts: [ACCOUNT_A, ACCOUNT_B, CODEX_ACCOUNT],
     devices: [SHARED_SELECTED_B, SHARED_SELECTED_A, REVOKED, LEGACY_UNATTRIBUTED, INVALID_UNATTRIBUTED],
     machines: [
@@ -258,7 +259,9 @@ test('revoked rows and a Codex row with no second usable account do not render s
   assert.doesNotMatch(revoked, /\/account"/);
   assert.doesNotMatch(revoked, /name="selected_account_id"/);
 
-  const codexRow = [...html.matchAll(/<tr data-credential-state="active">[\s\S]*?<\/tr>/g)]
+  // Codex rows live in the Codex section now, so this has to ask for that tab.
+  const codexHtml = render({ providerFilter: 'codex' });
+  const codexRow = [...codexHtml.matchAll(/<tr data-credential-state="active">[\s\S]*?<\/tr>/g)]
     .map((match) => match[0])
     .find((row) => row.includes('<td>Codex</td>'));
   assert.ok(codexRow, 'Codex row should render');

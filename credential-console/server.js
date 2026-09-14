@@ -1886,6 +1886,7 @@ export async function createCredentialConsole(options = {}) {
         accountFilter: url.searchParams.get('account'),
         memberFilter: url.searchParams.get('member'),
         groupFilter: url.searchParams.get('group'),
+        providerFilter: url.searchParams.get('provider'),
         completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
       }));
       return;

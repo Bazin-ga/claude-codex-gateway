@@ -207,6 +207,12 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .quota-window strong { display: block; margin: 3px 0; font-size: 15px; }
 .quota-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin-top: 8px; color: var(--muted); font-size: 11px; }
 .quota-fable, .quota-reset-credits { margin-left: auto; }
+.provider-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+.provider-tab { display: inline-flex; align-items: center; gap: 8px; padding: 9px 15px; border: 1px solid var(--line); border-bottom: 0; border-radius: 11px 11px 0 0; margin-bottom: -1px; background: #f3f5f2; color: var(--muted); font-weight: 700; font-size: 14px; text-decoration: none; }
+.provider-tab:hover { color: var(--ink); }
+.provider-tab.is-current { background: var(--card); color: var(--green); border-color: var(--line); box-shadow: inset 0 2px 0 var(--green); }
+.provider-tab-count { min-width: 20px; padding: 1px 7px; border-radius: 999px; background: #e4e9e3; color: var(--muted); font-size: 11px; font-weight: 800; text-align: center; }
+.provider-tab.is-current .provider-tab-count { background: var(--green); color: #fff; }
 .quota-message { margin: 8px 0 0; color: var(--amber); font-size: 12px; line-height: 1.4; display: flex; align-items: center; gap: 6px; }
 .quota-message.error { color: var(--red); background: transparent; border: 0; padding: 0; }
 .quota-help { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 50%; border: 1px solid currentColor; opacity: 0.7; font-size: 10px; line-height: 1; cursor: help; flex: 0 0 auto; }
@@ -1171,15 +1177,11 @@ function accountSwitchControl(device, selection, accounts, csrf) {
     && accountCanReceiveDevice(account)
   ));
   if (providerAccounts.length === 0) {
-    return `<div class="muted tiny">No ${escapeHtml(
-      deviceProvider === 'codex' ? 'Codex' : 'Claude',
-    )} accounts are registered.</div>`;
+    return `<div class="muted tiny">No ${escapeHtml(providerLabel(deviceProvider))} accounts are registered.</div>`;
   }
   const alternatives = destinations.filter((account) => account.id !== selection.selectedAccountId);
   if (alternatives.length === 0) {
-    return `<div class="muted tiny">No other usable ${escapeHtml(
-      deviceProvider === 'codex' ? 'Codex' : 'Claude',
-    )} account is available.</div>`;
+    return `<div class="muted tiny">No other usable ${escapeHtml(providerLabel(deviceProvider))} account is available.</div>`;
   }
   // Keep an unavailable current account visible as the selected option while
   // offering only usable destinations. Removing it makes a recovery switch
@@ -1367,8 +1369,19 @@ function machineInventory({ machines, codexClients }) {
   }));
 }
 
-function machineEntryView(entry, { accounts, csrf, machineOptions, groupNames = [] }) {
+/**
+ * `section` names the provider partition this card is being rendered inside, so
+ * a machine that holds both a Claude and a Codex credential shows only the ones
+ * belonging to the tab being looked at. Rendering all of them under a provider
+ * heading would put the mixed list back inside the card and undo the split one
+ * level down; null keeps every row, for callers with no section.
+ */
+function machineEntryView(entry, {
+  accounts, csrf, machineOptions, groupNames = [], section = null, deviceProvider = null,
+}) {
   const accountFor = (id) => accounts.find((account) => account.id === id) ?? null;
+  const inSection = (device) => !section || !deviceProvider || deviceProvider(device) === section;
+  const codexInSection = !section || section === 'codex';
   // Everything a person might type to find this machine, flattened and lowercased
   // for the overview's client-side keyword filter: machine handle, every device /
   // codex client name, every member label, and every account alias it holds.
@@ -1380,11 +1393,11 @@ function machineEntryView(entry, { accounts, csrf, machineOptions, groupNames = 
     ...entry.codex.map((client) => accountFor(client.account_id)?.alias),
   ].filter(Boolean).join(' ').toLowerCase();
   const rows = [
-    ...entry.devices.map((device) => ({
+    ...entry.devices.filter(inSection).map((device) => ({
       revoked: Boolean(device.revoked_at),
       html: consoleCredentialRow(device, accounts, csrf, groupNames),
     })),
-    ...entry.codex.map((client) => ({
+    ...(codexInSection ? entry.codex : []).map((client) => ({
       revoked: client.revoked,
       html: codexCredentialRow(client, accountFor(client.account_id)),
     })),
@@ -3678,6 +3691,7 @@ export function dashboardView({
   accountFilter = null,
   memberFilter = null,
   groupFilter = null,
+  providerFilter = null,
   deviceGroups = [],
   completedDraft = null,
   credentialAlerts = null,
@@ -3813,30 +3827,83 @@ export function dashboardView({
     `<option value="${escapeHtml(entry.machine_id)}">${escapeHtml(entry.names.join(', ') || entry.machine_id)} · ${escapeHtml(entry.machine_id)}</option>`
   )).join('');
   const groupNames = Array.isArray(deviceGroups) ? deviceGroups : [];
-  const entryView = (entry) => machineEntryView(entry, { accounts, csrf, machineOptions, groupNames });
+  // Declared here but only ever called after the section is resolved below, so
+  // the closure reads the settled values rather than the ones in scope now.
+  const entryView = (entry) => machineEntryView(entry, {
+    accounts, csrf, machineOptions, groupNames, section: filterProvider, deviceProvider,
+  });
   // Filtering is judged on the *device* rows, not the machine: one machine can
   // hold Claude credentials on several accounts, so a machine is shown when any
   // of its rows matches, and the count below counts rows rather than machines.
   const filterAccounts = accounts.filter((account) => GATEWAY_PROVIDERS.includes(account.provider));
   const destinationAccounts = filterAccounts.filter(accountCanReceiveDevice);
-  const filterAccount = filterAccounts.find((account) => account.id === accountFilter) ?? null;
+  const requestedAccount = filterAccounts.find((account) => account.id === accountFilter) ?? null;
   const memberLabels = [...new Set(devices
     .filter((device) => !device.revoked_at && device.member_label)
     .map((device) => device.member_label))].sort((a, b) => a.localeCompare(b));
   const filterMember = memberLabels.includes(memberFilter) ? memberFilter : null;
   const filterGroup = groupNames.includes(groupFilter) ? groupFilter : null;
+  // The provider a credential actually routes through. Falls back to the row's
+  // original account for the same reason consoleCredentialRow does: a row with a
+  // broken policy still belongs to a client, and guessing "Claude Code" for it
+  // would put it in the wrong section rather than admitting the problem.
+  const deviceProvider = (device) => {
+    const selection = accountSelectionForDevice(device, accounts);
+    return accountForId(accounts, selection.selectedAccountId ?? selection.originalAccountId)
+      ?.provider ?? null;
+  };
+  // The inventory is partitioned by provider, and these two are always present
+  // even when empty: a section that appeared only when populated would make an
+  // empty one look like a page that had not finished loading.
+  const INVENTORY_PROVIDERS = ['claude', 'codex'];
+  const activeDeviceRows = devices.filter((device) => !device.revoked_at);
+  // Any other provider a live credential is actually on. Empty in practice, and
+  // therefore invisible — but a Bedrock credential that someone self-serves must
+  // not silently vanish from the inventory just because the section list was
+  // written when there were only two providers.
+  const extraProviders = [...new Set(activeDeviceRows
+    .map(deviceProvider)
+    .filter((provider) => provider && !INVENTORY_PROVIDERS.includes(provider)))].sort();
+  const sectionProviders = [...INVENTORY_PROVIDERS, ...extraProviders];
+  // An account named in the URL decides the section when no section is named.
+  // Otherwise a link to a Codex account would land on the Claude tab and drop
+  // the very filter it was built to carry.
+  const filterProvider = sectionProviders.includes(providerFilter)
+    ? providerFilter
+    : (sectionProviders.includes(requestedAccount?.provider)
+      ? requestedAccount.provider
+      : sectionProviders[0]);
+  const sectionFilterAccounts = filterAccounts
+    .filter((account) => account.provider === filterProvider);
+  // Scoped to the section, so an account id left over from another tab is
+  // ignored rather than silently filtering this one to nothing.
+  const filterAccount = requestedAccount?.provider === filterProvider ? requestedAccount : null;
   const anyFilter = Boolean(filterAccount || filterMember || filterGroup);
+  // The provider partition, applied before any operator-chosen filter. It is not
+  // one of them: `anyFilter` deliberately stays false when only a section is
+  // selected, so the bulk switch still demands that the operator narrow the
+  // selection rather than offering "move every Claude credential" as the
+  // resting state of the page.
+  const providerRows = (entry, { includeRevoked = false } = {}) => (entry.devices ?? [])
+    .filter((device) => (includeRevoked || !device.revoked_at)
+      && deviceProvider(device) === filterProvider);
+  // A Codex machine enrolled against the dispenser holds no device row here at
+  // all — it reports to the dispenser and never contacts this console. Judging
+  // the section by device rows alone would drop those machines out of the Codex
+  // section and out of every other one, which is to say off the page.
+  const holdsSection = (entry, options) => providerRows(entry, options).length > 0
+    || (filterProvider === 'codex' && (entry.codex ?? []).length > 0);
   // Both conditions apply together: "everyone under this GitHub account who is
   // currently on that provider account" is the selection worth acting on.
-  const matchedRows = (entry) => (entry.devices ?? []).filter((device) => {
-    if (device.revoked_at) return false;
+  const matchedRows = (entry) => providerRows(entry).filter((device) => {
     if (filterMember && device.member_label !== filterMember) return false;
     // Membership, not equality: a machine can be in more than one group.
     if (filterGroup && !(device.groups ?? []).includes(filterGroup)) return false;
     if (!filterAccount) return true;
     return accountSelectionForDevice(device, accounts).selectedAccountId === filterAccount.id;
   });
-  const matchesFilter = (entry) => !anyFilter || matchedRows(entry).length > 0;
+  const matchesFilter = (entry, options) => holdsSection(entry, options)
+    && (!anyFilter || matchedRows(entry).length > 0);
   const filteredCount = anyFilter
     ? inventory.reduce((total, entry) => total + matchedRows(entry).length, 0)
     : 0;
@@ -3845,25 +3912,72 @@ export function dashboardView({
     .map((device) => accountSelectionForDevice(device, accounts).selectedAccount?.provider)
     .filter(Boolean));
   const matchedProvider = matchedProviders.size === 1 ? [...matchedProviders][0] : null;
-  const bulkProviderAmbiguous = filteredCount > 0 && matchedProvider === null;
+  // #19's ambiguity flag is gone rather than kept as a dormant guard: every row
+  // in `matchedRows` comes from `providerRows`, which already required the
+  // section's provider, so the flag could never be true again and the notice it
+  // controlled could never render. `matchedProvider` itself stays — it is the
+  // belt to the partition's braces if a later change loosens the section — and
+  // the store's cross-provider refusal remains the real backstop.
   const filterSummary = [
     filterGroup ? `in <strong>${escapeHtml(filterGroup)}</strong>` : null,
     filterAccount ? `on <strong>${escapeHtml(filterAccount.alias)}</strong>` : null,
     filterMember ? `for <strong>${escapeHtml(filterMember)}</strong>` : null,
   ].filter(Boolean).join(' ');
+  // The section already guarantees a single provider, so this is now a statement
+  // of that fact rather than a rule that has to hold on its own. `matchedProvider`
+  // is kept in the chain because a row whose account no longer resolves has no
+  // section-derived provider either, and #19's refusal is still the thing that
+  // catches it.
+  // Where the matched rows already sit. An account holding every one of them can
+  // only produce "already on target, skipped", so offering it is offering a
+  // button with no effect -- which is what the account filter's own exclusion
+  // has always said, just stated for the member and group filters too.
+  const matchedAccountIds = new Set(inventory
+    .flatMap((entry) => matchedRows(entry))
+    .map((device) => accountSelectionForDevice(device, accounts).selectedAccountId));
+  const everyRowAlreadyOn = (accountId) => filteredCount > 0
+    && matchedAccountIds.size === 1
+    && matchedAccountIds.has(accountId);
   const bulkTargetAccounts = destinationAccounts.filter((account) => (
     account.id !== filterAccount?.id
-    && account.provider === (filterAccount?.provider ?? matchedProvider)
+    && !everyRowAlreadyOn(account.id)
+    && account.provider === (filterAccount?.provider ?? matchedProvider ?? filterProvider)
   ));
 
   const liveMachines = inventory.filter((entry) => entry.active > 0 && !entry.legacy && matchesFilter(entry));
+  // Counted across the whole inventory, not the current section, so the tab a
+  // machine is NOT on still says how much is over there. Without it a filter
+  // that matches nothing here reads as "gone" rather than "on the other tab".
+  const sectionCounts = new Map(sectionProviders.map((provider) => [
+    provider,
+    activeDeviceRows.filter((device) => deviceProvider(device) === provider).length
+      + (provider === 'codex' ? codexClients.filter((client) => !client.revoked).length : 0),
+  ]));
+  const sectionHref = (provider) => {
+    const params = new URLSearchParams();
+    params.set('provider', provider);
+    if (filterGroup) params.set('group', filterGroup);
+    if (filterMember) params.set('member', filterMember);
+    // The account filter is deliberately dropped when changing section: it names
+    // an account of the section being left, so carrying it over would land on a
+    // tab filtered to something it cannot contain.
+    return `/?${params.toString()}`;
+  };
+  const sectionTabs = `<nav class="provider-tabs" aria-label="Credential provider">${sectionProviders.map((provider) => (
+    `<a class="provider-tab${provider === filterProvider ? ' is-current' : ''}" href="${escapeHtml(sectionHref(provider))}"${provider === filterProvider ? ' aria-current="page"' : ''}>${escapeHtml(providerLabel(provider))}<span class="provider-tab-count">${sectionCounts.get(provider) ?? 0}</span></a>`
+  )).join('')}</nav>`;
   // Kept in a group of their own rather than mixed in among machines: an issuance
   // nobody can attribute is not an inventory entry, and listing it as one would be
   // the quiet guess this whole view exists to avoid.
   const unattributed = inventory.filter((entry) => entry.active > 0 && entry.legacy && matchesFilter(entry));
   // Everything a machine ever held is kept, but one holding nothing live is history
   // rather than inventory, so it starts folded away.
-  const retiredMachines = inventory.filter((entry) => entry.active === 0 && matchesFilter(entry));
+  // Revoked rows count for the section here: a retired machine has nothing live
+  // by definition, so judging its section on live rows only would hide every
+  // retired machine on every tab.
+  const retiredMachines = inventory.filter((entry) => (
+    entry.active === 0 && matchesFilter(entry, { includeRevoked: true })
+  ));
 
   return layout('Dashboard', `
     <div class="stack">
@@ -4074,11 +4188,13 @@ export function dashboardView({
               </li>`).join('')}</ul>` : '<p class="muted tiny">No groups yet.</p>'}
             </details>
             ${openMode ? '<div class="notice error open-banner" role="status" data-i18n="open-account-switch-warning">Open mode has no verified actor: anyone who can reach this console can switch any active device. The actor is recorded as anonymous; a member label is not an actor.</div>' : ''}
+            ${sectionTabs}
             ${filterAccounts.length ? `<form method="get" action="/" class="machine-filter">
-              <label><span>Provider account</span>
+              <input type="hidden" name="provider" value="${escapeHtml(filterProvider)}">
+              <label><span>${escapeHtml(providerLabel(filterProvider))} account</span>
                 <select name="account">
-                  <option value="">All accounts</option>
-                  ${filterAccounts.map((account) => (
+                  <option value="">All ${escapeHtml(providerLabel(filterProvider))} accounts</option>
+                  ${sectionFilterAccounts.map((account) => (
                     `<option value="${escapeHtml(account.id)}"${account.id === filterAccount?.id ? ' selected' : ''}>${escapeHtml(account.alias)}</option>`
                   )).join('')}
                 </select>
@@ -4118,9 +4234,7 @@ export function dashboardView({
               <button type="submit" class="danger">Switch all ${filteredCount}</button>
               <div class="muted tiny">Applies to whatever matches when you press it, and refuses if that is no longer ${filteredCount}. Rows already on the target, or that cannot move, are reported and left alone.</div>
             </form>` : `<div class="notice"><span>${filteredCount
-    ? (bulkProviderAmbiguous
-      ? 'The selection spans multiple or unknown providers. Add a Provider account filter before switching.'
-      : `No other usable provider account is available for ${filterSummary}.`)
+    ? `No other usable ${escapeHtml(providerLabel(filterProvider))} account is available for ${filterSummary}.`
     : `No active credential matches ${filterSummary}.`}</span></div>`) : ''}
             ${codexUnavailable.length ? `<div class="notice"><span data-i18n="codex-inventory-unavailable">Codex machines could not be read for at least one credential home, so any machine known only to the dispenser is missing from this list.</span><br><span class="tiny">${escapeHtml(codexUnavailable.map((entry) => entry.alias).join(', '))}</span></div>` : ''}
             ${liveMachines.length + unattributed.length + retiredMachines.length ? `<div class="machine-search-bar">

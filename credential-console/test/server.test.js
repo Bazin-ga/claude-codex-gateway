@@ -3052,19 +3052,27 @@ test('the device list renders as a machine inventory, Codex machines included', 
     const html = await (await fetch(`${app.baseUrl}/`)).text();
 
     // One machine, four credentials: the Claude issuance and the Codex enrollment
-    // are the same box, and only the reported handle can say so.
+    // are the same box, and only the reported handle can say so. The machine
+    // therefore appears on both tabs -- but each tab shows only the credentials
+    // belonging to it, so the card is never a mixed list.
     const machine = machineArticle(html, `machine:${MACHINE_HANDLE}`);
     assert.match(machine, /data-machine-legacy="false"/);
-    assert.equal(credentialRows(machine, 'active').length, 2);
-    assert.equal(credentialRows(machine, 'revoked').length, 2);
+    assert.equal(credentialRows(machine, 'active').length, 1);
+    assert.equal(credentialRows(machine, 'revoked').length, 1);
     assert.match(credentialRows(machine, 'active')[0], /work-laptop/);
-    assert.match(credentialRows(machine, 'active')[1], /Codex/);
+    assert.equal(credentialRows(machine, 'active')[0].includes('<td>Codex</td>'), false);
+
+    const codexHtml = await (await fetch(`${app.baseUrl}/?provider=codex`)).text();
+    const codexMachine = machineArticle(codexHtml, `machine:${MACHINE_HANDLE}`);
+    assert.equal(credentialRows(codexMachine, 'active').length, 1);
+    assert.equal(credentialRows(codexMachine, 'revoked').length, 1);
+    assert.match(credentialRows(codexMachine, 'active')[0], /<td>Codex<\/td>/);
 
     // Revoked credentials are the majority of rows over time. They stay in the
     // page — and out of the way.
-    const collapsed = machine.indexOf('<details data-revoked-credentials="2"');
+    const collapsed = machine.indexOf('<details data-revoked-credentials="1"');
     assert.notEqual(collapsed, -1);
-    assert.equal(machine.includes('<details data-revoked-credentials="2" open'), false);
+    assert.equal(machine.includes('<details data-revoked-credentials="1" open'), false);
     assert.equal(
       machine.slice(0, collapsed).includes('data-credential-state="revoked"'),
       false,
@@ -3078,8 +3086,12 @@ test('the device list renders as a machine inventory, Codex machines included', 
     // rather than listed as if they were machines.
     // Seven, not two: the five malformed handles are each their own unattributed
     // row rather than a `machine:42` / `machine:[object Object]` group.
-    const legacyGroup = html.indexOf('data-unattributed-credentials="7"');
+    // One here and six on the Codex tab, not seven on both: the partition reaches
+    // the unattributed group too. The six are the dispenser's own rows -- one
+    // enrolled before handles existed, five carrying a malformed handle.
+    const legacyGroup = html.indexOf('data-unattributed-credentials="1"');
     assert.notEqual(legacyGroup, -1);
+    assert.match(codexHtml, /data-unattributed-credentials="6"/);
     assert.ok(html.indexOf(`data-machine-key="machine:${MACHINE_HANDLE}"`) < legacyGroup);
     assert.ok(html.indexOf(`data-machine-key="issuance:${unattributed.device.id}"`) > legacyGroup);
     const legacy = machineArticle(html, `issuance:${unattributed.device.id}`);
@@ -3089,8 +3101,9 @@ test('the device list renders as a machine inventory, Codex machines included', 
     assert.match(legacy, new RegExp(`<option value="${MACHINE_HANDLE}"`));
 
     // Keyed by its position in the dispenser's registry, because there is nothing
-    // else about it that is known to be unique.
-    const codexLegacy = machineArticle(html, `codex:${codexAccount.id}:2`);
+    // else about it that is known to be unique. Read from the Codex tab: these
+    // rows are the dispenser's, so that is the section they belong to.
+    const codexLegacy = machineArticle(codexHtml, `codex:${codexAccount.id}:2`);
     assert.match(codexLegacy, /ancient-box/);
     assert.match(codexLegacy, /data-i18n="legacy-no-handle"/);
     assert.match(codexLegacy, /data-i18n="codex-legacy-note"/);
@@ -3103,14 +3116,16 @@ test('the device list renders as a machine inventory, Codex machines included', 
       [3, 'malformed-number'], [4, 'malformed-object'], [5, 'malformed-short'],
       [6, 'malformed-empty'], [7, 'malformed-charset'],
     ]) {
-      const row = machineArticle(html, `codex:${codexAccount.id}:${index}`);
+      const row = machineArticle(codexHtml, `codex:${codexAccount.id}:${index}`);
       assert.match(row, new RegExp(name), `${name} should keep a key of its own`);
       assert.match(row, /data-machine-legacy="true"/);
       assert.match(row, /data-i18n="legacy-no-handle"/);
     }
-    assert.equal(html.includes('machine:42'), false);
-    assert.equal(html.includes('[object Object]'), false);
-    assert.equal(html.includes('machine:short'), false);
+    for (const page of [html, codexHtml]) {
+      assert.equal(page.includes('machine:42'), false);
+      assert.equal(page.includes('[object Object]'), false);
+      assert.equal(page.includes('machine:short'), false);
+    }
     // And the only handle the merge control offers is the one real one.
     assert.equal((legacy.match(/<option value="/g) ?? []).length, 1);
 
@@ -3250,9 +3265,14 @@ test('a legacy row files under a machine only the dispenser knows about', async 
       codexOnlyHandle,
     );
 
-    // And the two credentials now read as one machine.
+    // And the two credentials now read as one machine: the same handle carries a
+    // credential on each tab, which is what "one machine" means once the
+    // inventory is partitioned by provider.
     const html = await (await fetch(`${app.baseUrl}/`, { headers: { Cookie: cookie } })).text();
-    assert.equal(credentialRows(machineArticle(html, `machine:${codexOnlyHandle}`), 'active').length, 2);
+    const codexHtml = await (await fetch(`${app.baseUrl}/?provider=codex`, { headers: { Cookie: cookie } })).text();
+    assert.equal(credentialRows(machineArticle(html, `machine:${codexOnlyHandle}`), 'active').length, 1);
+    assert.equal(credentialRows(machineArticle(codexHtml, `machine:${codexOnlyHandle}`), 'active').length, 1);
+    assert.match(credentialRows(machineArticle(codexHtml, `machine:${codexOnlyHandle}`), 'active')[0], /codex-box/);
   } finally {
     await app.close();
   }

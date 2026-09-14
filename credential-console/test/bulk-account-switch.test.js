@@ -231,7 +231,22 @@ test('the move is recorded in the audit log, one entry per device', async () => 
   }
 });
 
-function render(store, { accountFilter = null, memberFilter = null, groupFilter = null, deviceGroups = [] } = {}) {
+// The bulk-switch form only, so an assertion about "which accounts are offered
+// as destinations" cannot be satisfied by an id that merely appears elsewhere
+// on the page -- the filter dropdown lists every account in the section too.
+function bulkForm(html) {
+  const start = html.indexOf('action="/devices/account"');
+  if (start === -1) return '';
+  return html.slice(start, html.indexOf('</form>', start));
+}
+
+function render(store, {
+  accountFilter = null,
+  memberFilter = null,
+  groupFilter = null,
+  providerFilter = null,
+  deviceGroups = [],
+} = {}) {
   return dashboardView({
     accounts: store.publicAccounts(),
     devices: store.publicDevices(),
@@ -241,6 +256,7 @@ function render(store, { accountFilter = null, memberFilter = null, groupFilter 
     accountFilter,
     memberFilter,
     groupFilter,
+    providerFilter,
     deviceGroups,
   });
 }
@@ -248,9 +264,12 @@ function render(store, { accountFilter = null, memberFilter = null, groupFilter 
 test('the dashboard offers a provider account filter', async () => {
   const { store, from, to } = await fixture();
   const html = render(store);
-  assert.match(html, /<span>Provider account<\/span>/);
+  // The filter is scoped to the section the operator is looking at, and says so:
+  // "Provider account" spanning every provider at once was the thing that let a
+  // Claude selection be aimed at a Codex destination.
+  assert.match(html, /<span>Claude Code account<\/span>/);
   assert.match(html, /<span>Member<\/span>/);
-  assert.match(html, /<option value="">All accounts<\/option>/);
+  assert.match(html, /<option value="">All Claude Code accounts<\/option>/);
   assert.ok(html.includes(from.alias) && html.includes(to.alias));
   // With no filter there is nothing to bulk-switch, so no bulk form.
   assert.equal(html.includes('/devices/account'), false);
@@ -433,7 +452,43 @@ test('a member-only bulk form offers accounts for the matched provider only', as
   assert.equal(bulk.includes(codexB.id), false);
 });
 
-test('a member selection spanning providers requires a provider-account filter', async () => {
+test('one member on two providers is split across sections, each aimed at its own', async () => {
+  const store = await newStore();
+  const claudeA = await claudeAccount(store, 'claude-a');
+  const claudeB = await claudeAccount(store, 'claude-b');
+  const codexA = await codexAccount(store, 'codex-a');
+  const codexB = await codexAccount(store, 'codex-b');
+  await store.issueDeviceCredential({
+    accountId: claudeA.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-claude',
+  });
+  await store.issueDeviceCredential({
+    accountId: codexA.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-codex',
+  });
+
+  // Before the partition this same selection offered destinations from both
+  // providers at once, which is how a Claude credential came to be aimed at a
+  // Codex account. Now the selection cannot span providers at all: each section
+  // sees one of Alice's rows and offers only that provider's accounts.
+  const claudeHtml = render(store, { memberFilter: 'alice@github' });
+  const claudeBulk = bulkForm(claudeHtml);
+  assert.match(claudeHtml, /<strong>1<\/strong> active credential\(s\)/);
+  assert.ok(claudeBulk.includes(claudeB.id), 'the other Claude account is offered');
+  assert.equal(claudeBulk.includes(codexA.id), false);
+  assert.equal(claudeBulk.includes(codexB.id), false);
+
+  const codexHtml = render(store, { memberFilter: 'alice@github', providerFilter: 'codex' });
+  const codexBulk = bulkForm(codexHtml);
+  assert.match(codexHtml, /<strong>1<\/strong> active credential\(s\)/);
+  assert.ok(codexBulk.includes(codexB.id), 'the other Codex account is offered');
+  assert.equal(codexBulk.includes(claudeA.id), false);
+  assert.equal(codexBulk.includes(claudeB.id), false);
+});
+
+test('both sections are always offered, with a count of what each holds', async () => {
   const store = await newStore();
   const claude = await claudeAccount(store, 'claude-a');
   const codex = await codexAccount(store, 'codex-a');
@@ -442,15 +497,27 @@ test('a member selection spanning providers requires a provider-account filter',
     memberLabel: 'alice@github',
     deviceName: 'alice-claude',
   });
-  await store.issueDeviceCredential({
-    accountId: codex.id,
-    memberLabel: 'alice@github',
-    deviceName: 'alice-codex',
-  });
+  for (const name of ['bob-codex-1', 'bob-codex-2']) {
+    await store.issueDeviceCredential({
+      accountId: codex.id,
+      memberLabel: 'bob@github',
+      deviceName: name,
+    });
+  }
 
-  const html = render(store, { memberFilter: 'alice@github' });
-  assert.equal(html.includes('action="/devices/account"'), false);
-  assert.match(html, /selection spans multiple or unknown providers/);
+  const html = render(store);
+  // The count is of the whole inventory, not the section being viewed: a tab
+  // that said 0 for the rows sitting on it would read as "gone".
+  assert.match(html, /provider-tab[^>]*>Claude Code<span class="provider-tab-count">1</);
+  assert.match(html, /provider-tab[^>]*>Codex<span class="provider-tab-count">2</);
+  assert.match(html, /href="\/\?provider=codex"/);
+  // Scoped to the tab strip: the administrator area always carries an "Add an
+  // AWS Bedrock account" form, which is the only way to create the first one.
+  const tabs = /<nav class="provider-tabs"[\s\S]*?<\/nav>/.exec(html)?.[0] ?? '';
+  assert.equal(tabs.includes('AWS Bedrock'), false, 'a provider nothing is on gets no section');
+  // Not /provider-tab\b/: the word boundary also matches inside
+  // "provider-tab-count", counting every tab twice.
+  assert.equal((tabs.match(/class="provider-tab[ "]/g) ?? []).length, 2);
 });
 
 test('an unknown member in the URL is ignored rather than obeyed', async () => {
@@ -474,7 +541,10 @@ test('a Codex gateway credential is labelled Codex, not Claude Code', async () =
     deviceName: 'codex-laptop',
   });
 
-  const html = render(store);
+  // Codex rows live in the Codex section; the Claude section no longer shows
+  // them at all, which is the point of the partition.
+  assert.equal(render(store).includes('codex-laptop'), false);
+  const html = render(store, { providerFilter: 'codex' });
   const row = /<tr[^>]*data-device-row[\s\S]*?<\/tr>/.exec(html)?.[0] ?? '';
   assert.ok(row.includes('codex-laptop'), 'the row is rendered');
   assert.match(row, /<td>Codex<\/td>/, 'the client it belongs to is named correctly');
@@ -498,7 +568,7 @@ test('no switch form is offered when there is nowhere to switch to', async () =>
   });
 
   const html = render(store);
-  assert.match(html, /No other usable Claude account is available/);
+  assert.match(html, /No other usable Claude Code account is available/);
   assert.equal(
     html.includes('action="/devices/'),
     true,
@@ -512,7 +582,7 @@ test('the switch form returns as soon as there is a second account', async () =>
   const { store } = await fixture();
   const html = render(store);
   assert.ok((html.match(/data-account-switch\b/g) ?? []).length > 0);
-  assert.equal(html.includes('No other usable Claude account is available'), false);
+  assert.equal(html.includes('No other usable Claude Code account is available'), false);
 });
 
 async function machineGroupFixture() {
@@ -658,4 +728,47 @@ test('once groups exist the registry folds away and remembers that', async () =>
   const registry = /<details class="machine-group-registry"[^>]*>/.exec(html)?.[0] ?? '';
   assert.equal(/\bopen\b/.test(registry), false, 'it stops taking up room');
   assert.match(registry, /data-persist-details="machine-groups"/, 'and remembers if reopened');
+});
+
+// The account filter has always excluded the account being switched away from.
+// The member and group filters never did, so a member whose rows all sit on one
+// account was offered that account as a destination -- a button whose only
+// possible outcome is "0 moved, N skipped".
+test('an account every matched row already sits on is not offered as a destination', async () => {
+  const store = await newStore();
+  const here = await claudeAccount(store, 'claude-here');
+  const there = await claudeAccount(store, 'claude-there');
+  for (const name of ['alice-mac', 'alice-desktop']) {
+    await store.issueDeviceCredential({
+      accountId: here.id,
+      memberLabel: 'alice@github',
+      deviceName: name,
+    });
+  }
+
+  const bulk = bulkForm(render(store, { memberFilter: 'alice@github' }));
+  assert.ok(bulk.includes(there.id), 'the account that would actually move them is offered');
+  assert.equal(bulk.includes(here.id), false, 'the one they are already on is not');
+});
+
+// But only when it holds all of them: with the rows split across two accounts,
+// either is a real destination for the other's rows.
+test('an account holding only some of the matched rows is still a destination', async () => {
+  const store = await newStore();
+  const first = await claudeAccount(store, 'claude-first');
+  const second = await claudeAccount(store, 'claude-second');
+  await store.issueDeviceCredential({
+    accountId: first.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-mac',
+  });
+  await store.issueDeviceCredential({
+    accountId: second.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-desktop',
+  });
+
+  const bulk = bulkForm(render(store, { memberFilter: 'alice@github' }));
+  assert.ok(bulk.includes(first.id));
+  assert.ok(bulk.includes(second.id));
 });
