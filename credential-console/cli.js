@@ -3,6 +3,7 @@ import { access, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { CredentialStore } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
+import { externalAccountStatus } from './lib/external-account-status.js';
 
 const HOME = process.env.CREDENTIAL_CONSOLE_HOME ?? '/var/lib/credential-console';
 
@@ -26,7 +27,24 @@ async function main() {
   if (!['init-key', 'import-codex', 'checkpoint-metrics'].includes(command)) {
     if (command === 'list') {
       const store = await new CredentialStore(HOME).init();
-      console.log(JSON.stringify(store.publicAccounts(), null, 2));
+      // `status` in the stored row is only refreshed by requests that reach
+      // upstream, so an expired or quarantined Codex credential reads `healthy`
+      // here forever. Overlay the same public health surface the dashboard
+      // uses, and keep the stored value alongside it as `cached_status` so the
+      // two can be told apart when they disagree.
+      const accounts = await Promise.all(store.publicAccounts().map(async (account) => {
+        const external = await externalAccountStatus(store.accountById(account.id));
+        if (typeof external.status !== 'string') return account;
+        return {
+          ...account,
+          status: external.status,
+          cached_status: account.status,
+          expires_at: external.expires_at ?? account.expires_at,
+          refresh_health_status: external.refresh_health_status ?? null,
+          quarantined: external.refresh_health?.quarantine?.present ?? null,
+        };
+      }));
+      console.log(JSON.stringify(accounts, null, 2));
       return;
     }
     return usage();

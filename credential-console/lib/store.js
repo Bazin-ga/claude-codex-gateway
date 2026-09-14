@@ -16,6 +16,7 @@ import {
   secretMatches,
   sha256,
 } from './security.js';
+import { credentialSwitchBlock, externalAccountStatus } from './external-account-status.js';
 
 const STATE_VERSION = 1;
 const MAX_AUDIT_EVENTS = 2_000;
@@ -578,6 +579,45 @@ export class CredentialStore {
   }
 
   /**
+   * The half of the switch guard that has to touch the filesystem.
+   *
+   * `#assertSwitchableAccount` can only see the stored row, and the stored row
+   * is a lagging indicator: `expires_at` says whether the credential has
+   * already died, never whether anything is still able to renew it. A Codex
+   * account whose refresh has been quarantined keeps a future `expires_at`
+   * right up until the moment it lapses, so the synchronous guard waves it
+   * through and the device it was just pointed at starts 503-ing a few hours
+   * later, with nothing in the store to explain why.
+   *
+   * The refresh centre already publishes that missing fact in health.json, and
+   * the dashboard already renders it. This reads the same file through the same
+   * sanitizer so a switch cannot be made into a state the dashboard is
+   * simultaneously flagging as critical.
+   *
+   * Read failures are deliberately not fatal: `externalAccountStatus` reports
+   * them as categories rather than throwing, and `credentialSwitchBlock`
+   * treats "cannot read" as "no opinion". A home the console cannot see must
+   * stay switchable, because the alternative is an account nobody can select.
+   */
+  async #assertSwitchableCredentialHealth(account) {
+    let block = null;
+    try {
+      block = credentialSwitchBlock(account, await externalAccountStatus(account));
+    } catch {
+      // Defence in depth. Neither call is expected to throw, and a fault in
+      // observability code must not be able to freeze account switching.
+      return;
+    }
+    if (!block) return;
+    // `block.code` comes from the classifier's fixed vocabulary, so this
+    // message can never carry a path, an exception, or a credential.
+    throw storeError(
+      `target account credential is not usable (${block.code})`,
+      'ACCOUNT_UNAVAILABLE',
+    );
+  }
+
+  /**
    * Resolve the exact device row's account policy. A legacy row is the only
    * case where missing fields fall back silently; partial or malformed P3
    * fields are explicit state errors so a bad migration cannot route traffic
@@ -631,6 +671,46 @@ export class CredentialStore {
     };
   }
 
+  /**
+   * `deviceAccountSummary` plus the credential's real condition.
+   *
+   * The synchronous summary reports `account.status`, which the proxy only
+   * updates on requests that actually reach upstream. A credential the gateway
+   * rejects at the door never gets that far, so a device pointed at a dead
+   * account is told `healthy` indefinitely — the machine-facing status endpoint
+   * was the last place still saying so while every request 503'd.
+   *
+   * Kept separate from the synchronous method rather than replacing it: that
+   * one is called from non-async paths and is part of the existing surface.
+   * `account_status` is promoted to the top level because that is the first key
+   * machine-control's projection reads.
+   */
+  async deviceAccountSummaryWithHealth(deviceId) {
+    const summary = this.deviceAccountSummary(deviceId);
+    const account = this.accountById(summary.account.id);
+    if (!account) return summary;
+    let external = {};
+    try {
+      external = await externalAccountStatus(account);
+    } catch {
+      // Observability must not be able to break a status read.
+      return summary;
+    }
+    if (typeof external.status !== 'string') return summary;
+    return {
+      ...summary,
+      account_status: external.status,
+      account: {
+        ...summary.account,
+        status: external.status,
+        cached_status: summary.account.status,
+        expires_at: external.expires_at ?? summary.account.expires_at,
+        refresh_health_status: external.refresh_health_status ?? null,
+        quarantined: external.refresh_health?.quarantine?.present ?? null,
+      },
+    };
+  }
+
   async configureDeviceAccount({
     deviceId,
     selectedAccountId,
@@ -659,7 +739,10 @@ export class CredentialStore {
         // would cut the device over to a guaranteed 503, so refuse before the
         // policy changes. Claude keeps its historical pre-authorization policy
         // workflow unchanged.
-        if (account.provider !== 'claude') this.#assertSwitchableAccount(account);
+        if (account.provider !== 'claude') {
+          this.#assertSwitchableAccount(account);
+          await this.#assertSwitchableCredentialHealth(account);
+        }
         const policy = this.#deviceAccountPolicy(device);
         // Refuse before touching the row, not after. Appending another provider
         // to this device's allowlist makes it mixed, and the mutation below
@@ -744,6 +827,7 @@ export class CredentialStore {
         }
         const account = this.accountById(selectedAccountId);
         this.#assertSwitchableAccount(account);
+        await this.#assertSwitchableCredentialHealth(account);
         const outcome = policy.selectedAccountId === selectedAccountId ? 'noop' : 'success';
         device.allowed_account_ids = [...policy.allowedAccountIds];
         device.selected_account_id = selectedAccountId;

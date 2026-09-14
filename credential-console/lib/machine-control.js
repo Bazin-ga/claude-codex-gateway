@@ -345,7 +345,13 @@ export async function handleMachineControl(req, res, {
       if (typeof store.deviceAccountSummary !== 'function') {
         throw new MachineControlError('DEVICE_CONFIGURATION_INVALID');
       }
-      const summary = await store.deviceAccountSummary(device.id);
+      // Prefer the health-aware summary: a machine asking why it is being
+      // refused needs the credential's real condition, not the cached status
+      // column the proxy stops updating the moment it starts rejecting the
+      // credential at the door. Falls back when the Store predates it.
+      const summary = typeof store.deviceAccountSummaryWithHealth === 'function'
+        ? await store.deviceAccountSummaryWithHealth(device.id)
+        : await store.deviceAccountSummary(device.id);
       sendJson(res, 200, safeDeviceAccountSummary(summary, device.id));
       return true;
     }
