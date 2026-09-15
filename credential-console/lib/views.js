@@ -3692,6 +3692,7 @@ export function dashboardView({
   memberFilter = null,
   groupFilter = null,
   providerFilter = null,
+  bedrockEnabled = false,
   deviceGroups = [],
   completedDraft = null,
   credentialAlerts = null,
@@ -3768,7 +3769,13 @@ export function dashboardView({
   // Bedrock account registered renders exactly what it rendered before — the
   // card, the self-service form and the admin form all disappear together.
   // That is the configuration gate: state, not an environment variable.
-  const bedrockAccounts = accounts.filter((account) => account.provider === 'bedrock');
+  // Gated on the deployment flag first and the account list second. The flag is
+  // what keeps a console that must not offer this login path from rendering any
+  // trace of it — including the empty registration form, which carries no
+  // credential but announces the mechanism just by existing.
+  const bedrockAccounts = bedrockEnabled
+    ? accounts.filter((account) => account.provider === 'bedrock')
+    : [];
   const bedrockUsableAccounts = bedrockAccounts.filter(accountCanReceiveDevice);
   const bedrockOptions = bedrockUsableAccounts.map((account) => (
     `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)} · ${escapeHtml(account.bedrock?.model_id ?? '')}</option>`
@@ -3861,9 +3868,15 @@ export function dashboardView({
   // therefore invisible — but a Bedrock credential that someone self-serves must
   // not silently vanish from the inventory just because the section list was
   // written when there were only two providers.
+  // A section for a provider this console does not offer would be a navigation
+  // affordance for a switched-off mechanism, so the flag suppresses it. The
+  // account row itself stays in the accounts table: it is real, it holds a key,
+  // and an operator who cannot see it cannot delete it either.
   const extraProviders = [...new Set(activeDeviceRows
     .map(deviceProvider)
-    .filter((provider) => provider && !INVENTORY_PROVIDERS.includes(provider)))].sort();
+    .filter((provider) => provider
+      && !INVENTORY_PROVIDERS.includes(provider)
+      && (provider !== 'bedrock' || bedrockEnabled)))].sort();
   const sectionProviders = [...INVENTORY_PROVIDERS, ...extraProviders];
   // An account named in the URL decides the section when no section is named.
   // Otherwise a link to a Codex account would land on the Claude tab and drop
@@ -4124,7 +4137,7 @@ export function dashboardView({
               <button type="submit" data-i18n="register-account">Register account</button>
             </form>
           </article>
-          <article class="card split">
+          ${bedrockEnabled ? `<article class="card split">
             <h2 data-i18n="add-bedrock-heading">Add an AWS Bedrock account</h2>
             <div class="notice"><span data-i18n="add-bedrock-help">The only provider whose key is pasted rather than authorized: a Bedrock API key is issued in the AWS console, so there is no OAuth round trip to make. It is encrypted on submission and never shown again. Registering the first one makes the Bedrock panel appear for members.</span></div>
             <form method="post" action="/accounts" class="stack" autocomplete="off">
@@ -4144,7 +4157,7 @@ export function dashboardView({
               </label>
               <button type="submit" data-i18n="register-account">Register account</button>
             </form>
-          </article>
+          </article>` : ''}
           <article class="card split">
             <h2 data-i18n="member-flow">What members actually do</h2>
             <div class="stack">

@@ -88,6 +88,12 @@ const COOKIE_SECURE = process.env.CREDENTIAL_CONSOLE_COOKIE_SECURE !== '0';
 // handing credential issuance to whoever can route to the listener. `open` is a
 // deliberate choice, never a default.
 const ADMIN_AUTH = process.env.CREDENTIAL_CONSOLE_ADMIN_AUTH ?? 'tailscale';
+// Off unless a deployment explicitly turns it on, and off for any value other
+// than exactly "1" so a typo fails closed rather than open. This is the whole
+// difference between the two consoles: only one of them is supposed to know
+// that a paste-a-key login path exists at all, and an empty registration form
+// on the other one still announces the mechanism to everyone who can reach it.
+const BEDROCK_ENABLED = process.env.CREDENTIAL_CONSOLE_BEDROCK_ENABLED === '1';
 const CODEX_ENDPOINT = process.env.CREDENTIAL_CONSOLE_CODEX_ENDPOINT;
 const CODEX_CERT_PIN = process.env.CREDENTIAL_CONSOLE_CODEX_CERT_PIN;
 const CODEX_ENROLLMENT_KEY_FILE = process.env.CREDENTIAL_CONSOLE_CODEX_ENROLLMENT_KEY_FILE;
@@ -402,6 +408,7 @@ export async function createCredentialConsole(options = {}) {
     ?? `${publicBaseUrl.replace(/\/$/, '')}${CODEX_PROXY_PREFIX}`;
   const cookieSecure = options.cookieSecure ?? COOKIE_SECURE;
   const adminAuth = options.adminAuth ?? ADMIN_AUTH;
+  const bedrockEnabled = options.bedrockEnabled ?? BEDROCK_ENABLED;
   // Overridable only so a test can drive the eviction path without minting the real
   // ceiling's worth of sessions.
   const maxSessions = options.maxSessions ?? MAX_SESSIONS;
@@ -1301,6 +1308,13 @@ export async function createCredentialConsole(options = {}) {
     // Bedrock account, because the proxy resolves the device's account first
     // and refuses anything that is not one. A console with no Bedrock account
     // registered — every deployment until one is — behaves exactly as before.
+    // Off means off end to end. Without this the data plane would still serve a
+    // console whose UI denies the mechanism exists, and any account left behind
+    // on such a console would keep working invisibly.
+    if (path.startsWith(`${BEDROCK_PROXY_PREFIX}/`) && !bedrockEnabled) {
+      sendJson(res, 404, { message: 'not found' });
+      return;
+    }
     if (path.startsWith(`${BEDROCK_PROXY_PREFIX}/`)) {
       await handleBedrockProxy(req, res, {
         store,
@@ -1675,6 +1689,7 @@ export async function createCredentialConsole(options = {}) {
         memberFilter: url.searchParams.get('member'),
         groupFilter: url.searchParams.get('group'),
         providerFilter: url.searchParams.get('provider'),
+        bedrockEnabled,
         completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
       }));
       return;
@@ -1817,6 +1832,12 @@ export async function createCredentialConsole(options = {}) {
         const provider = String(form.provider ?? '');
         if (!['claude', 'codex', 'bedrock'].includes(provider)) {
           throw new Error('only Claude, Codex and Bedrock accounts can be added in the web UI');
+        }
+        // Hiding the form is not the same as closing the route. A console where
+        // the Bedrock path is switched off must refuse the request too, or the
+        // mechanism is still there for anyone who knows the field name.
+        if (provider === 'bedrock' && !bedrockEnabled) {
+          throw new Error('Bedrock accounts are not enabled on this console');
         }
         const emailLabel = String(form.email_label ?? '').trim().toLowerCase();
         // Claude matches this email against the authorized account before storing

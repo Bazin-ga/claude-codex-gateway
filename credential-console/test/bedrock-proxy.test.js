@@ -304,3 +304,80 @@ test('GET is refused on a recognised converse path', async (t) => {
   const response = await converse(proxyUrl, { method: 'GET' });
   assert.equal(response.status, 405);
 });
+
+// Hiding the UI is not the same as closing the door. A console that denies the
+// mechanism exists must not still serve it to anyone holding a device token.
+test('the data plane and the registration route are closed when the flag is off', async () => {
+  const { createCredentialConsole } = await import('../server.js');
+  const { CredentialStore } = await import('../lib/store.js');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const home = await mkdtemp(join(tmpdir(), 'bedrock-flag-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const account = await store.addAccount({
+    provider: 'bedrock',
+    alias: 'bedrock-astra-1',
+    emailLabel: '',
+    credential: { api_key: API_KEY },
+    bedrock: { region: 'us-west-2', modelId: MODEL_ID },
+  });
+  const issued = await store.issueDeviceCredential({
+    accountId: account.id,
+    memberLabel: 'member@example.com',
+    deviceName: 'laptop',
+  });
+  const created = await createCredentialConsole({
+    store,
+    adminAuth: 'open',
+    cookieSecure: false,
+    publicBaseUrl: 'http://console.test',
+    bedrockEnabled: false,
+    usageMonitor: { snapshotForAccount: () => null, refreshAccount: async () => null, stop() {} },
+    codexManagedRefresher: false,
+  });
+  await new Promise((resolve) => created.server.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${created.server.address().port}`;
+  try {
+    const proxied = await fetch(
+      `${baseUrl}${BEDROCK_PROXY_PREFIX}/model/${encodeURIComponent(MODEL_ID)}/converse`,
+      {
+        method: 'POST',
+        headers: { 'x-api-key': issued.token, 'content-type': 'application/json' },
+        body: '{"messages":[]}',
+      },
+    );
+    // 404, not 403: a console with the path switched off has no such route,
+    // which is also what it tells anyone probing for one.
+    assert.equal(proxied.status, 404);
+
+    const page = await fetch(`${baseUrl}/`);
+    const html = await page.text();
+    const cookie = page.headers.getSetCookie()[0].split(';')[0];
+    const csrf = /name="csrf" value="([^"]+)"/.exec(html)[1];
+    const registered = await fetch(`${baseUrl}/accounts`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        csrf,
+        provider: 'bedrock',
+        alias: 'sneaked-in',
+        region: 'us-west-2',
+        model_id: MODEL_ID,
+        api_key: 'ABSK-whatever',
+      }),
+    });
+    assert.equal(registered.status, 303);
+    assert.match(
+      decodeURIComponent(registered.headers.get('location')),
+      /not enabled on this console/,
+    );
+    assert.equal(store.publicAccounts().some((entry) => entry.alias === 'sneaked-in'), false);
+  } finally {
+    await new Promise((resolve) => created.server.close(resolve));
+    await created.stop?.();
+    await rm(home, { recursive: true, force: true });
+  }
+});

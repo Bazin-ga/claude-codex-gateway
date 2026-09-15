@@ -34,6 +34,7 @@ async function fixture({
   metricsPageClock,
   metricsQueryService = false,
   usageSnapshot = () => null,
+  bedrockEnabled = false,
 } = {}) {
   const upstreamRequests = [];
   const upstream = http.createServer(async (req, res) => {
@@ -77,6 +78,7 @@ async function fixture({
     ...(metricsPageCacheTtlMs === undefined ? {} : { metricsPageCacheTtlMs }),
     ...(metricsPageClock === undefined ? {} : { metricsPageClock }),
     metricsQueryService,
+    bedrockEnabled,
     publicBaseUrl: 'http://credential-console.test',
     claudeUpstreamBaseUrl: upstreamUrl,
     codexUpstreamBaseUrl: upstreamUrl,
@@ -3514,7 +3516,7 @@ test('the docs tab carries the guide, and every endpoint it lists exists', async
 // with the device already enrolled and its token lost. Nothing below the route
 // level could have caught that.
 test('a Bedrock member self-serves a token and the page tells them how to use it', async () => {
-  const app = await fixture({ adminAuth: 'open' });
+  const app = await fixture({ adminAuth: 'open', bedrockEnabled: true });
   try {
     const account = await app.store.addAccount({
       provider: 'bedrock',

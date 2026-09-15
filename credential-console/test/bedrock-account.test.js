@@ -173,15 +173,17 @@ test('the member-facing Bedrock panel is absent until an account is registered',
     openMode: true,
   };
 
-  const without = dashboardView(base);
+  // Enabled, but with nothing registered: the member panel is what the account
+  // list gates, and the registration form is what the deployment flag gates.
+  const without = dashboardView({ ...base, bedrockEnabled: true });
   assert.equal(without.includes('data-i18n="bedrock-description"'), false);
   assert.equal(without.includes('data-persist-draft="bedrock-self-service"'), false);
-  // The way in still exists for an administrator.
+  // The way in still exists for an administrator on a console that offers it.
   assert.match(without, /name="provider" value="bedrock"/);
 
   const store = await newStore(t);
   const account = await store.addAccount(bedrockInput());
-  const withOne = dashboardView({ ...base, accounts: store.publicAccounts() });
+  const withOne = dashboardView({ ...base, accounts: store.publicAccounts(), bedrockEnabled: true });
   assert.match(withOne, /data-i18n="bedrock-description"/);
   assert.match(withOne, /data-persist-draft="bedrock-self-service"/);
   assert.match(withOne, new RegExp(`<option value="${account.id}">`));
@@ -201,6 +203,7 @@ test('a Bedrock account shows no quota window', async (t) => {
     codexClients: [],
     csrf: 'csrf-token',
     openMode: true,
+    bedrockEnabled: true,
   });
   assert.match(html, /data-i18n="usage-per-token"/);
   assert.equal(html.includes('data-i18n="usage-loading"'), false);
@@ -250,4 +253,71 @@ test('a Claude account holding a stored credential is still undeletable', async 
   });
 
   await assert.rejects(store.deleteAccount(claude.id), /cannot be deleted/);
+});
+
+// The two consoles run one build, and only one of them is supposed to offer a
+// paste-a-key login path. An empty registration form carries no credential, but
+// it announces the mechanism to everyone who can reach the page, which is the
+// thing that must not happen on the console that does not use it.
+test('with the deployment flag off, a console renders no trace of Bedrock', async (t) => {
+  const { dashboardView } = await import('../lib/views.js');
+  const store = await newStore(t);
+  await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-a',
+    emailLabel: 'a@example.com',
+    credential: { oauth_token: 'sk-ant-oat-a' },
+  });
+  // Deliberately present: the flag has to hold even on a console that somehow
+  // carries an account, not merely on one that has none.
+  const bedrock = await store.addAccount(bedrockInput());
+  await store.issueDeviceCredential({
+    accountId: bedrock.id,
+    memberLabel: 'alice@github',
+    deviceName: 'alice-bedrock',
+  });
+  const base = {
+    accounts: store.publicAccounts(),
+    devices: store.publicDevices(),
+    machines: store.publicMachines({ includeRevoked: true }),
+    csrf: 'csrf-token',
+    adminIdentity: 'admin@example.com',
+    deviceGroups: [],
+  };
+
+  const off = dashboardView({ ...base, bedrockEnabled: false });
+  assert.equal(off.includes('name="provider" value="bedrock"'), false, 'no registration form');
+  assert.equal(off.includes('data-i18n="add-bedrock-heading"'), false);
+  assert.equal(off.includes('data-i18n="bedrock-api-key"'), false);
+  assert.equal(off.includes('data-i18n="bedrock-description"'), false, 'no member panel');
+  assert.equal(off.includes('us.openai.gpt-6-astra'), false, 'not even the placeholder model id');
+  assert.equal(off.includes('/?provider=bedrock'), false, 'no inventory section to navigate to');
+  const tabs = /<nav class="provider-tabs"[\s\S]*?<\/nav>/.exec(off)?.[0] ?? '';
+  assert.equal(tabs.includes('Bedrock'), false);
+
+  const on = dashboardView({ ...base, bedrockEnabled: true });
+  assert.match(on, /name="provider" value="bedrock"/);
+  assert.match(on, /data-i18n="bedrock-description"/);
+  assert.match(on, /\/\?provider=bedrock/);
+});
+
+// The account row is the deliberate exception: it is real, it holds a key, and
+// an operator who cannot see it cannot delete it either. It states the provider
+// plainly rather than being disguised.
+test('an account that exists is still listed for the operator when the flag is off', async (t) => {
+  const { dashboardView } = await import('../lib/views.js');
+  const store = await newStore(t);
+  const bedrock = await store.addAccount(bedrockInput());
+  const html = dashboardView({
+    accounts: store.publicAccounts(),
+    devices: [],
+    machines: [],
+    codexClients: [],
+    csrf: 'csrf-token',
+    adminIdentity: 'admin@example.com',
+    deviceGroups: [],
+    bedrockEnabled: false,
+  });
+  assert.match(html, new RegExp(`data-account-row="${bedrock.id}"`));
+  assert.match(html, new RegExp(`action="/accounts/${bedrock.id}/delete"`), 'and can be removed');
 });
