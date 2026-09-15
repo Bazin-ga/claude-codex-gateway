@@ -1,5 +1,6 @@
 import { APP_ASSET_URL } from './app-asset.js';
 import { GATEWAY_PROVIDERS } from './store.js';
+import { CODEX_RESET_QUOTA_CEILING, codexResetEligibility } from './codex-reset.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { sanitizeUrl } from './onboarding.js';
@@ -957,6 +958,40 @@ function usageMessage(usage) {
     return `<div class="quota-message"><span data-i18n="usage-stale">Showing the last successful reading; the latest refresh failed.</span>${help}</div>`;
   }
   return `<div class="quota-message"><span data-i18n="usage-quota-hidden">Quota unavailable</span>${help}</div>`;
+}
+
+/**
+ * The control for spending a reset credit, and only when one may be spent.
+ *
+ * Rendered from the same `codexResetEligibility` the route enforces, so the
+ * button is never offered for a click the server would refuse. When the account
+ * holds credits but is not eligible, the reason is stated instead of the button
+ * being silently absent — "why is there no button" is the question an operator
+ * would otherwise be left with while an account sits at its limit.
+ *
+ * The confirmation text is built here rather than in the client script because
+ * it names the account and quotes the numbers the decision rests on; a generic
+ * "are you sure?" is a dialog people learn to dismiss.
+ */
+function codexResetControl(account, csrf) {
+  const usage = account.usage;
+  const { eligible, reason, resetCredits, remainingPercent } = codexResetEligibility(account, usage);
+  if (eligible) {
+    const confirm = `Spend one reset credit on ${account.alias}?\n\n`
+      + `Quota remaining: ${remainingPercent}%\n`
+      + `Reset credits after this: ${resetCredits - 1} of ${resetCredits}\n\n`
+      + 'This cannot be undone and the credit cannot be recovered.';
+    return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-reset" class="inline" data-confirm="${escapeHtml(confirm)}">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <button class="danger" type="submit" data-i18n="codex-reset-usage">Use a reset credit</button>
+    </form>
+    <div class="muted tiny"><span data-i18n="codex-reset-available">Reset credits</span>: ${escapeHtml(String(resetCredits))} · <span data-i18n="usage-remaining">Remaining</span> ${escapeHtml(String(remainingPercent))}%</div>`;
+  }
+  if (!resetCredits) return '';
+  const explanation = reason === 'quota_not_low'
+    ? `<span data-i18n="codex-reset-quota-not-low">A reset credit is only offered below ${CODEX_RESET_QUOTA_CEILING}% remaining.</span> <span data-i18n="usage-remaining">Remaining</span> ${escapeHtml(String(remainingPercent))}%`
+    : '<span data-i18n="codex-reset-quota-unknown">Quota cannot be read right now, so no reset credit is offered.</span>';
+  return `<div class="muted tiny"><span data-i18n="codex-reset-available">Reset credits</span>: ${escapeHtml(String(resetCredits))} · ${explanation}</div>`;
 }
 
 function accountUsageView(account, { showAccount = false } = {}) {
@@ -3811,6 +3846,7 @@ export function dashboardView({
         </div>` : `<div class="stack">
           <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>
           ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}
+          ${codexResetControl(account, csrf)}
         </div>`}
         ${(account.status === 'login_required' || account.provider === 'bedrock') && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">

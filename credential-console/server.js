@@ -2,7 +2,7 @@
 import { APP_ASSET_SHA256, APP_ASSET_SOURCE, APP_ASSET_URL } from './lib/app-asset.js';
 import http from 'node:http';
 import https from 'node:https';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,13 +24,22 @@ import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
+import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
 import { queryMetricsDataset } from './lib/metrics-page-query.js';
 import { MetricsQueryService } from './lib/metrics-query-service.js';
 import { CLIENT_CONFIG_VERSION } from './lib/client-config-version.js';
 import { buildOnboardingGuideUrl, buildOnboardingMarkdown } from './lib/onboarding.js';
-import { UsageMonitor } from './lib/usage.js';
+import { UsageMonitor, fetchCodexUsage } from './lib/usage.js';
+import {
+  CODEX_RESET_QUOTA_CEILING,
+  CodexResetError,
+  codexResetEligibility,
+  consumeCodexResetCredit,
+  listCodexResetCredits,
+  usableResetCredit,
+} from './lib/codex-reset.js';
 import { safeTimestamp } from './lib/credential-alerts.js';
 import { externalAccountStatus } from './lib/external-account-status.js';
 import { buildMetricsChartPayload } from './lib/metrics-chart-data.js';
@@ -2262,6 +2271,151 @@ export async function createCredentialConsole(options = {}) {
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }
+      return;
+    }
+
+
+    const codexResetParams = routeMatch(path, '/accounts/:id/codex-reset');
+    if (req.method === 'POST' && codexResetParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const actor = session.admin_identity ?? 'anonymous';
+      const accountId = codexResetParams.id;
+      const account = store.accountById(accountId);
+      const refuse = (code, message) => {
+        log('codex_reset_refused', { account_id: accountId, actor, code });
+        redirect(res, `/?error=${encodeURIComponent(message)}`);
+      };
+      if (!account || account.provider !== 'codex') {
+        refuse('not_codex', 'that account is not a Codex account');
+        return;
+      }
+      let credential;
+      try {
+        credential = await readPublishedCodexCredential(account);
+      } catch (error) {
+        refuse(error?.code ?? 'credential_unavailable', 'the account credential could not be read');
+        return;
+      }
+      if (credential.expiresAtMs <= Date.now()) {
+        refuse('credential_expired', 'the account credential has expired');
+        return;
+      }
+
+      // Re-read from upstream rather than trusting the hourly snapshot the
+      // button was rendered from. That snapshot can be nearly an hour old, and
+      // the whole point of the quota rule is that a credit is only spent on an
+      // account that is actually out of quota right now.
+      let liveUsage;
+      try {
+        liveUsage = await fetchCodexUsage({
+          accessToken: credential.accessToken,
+          accountId: credential.accountId,
+        });
+      } catch (error) {
+        refuse(error?.code ?? 'usage_unavailable', 'the account quota could not be read, so nothing was spent');
+        return;
+      }
+      const eligibility = codexResetEligibility(account, liveUsage);
+      if (!eligibility.eligible) {
+        refuse(eligibility.reason, eligibility.reason === 'quota_not_low'
+          ? `that account still has ${eligibility.remainingPercent}% quota left; a reset credit is only spent below ${CODEX_RESET_QUOTA_CEILING}%`
+          : 'that account is not eligible for a reset credit right now');
+        return;
+      }
+
+      let credit;
+      try {
+        const listed = await listCodexResetCredits({
+          accessToken: credential.accessToken,
+          accountId: credential.accountId,
+        });
+        credit = usableResetCredit(listed.credits);
+      } catch (error) {
+        refuse(error?.code ?? 'credits_unavailable', 'the account\'s reset credits could not be listed');
+        return;
+      }
+      if (!credit) {
+        refuse('no_usable_credit', 'no spendable reset credit is available on that account');
+        return;
+      }
+
+      // Recorded before the call, not after: if the response never arrives,
+      // this is the only record of which credit was staked and under which
+      // idempotency key, and it is what a human needs to reconcile by hand.
+      const redeemRequestId = randomUUID();
+      await store.recordExternalAudit('codex_reset_credit_redeem_started', {
+        account_id: account.id,
+        credit_id: credit.id,
+        redeem_request_id: redeemRequestId,
+        remaining_percent: eligibility.remainingPercent,
+        actor,
+      }).catch(() => {});
+      log('codex_reset_started', {
+        account_id: account.id,
+        credit_id: credit.id,
+        redeem_request_id: redeemRequestId,
+        remaining_percent: eligibility.remainingPercent,
+        actor,
+      });
+
+      try {
+        await consumeCodexResetCredit({
+          accessToken: credential.accessToken,
+          accountId: credential.accountId,
+          creditId: credit.id,
+          redeemRequestId,
+        });
+      } catch (error) {
+        const code = error instanceof CodexResetError ? error.code : 'redeem_failed';
+        // Never retried here, automatically or otherwise. A timeout or a dropped
+        // connection cannot be distinguished from a redemption that succeeded,
+        // and a second attempt under a fresh id is how one click spends two
+        // credits.
+        const ambiguous = ['upstream_timeout', 'upstream_unreachable'].includes(code);
+        await store.recordExternalAudit('codex_reset_credit_redeem_failed', {
+          account_id: account.id,
+          credit_id: credit.id,
+          redeem_request_id: redeemRequestId,
+          code,
+          ambiguous,
+          actor,
+        }).catch(() => {});
+        log('codex_reset_failed', {
+          account_id: account.id,
+          credit_id: credit.id,
+          redeem_request_id: redeemRequestId,
+          code,
+          ambiguous,
+          actor,
+        });
+        redirect(res, `/?error=${encodeURIComponent(ambiguous
+          ? `the reset request did not complete cleanly (${code}); it was NOT retried, and whether the credit was spent must be checked before trying again`
+          : `the reset credit could not be redeemed (${code})`)}`);
+        return;
+      }
+
+      await store.recordExternalAudit('codex_reset_credit_redeemed', {
+        account_id: account.id,
+        credit_id: credit.id,
+        redeem_request_id: redeemRequestId,
+        actor,
+      }).catch(() => {});
+      log('codex_reset_completed', {
+        account_id: account.id,
+        credit_id: credit.id,
+        redeem_request_id: redeemRequestId,
+        actor,
+      });
+      // The panel reads the snapshot, so refresh it before the redirect or the
+      // page the operator lands on still shows the account at its limit.
+      await usageMonitor.refreshAccount?.(account.id).catch?.(() => {});
+      redirect(res, '/?reset=ok');
       return;
     }
 

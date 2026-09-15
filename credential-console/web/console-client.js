@@ -48,6 +48,10 @@ const translations = {
   'usage-fable-remaining': 'Fable 额度剩余',
   'usage-reset-credits': '重置卡剩余',
   'usage-per-token': '按 token 计费，无额度窗口',
+  'codex-reset-usage': '使用一张重置卡',
+  'codex-reset-available': '重置卡剩余',
+  'codex-reset-quota-not-low': '只有余额低于 5% 时才提供重置。',
+  'codex-reset-quota-unknown': '当前读不到额度，因此不提供重置。',
   'bedrock-description': '交进一个设备令牌，换出一次已计量的 Converse 调用。AWS key 留在服务端；每个账号固定一个区域和一个模型。',
   'get-bedrock': '获取 Bedrock 令牌',
   'bedrock-scope-note': '只代理非流式 /converse，且这条路径不归档正文，只记录每次调用的 token 数。',
@@ -1648,3 +1652,21 @@ if (conversationFragmentSupported()) {
     });
   });
 }
+
+// A confirmation the operator has to read, for the one action on this console
+// that cannot be undone. The text is composed server-side and names the account
+// and the numbers, because a dialog that always says the same thing is one
+// people learn to click through.
+//
+// Not the last line of defence and not treated as one: the route re-reads the
+// account's quota from upstream and refuses on its own terms, so a submission
+// that arrives without this dialog having run is still judged on the facts.
+document.addEventListener('submit', (event) => {
+  const form = event.target instanceof HTMLFormElement ? event.target : null;
+  const message = form?.dataset?.confirm;
+  if (!message) return;
+  if (!window.confirm(message)) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+}, true);

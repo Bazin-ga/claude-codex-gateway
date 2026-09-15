@@ -1028,6 +1028,22 @@ export class CredentialStore {
     });
   }
 
+  /**
+   * Append an audit entry for something that happened outside this store.
+   *
+   * Spending a reset credit changes nothing here — the credit lives upstream —
+   * but it is irreversible and worth the same durable record as a credential
+   * rotation. Written through `serialized` so it cannot interleave with a
+   * mutation mid-persist.
+   */
+  async recordExternalAudit(event, detail = {}) {
+    return this.serialized(async () => {
+      this.audit(String(event), detail);
+      await this.persist();
+      return true;
+    });
+  }
+
   async updateExternalAccountExpiry(id, expiresAt) {
     return this.serialized(async () => {
       const account = this.accountById(id);
