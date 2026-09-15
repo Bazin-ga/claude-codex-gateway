@@ -139,7 +139,14 @@ export function codexResetEligibility(account, usage) {
   if (!account || account.provider !== 'codex') {
     return { eligible: false, reason: 'not_codex' };
   }
-  if (account.external?.kind !== 'codex-credential' || !account.external.home) {
+  // Kind only, deliberately not `home`. This runs against both the internal
+  // account row and the projection the dashboard receives, and that projection
+  // carries `{ kind }` alone -- the home is a filesystem path and has no
+  // business on a page. Requiring it here made the button judge every account
+  // unusable while the route, which reads the real credential, was perfectly
+  // able to proceed. The route still fails cleanly on a missing home, because
+  // readPublishedCodexCredential refuses one.
+  if (account.external?.kind !== 'codex-credential') {
     return { eligible: false, reason: 'no_credential_home' };
   }
   const resetCredits = Number.isSafeInteger(usage?.reset_credits) ? usage.reset_credits : 0;

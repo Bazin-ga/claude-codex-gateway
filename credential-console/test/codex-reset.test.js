@@ -59,6 +59,14 @@ test('eligibility needs a credit, a readable quota, and a quota that is nearly g
     codexResetEligibility(codexAccount({ external: null }), usage()).reason,
     'no_credential_home',
   );
+  // The shape the dashboard actually receives: the server projects accounts
+  // through an allow-list that carries `{ kind }` and drops the home, because a
+  // filesystem path has no business on a page. Requiring the home here made the
+  // button judge every account ineligible while the route could proceed fine.
+  assert.equal(
+    codexResetEligibility(codexAccount({ external: { kind: 'codex-credential' } }), usage()).eligible,
+    true,
+  );
 });
 
 // The five-hour window can be fine while the weekly one is exhausted; the
@@ -383,4 +391,39 @@ test('a Claude account cannot be reset through this route', async (t) => {
   const response = await postReset(`http://127.0.0.1:${created.server.address().port}`, claude.id);
   assert.equal(response.status, 303);
   assert.match(decodeURIComponent(response.headers.get('location')), /not a Codex account/);
+});
+
+// The unit tests all passed while the live button was missing, because they fed
+// `codexResetEligibility` an internal account row. The dashboard gets a
+// projection built by an allow-list in server.js, and the first version of this
+// feature required a field that projection drops. This renders the real page
+// from the real server, which is the only place that mismatch shows up.
+test('the button reaches the rendered dashboard, not just the view function', async (t) => {
+  const app = await routeFixture(t, { upstream: upstreamFor({ remainingPercent: 0, resetCredits: 1 }) });
+  // Populate the snapshot the panel reads, the way the hourly monitor would.
+  const { fetchCodexUsage } = await import('../lib/usage.js');
+  const snapshot = await fetchCodexUsage({ accessToken: 'access-token', accountId: 'chatgpt-account' });
+  assert.equal(snapshot.reset_credits, 1);
+
+  const created = await createCredentialConsole({
+    store: app.store,
+    adminAuth: 'open',
+    cookieSecure: false,
+    publicBaseUrl: 'http://console.test',
+    usageMonitor: {
+      snapshotForAccount: (id) => (id === app.account.id ? snapshot : null),
+      refreshAccount: async () => snapshot,
+      stop() {},
+    },
+    codexManagedRefresher: false,
+  });
+  await new Promise((resolve) => created.server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    await new Promise((resolve) => created.server.close(resolve));
+    await created.stop?.();
+  });
+
+  const html = await (await fetch(`http://127.0.0.1:${created.server.address().port}/`)).text();
+  assert.match(html, new RegExp(`action="/accounts/${app.account.id}/codex-reset"`));
+  assert.match(html, /data-confirm="Spend one reset credit on codex-shared-1/);
 });
