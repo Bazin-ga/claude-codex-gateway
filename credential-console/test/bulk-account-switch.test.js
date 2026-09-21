@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -518,6 +518,17 @@ test('both sections are always offered, with a count of what each holds', async 
   // Not /provider-tab\b/: the word boundary also matches inside
   // "provider-tab-count", counting every tab twice.
   assert.equal((tabs.match(/class="provider-tab[ "]/g) ?? []).length, 2);
+});
+
+test('the live machine filter preserves its provider section', async () => {
+  const source = await readFile(new URL('../web/console-client.js', import.meta.url), 'utf8');
+  const handler = source.slice(
+    source.indexOf("select?.matches?.('.machine-filter"),
+    source.indexOf("if (conversationFragmentSupported())"),
+  );
+
+  assert.match(handler, /\['provider', 'account', 'member', 'group'\]/);
+  assert.match(handler, /form\.elements\[name\]/);
 });
 
 test('an unknown member in the URL is ignored rather than obeyed', async () => {
