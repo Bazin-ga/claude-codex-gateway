@@ -151,13 +151,83 @@ test('a nonsense header is ignored rather than believed', () => {
   assert.equal(signal.weeklyRemainingPercent('a1', null), null);
 });
 
+// The shape that actually broke production. On a Pro plan the provider reports
+// the seven-day allowance in `primary_window` and no secondary window at all,
+// so the account's weekly window has kind 'weekly' and position 'primary'.
+// Pairing kind with the secondary header wrote a figure for a window that does
+// not exist onto the one that does: an account at 93% rendered as 100%, and an
+// account at 0% also read as 100% -- the guard could never fire on exactly the
+// accounts it exists for.
+function proPlanSnapshot(remaining, { fetchedAtMs = Date.now() } = {}) {
+  return {
+    provider: 'codex',
+    status: 'available',
+    fetched_at: new Date(fetchedAtMs).toISOString(),
+    windows: [{
+      kind: 'weekly',
+      position: 'primary',
+      used_percent: 100 - remaining,
+      remaining_percent: remaining,
+      duration_seconds: 604800,
+    }],
+  };
+}
+
+test('a weekly window reported in the primary slot reads the primary header', () => {
+  const signal = new CodexQuotaSignal();
+  const now = Date.now();
+  // What the upstream sends such an account: the week in primary, and a
+  // secondary figure for a window it does not have.
+  signal.observe('a1', {
+    'x-codex-primary-used-percent': '7',
+    'x-codex-secondary-used-percent': '0',
+  }, now);
+
+  const snapshot = proPlanSnapshot(93, { fetchedAtMs: now - 600_000 });
+  assert.equal(signal.weeklyRemainingPercent('a1', snapshot), 93);
+  assert.equal(signal.merge('a1', snapshot).windows[0].remaining_percent, 93);
+});
+
+test('the guard still fires on an exhausted week reported in the primary slot', () => {
+  const signal = new CodexQuotaSignal();
+  const now = Date.now();
+  signal.observe('a1', {
+    'x-codex-primary-used-percent': '100',
+    'x-codex-secondary-used-percent': '0',
+  }, now);
+  const remaining = signal.weeklyRemainingPercent('a1', proPlanSnapshot(0, { fetchedAtMs: now - 1 }));
+  assert.equal(remaining, 0);
+  assert.equal(guardRestricts({ enabled: true, threshold_percent: 15 }, remaining), true);
+});
+
+test('a window with no recorded slot is left alone rather than guessed at', () => {
+  const signal = new CodexQuotaSignal();
+  const now = Date.now();
+  signal.observe('a1', { 'x-codex-secondary-used-percent': '0' }, now);
+  // A snapshot cached before positions were recorded. Ignoring the observation
+  // costs an hour of freshness; guessing costs the correctness of the guard.
+  const legacy = {
+    provider: 'codex',
+    status: 'available',
+    fetched_at: new Date(now - 600_000).toISOString(),
+    windows: [{ kind: 'weekly', used_percent: 7, remaining_percent: 93 }],
+  };
+  assert.equal(signal.weeklyRemainingPercent('a1', legacy), 93);
+  assert.equal(signal.merge('a1', legacy), legacy);
+});
+
 test('the newer of the two readings wins, in both directions', () => {
   const signal = new CodexQuotaSignal();
   const snapshot = (fetchedAtMs, remaining) => ({
     provider: 'codex',
     status: 'available',
     fetched_at: new Date(fetchedAtMs).toISOString(),
-    windows: [{ kind: 'weekly', used_percent: 100 - remaining, remaining_percent: remaining }],
+    windows: [{
+      kind: 'weekly',
+      position: 'secondary',
+      used_percent: 100 - remaining,
+      remaining_percent: remaining,
+    }],
   });
   const now = Date.now();
 
@@ -183,8 +253,8 @@ test('a merged snapshot carries the newer numbers and still admits the poll fail
     last_error: 'timeout',
     fetched_at: new Date(now - 3_600_000).toISOString(),
     windows: [
-      { kind: 'five_hour', used_percent: 10, remaining_percent: 90 },
-      { kind: 'weekly', used_percent: 50, remaining_percent: 50 },
+      { kind: 'five_hour', position: 'primary', used_percent: 10, remaining_percent: 90 },
+      { kind: 'weekly', position: 'secondary', used_percent: 50, remaining_percent: 50 },
     ],
   });
 
@@ -200,7 +270,7 @@ test('merging is a no-op when there is nothing newer to say', () => {
     provider: 'codex',
     status: 'available',
     fetched_at: new Date().toISOString(),
-    windows: [{ kind: 'weekly', used_percent: 50, remaining_percent: 50 }],
+    windows: [{ kind: 'weekly', position: 'secondary', used_percent: 50, remaining_percent: 50 }],
   };
   assert.equal(signal.merge('a1', snapshot), snapshot, 'no observation, same object');
   assert.equal(signal.merge('a1', null), null);

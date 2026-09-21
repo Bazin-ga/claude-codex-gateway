@@ -94,6 +94,11 @@ test('maps Codex windows by duration instead of assuming primary means five hour
   assert.equal(usage.windows.length, 1);
   assert.equal(usage.windows[0].kind, 'weekly');
   assert.equal(usage.windows[0].remaining_percent, 91);
+  // Kind says how long the window is; position says which slot the provider
+  // sent it in, and on this plan the seven-day window IS the primary one.
+  // Anything reading x-codex-primary/secondary-used-percent must line up by
+  // position -- conflating the two made a 91% account render as 100%.
+  assert.equal(usage.windows[0].position, 'primary');
   // The field is absent on plans that do not report it. Null, not zero: the
   // panel must be able to tell "holds none" from "did not say".
   assert.equal(usage.reset_credits, null);

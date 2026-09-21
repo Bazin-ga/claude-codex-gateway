@@ -45,11 +45,23 @@ function windowKind(seconds, fallback) {
   return fallback;
 }
 
-function normalizedWindow(kind, used, resetsAt, durationSeconds = null) {
+/**
+ * `position` is the slot the provider reported this window in, kept separate
+ * from `kind`, which describes how long the window is.
+ *
+ * They are not the same thing and assuming so was a bug: on a Pro plan the
+ * provider puts the seven-day window in `primary_window` and reports no
+ * secondary at all, so a window of kind 'weekly' can perfectly well be the
+ * primary one. Anything that reads `x-codex-primary-used-percent` /
+ * `x-codex-secondary-used-percent` has to line up by position, because that is
+ * what those header names mean.
+ */
+function normalizedWindow(kind, used, resetsAt, durationSeconds = null, position = null) {
   const usedPercent = percent(used);
   if (usedPercent === null) return null;
   return {
     kind,
+    position,
     used_percent: usedPercent,
     remaining_percent: remainingPercent(usedPercent),
     resets_at: resetIso(resetsAt),
@@ -118,14 +130,15 @@ export async function fetchCodexUsage({ accessToken, accountId, fetchImpl = fetc
   const windows = [
     ['primary', rateLimit.primary_window],
     ['secondary', rateLimit.secondary_window],
-  ].flatMap(([fallback, value]) => {
+  ].flatMap(([position, value]) => {
     if (!value) return [];
-    const kind = windowKind(value.limit_window_seconds, fallback);
+    const kind = windowKind(value.limit_window_seconds, position);
     const window = normalizedWindow(
       kind,
       value.used_percent,
       value.reset_at,
       value.limit_window_seconds,
+      position,
     );
     return window ? [window] : [];
   });

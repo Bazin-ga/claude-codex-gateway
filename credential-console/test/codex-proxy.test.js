@@ -811,6 +811,7 @@ function weeklySnapshot(remainingPercent) {
     fetched_at: new Date().toISOString(),
     windows: [{
       kind: 'weekly',
+      position: 'secondary',
       used_percent: 100 - remainingPercent,
       remaining_percent: remainingPercent,
       resets_at: null,
@@ -942,7 +943,7 @@ test('a fresh response header outranks an hour-old snapshot', async (t) => {
       provider: 'codex',
       status: 'available',
       fetched_at: new Date(Date.now() - 60 * 60_000).toISOString(),
-      windows: [{ kind: 'weekly', used_percent: 40, remaining_percent: 60 }],
+      windows: [{ kind: 'weekly', position: 'secondary', used_percent: 40, remaining_percent: 60 }],
     }),
   });
 
@@ -973,9 +974,16 @@ test('every proxied answer refreshes what the console knows about the window', a
   const observation = quotaSignal.observationFor(DEVICE.account_id);
   assert.equal(observation.secondary_used_percent, 88.5);
   assert.equal(observation.primary_used_percent, 41);
+  // With a snapshot to say which slot the week arrived in, the observation is
+  // usable immediately; without one there is nothing to line the headers up
+  // against, and the console says so rather than guessing.
   assert.equal(
-    quotaSignal.weeklyRemainingPercent(DEVICE.account_id, null),
+    quotaSignal.weeklyRemainingPercent(DEVICE.account_id, {
+      fetched_at: new Date(Date.now() - 600_000).toISOString(),
+      windows: [{ kind: 'weekly', position: 'secondary', used_percent: 40, remaining_percent: 60 }],
+    }),
     11.5,
     'read straight off traffic that was happening anyway',
   );
+  assert.equal(quotaSignal.weeklyRemainingPercent(DEVICE.account_id, null), null);
 });

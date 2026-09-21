@@ -30,17 +30,28 @@ function usedPercent(value) {
 }
 
 /**
- * The snapshot window a header refers to.
+ * Which header belongs to which window is decided by the window's `position`
+ * — the slot the provider reported it in — and never by its `kind`.
  *
- * `windowKind` in usage.js turns the upstream primary window into 'five_hour'
- * and the secondary into 'weekly' when their durations say so, and leaves the
- * positional name in place when they do not. Both spellings are accepted here
- * so an unusual plan still lines up.
+ * This was the bug. `kind` comes from the window's *duration*, and on a Pro
+ * plan the provider puts the seven-day window in `primary_window` and reports
+ * no secondary at all. Pairing kind 'weekly' with the secondary header meant
+ * writing a figure for a window that does not exist onto the one that does:
+ * an account genuinely at 93% remaining rendered as 100%, and — far worse —
+ * an account at 0% also read as 100%, so the low-quota guard could never fire
+ * on the accounts that needed it.
+ *
+ * A window with no recorded position is left alone rather than guessed at. The
+ * hourly poll rewrites the cache with positions, so the only cost is that an
+ * observation is ignored until the next poll.
  */
-const WINDOW_KINDS = Object.freeze({
-  primary: ['five_hour', 'primary'],
-  secondary: ['weekly', 'secondary'],
+const HEADER_FOR_POSITION = Object.freeze({
+  primary: 'primary_used_percent',
+  secondary: 'secondary_used_percent',
 });
+
+/** Window kinds that mean "the seven-day allowance", most specific first. */
+const WEEKLY_KINDS = Object.freeze(['weekly', 'secondary']);
 
 export class CodexQuotaSignal {
   constructor() {
@@ -96,21 +107,22 @@ export class CodexQuotaSignal {
    * better than a poll, it is only usually more recent. Comparing timestamps
    * rather than preferring a source keeps a stale observation from overriding
    * a poll that just ran.
+   *
+   * The snapshot is what says which window is the weekly one and which slot it
+   * arrived in, so with no snapshot there is no weekly reading to give — the
+   * headers alone cannot say which of them describes the week.
    */
   weeklyRemainingPercent(accountId, snapshot) {
-    const observation = this.observations.get(accountId);
-    const observed = observation?.secondary_used_percent;
-    const observedAtMs = Number.isFinite(observed) ? observation.observed_at_ms : null;
-
     const window = weeklyWindow(snapshot);
-    const snapshotAtMs = window ? Date.parse(String(snapshot?.fetched_at ?? '')) : Number.NaN;
+    if (!window) return null;
 
-    const useObservation = observedAtMs !== null
-      && (!Number.isFinite(snapshotAtMs) || observedAtMs >= snapshotAtMs);
-    if (useObservation) return Math.round((100 - observed) * 10) / 10;
-    if (window && Number.isFinite(Number(window.remaining_percent))) {
-      return Number(window.remaining_percent);
-    }
+    const observation = this.observations.get(accountId);
+    const observed = observedUsedPercent(observation, window.position);
+    const snapshotAtMs = Date.parse(String(snapshot?.fetched_at ?? ''));
+    const fresher = observed !== null
+      && (!Number.isFinite(snapshotAtMs) || observation.observed_at_ms >= snapshotAtMs);
+    if (fresher) return Math.round((100 - observed) * 10) / 10;
+    if (Number.isFinite(Number(window.remaining_percent))) return Number(window.remaining_percent);
     return null;
   }
 
@@ -134,8 +146,8 @@ export class CodexQuotaSignal {
 
     let changed = false;
     const windows = snapshot.windows.map((window) => {
-      const used = observation[`${positionFor(window?.kind)}_used_percent`];
-      if (!Number.isFinite(used) || used === window.used_percent) return window;
+      const used = observedUsedPercent(observation, window?.position);
+      if (used === null || used === window.used_percent) return window;
       changed = true;
       return {
         ...window,
@@ -152,16 +164,21 @@ export class CodexQuotaSignal {
   }
 }
 
-function positionFor(kind) {
-  for (const [position, kinds] of Object.entries(WINDOW_KINDS)) {
-    if (kinds.includes(kind)) return position;
-  }
-  return 'none';
+/** The observed figure for a window's slot, or null if there isn't one. */
+function observedUsedPercent(observation, position) {
+  const field = HEADER_FOR_POSITION[position];
+  if (!observation || !field) return null;
+  const used = observation[field];
+  return Number.isFinite(used) ? used : null;
 }
 
 function weeklyWindow(snapshot) {
   if (!Array.isArray(snapshot?.windows)) return null;
-  return snapshot.windows.find((window) => WINDOW_KINDS.secondary.includes(window?.kind)) ?? null;
+  for (const kind of WEEKLY_KINDS) {
+    const window = snapshot.windows.find((entry) => entry?.kind === kind);
+    if (window) return window;
+  }
+  return null;
 }
 
 /**
