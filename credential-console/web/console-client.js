@@ -1583,7 +1583,7 @@ function applyConversationFilter(form) {
 }
 
 /**
- * The dashboard's Claude-account filter.
+ * The dashboard's provider-scoped machine filter.
  *
  * Deliberately its own handler rather than reusing the `[data-autoapply]` one
  * below: that path is built around the conversation results fragment and is on
@@ -1598,8 +1598,10 @@ document.addEventListener('change', (event) => {
   const url = new URL(form.getAttribute('action') || location.pathname, location.href);
   // An empty value means "all", and an empty query parameter reads better than
   // `?account=` in the address bar and in a shared link.
-  // Both selects submit together, so narrowing by one keeps the other.
-  for (const name of ['account', 'member', 'group']) {
+  // Every control submits together, including the hidden provider that keeps a
+  // Codex or another provider section selected. Omitting it resets the page to
+  // its default Claude section as soon as any visible filter changes.
+  for (const name of ['provider', 'account', 'member', 'group']) {
     const value = form.elements[name]?.value ?? '';
     if (value) url.searchParams.set(name, value);
     else url.searchParams.delete(name);
