@@ -1015,6 +1015,11 @@ function codexResetControl(account, csrf) {
  * advertises — an input attribute is a hint, not a check.
  */
 function codexModelGuardControl(account, csrf) {
+  // The action cell this renders into is "everything that is not Claude", which
+  // includes Bedrock -- an account with no quota window at all, where the store
+  // refuses the setting outright. Offering the control there is offering a
+  // control whose only possible outcome is an error.
+  if (account.provider !== 'codex') return '';
   const guard = normalizeCodexGuard(account.codex_guard);
   return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-model-guard" class="guard-form">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">

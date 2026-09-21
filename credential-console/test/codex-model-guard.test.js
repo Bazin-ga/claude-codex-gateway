@@ -342,6 +342,15 @@ test('the guard belongs to Codex accounts only', async (t) => {
     alias: 'claude-shared-1',
     emailLabel: 'owner@example.com',
   });
+  // Bedrock, not just Claude. It shares the action cell with Codex, so it is
+  // the one that actually slipped through: a guard form rendered on an account
+  // billed per token, where the store can only refuse it.
+  await app.store.addAccount({
+    provider: 'bedrock',
+    alias: 'bedrock-astra-1',
+    bedrock: { region: 'us-west-2', modelId: 'us.openai.gpt-6-astra' },
+    credential: { api_key: 'secret-key-value' },
+  });
   await assert.rejects(
     app.store.setCodexModelGuard(claude.id, { enabled: true, thresholdPercent: '15' }),
     /not a Codex account/,
