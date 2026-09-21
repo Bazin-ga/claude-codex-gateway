@@ -10,6 +10,14 @@ import {
   createResponseObservationTee,
 } from './response-observation.js';
 import { createCodexUsageParser } from './codex-usage.js';
+import {
+  CODEX_GUARD_MODEL_KEYWORD,
+  codexGuardAllowsModel,
+  guardRestricts,
+  normalizeCodexGuard,
+  readCodexModelPrefix,
+} from './codex-model-guard.js';
+import { codexQuotaSignal as defaultQuotaSignal } from './codex-quota-signal.js';
 import { createCodexResponseContentAssembler } from './codex-response-content.js';
 import { codexTurnMetadata, extractCodexPromptCandidate } from './codex-prompt-capture.js';
 import {
@@ -177,6 +185,8 @@ export async function handleCodexProxy(req, res, {
   codexUsageParserFactory = createCodexUsageParser,
   codexContentAssemblerFactory = createCodexResponseContentAssembler,
   credentialReader = readPublishedCodexCredential,
+  quotaSignal = defaultQuotaSignal,
+  usageSnapshotFor = () => null,
   now = Date.now,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
@@ -218,7 +228,7 @@ export async function handleCodexProxy(req, res, {
     }
   }
 
-  const recordRejected = (statusCode, outcome = 'rejected') => {
+  const recordRejected = (statusCode, outcome = 'rejected', extra = {}) => {
     enqueueMetricSafely(requestMetrics, {
       startedAtMs: authenticatedAtMs,
       method: req.method ?? 'UNKNOWN',
@@ -238,6 +248,7 @@ export async function handleCodexProxy(req, res, {
       responseBytes: 0,
       upstreamRequestId: null,
       ...unavailableUsage(),
+      ...extra,
     }, { accountId, deviceId: device.id });
   };
 
@@ -271,6 +282,60 @@ export async function handleCodexProxy(req, res, {
   }
   const inferenceRequest = upstreamPath === '/responses';
 
+  // The low-quota model guard, evaluated before anything is acquired: no
+  // credential read, no concurrency slot, no upstream socket. A request refused
+  // here has cost the account nothing.
+  //
+  // Three conditions have to hold before the body is touched at all — the
+  // account opted in, this is an inference call, and the quota reading is
+  // actually below the threshold. An account with the switch off takes exactly
+  // the path it took before this existed.
+  const guard = normalizeCodexGuard(account.codex_guard);
+  let guardPrefix = null;
+  if (inferenceRequest && guard.enabled) {
+    const remainingPercent = quotaSignal.weeklyRemainingPercent(
+      account.id,
+      usageSnapshotFor(account.id),
+    );
+    if (guardRestricts(guard, remainingPercent)) {
+      guardPrefix = await readCodexModelPrefix(req);
+      if (guardPrefix.aborted || res.destroyed) {
+        log('codex_proxy_client_gone_during_model_read', {
+          account_id: account.id,
+          device_id: device.id,
+        });
+        recordRejected(null, 'client_disconnected');
+        return;
+      }
+      if (!codexGuardAllowsModel(guardPrefix.model)) {
+        log('codex_proxy_model_restricted', {
+          account_id: account.id,
+          device_id: device.id,
+          model: guardPrefix.model,
+          remaining_percent: remainingPercent,
+          threshold_percent: guard.threshold_percent,
+        });
+        recordRejected(403, 'model_restricted', {
+          model: guardPrefix.model,
+          requestBytes: guardPrefix.bytes,
+        });
+        // The body was only read far enough to find the model, so the rest of
+        // an upload nobody will forward is still arriving. Closing the
+        // connection is what stops it; keeping it alive would leave the server
+        // draining megabytes for a request it has already refused.
+        res.once('finish', () => {
+          if (!req.destroyed) req.destroy();
+        });
+        sendJson(res, 403, errorBody(
+          'permission_error',
+          `account weekly quota is ${remainingPercent}% remaining, below this account's ${guard.threshold_percent}% guard; only "${CODEX_GUARD_MODEL_KEYWORD}" models are allowed until it recovers `
+          + `(该账号周额度剩余 ${remainingPercent}%，低于设定的 ${guard.threshold_percent}% 阈值，当前仅允许含 ${CODEX_GUARD_MODEL_KEYWORD} 的模型)`,
+        ), { Connection: 'close' });
+        return;
+      }
+    }
+  }
+
   let credential;
   try {
     credential = await credentialReader(account);
@@ -285,15 +350,21 @@ export async function handleCodexProxy(req, res, {
     sendJson(res, 503, errorBody('api_error', code));
     return;
   }
-  // The credential read above is this handler's only await, and every listener
-  // that frees a resource is registered after it. If the client went away while
-  // it was pending, `res` has already emitted 'close' and every once() below
-  // would be waiting on an event that cannot fire again: the concurrency slot
-  // would be taken and never released, and that Map is shared with the Claude
-  // proxy, so after DEVICE_CONCURRENCY_LIMIT such cancellations the device is
-  // 429'd on /claude too, until the process restarts. handleClaudeProxy is
-  // immune only because its credential read is synchronous.
-  if (res.destroyed || req.destroyed) {
+  // Every listener that frees a resource is registered after this point. If the
+  // client went away while the awaits above were pending, `res` has already
+  // emitted 'close' and every once() below would be waiting on an event that
+  // cannot fire again: the concurrency slot would be taken and never released,
+  // and that Map is shared with the Claude proxy, so after
+  // DEVICE_CONCURRENCY_LIMIT such cancellations the device is 429'd on /claude
+  // too, until the process restarts. handleClaudeProxy is immune only because
+  // its credential read is synchronous.
+  //
+  // `req.destroyed` is checked only when the guard did not read the body to its
+  // end: Node destroys the IncomingMessage the moment a body has been fully
+  // consumed, so after a short guarded request that flag is true on the
+  // *successful* path, and testing it unconditionally would refuse every
+  // request the guard let through.
+  if (res.destroyed || (!guardPrefix?.ended && req.destroyed)) {
     log('codex_proxy_client_gone_during_credential_read', {
       account_id: account.id,
       device_id: device.id,
@@ -492,6 +563,10 @@ export async function handleCodexProxy(req, res, {
       upstreamStatus = status;
       const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
       upstreamRequestId = typeof requestId === 'string' ? requestId : null;
+      // Free, and an hour fresher than the usage poll: the upstream stamps the
+      // account's window usage on every answer. Taken here rather than from the
+      // streamed body so it is recorded even when a turn is abandoned halfway.
+      quotaSignal.observe(account.id, upstreamRes.headers, now());
       res.writeHead(status, {
         ...responseHeaders(upstreamRes.headers),
         'Cache-Control': 'no-store',
@@ -672,5 +747,22 @@ export async function handleCodexProxy(req, res, {
     finalizeCompletedWhenReady();
   });
 
-  req.pipe(requestMetadata.stream).pipe(requestLimit.stream).pipe(upstreamReq);
+  requestMetadata.stream.pipe(requestLimit.stream).pipe(upstreamReq);
+  if (guardPrefix?.head) {
+    // The bytes the guard consumed while looking for `model` go back in front
+    // of the body, before anything else is written, so the upstream sees the
+    // request exactly as the client sent it.
+    requestMetadata.stream.write(guardPrefix.head);
+  }
+  if (guardPrefix?.ended) {
+    // Defensive, and deliberately so. The guard stops as soon as it has the
+    // model, so today it only ever reaches the end of a body it is about to
+    // refuse — but the forward path must not quietly depend on that. Piping an
+    // already-ended stream attaches to something that will never emit 'data'
+    // or 'end' again, and the upstream request would hang until its ten-minute
+    // timeout rather than fail.
+    requestMetadata.stream.end();
+  } else {
+    req.pipe(requestMetadata.stream);
+  }
 }

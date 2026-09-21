@@ -1,6 +1,12 @@
 import { APP_ASSET_URL } from './app-asset.js';
 import { GATEWAY_PROVIDERS } from './store.js';
 import { CODEX_RESET_QUOTA_CEILING, codexResetEligibility } from './codex-reset.js';
+import {
+  CODEX_GUARD_MAX_THRESHOLD_PERCENT,
+  CODEX_GUARD_MIN_THRESHOLD_PERCENT,
+  CODEX_GUARD_MODEL_KEYWORD,
+  normalizeCodexGuard,
+} from './codex-model-guard.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { sanitizeUrl } from './onboarding.js';
@@ -208,6 +214,11 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .quota-window strong { display: block; margin: 3px 0; font-size: 15px; }
 .quota-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin-top: 8px; color: var(--muted); font-size: 11px; }
 .quota-fable, .quota-reset-credits { margin-left: auto; }
+.quota-guard { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.guard-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 4px; }
+.guard-toggle, .guard-threshold { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+.guard-threshold input { width: 62px; }
+.guard-form .muted.tiny { flex-basis: 100%; }
 .provider-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
 .provider-tab { display: inline-flex; align-items: center; gap: 8px; padding: 9px 15px; border: 1px solid var(--line); border-bottom: 0; border-radius: 11px 11px 0 0; margin-bottom: -1px; background: #f3f5f2; color: var(--muted); font-weight: 700; font-size: 14px; text-decoration: none; }
 .provider-tab:hover { color: var(--ink); }
@@ -994,6 +1005,40 @@ function codexResetControl(account, csrf) {
   return `<div class="muted tiny"><span data-i18n="codex-reset-available">Reset credits</span>: ${escapeHtml(String(resetCredits))} · ${explanation}</div>`;
 }
 
+/**
+ * The low-quota guard switch, on the account it governs.
+ *
+ * Deliberately not behind an admin-only gate: this deployment lets every member
+ * change it, and the store records who did. The threshold is a number field
+ * rather than a preset list so an account can be tuned to how its week actually
+ * runs out, and the server refuses anything outside the same bounds the input
+ * advertises — an input attribute is a hint, not a check.
+ */
+function codexModelGuardControl(account, csrf) {
+  const guard = normalizeCodexGuard(account.codex_guard);
+  return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-model-guard" class="guard-form">
+    <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+    <label class="guard-toggle"><input type="checkbox" name="enabled" value="1"${guard.enabled ? ' checked' : ''}><span data-i18n="codex-guard-enable">Low-quota guard</span></label>
+    <label class="guard-threshold"><span data-i18n="codex-guard-threshold">Weekly quota below</span>
+      <input type="number" name="threshold_percent" min="${CODEX_GUARD_MIN_THRESHOLD_PERCENT}" max="${CODEX_GUARD_MAX_THRESHOLD_PERCENT}" step="1" value="${escapeHtml(String(guard.threshold_percent))}" aria-label="Low-quota guard threshold for ${escapeHtml(account.alias)}">%
+    </label>
+    <button class="secondary" type="submit" data-i18n="codex-guard-save">Save guard</button>
+    <div class="muted tiny"><span data-i18n="codex-guard-help">Under the threshold, only models named</span> ${escapeHtml(CODEX_GUARD_MODEL_KEYWORD)} <span data-i18n="codex-guard-help-tail">are allowed through the gateway.</span></div>
+  </form>`;
+}
+
+/**
+ * The same rule, stated where members read quota rather than where it is set.
+ *
+ * Without this a refused request looks like an outage. Only rendered when the
+ * guard is on: an off switch is not news.
+ */
+function codexModelGuardNote(account) {
+  const guard = normalizeCodexGuard(account.codex_guard);
+  if (!guard.enabled) return '';
+  return `<div class="quota-guard muted tiny"><span data-i18n="codex-guard-active">Low-quota guard</span> ${escapeHtml(String(guard.threshold_percent))}% · <span data-i18n="codex-guard-luna-only">only ${escapeHtml(CODEX_GUARD_MODEL_KEYWORD)} models below that</span></div>`;
+}
+
 function accountUsageView(account, { showAccount = false } = {}) {
   // Bedrock has no quota window to report — it is billed per token, not against
   // a rolling allowance. Saying so is the accurate answer; falling through
@@ -1007,7 +1052,10 @@ function accountUsageView(account, { showAccount = false } = {}) {
   }
   const usage = account.usage;
   const message = usageMessage(usage);
-  const updatedAt = usage?.fetched_at ?? usage?.attempted_at;
+  // `observed_at` outranks `fetched_at` because it is only ever set when a
+  // proxied response carried newer window figures than the poll did; the line
+  // dates the numbers on screen, not the last time the poller ran.
+  const updatedAt = usage?.observed_at ?? usage?.fetched_at ?? usage?.attempted_at;
   const fableWeekly = usage?.windows?.find((entry) => entry.kind === 'fable_weekly');
   // Only a stock worth acting on earns a line. Zero is the ordinary state of a
   // Codex account, and printing "Reset credits 0" on every card would spend the
@@ -1036,6 +1084,7 @@ function accountUsageView(account, { showAccount = false } = {}) {
     </div>
     ${message}
     ${quotaMeta ? `<div class="quota-meta">${quotaMeta}</div>` : ''}
+    ${codexModelGuardNote(account)}
   </div>`;
 }
 
@@ -3847,6 +3896,7 @@ export function dashboardView({
           <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>
           ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}
           ${codexResetControl(account, csrf)}
+          ${codexModelGuardControl(account, csrf)}
         </div>`}
         ${(account.status === 'login_required' || account.provider === 'bedrock') && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">

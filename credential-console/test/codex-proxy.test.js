@@ -11,6 +11,7 @@ import {
   readPublishedCodexCredential,
 } from '../lib/codex-proxy.js';
 import { DEVICE_CONCURRENCY_LIMIT, deviceConcurrency } from '../lib/proxy.js';
+import { CodexQuotaSignal } from '../lib/codex-quota-signal.js';
 
 const DEVICE_TOKEN = 'codex-device-test-token';
 const ACCESS_TOKEN = 'codex-upstream-access-token';
@@ -93,11 +94,22 @@ function close(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-async function startHarness(t, { upstreamHandler, requestMetrics = null, store, seen = {} }) {
+async function startHarness(t, {
+  upstreamHandler,
+  requestMetrics = null,
+  store,
+  seen = {},
+  ...extra
+}) {
   const upstream = http.createServer((req, res) => {
     seen.method = req.method;
     seen.url = req.url;
     seen.headers = req.headers;
+    // Collected so a test can prove the forwarded body is byte-identical to the
+    // one the client sent, including any prefix the guard read on the way past.
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => { seen.body = Buffer.concat(chunks).toString('utf8'); });
     upstreamHandler(req, res);
   });
   const upstreamUrl = await listen(upstream);
@@ -106,6 +118,7 @@ async function startHarness(t, { upstreamHandler, requestMetrics = null, store, 
       store,
       upstreamBaseUrl: upstreamUrl,
       requestMetrics,
+      ...extra,
     })).catch((error) => {
       if (!res.headersSent) res.writeHead(500).end();
       else res.destroy(error);
@@ -775,4 +788,194 @@ test('a turn carrying no user message records no conversation', async (t) => {
   const row = await waitFor(() => metrics.rows[0]);
   assert.equal(row.outcome, 'completed');
   assert.deepEqual(metrics.conversations, [], 'inventing a prompt would be worse than none');
+});
+
+// --- the low-quota model guard -------------------------------------------
+//
+// The switch is per account and off by default, so every test here has to turn
+// it on explicitly. What is being checked is not only that a refusal happens,
+// but that a request the guard lets through is forwarded byte for byte: the
+// guard reads the head of the body to find `model`, and those bytes have to go
+// back in front of the rest before anything reaches the upstream.
+
+function guardedAccount(home, { enabled = true, thresholdPercent = 15 } = {}) {
+  return codexAccount(home, {
+    codex_guard: { enabled, threshold_percent: thresholdPercent },
+  });
+}
+
+function weeklySnapshot(remainingPercent) {
+  return () => ({
+    provider: 'codex',
+    status: 'available',
+    fetched_at: new Date().toISOString(),
+    windows: [{
+      kind: 'weekly',
+      used_percent: 100 - remainingPercent,
+      remaining_percent: remainingPercent,
+      resets_at: null,
+      duration_seconds: 7 * 24 * 60 * 60,
+    }],
+  });
+}
+
+test('below the threshold a large model is refused before anything is spent', async (t) => {
+  const home = await credentialHome(t);
+  const metrics = sink();
+  const seen = {};
+  let upstreamCalls = 0;
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(guardedAccount(home)),
+    upstreamHandler: (req, res) => { upstreamCalls += 1; res.writeHead(200); res.end(TURN_SSE); },
+    requestMetrics: metrics,
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: weeklySnapshot(3),
+    seen,
+  });
+
+  const response = await post(proxyUrl, JSON.stringify({
+    model: 'gpt-5.6-sol',
+    stream: true,
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+  }));
+
+  assert.equal(response.status, 403);
+  const body = await response.json();
+  assert.equal(body.error.type, 'permission_error');
+  assert.match(body.error.message, /luna/, 'the refusal names the model family that still works');
+  assert.match(body.error.message, /3%/, 'and the reading the decision rested on');
+  assert.equal(upstreamCalls, 0, 'a refused request never reaches chatgpt.com');
+
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_restricted');
+  assert.equal(row.statusCode, 403);
+  assert.equal(row.model, 'gpt-5.6-sol', 'the blocked model is recorded, not null');
+});
+
+test('below the threshold the small model still goes through, byte for byte', async (t) => {
+  const home = await credentialHome(t);
+  const seen = {};
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(guardedAccount(home)),
+    upstreamHandler: sseUpstream(),
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: weeklySnapshot(3),
+    seen,
+  });
+
+  // Long enough to span more than the guard's first chunk in practice, so the
+  // prefix it consumed is genuinely a prefix and not the whole body.
+  const sent = JSON.stringify({
+    model: 'gpt-5.6-luna',
+    stream: true,
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'x'.repeat(50_000) }] }],
+  });
+  const response = await post(proxyUrl, sent);
+
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), TURN_SSE);
+  await waitFor(() => seen.body);
+  assert.equal(seen.body, sent, 'the bytes the guard read are put back in front of the body');
+});
+
+test('above the threshold the guard does not look at the request at all', async (t) => {
+  const home = await credentialHome(t);
+  const seen = {};
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(guardedAccount(home)),
+    upstreamHandler: sseUpstream(),
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: weeklySnapshot(60),
+    seen,
+  });
+
+  const sent = JSON.stringify({ model: 'gpt-5.6-sol', stream: true, input: [] });
+  const response = await post(proxyUrl, sent);
+
+  assert.equal(response.status, 200);
+  await response.text();
+  await waitFor(() => seen.body);
+  assert.equal(seen.body, sent);
+});
+
+test('an unreadable quota lets the request through rather than taking the account down', async (t) => {
+  const home = await credentialHome(t);
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(guardedAccount(home)),
+    upstreamHandler: sseUpstream(),
+    quotaSignal: new CodexQuotaSignal(),
+    // What a failed hourly poll on a never-polled account looks like.
+    usageSnapshotFor: () => null,
+  });
+
+  const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-5.6-sol', stream: true, input: [] }));
+  assert.equal(response.status, 200, 'one broken poll must not ban every large model');
+  await response.text();
+});
+
+test('an account that never opted in is untouched at zero quota', async (t) => {
+  const home = await credentialHome(t);
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(guardedAccount(home, { enabled: false })),
+    upstreamHandler: sseUpstream(),
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: weeklySnapshot(0),
+  });
+
+  const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-5.6-sol', stream: true, input: [] }));
+  assert.equal(response.status, 200);
+  await response.text();
+});
+
+test('a fresh response header outranks an hour-old snapshot', async (t) => {
+  const home = await credentialHome(t);
+  const quotaSignal = new CodexQuotaSignal();
+  // The poll said 60% remaining an hour ago; a response since then said the
+  // weekly window is 98% used. The guard must act on the newer number.
+  quotaSignal.observe(DEVICE.account_id, { 'x-codex-secondary-used-percent': '98' }, Date.now());
+  let upstreamCalls = 0;
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(guardedAccount(home)),
+    upstreamHandler: (req, res) => { upstreamCalls += 1; res.writeHead(200); res.end(TURN_SSE); },
+    quotaSignal,
+    usageSnapshotFor: () => ({
+      provider: 'codex',
+      status: 'available',
+      fetched_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+      windows: [{ kind: 'weekly', used_percent: 40, remaining_percent: 60 }],
+    }),
+  });
+
+  const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-5.6-sol', stream: true, input: [] }));
+  assert.equal(response.status, 403);
+  await response.json();
+  assert.equal(upstreamCalls, 0);
+});
+
+test('every proxied answer refreshes what the console knows about the window', async (t) => {
+  const home = await credentialHome(t);
+  const quotaSignal = new CodexQuotaSignal();
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'x-codex-primary-used-percent': '41',
+        'x-codex-secondary-used-percent': '88.5',
+      });
+      res.end(TURN_SSE);
+    },
+    quotaSignal,
+  });
+
+  await post(proxyUrl, '{"model":"gpt-5.6-sol"}').then((r) => r.text());
+
+  const observation = quotaSignal.observationFor(DEVICE.account_id);
+  assert.equal(observation.secondary_used_percent, 88.5);
+  assert.equal(observation.primary_used_percent, 41);
+  assert.equal(
+    quotaSignal.weeklyRemainingPercent(DEVICE.account_id, null),
+    11.5,
+    'read straight off traffic that was happening anyway',
+  );
 });

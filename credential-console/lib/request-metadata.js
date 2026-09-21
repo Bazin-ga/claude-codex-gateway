@@ -443,8 +443,14 @@ class JsonValueScanner {
   }
 }
 
-class TopLevelJsonScanner {
-  constructor({ maxModelChars }) {
+/**
+ * Exported so the Codex model guard can reuse it rather than grow a second,
+ * subtly different idea of what "the model field" is. A gate that disagreed
+ * with the metrics about which model a request carried would block one model
+ * and record another.
+ */
+export class TopLevelJsonScanner {
+  constructor({ maxModelChars = 256 } = {}) {
     this.decoder = new TextDecoder('utf-8', { fatal: true });
     this.maxModelChars = maxModelChars;
     this.phase = 'start';

@@ -23,6 +23,7 @@ import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
+import { codexQuotaSignal } from './lib/codex-quota-signal.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
@@ -676,12 +677,20 @@ export async function createCredentialConsole(options = {}) {
         // and told members to wait for an account owner who had already
         // registered it.
         bedrock: account.bedrock ? { ...account.bedrock } : null,
+        // Same allow-list, same trap: a field omitted here simply does not
+        // reach the page, so the guard control would render as permanently off
+        // no matter what the account actually holds.
+        codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
         active_devices: account.active_devices,
       };
       return {
         ...safeAccount,
         ...await externalAccountStatus(internal),
-        usage: usageMonitor.snapshotForAccount(account.id),
+        // Folded in here rather than written back into the monitor: the
+        // observation is evidence about two windows, not a usage poll, and
+        // merging at read time keeps the cached snapshot honest about what was
+        // actually fetched.
+        usage: codexQuotaSignal.merge(account.id, usageMonitor.snapshotForAccount(account.id)),
       };
     }));
   }
@@ -1309,6 +1318,8 @@ export async function createCredentialConsole(options = {}) {
         store,
         upstreamBaseUrl: options.codexUpstreamBaseUrl,
         requestMetrics,
+        quotaSignal: codexQuotaSignal,
+        usageSnapshotFor: (accountId) => usageMonitor.snapshotForAccount(accountId),
       });
       return;
     }
@@ -2274,6 +2285,30 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+
+    const codexGuardParams = routeMatch(path, '/accounts/:id/codex-model-guard');
+    if (req.method === 'POST' && codexGuardParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        await store.setCodexModelGuard(codexGuardParams.id, {
+          // An unchecked checkbox is simply absent from a form submission, so
+          // "off" arrives as a missing field rather than a false one.
+          enabled: form.enabled === '1',
+          thresholdPercent: form.threshold_percent,
+          actor: session.admin_identity ?? 'anonymous',
+        });
+        redirect(res, '/');
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
 
     const codexResetParams = routeMatch(path, '/accounts/:id/codex-reset');
     if (req.method === 'POST' && codexResetParams) {

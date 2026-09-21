@@ -17,6 +17,7 @@ import {
   sha256,
 } from './security.js';
 import { credentialSwitchBlock, externalAccountStatus } from './external-account-status.js';
+import { normalizeCodexGuard, parseCodexGuardInput } from './codex-model-guard.js';
 
 const STATE_VERSION = 1;
 const MAX_AUDIT_EVENTS = 2_000;
@@ -269,6 +270,7 @@ export class CredentialStore {
       last_failure: account.last_failure ?? null,
       external: account.external ? { kind: account.external.kind } : null,
       bedrock: account.bedrock ? { ...account.bedrock } : null,
+      codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
       active_devices: this.state.devices.filter((device) => {
         if (device.revoked_at) return false;
         try {
@@ -1072,6 +1074,39 @@ export class CredentialStore {
       }
       account.email_label = normalized.slice(0, 160);
       this.audit('account_email_updated', { account_id: id });
+      await this.persist();
+      return account;
+    });
+  }
+
+  /**
+   * Turn the low-quota model guard on or off for one Codex account.
+   *
+   * Anyone who can reach the console can change this, which is the deployment's
+   * own choice — so the audit records who, and what the setting was before. A
+   * switch everybody shares is only manageable if turning it off leaves a
+   * trace.
+   */
+  async setCodexModelGuard(id, { enabled, thresholdPercent, actor = null }) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account) throw new Error('account not found');
+      if (account.provider !== 'codex') throw new Error('account is not a Codex account');
+      const guard = parseCodexGuardInput({ enabled, thresholdPercent });
+      const previous = normalizeCodexGuard(account.codex_guard);
+      account.codex_guard = {
+        ...guard,
+        updated_at: nowIso(),
+        updated_by: typeof actor === 'string' && actor ? actor.slice(0, 160) : null,
+      };
+      this.audit('codex_model_guard_updated', {
+        account_id: id,
+        enabled: guard.enabled,
+        threshold_percent: guard.threshold_percent,
+        previous_enabled: previous.enabled,
+        previous_threshold_percent: previous.threshold_percent,
+        actor: account.codex_guard.updated_by,
+      });
       await this.persist();
       return account;
     });
