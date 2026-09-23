@@ -468,6 +468,11 @@ export class TopLevelJsonScanner {
     this.complete = false;
     this.finished = false;
     this.prefixDecodeIncomplete = false;
+    // How many top-level `model` keys this body has carried so far. JSON
+    // leaves duplicate keys undefined and parsers disagree -- Python's keeps the
+    // last, this scanner's `model` is also the last -- so anything that rules
+    // on the FIRST one needs to know whether there was a second.
+    this.modelKeys = 0;
   }
 
   fail() {
@@ -604,6 +609,7 @@ export class TopLevelJsonScanner {
         this.fail();
         return;
       }
+      if (this.currentKey === 'model') this.modelKeys += 1;
       this.valueScanner = new JsonValueScanner({
         target: this.currentKey === 'model' || this.currentKey === 'stream' ? this.currentKey : null,
         maxModelChars: this.maxModelChars,

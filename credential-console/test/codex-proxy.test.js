@@ -987,3 +987,178 @@ test('every proxied answer refreshes what the console knows about the window', a
   );
   assert.equal(quotaSignal.weeklyRemainingPercent(DEVICE.account_id, null), null);
 });
+
+// --- bodies whose first `model` is not the one that would run ---------------
+//
+// The guard reads the head of a body. JSON leaves duplicate keys undefined and
+// Python keeps the LAST one, so a body naming luna then sol would pass a guard
+// that reads the first and run sol upstream. The same goes for syntax only a
+// laxer parser accepts (`NaN`): past it this scanner is blind. Both have to be
+// stopped, and when the giveaway arrives in a later chunk, stopped before the
+// upstream ever holds a complete body.
+
+/** Send a body in separate writes, so later parts arrive as later chunks. */
+function postInChunks(url, parts, { gapMs = 30 } = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(`${url}/codex-api/responses`);
+    const req = http.request(target, {
+      method: 'POST',
+      headers: { 'x-api-key': DEVICE_TOKEN, 'content-type': 'application/json' },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+      res.on('error', reject);
+    });
+    // A refusal closes the connection while later parts may still be queued;
+    // that is the behaviour under test, not a failure of the helper.
+    req.on('error', (error) => {
+      if (error.code === 'ECONNRESET' || error.code === 'EPIPE') return;
+      reject(error);
+    });
+    (async () => {
+      for (const part of parts) {
+        if (req.destroyed) return;
+        req.write(part);
+        await new Promise((r) => setTimeout(r, gapMs));
+      }
+      if (!req.destroyed) req.end();
+    })();
+  });
+}
+
+function guardedHarness(t, { metrics = null } = {}) {
+  return (async () => {
+    const home = await credentialHome(t);
+    const upstream = { calls: 0, completeBodies: [] };
+    const harness = await startHarness(t, {
+      store: storeFixture(guardedAccount(home)),
+      upstreamHandler: (req, res) => {
+        upstream.calls += 1;
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+          upstream.completeBodies.push(Buffer.concat(chunks).toString('utf8'));
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(TURN_SSE);
+        });
+      },
+      requestMetrics: metrics,
+      quotaSignal: new CodexQuotaSignal(),
+      usageSnapshotFor: weeklySnapshot(3),
+    });
+    return { ...harness, upstream };
+  })();
+}
+
+test('a second model key in the head is refused, not decided by the first', async (t) => {
+  const metrics = sink();
+  const { proxyUrl, upstream } = await guardedHarness(t, { metrics });
+
+  const response = await post(proxyUrl, '{"model":"gpt-5.6-luna","input":[],"model":"gpt-5.6-sol"}');
+  assert.equal(response.status, 403);
+  assert.match((await response.json()).error.message, /luna/);
+  assert.equal(upstream.calls, 0, 'nothing reached chatgpt.com');
+
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_restricted');
+  assert.equal(row.model, 'gpt-5.6-sol', 'recorded as the model that would have run');
+});
+
+test('syntax only a laxer parser accepts is refused rather than trusted', async (t) => {
+  const { proxyUrl, upstream } = await guardedHarness(t);
+  // Python's json accepts NaN; this scanner does not, and must not wave through
+  // whatever follows a construct it cannot read.
+  const response = await post(proxyUrl, '{"model":"gpt-5.6-luna","x":NaN,"model":"gpt-5.6-sol"}');
+  assert.equal(response.status, 403);
+  await response.json();
+  assert.equal(upstream.calls, 0);
+});
+
+test('a second model key in a later chunk stops the upload before it completes', async (t) => {
+  const metrics = sink();
+  const { proxyUrl, upstream } = await guardedHarness(t, { metrics });
+
+  const response = await postInChunks(proxyUrl, [
+    `{"model":"gpt-5.6-luna","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"${'x'.repeat(2_000)}"}]}]`,
+    ',"model":"gpt-5.6-sol"',
+    '}',
+  ]);
+
+  assert.equal(response.status, 403);
+  assert.match(response.body, /luna/);
+  // The upstream may have seen the head, but it must never have held a body it
+  // could run: an incomplete body is the whole point of withholding the chunk.
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(upstream.completeBodies, [], 'the upstream never received a complete body');
+
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_restricted');
+  assert.equal(row.statusCode, 403);
+  assert.equal(row.model, 'gpt-5.6-sol');
+});
+
+test('an honest multi-chunk luna upload still goes through byte for byte', async (t) => {
+  const { proxyUrl, upstream } = await guardedHarness(t);
+  const parts = [
+    '{"model":"gpt-5.6-luna","stream":true,',
+    `"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"${'y'.repeat(3_000)}"}]}]`,
+    ',"store":false}',
+  ];
+
+  const response = await postInChunks(proxyUrl, parts);
+  assert.equal(response.status, 200);
+  assert.equal(response.body, TURN_SSE);
+  assert.deepEqual(upstream.completeBodies, [parts.join('')]);
+});
+
+test('an account above its threshold is not held to any of this', async (t) => {
+  // The body checks cost a scan of every byte, so they are only paid where the
+  // guard is actually biting. A healthy account's body is forwarded untouched.
+  const home = await credentialHome(t);
+  const seen = {};
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(guardedAccount(home)),
+    upstreamHandler: sseUpstream(),
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: weeklySnapshot(60),
+    seen,
+  });
+  const sent = '{"model":"gpt-5.6-luna","input":[],"model":"gpt-5.6-sol"}';
+  const response = await post(proxyUrl, sent);
+  assert.equal(response.status, 200);
+  await response.text();
+  await waitFor(() => seen.body);
+  assert.equal(seen.body, sent);
+});
+
+// Each of these slips past every check except the one it names. In the head
+// both are also caught by the last-model check, which is why they are sent in
+// a later chunk: that is the only place the named check stands alone.
+
+test('a later `"model": null` is caught by the key count alone', async (t) => {
+  const { proxyUrl, upstream } = await guardedHarness(t);
+  // The last model read is null, which is not a model the guard can refuse by
+  // name -- and a parser that keeps the last key hands the upstream a null
+  // model, which it may well answer with its default.
+  const response = await postInChunks(proxyUrl, [
+    '{"model":"gpt-5.6-luna","input":[]',
+    ',"model":null',
+    '}',
+  ]);
+  assert.equal(response.status, 403);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(upstream.completeBodies, []);
+});
+
+test('later syntax this parser cannot follow is refused, not forwarded', async (t) => {
+  const { proxyUrl, upstream } = await guardedHarness(t);
+  const response = await postInChunks(proxyUrl, [
+    '{"model":"gpt-5.6-luna","x":',
+    'NaN,"model":"gpt-5.6-sol"',
+    '}',
+  ]);
+  assert.equal(response.status, 403);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(upstream.completeBodies, []);
+});

@@ -14,6 +14,7 @@
  * that has not opted in.
  */
 
+import { Transform } from 'node:stream';
 import { TopLevelJsonScanner } from './request-metadata.js';
 
 /**
@@ -134,6 +135,9 @@ export function readCodexModelPrefix(req, { limitBytes = CODEX_GUARD_PREFIX_BYTE
         ...result,
         head: chunks.length ? Buffer.concat(chunks) : null,
         bytes,
+        // Handed on so the rest of the body can be checked with the same
+        // parse state, rather than restarting mid-object where nothing parses.
+        scanner,
       });
     };
 
@@ -155,7 +159,17 @@ export function readCodexModelPrefix(req, { limitBytes = CODEX_GUARD_PREFIX_BYTE
         return;
       }
       const { model, parseState } = scanner.snapshot();
-      if (model !== null) settle({ model });
+      if (model !== null) {
+        // The rest of the chunk the model arrived in is scanned too, bounded by
+        // one socket read. The bytes handed back as `head` must all have been
+        // seen: a second `model` key sitting just past the first would
+        // otherwise be forwarded without ever being looked at.
+        if (take < chunk.length) {
+          scanner.push(chunk.subarray(take));
+          scanned += chunk.length - take;
+        }
+        settle({ model });
+      }
       // 'invalid' and 'not_object' are terminal: no later byte can produce a
       // model, so there is nothing to gain by buffering the rest.
       else if (parseState === 'invalid' || parseState === 'not_object') settle({ model: null });
@@ -181,5 +195,62 @@ export function readCodexModelPrefix(req, { limitBytes = CODEX_GUARD_PREFIX_BYTE
     req.once('error', onFailure);
     req.once('aborted', onFailure);
     req.resume();
+  });
+}
+
+export class CodexGuardViolation extends Error {
+  constructor(code) {
+    super(code);
+    this.name = 'CodexGuardViolation';
+    this.code = code;
+  }
+}
+
+/**
+ * Why a body whose first `model` was allowed must still be stopped, or null.
+ *
+ * Reading the first `model` is not enough on its own, because the guard and
+ * the upstream need not agree on what "the model" of a body is:
+ *
+ * - `duplicate_model`: JSON leaves duplicate keys undefined. Python keeps the
+ *   last one; this guard, reading a prefix, sees the first. A body naming luna
+ *   and then sol would pass here and run sol there.
+ * - `unparseable`: this scanner is strict JSON, and some upstream parsers are
+ *   not — Python accepts `NaN`. Past a construct only the upstream can read,
+ *   the guard is blind to anything that follows it, so a body it cannot parse
+ *   to the end is not a body it can vouch for.
+ *
+ * Both fail closed. That is only affordable because this runs solely on an
+ * account that is already below its threshold, and no Codex client produces
+ * either shape.
+ */
+export function guardBodyViolation(scanner) {
+  if (scanner.modelKeys > 1) return 'duplicate_model';
+  const { parseState, model } = scanner.snapshot();
+  if (parseState === 'invalid' || parseState === 'not_object') return 'unparseable';
+  if (model !== null && !codexGuardAllowsModel(model)) return 'model_not_allowed';
+  return null;
+}
+
+/**
+ * Scan the rest of a guarded body as it streams past, and stop it the moment
+ * it stops being one the guard can vouch for.
+ *
+ * A chunk is only passed on after it has been scanned, so a violation found in
+ * it means that chunk is withheld: the upstream is left holding an incomplete
+ * body, which it cannot run, and the caller destroys the request. Nothing is
+ * buffered beyond the chunk in hand, so this costs no memory on a large body.
+ */
+export function createCodexGuardTail(scanner) {
+  return new Transform({
+    transform(chunk, encoding, callback) {
+      scanner.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding));
+      const violation = guardBodyViolation(scanner);
+      if (violation) {
+        callback(new CodexGuardViolation(violation));
+        return;
+      }
+      callback(null, chunk);
+    },
   });
 }

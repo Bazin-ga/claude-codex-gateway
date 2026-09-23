@@ -13,6 +13,8 @@ import { createCodexUsageParser } from './codex-usage.js';
 import {
   CODEX_GUARD_MODEL_KEYWORD,
   codexGuardAllowsModel,
+  createCodexGuardTail,
+  guardBodyViolation,
   guardRestricts,
   normalizeCodexGuard,
   readCodexModelPrefix,
@@ -292,12 +294,22 @@ export async function handleCodexProxy(req, res, {
   // the path it took before this existed.
   const guard = normalizeCodexGuard(account.codex_guard);
   let guardPrefix = null;
+  let guardRemainingPercent = null;
+  // One message for every way the guard refuses, including a refusal that only
+  // becomes possible halfway through the upload: the rule the caller hit is the
+  // same whichever byte gave it away.
+  const guardRefusalBody = () => errorBody(
+    'permission_error',
+    `account weekly quota is ${guardRemainingPercent}% remaining, below this account's ${guard.threshold_percent}% guard; only "${CODEX_GUARD_MODEL_KEYWORD}" models are allowed until it recovers `
+    + `(该账号周额度剩余 ${guardRemainingPercent}%，低于设定的 ${guard.threshold_percent}% 阈值，当前仅允许含 ${CODEX_GUARD_MODEL_KEYWORD} 的模型)`,
+  );
   if (inferenceRequest && guard.enabled) {
     const remainingPercent = quotaSignal.weeklyRemainingPercent(
       account.id,
       usageSnapshotFor(account.id),
     );
     if (guardRestricts(guard, remainingPercent)) {
+      guardRemainingPercent = remainingPercent;
       guardPrefix = await readCodexModelPrefix(req);
       if (guardPrefix.aborted || res.destroyed) {
         log('codex_proxy_client_gone_during_model_read', {
@@ -307,16 +319,27 @@ export async function handleCodexProxy(req, res, {
         recordRejected(null, 'client_disconnected');
         return;
       }
-      if (!codexGuardAllowsModel(guardPrefix.model)) {
+      // The first `model` decides nothing on its own: everything the guard
+      // has read so far has to be something it can vouch for, or a body naming
+      // luna first and sol second would pass here and run sol upstream.
+      const violation = codexGuardAllowsModel(guardPrefix.model)
+        ? guardBodyViolation(guardPrefix.scanner)
+        : 'model_not_allowed';
+      if (violation) {
+        // The model the upstream would have run, which is the last one named,
+        // not the first — that is the one worth recording.
+        const recordedModel = guardPrefix.scanner.snapshot().model ?? guardPrefix.model;
         log('codex_proxy_model_restricted', {
           account_id: account.id,
           device_id: device.id,
-          model: guardPrefix.model,
+          model: recordedModel,
+          code: violation,
+          stage: 'head',
           remaining_percent: remainingPercent,
           threshold_percent: guard.threshold_percent,
         });
         recordRejected(403, 'model_restricted', {
-          model: guardPrefix.model,
+          model: recordedModel,
           requestBytes: guardPrefix.bytes,
         });
         // The body was only read far enough to find the model, so the rest of
@@ -326,11 +349,7 @@ export async function handleCodexProxy(req, res, {
         res.once('finish', () => {
           if (!req.destroyed) req.destroy();
         });
-        sendJson(res, 403, errorBody(
-          'permission_error',
-          `account weekly quota is ${remainingPercent}% remaining, below this account's ${guard.threshold_percent}% guard; only "${CODEX_GUARD_MODEL_KEYWORD}" models are allowed until it recovers `
-          + `(该账号周额度剩余 ${remainingPercent}%，低于设定的 ${guard.threshold_percent}% 阈值，当前仅允许含 ${CODEX_GUARD_MODEL_KEYWORD} 的模型)`,
-        ), { Connection: 'close' });
+        sendJson(res, 403, guardRefusalBody(), { Connection: 'close' });
         return;
       }
     }
@@ -475,6 +494,10 @@ export async function handleCodexProxy(req, res, {
   // Set by whichever failure got there first, so a response that finishes after
   // the fact is not recorded as a clean turn.
   let pendingOutcome = null;
+  // When the guard stops a body partway through, the metadata tee has only seen
+  // the head and would record the first model named. The one worth recording
+  // is the one that got the body stopped.
+  let guardRecordedModel = null;
 
   const finalizeMetric = (outcome, statusCode = upstreamStatus) => {
     if (metricFinalized) return;
@@ -531,7 +554,7 @@ export async function handleCodexProxy(req, res, {
       memberLabel: device.member_label,
       accountId: account.id,
       accountAlias: account.alias,
-      model: metadata.model ?? null,
+      model: guardRecordedModel ?? metadata.model ?? null,
       stream: typeof metadata.stream === 'boolean' ? metadata.stream : null,
       statusCode: Number.isInteger(statusCode) ? statusCode : null,
       outcome,
@@ -748,6 +771,47 @@ export async function handleCodexProxy(req, res, {
   });
 
   requestMetadata.stream.pipe(requestLimit.stream).pipe(upstreamReq);
+
+  // While the guard is biting, the rest of the body is scanned on its way past
+  // and a chunk is only forwarded once it has been cleared. A chunk that
+  // carries a second `model`, or syntax this parser cannot follow, is withheld:
+  // the upstream is left with an incomplete body it cannot run, and is torn
+  // down here before it could.
+  let guardTail = null;
+  if (guardPrefix && !guardPrefix.ended) {
+    guardTail = createCodexGuardTail(guardPrefix.scanner);
+    guardTail.once('error', (error) => {
+      req.unpipe(guardTail);
+      if (metricFinalized) return;
+      guardRecordedModel = guardPrefix.scanner.snapshot().model ?? guardPrefix.model;
+      log('codex_proxy_model_restricted', {
+        account_id: account.id,
+        device_id: device.id,
+        model: guardRecordedModel,
+        code: error?.code ?? 'unknown',
+        stage: 'body',
+        remaining_percent: guardRemainingPercent,
+        threshold_percent: guard.threshold_percent,
+      });
+      pendingOutcome = 'model_restricted';
+      // Finalized before the upstream is destroyed, so the 'error' that
+      // destruction raises finds the metric already written and stays quiet
+      // instead of recording a 502.
+      finalizeMetric('model_restricted', 403);
+      upstreamReq.destroy();
+      requestMetadata.stream.destroy();
+      if (!res.headersSent) {
+        res.once('finish', () => {
+          if (!req.destroyed) req.destroy();
+        });
+        sendJson(res, 403, guardRefusalBody(), { Connection: 'close' });
+      } else if (!res.destroyed) {
+        res.destroy();
+      }
+    });
+    guardTail.pipe(requestMetadata.stream);
+  }
+
   if (guardPrefix?.head) {
     // The bytes the guard consumed while looking for `model` go back in front
     // of the body, before anything else is written, so the upstream sees the
@@ -763,6 +827,6 @@ export async function handleCodexProxy(req, res, {
     // timeout rather than fail.
     requestMetadata.stream.end();
   } else {
-    req.pipe(requestMetadata.stream);
+    req.pipe(guardTail ?? requestMetadata.stream);
   }
 }
