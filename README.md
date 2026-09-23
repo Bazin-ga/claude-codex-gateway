@@ -150,7 +150,7 @@ centre's `refresh_token` means asking a human to log in again. Losing the consol
 - **Split planes.** Control plane private; only token-authenticated data planes public. The
   Claude gateway allowlists paths, strips the device authorization header before attaching the
   provider credential, rate-limits failed authentication by source IP, and applies per-device
-  request budgets (and a concurrency cap, when configured).
+  request-rate and concurrency caps when configured.
 - **Separated request telemetry, reliable rounds, and API diagnostics.** The Claude gateway persists request metadata
   and separate input, cache-creation input, cache-read input, and output token counts for shared
   metrics. The body-free metrics page progressively enhances its server-rendered fallback with a

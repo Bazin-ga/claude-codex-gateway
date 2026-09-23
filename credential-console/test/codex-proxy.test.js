@@ -10,7 +10,15 @@ import {
   handleCodexProxy,
   readPublishedCodexCredential,
 } from '../lib/codex-proxy.js';
-import { DEVICE_CONCURRENCY_LIMIT, deviceConcurrency, parseDeviceConcurrencyLimit } from '../lib/proxy.js';
+import {
+  DEVICE_CONCURRENCY_LIMIT,
+  DEVICE_REQUEST_LIMIT,
+  deviceConcurrency,
+  deviceRequests,
+  parseDeviceConcurrencyLimit,
+  parseDeviceRequestLimit,
+  rateLimited,
+} from '../lib/proxy.js';
 import { CodexQuotaSignal } from '../lib/codex-quota-signal.js';
 import { normalizeModelBlockRules } from '../lib/model-block-rules.js';
 
@@ -1373,4 +1381,55 @@ test('the concurrency cap is off unless a positive integer is configured', async
   });
   assert.equal(await read({ CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT: '12' }), '12');
   assert.equal(await read({ CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT: '' }), 'Infinity');
+});
+
+test('one device is not capped at 120 requests a minute by default', async (t) => {
+  // Its own device, so no other test's traffic is counted against it.
+  const device = { ...DEVICE, id: 'device-codex-request-budget' };
+  const account = codexAccount(await credentialHome(t));
+  const store = {
+    ...storeFixture(account),
+    deviceByToken(token) { return token === DEVICE_TOKEN ? device : null; },
+    resolveDeviceAccount() { return { device, account, effective_account_id: account.id }; },
+  };
+  const { proxyUrl } = await startHarness(t, { store, upstreamHandler: sseUpstream() });
+
+  assert.equal(DEVICE_REQUEST_LIMIT.max, Number.POSITIVE_INFINITY, 'no budget unless one is configured');
+  // Well past the old 120, inside one window, in batches so the test is quick.
+  const total = 150;
+  const statuses = [];
+  for (let sent = 0; sent < total; sent += 25) {
+    const batch = await Promise.all(Array.from({ length: 25 }, () => post(proxyUrl, '{}')));
+    for (const response of batch) {
+      statuses.push(response.status);
+      await response.text();
+    }
+  }
+  assert.equal(statuses.length, total);
+  assert.deepEqual([...new Set(statuses)], [200], 'every request reached upstream; none was refused locally');
+  assert.equal(deviceRequests.has(device.id), false, 'an uncapped budget keeps no per-device bookkeeping');
+});
+
+test('a finite budget is still enforced, and the request cap is off unless configured', async () => {
+  // The same limiter guards failed authentication by source IP; that stays on.
+  const bucket = new Map();
+  const limit = { windowMs: 60_000, max: 3 };
+  const verdicts = Array.from({ length: 5 }, () => rateLimited(bucket, 'key', limit));
+  assert.deepEqual(verdicts, [false, false, false, true, true]);
+  assert.equal(rateLimited(new Map(), 'key', { windowMs: 60_000, max: Number.POSITIVE_INFINITY }), false);
+
+  for (const value of [undefined, '', '0', '-1', '1.5', 'many']) {
+    assert.equal(parseDeviceRequestLimit(value), Number.POSITIVE_INFINITY, `value ${value}`);
+  }
+  assert.equal(parseDeviceRequestLimit('120'), 120);
+
+  const { execFile } = await import('node:child_process');
+  const read = (env) => new Promise((resolve, reject) => {
+    execFile(process.execPath, ['--no-warnings', '--input-type=module', '-e',
+      "const m = await import('./lib/proxy.js'); process.stdout.write(String(m.DEVICE_REQUEST_LIMIT.max));"],
+    { cwd: new URL('..', import.meta.url), env: { ...process.env, ...env } },
+    (error, stdout) => (error ? reject(error) : resolve(stdout)));
+  });
+  assert.equal(await read({ CREDENTIAL_CONSOLE_DEVICE_REQUEST_LIMIT_PER_MINUTE: '120' }), '120');
+  assert.equal(await read({ CREDENTIAL_CONSOLE_DEVICE_REQUEST_LIMIT_PER_MINUTE: '' }), 'Infinity');
 });
