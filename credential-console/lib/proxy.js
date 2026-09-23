@@ -48,7 +48,31 @@ export const CONVERSATION_PREFIX_BYTES = Math.min(
 );
 export const AUTH_FAILURE_LIMIT = { windowMs: 60_000, max: 30 };
 export const DEVICE_REQUEST_LIMIT = { windowMs: 60_000, max: 120 };
-export const DEVICE_CONCURRENCY_LIMIT = 8;
+/**
+ * Parse the optional per-device concurrency cap.
+ *
+ * Unset, empty, `0`, or anything that is not a positive integer means no cap.
+ * The cap used to be a fixed 8, shared by the Claude, Codex, and Bedrock routes
+ * of one device, and a single agent fanning out sub-agents crosses that
+ * routinely: on the Singapore console it produced over ten thousand 429s in two
+ * weeks, nearly all from two devices, while the per-device request budget
+ * above almost never fired. That budget still bounds how fast a device can
+ * start requests; this knob exists only so an operator can put a ceiling back
+ * without a code deploy if one device ever threatens the host.
+ *
+ * @param {string|undefined} value
+ * @returns {number} a positive integer, or Infinity for "no cap"
+ */
+export function parseDeviceConcurrencyLimit(value) {
+  const text = String(value ?? '').trim();
+  if (!/^\d+$/.test(text)) return Number.POSITIVE_INFINITY;
+  const limit = Number(text);
+  return Number.isSafeInteger(limit) && limit > 0 ? limit : Number.POSITIVE_INFINITY;
+}
+
+export const DEVICE_CONCURRENCY_LIMIT = parseDeviceConcurrencyLimit(
+  process.env.CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT,
+);
 export const authFailures = new Map();
 export const deviceRequests = new Map();
 export const deviceConcurrency = new Map();

@@ -59,7 +59,7 @@ V1 implements:
   being filed under a machine — see [Machine inventory](#machine-inventory);
 - a public-capable streaming Claude gateway limited to `/v1/messages`,
   `/v1/messages/count_tokens`, and `/v1/models`, with failed-authentication, per-device rate,
-  and per-device concurrency limits;
+  and an optional per-device concurrency cap (off by default);
 - macOS/Linux and Windows profile instructions shown once at enrollment;
 - read-only import and expiry/health display for one or more existing
   `codex-credential` homes;
@@ -643,7 +643,7 @@ the synchronous command hook may nevertheless add bounded delay while that failu
   the provider credential. `GET /claude/api/hello` is an unauthenticated health probe that
   returns a fixed response; every other path requires a valid device token.
 - The public gateway rate-limits failed authentication by source IP and applies per-device
-  request and concurrency budgets after authentication.
+  request budgets (and a concurrency cap, when configured) after authentication.
 - Prompt and response bodies are streamed; eligible Claude API turns are permanently retained in the
   captured-turn archive and visible to every console-reachable member, while routing, model, status,
   timing, and byte-count metadata remains visible on `/metrics`. Codex traffic is outside capture.
@@ -678,6 +678,7 @@ retain an emergency service-stop and provider-token revocation procedure.
 | `CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT` | — | Root for isolated, automatically refreshed homes of newly authorized Codex gateway accounts. Existing imports outside the root remain read-only |
 | `CREDENTIAL_CONSOLE_CODEX_MANAGED_REFRESH_INTERVAL_SECONDS` | `21600` | Interval for checking every console-managed Codex home; the refresh centre itself skips credentials that are not near expiry |
 | `CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS` | `3600000` | Provider quota refresh interval (minimum 60 seconds) |
+| `CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT` | — (no cap) | Optional ceiling on one device's in-flight gateway requests, counted across its Claude, Codex, and Bedrock routes together. Unset or `0` means unlimited; a device that exceeds a configured cap gets `429` with `Retry-After: 1`. The per-device request budget (120 per minute) applies either way |
 
 Quota polling calls the read-only provider endpoints used behind Claude Code and Codex status
 surfaces; it does not submit a model turn. Normalized snapshots are stored in mode-600

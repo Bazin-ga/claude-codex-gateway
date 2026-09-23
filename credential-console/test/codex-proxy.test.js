@@ -10,7 +10,7 @@ import {
   handleCodexProxy,
   readPublishedCodexCredential,
 } from '../lib/codex-proxy.js';
-import { DEVICE_CONCURRENCY_LIMIT, deviceConcurrency } from '../lib/proxy.js';
+import { DEVICE_CONCURRENCY_LIMIT, deviceConcurrency, parseDeviceConcurrencyLimit } from '../lib/proxy.js';
 import { CodexQuotaSignal } from '../lib/codex-quota-signal.js';
 import { normalizeModelBlockRules } from '../lib/model-block-rules.js';
 
@@ -561,7 +561,10 @@ test('a client that gives up while the credential is being read leaks nothing', 
   t.after(async () => { await Promise.all([close(proxy), close(upstream)]); });
 
   const before = deviceConcurrency.get(DEVICE.id) ?? 0;
-  const attempts = DEVICE_CONCURRENCY_LIMIT + 2;
+  // Two more than the cap this console shipped with for years. There is no cap
+  // by default now, but an operator can configure one, and a stranded slot
+  // would bring that cap forward by one each time.
+  const attempts = 10;
   for (let i = 0; i < attempts; i += 1) {
     const controller = new AbortController();
     const pending = post(proxyUrl, '{}', {}, controller.signal).catch(() => {});
@@ -1315,4 +1318,59 @@ test('a biting low-quota guard and a block rule each give their own refusal', as
 
   await waitFor(() => metrics.rows.length >= 3 && metrics.rows);
   assert.deepEqual(metrics.rows.slice(0, 2).map((row) => row.outcome), ['model_blocked', 'model_restricted']);
+});
+
+test('one device is not capped at eight in-flight requests by default', async (t) => {
+  // Its own device, so the per-device request budget other tests in this file
+  // draw on cannot make this one flaky.
+  const device = { ...DEVICE, id: 'device-codex-fanout' };
+  const account = codexAccount(await credentialHome(t));
+  const store = {
+    ...storeFixture(account),
+    deviceByToken(token) { return token === DEVICE_TOKEN ? device : null; },
+    resolveDeviceAccount() { return { device, account, effective_account_id: account.id }; },
+  };
+  const parallel = 16;
+  let arrived = 0;
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const { proxyUrl } = await startHarness(t, {
+    store,
+    upstreamHandler: (req, res) => {
+      arrived += 1;
+      // Hold every response open until all of them are in flight at once.
+      held.then(() => sseUpstream()(req, res));
+    },
+  });
+
+  assert.equal(DEVICE_CONCURRENCY_LIMIT, Number.POSITIVE_INFINITY, 'no cap unless one is configured');
+  const pending = Array.from({ length: parallel }, () => post(proxyUrl, '{}'));
+  await waitFor(() => arrived === parallel);
+  assert.equal(deviceConcurrency.get(device.id), parallel, 'every request holds a slot at the same time');
+  release();
+  const responses = await Promise.all(pending);
+  for (const response of responses) {
+    assert.equal(response.status, 200);
+    await response.text();
+  }
+  await waitFor(() => !deviceConcurrency.has(device.id));
+});
+
+test('the concurrency cap is off unless a positive integer is configured', async () => {
+  for (const value of [undefined, '', '  ', '0', '-3', '2.5', 'eight', '1e3', '99999999999999999999']) {
+    assert.equal(parseDeviceConcurrencyLimit(value), Number.POSITIVE_INFINITY, `value ${value}`);
+  }
+  assert.equal(parseDeviceConcurrencyLimit('8'), 8);
+  assert.equal(parseDeviceConcurrencyLimit(' 32 '), 32);
+
+  // And the environment variable is what the proxies actually read.
+  const { execFile } = await import('node:child_process');
+  const read = (env) => new Promise((resolve, reject) => {
+    execFile(process.execPath, ['--no-warnings', '--input-type=module', '-e',
+      "const m = await import('./lib/proxy.js'); process.stdout.write(String(m.DEVICE_CONCURRENCY_LIMIT));"],
+    { cwd: new URL('..', import.meta.url), env: { ...process.env, ...env } },
+    (error, stdout) => (error ? reject(error) : resolve(stdout)));
+  });
+  assert.equal(await read({ CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT: '12' }), '12');
+  assert.equal(await read({ CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT: '' }), 'Infinity');
 });
