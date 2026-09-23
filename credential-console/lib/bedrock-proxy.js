@@ -14,6 +14,7 @@ import {
   sourceIp,
   unavailableUsage,
 } from './proxy.js';
+import { modelBlockMessage, modelBlockRuleFor } from './model-block-rules.js';
 
 /**
  * The Bedrock data proxy: a device token in, one metered Converse turn out.
@@ -235,6 +236,22 @@ export async function handleBedrockProxy(req, res, {
     });
     record({ statusCode: 403, outcome: 'rejected', model: route.modelId });
     sendJson(res, 403, errorBody(`this account may only invoke ${pin.model_id}`));
+    return;
+  }
+  // The console-wide block rules apply here too. The model is in the path, so
+  // unlike the streaming gateways there is no body to read to find it.
+  const blockRule = typeof store.modelBlockRules === 'function'
+    ? modelBlockRuleFor(store.modelBlockRules(), route.modelId)
+    : null;
+  if (blockRule) {
+    log('bedrock_proxy_model_blocked', {
+      account_id: account.id,
+      device_id: device.id,
+      model: route.modelId,
+      rule_id: blockRule.id,
+    });
+    record({ statusCode: 403, outcome: 'model_blocked', model: route.modelId });
+    sendJson(res, 403, errorBody(modelBlockMessage(blockRule, route.modelId)));
     return;
   }
 

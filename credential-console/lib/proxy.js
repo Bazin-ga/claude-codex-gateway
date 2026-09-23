@@ -17,6 +17,17 @@ import {
   createResponseContentAssembler,
 } from './response-content.js';
 import { createResponseUsageParser } from './response-usage.js';
+import {
+  createModelGateTail,
+  createModelJudge,
+  modelHeadRefusal,
+  readModelPrefix,
+} from './model-gate.js';
+import {
+  MODEL_POLICY_UNCHECKABLE_MESSAGE,
+  anyModelBlockRuleEnabled,
+  modelBlockMessage,
+} from './model-block-rules.js';
 
 const ALLOWED_PATHS = new Set([
   '/v1/messages',
@@ -324,7 +335,7 @@ export async function handleClaudeProxy(req, res, {
       accountId = device.selected_account_id;
     }
   }
-  const recordRejected = (statusCode, outcome = 'rejected') => {
+  const recordRejected = (statusCode, outcome = 'rejected', extra = {}) => {
     enqueueMetricSafely(requestMetrics, {
       startedAtMs: authenticatedAtMs,
       method: req.method ?? 'UNKNOWN',
@@ -344,6 +355,7 @@ export async function handleClaudeProxy(req, res, {
       responseBytes: 0,
       upstreamRequestId: null,
       ...unavailableUsage(),
+      ...extra,
     }, { accountId, deviceId: device.id });
   };
   if (accountResolutionError) {
@@ -374,6 +386,69 @@ export async function handleClaudeProxy(req, res, {
     recordRejected(404);
     sendJson(res, 404, { type: 'error', error: { type: 'not_found_error', message: 'unsupported gateway path' } });
     return;
+  }
+
+  // The console-wide model block rules, evaluated before anything is acquired.
+  // Only an inference call is judged — counting tokens against a blocked model
+  // costs nothing and refusing it would only break the client's bookkeeping —
+  // and with no rule switched on the body is not touched at all.
+  const blockRules = upstreamPath === '/v1/messages' && typeof store.modelBlockRules === 'function'
+    ? store.modelBlockRules()
+    : [];
+  const judge = createModelJudge({ rules: blockRules });
+  const refusalBody = (refusal) => ({
+    type: 'error',
+    error: {
+      type: 'permission_error',
+      message: refusal.code === 'model_blocked'
+        ? modelBlockMessage(refusal.rule, refusal.model)
+        : MODEL_POLICY_UNCHECKABLE_MESSAGE,
+    },
+  });
+  const logRefusal = (refusal, model, stage) => {
+    log('claude_proxy_model_blocked', {
+      account_id: account.id,
+      device_id: device.id,
+      model,
+      code: refusal.code,
+      rule_id: refusal.rule?.id ?? null,
+      stage,
+    });
+  };
+  let gatePrefix = null;
+  if (anyModelBlockRuleEnabled(blockRules)) {
+    gatePrefix = await readModelPrefix(req);
+    // This is the only await before the listeners that free resources are
+    // registered, so a client that left while it was pending is caught here
+    // or not at all. A body read to its end leaves `req.destroyed` true on
+    // the successful path, which is why that flag only counts when it was not.
+    if (gatePrefix.aborted || res.destroyed || (!gatePrefix.ended && req.destroyed)) {
+      log('claude_proxy_client_gone_during_model_read', {
+        account_id: account.id,
+        device_id: device.id,
+      });
+      recordRejected(null, 'client_disconnected');
+      return;
+    }
+    // Everything read so far has to be something the gate can vouch for, not
+    // just the first `model`: a body naming an allowed model and then a
+    // blocked one would otherwise pass here and run the blocked one upstream.
+    const refusal = modelHeadRefusal(gatePrefix, judge);
+    if (refusal) {
+      const recordedModel = gatePrefix.scanner.snapshot().model ?? gatePrefix.model;
+      logRefusal(refusal, recordedModel, 'head');
+      recordRejected(403, 'model_blocked', {
+        model: recordedModel,
+        requestBytes: gatePrefix.bytes,
+      });
+      // The rest of an upload nobody will forward is still arriving; closing
+      // the connection is what stops it.
+      res.once('finish', () => {
+        if (!req.destroyed) req.destroy();
+      });
+      sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+      return;
+    }
   }
 
   let credential;
@@ -496,6 +571,10 @@ export async function handleClaudeProxy(req, res, {
   let retryTimer = null;
   let attemptsUsed = 0;
   let retryBackoffMs = RETRY_BASE_DELAY_MS;
+  // When the gate stops a body partway through, the metadata tee has only seen
+  // the head and would record the first model named. The one worth recording
+  // is the one that got the body stopped.
+  let gateRecordedModel = null;
 
   const nextRetryDelayMs = (retryAfterHeader) => {
     const backoff = retryBackoffMs;
@@ -543,7 +622,7 @@ export async function handleClaudeProxy(req, res, {
       memberLabel: device.member_label,
       accountId: account.id,
       accountAlias: account.alias,
-      model: metadata.model ?? null,
+      model: gateRecordedModel ?? metadata.model ?? null,
       stream: typeof metadata.stream === 'boolean' ? metadata.stream : null,
       statusCode: Number.isInteger(statusCode) ? statusCode : null,
       outcome,
@@ -822,6 +901,8 @@ export async function handleClaudeProxy(req, res, {
     if (error.code !== 'ERR_REQUEST_BODY_TOO_LARGE') return;
     pendingOutcome = 'request_too_large';
     req.unpipe(requestMetadata.stream);
+    // Declared further down; by the time a body can overflow it is assigned.
+    if (gateTail) req.unpipe(gateTail);
     requestMetadata.stream.destroy();
     if (res.writableFinished) {
       finalizeMetric(pendingOutcome, upstreamStatus);
@@ -836,5 +917,53 @@ export async function handleClaudeProxy(req, res, {
   });
 
   const initialUpstreamReq = sendUpstream(null);
-  req.pipe(requestMetadata.stream).pipe(requestLimit.stream).pipe(bodyAccumulator).pipe(initialUpstreamReq);
+  requestMetadata.stream.pipe(requestLimit.stream).pipe(bodyAccumulator).pipe(initialUpstreamReq);
+
+  // While a block rule is on, the rest of the body is scanned on its way past
+  // and a chunk is only forwarded once it has been cleared. A refused chunk is
+  // withheld, so the upstream holds an incomplete body it cannot run, and the
+  // request is torn down before it could. The body never finishes, so the
+  // overload retry — which replays only a finished body — cannot resend it.
+  let gateTail = null;
+  if (gatePrefix && !gatePrefix.ended) {
+    gateTail = createModelGateTail(gatePrefix.scanner, judge);
+    gateTail.once('error', (error) => {
+      req.unpipe(gateTail);
+      if (metricFinalized) return;
+      const refusal = error?.refusal ?? { code: error?.code ?? 'unknown' };
+      gateRecordedModel = gatePrefix.scanner.snapshot().model ?? gatePrefix.model;
+      logRefusal(refusal, gateRecordedModel, 'body');
+      pendingOutcome = 'model_blocked';
+      cancelPendingRetry();
+      // Finalized before the upstream is destroyed, so the 'error' that
+      // destruction raises finds the metric already written and stays quiet
+      // instead of recording a 502.
+      finalizeMetric('model_blocked', 403);
+      if (currentUpstreamReq && !currentUpstreamReq.destroyed) currentUpstreamReq.destroy();
+      requestMetadata.stream.destroy();
+      if (!res.headersSent) {
+        res.once('finish', () => {
+          if (!req.destroyed) req.destroy();
+        });
+        sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+      } else if (!res.destroyed) {
+        res.destroy();
+      }
+    });
+    gateTail.pipe(requestMetadata.stream);
+  }
+
+  if (gatePrefix?.head) {
+    // The bytes the gate consumed while looking for `model` go back in front
+    // of the body, before anything else is written, so the upstream sees the
+    // request exactly as the client sent it.
+    requestMetadata.stream.write(gatePrefix.head);
+  }
+  if (gatePrefix?.ended) {
+    // The gate read the whole body. Piping an already-ended stream would wait
+    // forever for a 'data' or 'end' that has already happened.
+    requestMetadata.stream.end();
+  } else {
+    req.pipe(gateTail ?? requestMetadata.stream);
+  }
 }
