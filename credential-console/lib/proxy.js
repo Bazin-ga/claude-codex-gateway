@@ -47,29 +47,38 @@ export const CONVERSATION_PREFIX_BYTES = Math.min(
   Math.floor(captureBudget.maxBytes() / CAPTURE_MEMORY_AMPLIFICATION),
 );
 export const AUTH_FAILURE_LIMIT = { windowMs: 60_000, max: 30 };
-export const DEVICE_REQUEST_LIMIT = { windowMs: 60_000, max: 120 };
 /**
- * Parse the optional per-device concurrency cap.
+ * Parse an optional per-device cap from the environment.
  *
  * Unset, empty, `0`, or anything that is not a positive integer means no cap.
- * The cap used to be a fixed 8, shared by the Claude, Codex, and Bedrock routes
- * of one device, and a single agent fanning out sub-agents crosses that
- * routinely: on the Singapore console it produced over ten thousand 429s in two
- * weeks, nearly all from two devices, while the per-device request budget
- * above almost never fired. That budget still bounds how fast a device can
- * start requests; this knob exists only so an operator can put a ceiling back
- * without a code deploy if one device ever threatens the host.
+ *
+ * Both per-device gateway caps are off by default. The concurrency cap used to
+ * be a fixed 8, shared by the Claude, Codex, and Bedrock routes of one device;
+ * an agent fanning out sub-agents crossed it routinely, and on the Singapore
+ * console it produced over ten thousand 429s in two weeks. The request budget
+ * used to be a fixed 120 per minute, and once concurrency was uncapped it was
+ * the next wall the same agents would reach. Each knob exists only so an
+ * operator can put a ceiling back without a code deploy if one device ever
+ * threatens the host. Failed-authentication limiting by source IP is separate
+ * and unaffected.
  *
  * @param {string|undefined} value
  * @returns {number} a positive integer, or Infinity for "no cap"
  */
-export function parseDeviceConcurrencyLimit(value) {
+function parseOptionalDeviceCap(value) {
   const text = String(value ?? '').trim();
   if (!/^\d+$/.test(text)) return Number.POSITIVE_INFINITY;
   const limit = Number(text);
   return Number.isSafeInteger(limit) && limit > 0 ? limit : Number.POSITIVE_INFINITY;
 }
 
+export const parseDeviceConcurrencyLimit = parseOptionalDeviceCap;
+export const parseDeviceRequestLimit = parseOptionalDeviceCap;
+
+export const DEVICE_REQUEST_LIMIT = {
+  windowMs: 60_000,
+  max: parseDeviceRequestLimit(process.env.CREDENTIAL_CONSOLE_DEVICE_REQUEST_LIMIT_PER_MINUTE),
+};
 export const DEVICE_CONCURRENCY_LIMIT = parseDeviceConcurrencyLimit(
   process.env.CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT,
 );
@@ -250,6 +259,8 @@ export function sourceIp(req) {
 }
 
 export function rateLimited(bucket, key, limit) {
+  // An uncapped budget needs no bookkeeping: counting would only grow the map.
+  if (limit.max === Number.POSITIVE_INFINITY) return false;
   const now = Date.now();
   const record = bucket.get(key);
   if (!record || now - record.since > limit.windowMs) {
