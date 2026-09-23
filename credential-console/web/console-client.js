@@ -26,7 +26,7 @@ const translations = {
   'waiting-owner': '等待账号所有者录入',
   'owner-add-once': '账号所有者只需在下方管理员区录入一次，之后所有成员都能自行领取。',
   'codex-description': 'refresh center 会持续轮换主凭据。领取不依赖内网的单文件安装器与独立设备 token。',
-  'get-codex': '领取 Codex 安装脚本',
+  'get-codex-gateway': '领取 Codex 配置',
   'codex-unavailable': 'Codex 自助登记尚未配置。管理员需要连接 dispenser enrollment。',
   'admin-zone': '管理员区',
   'admin-heading': '账号、设备与特殊登记',

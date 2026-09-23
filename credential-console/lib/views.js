@@ -3773,7 +3773,6 @@ export function dashboardView({
   csrf,
   adminIdentity = null,
   openMode = false,
-  codexSelfServiceReady = false,
   claudeGatewayUrl = null,
   onboardingUrl = null,
   error = null,
@@ -3843,7 +3842,6 @@ export function dashboardView({
     conversationHookUpgrade = '';
   }
   const codexAccounts = accounts.filter((account) => account.provider === 'codex');
-  const primaryCodex = codexAccounts[0] ?? null;
   // Every gateway-capable Codex account is offered on the panel, not just the
   // first — a member picks one exactly as they do for Claude.
   const codexGatewayAccounts = codexAccounts.filter((account) => (
@@ -4142,17 +4140,6 @@ export function dashboardView({
               <label><span data-i18n="device-name">Device name</span><input disabled data-placeholder-en="Available after account enrollment" data-placeholder-zh="账号录入后即可填写" placeholder="Available after account enrollment"></label>
               <div><button type="button" disabled data-i18n="waiting-owner">Waiting for account owner</button></div>
             </div><p class="muted tiny" data-i18n="owner-add-once">An account owner adds it once below; every member can then self-serve.</p>`}
-            ${codexSelfServiceReady && primaryCodex ? `<hr>
-            <h3 data-i18n="codex-dispenser-heading">Or pull a local credential (dispenser)</h3>
-            <p class="muted tiny">The dispenser installer pulls a credential and talks to chatgpt.com directly, so those turns are not metered here.</p>
-            <form method="post" action="/codex/self-service" class="member-form codex-form${memberFormClass}" data-persist-draft="codex-self-service">
-              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-              ${memberLabelField}
-              <label><span data-i18n="device-name">Device name</span>
-                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
-              </label>
-              <div><button type="submit" data-i18n="get-codex">Get Codex installer</button></div>
-            </form>` : ''}
           </article>
           ${bedrockAccounts.length ? `<article class="provider-card">
             <div class="provider-title"><h2>AWS Bedrock</h2>${bedrockUsableAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>

@@ -326,17 +326,22 @@ test('open mode issues Claude device configs with no login while still enforcing
   }
 });
 
-test('open mode self-serves a Codex installer keyed to the self-asserted member label', async () => {
+// The dispenser installer handed a machine the account's access token to use
+// against chatgpt.com directly -- invisible to this console, so unmetered and
+// out of reach of the low-quota guard. It is retired. What this pins down is
+// that it stays retired even on a deployment that still has every dispenser
+// setting in place, which is exactly the state the Singapore console is in.
+test('the dispenser installer is retired: no button, and the route mints nothing', async () => {
   const enrollmentRequests = [];
   const app = await fixture({
-    adminAuth: 'open',
+    adminAuth: 'tailscale',
     codex: {
       codexEndpoint: 'https://203.0.113.10:8443',
       codexCertPin: 'a'.repeat(64),
       codexEnrollmentKey: 'test-enrollment-key-long-enough',
       codexEnroll: async (request) => {
         enrollmentRequests.push(request);
-        return { name: request.name, token: 'codex-open-device-token' };
+        return { name: request.name, token: 'codex-device-token-shown-once' };
       },
     },
   });
@@ -346,104 +351,44 @@ test('open mode self-serves a Codex installer keyed to the self-asserted member 
       alias: 'codex-shared-1',
       external: { kind: 'codex-credential', home: '/missing-test-home' },
     });
-    await app.store.addAccount({
-      provider: 'claude',
-      alias: 'claude-open',
-      credential: { oauth_token: 'open-mode-master-token' },
+    const dashboardResponse = await fetch(`${app.baseUrl}/`, {
+      headers: { 'Tailscale-User-Login': 'member@example.com' },
     });
-    const dashboardResponse = await fetch(`${app.baseUrl}/`);
+    assert.equal(dashboardResponse.status, 200);
     const cookie = cookieFrom(dashboardResponse);
     const dashboard = await dashboardResponse.text();
-    assert.match(dashboard, /Get Codex installer/);
-    // Every available self-service form carries the label. This imported Codex
-    // home is deliberately missing, so the gateway form fails closed while the
-    // independently configured dispenser installer remains available.
-    assert.doesNotMatch(dashboard, /Get Codex setup/);
-    assert.equal((dashboard.match(/name="member_label" required pattern=/g) ?? []).length, 2);
-    const csrf = csrfFrom(dashboard);
+    assert.equal(dashboard.includes('action="/codex/self-service"'), false, 'the old form is gone');
+    assert.equal(dashboard.includes('Get Codex installer'), false);
 
-    const missingLabel = await fetch(`${app.baseUrl}/codex/self-service`, {
+    // A page loaded before the change, or a hand-built request, still has to
+    // be refused -- a hidden button over a live route is not a retirement.
+    const attempt = await fetch(`${app.baseUrl}/codex/self-service`, {
       method: 'POST',
       redirect: 'manual',
-      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ csrf, device_name: 'open-laptop' }),
-    });
-    assert.equal(missingLabel.status, 303);
-    assert.equal(enrollmentRequests.length, 0);
-
-    const enrollment = await fetch(`${app.baseUrl}/codex/self-service`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ csrf, device_name: 'open-laptop', member_label: 'dana' }),
-    });
-    assert.equal(enrollment.status, 200);
-    const html = await enrollment.text();
-    assert.match(html, /install-codex-codex-shared-1-macos\.sh/);
-    assert.match(html, /install-codex-codex-shared-1-windows\.ps1/);
-    assert.match(html, /codex-open-device-token/);
-    assert.match(html, /No authentication: anyone who can reach this console/);
-    assert.equal(html.includes('test-enrollment-key-long-enough'), false);
-    assert.equal(enrollmentRequests.length, 1);
-    const suffix = createHash('sha256').update('dana').digest('hex').slice(0, 10);
-    assert.equal(enrollmentRequests[0].name, `open-laptop-${suffix}`);
-  } finally {
-    await app.close();
-  }
-});
-
-test('two members who assert the same label and device name do not evict each other', async () => {
-  // The console's Codex path is the one place a member takes a credential without
-  // ever running the agent, so nothing on their machine can report a handle. It
-  // therefore used to send none, and the dispenser fell back to its pre-handle
-  // rule: revoke every active row of that name. The name is
-  // `<device>-<sha256(member label)[0:10]>` over a label that is self-asserted and
-  // unverified, so two people who both typed `alex` and `shared` silently kicked
-  // each other offline — exactly the defect the handle exists to fix.
-  const enrollmentRequests = [];
-  const app = await fixture({
-    adminAuth: 'open',
-    codex: {
-      codexEndpoint: 'https://203.0.113.10:8443',
-      codexCertPin: 'a'.repeat(64),
-      codexEnrollmentKey: 'test-enrollment-key-long-enough',
-      codexEnroll: async (request) => {
-        enrollmentRequests.push(request);
-        return { name: request.name, token: `codex-token-${enrollmentRequests.length}` };
+      headers: {
+        Cookie: cookie,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Tailscale-User-Login': 'member@example.com',
       },
-    },
-  });
-  try {
-    const page = await fetch(`${app.baseUrl}/`);
-    const cookie = cookieFrom(page);
-    const csrf = csrfFrom(await page.text());
-    const claim = () => fetch(`${app.baseUrl}/codex/self-service`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ csrf, device_name: 'shared', member_label: 'alex' }),
+      body: new URLSearchParams({ csrf: csrfFrom(dashboard), device_name: 'my-laptop' }),
     });
+    assert.equal(attempt.status, 303);
+    assert.match(decodeURIComponent(attempt.headers.get('location')), /retired.*Get Codex setup/);
+    assert.deepEqual(enrollmentRequests, [], 'nothing was enrolled with the dispenser');
 
-    assert.equal((await claim()).status, 200);
-    assert.equal((await claim()).status, 200);
-
-    // Same dispenser name, as before — the collision in the name is a property of
-    // an unverified label and is not what this fixes.
-    assert.equal(enrollmentRequests[0].name, enrollmentRequests[1].name);
-    // Different handles, which is what stops the dispenser revoking the first
-    // person's row when the second person asks.
-    for (const request of enrollmentRequests) {
-      assert.match(request.machineId, /^[A-Za-z0-9_-]{16,64}$/);
-    }
-    assert.notEqual(enrollmentRequests[0].machineId, enrollmentRequests[1].machineId);
-    // Nothing that authenticates is used as the handle, and no secret rides along.
-    for (const request of enrollmentRequests) {
-      assert.equal(request.machineId.includes('alex'), false);
-      assert.equal(request.machineId.includes('shared'), false);
-      assert.equal(request.machineId, request.machineId.trim());
-    }
+    // Nor may the setup guide point new machines at the dispenser.
+    const guide = await fetch(`${app.baseUrl}/onboarding.md`, {
+      headers: { Cookie: cookie, 'Tailscale-User-Login': 'member@example.com' },
+    });
+    assert.equal(guide.status, 200);
+    const text = await guide.text();
+    assert.equal(text.includes('203.0.113.10'), false, 'no dispenser endpoint in the guide');
+    assert.equal(text.includes('a'.repeat(64)), false, 'no dispenser pin in the guide');
   } finally {
     await app.close();
   }
 });
+
 
 test('an unset CREDENTIAL_CONSOLE_ADMIN_AUTH defaults to tailscale, not open', async () => {
   // The default is resolved when server.js is imported, so it can only be observed
@@ -1739,72 +1684,6 @@ test('open mode cannot bind an authorization session to the visitor who started 
   }
 });
 
-test('tailnet members can self-enroll Codex once and choose any platform installer', async () => {
-  const enrollmentRequests = [];
-  const app = await fixture({
-    adminAuth: 'tailscale',
-    codex: {
-      codexEndpoint: 'https://203.0.113.10:8443',
-      codexCertPin: 'a'.repeat(64),
-      codexEnrollmentKey: 'test-enrollment-key-long-enough',
-      codexEnroll: async (request) => {
-        enrollmentRequests.push(request);
-        return { name: request.name, token: 'codex-device-token-shown-once' };
-      },
-    },
-  });
-  try {
-    await app.store.addAccount({
-      provider: 'codex',
-      alias: 'codex-shared-1',
-      external: { kind: 'codex-credential', home: '/missing-test-home' },
-    });
-    const dashboardResponse = await fetch(`${app.baseUrl}/`, {
-      headers: { 'Tailscale-User-Login': 'member@example.com' },
-    });
-    assert.equal(dashboardResponse.status, 200);
-    const cookie = cookieFrom(dashboardResponse);
-    const dashboard = await dashboardResponse.text();
-    assert.match(dashboard, /Get Codex installer/);
-    assert.equal(dashboard.includes('name="platform"'), false);
-
-    const enrollment = await fetch(`${app.baseUrl}/codex/self-service`, {
-      method: 'POST',
-      headers: {
-        Cookie: cookie,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Tailscale-User-Login': 'member@example.com',
-      },
-      body: new URLSearchParams({
-        csrf: csrfFrom(dashboard),
-        device_name: 'team-laptop',
-      }),
-    });
-    assert.equal(enrollment.status, 200);
-    const html = await enrollment.text();
-    assert.match(html, /install-codex-codex-shared-1-macos\.sh/);
-    assert.match(html, /install-codex-codex-shared-1-linux\.sh/);
-    assert.match(html, /install-codex-codex-shared-1-windows\.ps1/);
-    assert.equal((html.match(/data-download-target=/g) ?? []).length, 3);
-    assert.match(html, /Download installer/);
-    assert.match(html, /codex-device-token-shown-once/);
-    assert.match(html, /https:\/\/203\.0\.113\.10:8443/);
-    assert.match(html, /FromBase64String/);
-    assert.equal(html.includes('/codex-agent/'), false);
-    assert.equal(html.includes('Invoke-WebRequest'), false);
-    assert.match(html, /chmod 600/);
-    assert.match(html, /Remove-Item -Force \$installer/);
-    assert.equal(enrollmentRequests.length, 1);
-    assert.match(enrollmentRequests[0].name, /^team-laptop-[a-f0-9]{10}$/);
-    assert.equal(enrollmentRequests[0].enrollmentKey, 'test-enrollment-key-long-enough');
-
-    const asset = await fetch(`${app.baseUrl}/codex-agent/pull.js`);
-    assert.equal(asset.status, 200);
-    assert.match(await asset.text(), /client-agent/);
-  } finally {
-    await app.close();
-  }
-});
 
 test('admin can add account, issue enrollment, proxy traffic, and revoke one device', async () => {
   const masterToken = 'sk-ant-oat01-claude-master-token-visible-only-to-the-upstream';

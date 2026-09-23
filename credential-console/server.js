@@ -74,7 +74,6 @@ import {
   enrollmentView,
   messageView,
   codexAuthorizationView,
-  codexConfiguredView,
   codexCredentialView,
   metricsView,
   conversationsView,
@@ -83,7 +82,6 @@ import {
   conversationSessionDetailView,
   conversationRoundDetailView,
 } from './lib/views.js';
-import { requestEnrollment as requestCodexEnrollment } from '../codex-credential/client-agent/enroll.js';
 
 const HOME = process.env.CREDENTIAL_CONSOLE_HOME ?? '/var/lib/credential-console';
 const BIND = process.env.CREDENTIAL_CONSOLE_BIND ?? '127.0.0.1';
@@ -104,9 +102,10 @@ const ADMIN_AUTH = process.env.CREDENTIAL_CONSOLE_ADMIN_AUTH ?? 'tailscale';
 // that a paste-a-key login path exists at all, and an empty registration form
 // on the other one still announces the mechanism to everyone who can reach it.
 const BEDROCK_ENABLED = process.env.CREDENTIAL_CONSOLE_BEDROCK_ENABLED === '1';
-const CODEX_ENDPOINT = process.env.CREDENTIAL_CONSOLE_CODEX_ENDPOINT;
-const CODEX_CERT_PIN = process.env.CREDENTIAL_CONSOLE_CODEX_CERT_PIN;
-const CODEX_ENROLLMENT_KEY_FILE = process.env.CREDENTIAL_CONSOLE_CODEX_ENROLLMENT_KEY_FILE;
+// CREDENTIAL_CONSOLE_CODEX_ENDPOINT, _CODEX_CERT_PIN and _CODEX_ENROLLMENT_KEY_FILE
+// are no longer read. They configured the console's side of dispenser
+// enrollment, which is retired (see the /codex/self-service route); leaving
+// them set in a unit file is harmless.
 // Setting this elevates the console from read-only importer to writer of that
 // codex-credential home. See README "Codex account authorization".
 const CODEX_SEED_HOME = process.env.CREDENTIAL_CONSOLE_CODEX_SEED_HOME;
@@ -426,13 +425,6 @@ export async function createCredentialConsole(options = {}) {
     && options.metricsChartRateLimit > 0
     ? options.metricsChartRateLimit
     : METRICS_CHART_RATE_LIMIT;
-  const codexEndpoint = options.codexEndpoint ?? CODEX_ENDPOINT;
-  const codexCertPin = options.codexCertPin ?? CODEX_CERT_PIN;
-  let codexEnrollmentKey = options.codexEnrollmentKey;
-  if (codexEnrollmentKey === undefined && CODEX_ENROLLMENT_KEY_FILE) {
-    codexEnrollmentKey = (await readFile(CODEX_ENROLLMENT_KEY_FILE, 'utf8')).trim();
-  }
-  const codexEnroll = options.codexEnroll ?? requestCodexEnrollment;
   // Canonical from here on, so it compares equal to the `resolve()`d home that
   // `cli.js import-codex` records against an account.
   const configuredSeedHome = options.codexSeedHome ?? CODEX_SEED_HOME ?? null;
@@ -467,7 +459,6 @@ export async function createCredentialConsole(options = {}) {
   codexManagedRefresher?.start?.();
   const claudeOauthExchange = options.claudeOauthExchange ?? exchangeClaudeAuthorization;
   const codexOauthExchange = options.codexOauthExchange ?? exchangeCodexAuthorization;
-  const codexSelfServiceReady = Boolean(codexEndpoint && codexCertPin && codexEnrollmentKey);
   const codexAgentAssets = Object.fromEntries(await Promise.all(
     [...CODEX_AGENT_ASSETS].map(async ([assetName, relativePath]) => [
       assetName,
@@ -1361,9 +1352,11 @@ export async function createCredentialConsole(options = {}) {
         consoleUrl: publicBaseUrl,
         claudeGatewayUrl,
         clientConfigVersion: CLIENT_CONFIG_VERSION,
+        // No dispenser endpoint or pin: the guide is read by setup agents, and
+        // handing them the address of a retired path is how new machines end
+        // up on it. Codex setup goes through the web page, which issues a
+        // gateway device.
         accounts: await accountsWithExternalStatus(),
-        codexEndpoint,
-        codexCertPin,
         adminAuth,
       });
       sendText(res, 200, markdown, 'text/markdown; charset=utf-8');
@@ -1699,7 +1692,6 @@ export async function createCredentialConsole(options = {}) {
         csrf: session.csrf,
         adminIdentity: session.admin_identity,
         openMode,
-        codexSelfServiceReady,
         claudeGatewayUrl,
         onboardingUrl,
         error: url.searchParams.get('error'),
@@ -1715,88 +1707,22 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    // Retired. This used to register a machine with the token dispenser, which
+    // hands it the account's access token to use against chatgpt.com directly:
+    // the console never sees those turns, so nothing here can meter them or hold
+    // them to the low-quota guard. Every Codex account is reachable through the
+    // gateway form instead, which can.
+    //
+    // Refused rather than deleted so a page loaded before the change, or a
+    // hand-built request, gets told where to go instead of a bare 404 -- and so
+    // it cannot quietly mint another machine on the path being wound down.
+    // Machines already enrolled keep pulling from the dispenser until they are
+    // revoked there; that is a separate, deliberate step.
     if (req.method === 'POST' && path === '/codex/self-service') {
-      const session = requireSession(req, res);
-      if (!session) return;
-      if (!openMode && !session.admin_identity) {
-        sendHtml(res, 403, messageView(
-          'Tailnet identity required',
-          'Codex self-service requires a Tailscale user identity.',
-          { error: true },
-        ));
-        return;
-      }
-      const identity = session.admin_identity ?? 'anonymous';
-      const form = await readForm(req).catch(() => ({}));
-      if (!checkCsrf(session, form)) {
-        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
-        return;
-      }
-      try {
-        if (!codexSelfServiceReady) throw new Error('Codex self-service is not configured');
-        const memberLabel = memberLabelFor(session, form);
-        const deviceName = String(form.device_name ?? '').trim();
-        if (!DEVICE_NAME_PATTERN.test(deviceName)) {
-          throw new Error('device name must use letters, numbers, dots, underscores, or hyphens');
-        }
-        const memberSuffix = createHash('sha256')
-          .update(memberLabel)
-          .digest('hex')
-          .slice(0, 10);
-        const machineName = `${deviceName.slice(0, 53)}-${memberSuffix}`;
-        // A handle per issuance, minted here because the machine cannot mint one
-        // for itself: the generated installer carries pull.js, not enroll.js, so
-        // a console-configured machine never reaches /enroll and never reports
-        // anything of its own.
-        //
-        // Without it every console row went to the dispenser with no handle, and
-        // the dispenser then applied its pre-handle rule: revoke every active row
-        // of that name. The name is `<device>-<sha256(member label)[0:10]>` and
-        // the label is self-asserted and unverified (D-010), so two people who
-        // both typed `alex` and `shared` produced the same name and silently
-        // evicted each other — exactly the defect the handle exists to fix, still
-        // fully live on the one member-facing Codex path.
-        //
-        // The cost, stated plainly: a member re-requesting a config for the same
-        // device gets a new handle too, so their previous console-minted token
-        // stays active instead of being revoked. That is deliberate. The console
-        // cannot tell "the same person again" from "a second person asserting the
-        // same label", and evicting the wrong one is silent while a surplus row
-        // is visible in the inventory and revocable with `add-client.js --revoke`.
-        const machineId = randomToken(24);
-        const codexAccount = store.publicAccounts().find((account) => account.provider === 'codex');
-        const issued = await codexEnroll({
-          endpoint: codexEndpoint,
-          enrollmentKey: codexEnrollmentKey,
-          pin: codexCertPin,
-          name: machineName,
-          machineId,
-        });
-        log('codex_device_self_enrolled', {
-          identity,
-          member_label: memberLabel,
-          device_name: deviceName,
-          dispenser_name: issued.name,
-          // Opaque and safe to log: it identifies this issuance's machine and
-          // nothing else. The minted token never appears here.
-          machine_id: machineId,
-        });
-        sendHtml(res, 200, codexConfiguredView({
-          deviceName,
-          token: issued.token,
-          endpoint: codexEndpoint,
-          certPin: codexCertPin,
-          profileName: codexAccount?.alias ?? 'codex-team',
-          assets: codexAgentAssets,
-          openMode,
-        }));
-      } catch (error) {
-        log('codex_device_self_enroll_failed', {
-          identity,
-          error: error.message,
-        });
-        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
-      }
+      log('codex_dispenser_self_service_refused', {});
+      redirect(res, `/?error=${encodeURIComponent(
+        'the local-credential Codex installer has been retired; use "Get Codex setup" instead',
+      )}`);
       return;
     }
 
