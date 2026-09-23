@@ -408,10 +408,10 @@ export async function handleCodexProxy(req, res, {
   // client went away while the awaits above were pending, `res` has already
   // emitted 'close' and every once() below would be waiting on an event that
   // cannot fire again: the concurrency slot would be taken and never released,
-  // and that Map is shared with the Claude proxy, so after
-  // DEVICE_CONCURRENCY_LIMIT such cancellations the device is 429'd on /claude
-  // too, until the process restarts. handleClaudeProxy is immune only because
-  // its credential read is synchronous.
+  // and that Map is shared with the Claude proxy, so with a concurrency cap
+  // configured, that many such cancellations 429 the device on /claude too,
+  // until the process restarts. handleClaudeProxy is immune only because its
+  // credential read is synchronous.
   //
   // `req.destroyed` is checked only when the gate did not read the body to its
   // end: Node destroys the IncomingMessage the moment a body has been fully

@@ -312,45 +312,26 @@ test('eight concurrent SSE streams keep TTFB close with metrics on and off', {
   assert.equal(metrics.queryTotals({ scope: 'all' }).requestCount, rounds * 8);
 });
 
-test('the ninth stream is rejected until one of eight active streams finishes', {
+test('streams beyond the old cap of eight are admitted when no cap is configured', {
   timeout: 20_000,
 }, async (t) => {
+  // This device used to be refused its ninth concurrent stream. The cap is now
+  // opt-in (CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT), and an agent fanning
+  // out sub-agents must be able to hold more than eight streams open at once.
   const { state, on } = await createHarness(t);
   state.mode = 'held';
+  const streams = 12;
   const held = await Promise.all(
-    Array.from({ length: 8 }, () => openResponse(on.port)),
+    Array.from({ length: streams }, () => openResponse(on.port)),
   );
-  await waitFor(() => state.held.length === 8);
+  await waitFor(() => state.held.length === streams);
   assert.equal(held.every((entry) => entry.statusCode === 200), true);
-  const initialHeldIds = new Set(state.held.map((entry) => entry.id));
-
-  const upstreamBeforeNinth = state.upstreamRequests;
-  const ninth = await openResponse(on.port);
-  const ninthResult = await ninth.done;
-  assert.equal(ninth.statusCode, 429);
-  assert.equal(state.upstreamRequests, upstreamBeforeNinth);
-
-  state.held[0].release();
-  const firstResult = await held[0].done;
-  assert.equal(firstResult.statusCode, 200);
-  const replacement = await openResponse(on.port);
-  assert.equal(replacement.statusCode, 200);
-  await waitFor(() => state.held.some((entry) => !initialHeldIds.has(entry.id)));
-  const replacementHeld = state.held.find((entry) => !initialHeldIds.has(entry.id));
-  assert.ok(replacementHeld);
-  replacementHeld.release();
-  assert.equal((await replacement.done).statusCode, 200);
+  assert.equal(state.upstreamRequests, streams, 'every stream reached upstream; none was refused locally');
 
   for (const entry of [...state.held]) entry.release?.();
-  await Promise.all(held.slice(1).map((entry) => entry.done));
-  assert.equal(ninthResult.body.length > 0, true);
-  assert.equal(state.upstreamRequests, upstreamBeforeNinth + 1);
-  t.diagnostic(JSON.stringify({
-    initialStreams: 8,
-    rejectedStatus: ninth.statusCode,
-    upstreamBeforeNinth,
-    upstreamAfterReplacement: state.upstreamRequests,
-  }));
+  const results = await Promise.all(held.map((entry) => entry.done));
+  assert.equal(results.every((result) => result.statusCode === 200), true);
+  t.diagnostic(JSON.stringify({ concurrentStreams: streams, upstreamRequests: state.upstreamRequests }));
 });
 
 test('a paused slow client applies backpressure before the large upstream SSE body finishes', {
