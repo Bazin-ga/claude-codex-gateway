@@ -18,6 +18,11 @@ import {
 } from './security.js';
 import { credentialSwitchBlock, externalAccountStatus } from './external-account-status.js';
 import { normalizeCodexGuard, parseCodexGuardInput } from './codex-model-guard.js';
+import {
+  MODEL_BLOCK_MAX_RULES,
+  normalizeModelBlockRules,
+  parseModelBlockRuleInput,
+} from './model-block-rules.js';
 
 const STATE_VERSION = 1;
 const MAX_AUDIT_EVENTS = 2_000;
@@ -80,6 +85,10 @@ function storeError(message, code) {
 // A state.json written before the administrator-password mode was removed still
 // carries an `admin` record. Nothing reads it any more; it is left untouched
 // rather than migrated away, so a rollback finds the file it wrote.
+function auditActor(actor) {
+  return typeof actor === 'string' && actor ? actor.slice(0, 160) : null;
+}
+
 function newState() {
   return {
     version: STATE_VERSION,
@@ -1109,6 +1118,92 @@ export class CredentialStore {
       });
       await this.persist();
       return account;
+    });
+  }
+
+  /**
+   * The console-wide model block rules, normalized, in the order they are
+   * checked. Read on every gated request, so it returns what is stored rather
+   * than a copy built for editing.
+   */
+  modelBlockRules() {
+    return normalizeModelBlockRules(this.state.model_block_rules);
+  }
+
+  /**
+   * Add, change or remove a block rule. Like the low-quota guard, anyone who
+   * can reach the console may do this, so every change is audited with who
+   * made it and what the rule was before.
+   */
+  async addModelBlockRule({ patterns, messageZh, messageEn, enabled, actor = null }) {
+    return this.serialized(async () => {
+      const rule = parseModelBlockRuleInput({ patterns, messageZh, messageEn, enabled });
+      const rules = normalizeModelBlockRules(this.state.model_block_rules);
+      if (rules.length >= MODEL_BLOCK_MAX_RULES) {
+        throw new Error(`the console holds at most ${MODEL_BLOCK_MAX_RULES} block rules`);
+      }
+      const at = nowIso();
+      const stored = {
+        id: randomToken(12),
+        ...rule,
+        created_at: at,
+        updated_at: at,
+        updated_by: auditActor(actor),
+      };
+      this.state.model_block_rules = [...rules, stored];
+      this.audit('model_block_rule_added', {
+        rule_id: stored.id,
+        enabled: stored.enabled,
+        patterns: stored.patterns,
+        actor: stored.updated_by,
+      });
+      await this.persist();
+      return stored;
+    });
+  }
+
+  async updateModelBlockRule(id, { patterns, messageZh, messageEn, enabled, actor = null }) {
+    return this.serialized(async () => {
+      const rule = parseModelBlockRuleInput({ patterns, messageZh, messageEn, enabled });
+      const rules = normalizeModelBlockRules(this.state.model_block_rules);
+      const index = rules.findIndex((candidate) => candidate.id === id);
+      if (index < 0) throw new Error('block rule not found');
+      const previous = rules[index];
+      rules[index] = {
+        ...previous,
+        ...rule,
+        updated_at: nowIso(),
+        updated_by: auditActor(actor),
+      };
+      this.state.model_block_rules = rules;
+      this.audit('model_block_rule_updated', {
+        rule_id: id,
+        enabled: rule.enabled,
+        patterns: rule.patterns,
+        previous_enabled: previous.enabled,
+        previous_patterns: previous.patterns,
+        message_changed: previous.message_zh !== rule.message_zh
+          || previous.message_en !== rule.message_en,
+        actor: rules[index].updated_by,
+      });
+      await this.persist();
+      return rules[index];
+    });
+  }
+
+  async deleteModelBlockRule(id, { actor = null } = {}) {
+    return this.serialized(async () => {
+      const rules = normalizeModelBlockRules(this.state.model_block_rules);
+      const previous = rules.find((candidate) => candidate.id === id);
+      if (!previous) throw new Error('block rule not found');
+      this.state.model_block_rules = rules.filter((candidate) => candidate.id !== id);
+      this.audit('model_block_rule_deleted', {
+        rule_id: id,
+        previous_enabled: previous.enabled,
+        previous_patterns: previous.patterns,
+        actor: auditActor(actor),
+      });
+      await this.persist();
     });
   }
 

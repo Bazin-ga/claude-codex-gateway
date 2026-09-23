@@ -8,6 +8,7 @@ import {
   normalizeCodexGuard,
 } from './codex-model-guard.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
+import { MODEL_BLOCK_MAX_MESSAGE_CHARS } from './model-block-rules.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { sanitizeUrl } from './onboarding.js';
 import { derivePromptDisplay } from './prompt-display.js';
@@ -219,6 +220,16 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .guard-toggle, .guard-threshold { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
 .guard-threshold input { width: 62px; }
 .guard-form .muted.tiny { flex-basis: 100%; }
+.block-rule { border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; background: var(--card); }
+.block-rule.is-off { background: #f6f7f5; }
+.block-rule-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; }
+.block-rule-form .wide { grid-column: 1 / -1; }
+.block-rule-form textarea { min-height: 64px; width: 100%; }
+.block-rule-form input[type="text"] { width: 100%; }
+.block-rule-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 10px; }
+.block-rule-state { font-weight: 800; }
+.block-rule-state.on { color: var(--red); }
+@media (max-width: 720px) { .block-rule-form { grid-template-columns: minmax(0, 1fr); } }
 .provider-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
 .provider-tab { display: inline-flex; align-items: center; gap: 8px; padding: 9px 15px; border: 1px solid var(--line); border-bottom: 0; border-radius: 11px 11px 0 0; margin-bottom: -1px; background: #f3f5f2; color: var(--muted); font-weight: 700; font-size: 14px; text-decoration: none; }
 .provider-tab:hover { color: var(--ink); }
@@ -768,6 +779,7 @@ function layout(title, content, {
       <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
       <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
       <a href="/docs" data-i18n="tab-docs"${activeTab === 'docs' ? ' aria-current="page"' : ''}>Docs &amp; API</a>
+      <a href="/admin" data-i18n="tab-admin"${activeTab === 'admin' ? ' aria-current="page"' : ''}>Administration</a>
     </nav>` : ''}
     <div data-page-content data-active-tab="${escapeHtml(activeTab ?? '')}">${PAGE_CONTENT_START}${openMode ? openBanner : ''}
     ${content}${PAGE_CONTENT_END}</div>
@@ -5158,6 +5170,84 @@ function apiGroupCard(group) {
       </table>
     </div>
   </article>`;
+}
+
+function blockRuleFields(rule) {
+  const max = MODEL_BLOCK_MAX_MESSAGE_CHARS;
+  return `<label class="wide"><span data-i18n="admin-rule-patterns">Model names</span>
+      <input type="text" name="patterns" required maxlength="2600" value="${escapeHtml((rule?.patterns ?? []).join(', '))}" placeholder="claude-opus-5, gpt-5.6*" spellcheck="false" autocomplete="off">
+    </label>
+    <label><span data-i18n="admin-rule-message-zh">Message (Chinese)</span>
+      <textarea name="message_zh" maxlength="${max}">${escapeHtml(rule?.message_zh ?? '')}</textarea>
+    </label>
+    <label><span data-i18n="admin-rule-message-en">Message (English)</span>
+      <textarea name="message_en" maxlength="${max}">${escapeHtml(rule?.message_en ?? '')}</textarea>
+    </label>
+    <label class="guard-toggle wide"><input type="checkbox" name="enabled" value="1"${rule?.enabled ? ' checked' : ''}><span data-i18n="admin-rule-enabled">Block these models now</span></label>`;
+}
+
+function blockRuleCard(rule, csrf) {
+  const action = `/admin/model-block-rules/${encodeURIComponent(rule.id)}`;
+  const changed = rule.updated_at
+    ? `<span class="muted tiny"><span data-i18n="admin-rule-updated">Last changed</span> ${escapeHtml(dateText(rule.updated_at))}${rule.updated_by ? ` · ${escapeHtml(rule.updated_by)}` : ''}</span>`
+    : '';
+  return `<article class="block-rule${rule.enabled ? '' : ' is-off'}">
+    <form method="post" action="${action}" class="block-rule-form">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <div class="wide">${rule.enabled
+    ? '<span class="block-rule-state on" data-i18n="admin-rule-on">Blocking</span>'
+    : '<span class="block-rule-state muted" data-i18n="admin-rule-off">Off</span>'}</div>
+      ${blockRuleFields(rule)}
+      <div class="block-rule-actions wide">
+        <button type="submit" data-i18n="admin-rule-save">Save rule</button>
+        ${changed}
+      </div>
+    </form>
+    <form method="post" action="${action}/delete" class="inline block-rule-actions">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <button class="danger" type="submit" data-i18n="admin-rule-delete">Delete rule</button>
+    </form>
+  </article>`;
+}
+
+export function adminView({
+  blockRules = [],
+  csrf,
+  error = null,
+  openMode = false,
+} = {}) {
+  return layout('Administration', `
+    <section class="stack">
+      <header class="metrics-page-hero">
+        <div>
+        <h1 data-i18n="admin-heading">Administration</h1>
+        <p class="muted" data-i18n="admin-intro">Settings that apply to the whole console rather than to one account or device. Every change here is recorded in the audit log with who made it.</p>
+        </div>
+      </header>
+      ${error ? `<div class="notice error" role="alert">${escapeHtml(error)}</div>` : ''}
+      <article class="card stack">
+        <div>
+          <h2 data-i18n="admin-block-heading">Blocked models</h2>
+          <p class="muted" data-i18n="admin-block-intro">A request for a blocked model is refused by the gateway before it reaches any account, and the caller sees the message below instead of an answer. Applies to every account and device on the Claude and Codex gateways.</p>
+          <p class="muted tiny" data-i18n="admin-block-patterns">Each name matches the whole model id, ignoring case. * stands for any characters: gpt-5.6* covers gpt-5.6-sol and gpt-5.6-luna, while claude-opus-5 matches only claude-opus-5 and not claude-opus-5-5. Separate several names with commas.</p>
+          <p class="muted tiny" data-i18n="admin-block-scope">Only traffic that passes through this gateway is covered. A machine still using a local credential talks to the provider directly and is not affected.</p>
+        </div>
+        ${blockRules.length
+    ? blockRules.map((rule) => blockRuleCard(rule, csrf)).join('')
+    : '<p class="empty muted" data-i18n="admin-block-none">No models are blocked.</p>'}
+      </article>
+      <article class="card">
+        <h2 data-i18n="admin-block-add-heading">Add a rule</h2>
+        <form method="post" action="/admin/model-block-rules" class="block-rule-form">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          ${blockRuleFields({ enabled: true })}
+          <div class="block-rule-actions wide">
+            <button type="submit" data-i18n="admin-rule-add">Add rule</button>
+          </div>
+        </form>
+      </article>
+    </section>
+  `, { openMode, activeTab: 'admin' });
 }
 
 export function docsView({

@@ -12,6 +12,7 @@ import {
 } from '../lib/codex-proxy.js';
 import { DEVICE_CONCURRENCY_LIMIT, deviceConcurrency } from '../lib/proxy.js';
 import { CodexQuotaSignal } from '../lib/codex-quota-signal.js';
+import { normalizeModelBlockRules } from '../lib/model-block-rules.js';
 
 const DEVICE_TOKEN = 'codex-device-test-token';
 const ACCESS_TOKEN = 'codex-upstream-access-token';
@@ -1161,4 +1162,157 @@ test('later syntax this parser cannot follow is refused, not forwarded', async (
   assert.equal(response.status, 403);
   await new Promise((r) => setTimeout(r, 100));
   assert.deepEqual(upstream.completeBodies, []);
+});
+
+// --- Console-wide model block rules ---------------------------------------
+
+const GPT56_RULE = {
+  id: 'rule-gpt56',
+  enabled: true,
+  patterns: ['gpt-5.6*'],
+  message_zh: '建议使用 GPT 6 下的模型，更便宜且性能更好。',
+  message_en: 'Use a GPT 6 model instead: cheaper and better.',
+};
+
+function blockingStore(account, rules = [GPT56_RULE]) {
+  return { ...storeFixture(account), modelBlockRules: () => normalizeModelBlockRules(rules) };
+}
+
+function blockHarness(t, { metrics = null, account = null, rules, ...extra } = {}) {
+  return (async () => {
+    const home = await credentialHome(t);
+    const upstream = { calls: 0, completeBodies: [] };
+    const harness = await startHarness(t, {
+      store: blockingStore(account ?? codexAccount(home), rules),
+      upstreamHandler: (req, res) => {
+        upstream.calls += 1;
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+          upstream.completeBodies.push(Buffer.concat(chunks).toString('utf8'));
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(TURN_SSE);
+        });
+      },
+      requestMetrics: metrics,
+      ...extra,
+    });
+    return { ...harness, upstream, home };
+  })();
+}
+
+test('a blocked model is refused with the rule\'s own message, before anything is spent', async (t) => {
+  const metrics = sink();
+  const { proxyUrl, upstream } = await blockHarness(t, { metrics });
+
+  const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-5.6-sol', input: [] }));
+  assert.equal(response.status, 403);
+  const body = await response.json();
+  assert.equal(body.error.type, 'permission_error');
+  assert.match(body.error.message, /建议使用 GPT 6 下的模型/, 'the Chinese message is shown');
+  assert.match(body.error.message, /Use a GPT 6 model instead/, 'and the English one');
+  assert.match(body.error.message, /gpt-5\.6-sol/, 'naming the model that was refused');
+  assert.equal(upstream.calls, 0, 'a refused request never reaches chatgpt.com');
+
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_blocked');
+  assert.equal(row.statusCode, 403);
+  assert.equal(row.model, 'gpt-5.6-sol');
+});
+
+test('a model no rule names goes through byte for byte while rules are on', async (t) => {
+  const { proxyUrl, upstream } = await blockHarness(t);
+  const parts = [
+    '{"model":"gpt-6-sol","stream":true,',
+    `"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"${'y'.repeat(3_000)}"}]}]`,
+    ',"store":false}',
+  ];
+
+  const response = await postInChunks(proxyUrl, parts);
+  assert.equal(response.status, 200);
+  assert.equal(response.body, TURN_SSE);
+  assert.deepEqual(upstream.completeBodies, [parts.join('')]);
+});
+
+test('a rule that is switched off blocks nothing', async (t) => {
+  const { proxyUrl, upstream } = await blockHarness(t, { rules: [{ ...GPT56_RULE, enabled: false }] });
+  const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-5.6-sol', input: [] }));
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(upstream.calls, 1);
+});
+
+test('the model catalog is not gated by block rules', async (t) => {
+  const { proxyUrl } = await blockHarness(t);
+  const response = await getModels(proxyUrl);
+  assert.notEqual(response.status, 403);
+  await response.text();
+});
+
+test('a blocked model named a second time later in the body is still stopped', async (t) => {
+  const metrics = sink();
+  const { proxyUrl, upstream } = await blockHarness(t, { metrics });
+
+  const response = await postInChunks(proxyUrl, [
+    `{"model":"gpt-6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"${'x'.repeat(2_000)}"}]}]`,
+    ',"model":"gpt-5.6-sol"',
+    '}',
+  ]);
+
+  assert.equal(response.status, 403);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(upstream.completeBodies, [], 'the upstream never received a complete body');
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_blocked');
+  assert.equal(row.model, 'gpt-5.6-sol');
+});
+
+test('a blocked model that only turns up past the head is stopped by the tail', async (t) => {
+  const metrics = sink();
+  const { proxyUrl, upstream } = await blockHarness(t, { metrics });
+  // Over the 64 KiB head the gate reads before ruling, with the model after it.
+  const filler = 'z'.repeat(70 * 1024);
+
+  const response = await postInChunks(proxyUrl, [
+    `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"${filler}"}]}]`,
+    ',"model":"gpt-5.6-terra"',
+    '}',
+  ]);
+
+  assert.equal(response.status, 403);
+  assert.match(response.body, /GPT 6/);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(upstream.completeBodies, []);
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_blocked');
+  assert.equal(row.model, 'gpt-5.6-terra');
+});
+
+test('a biting low-quota guard and a block rule each give their own refusal', async (t) => {
+  const home = await credentialHome(t);
+  const metrics = sink();
+  const { proxyUrl, upstream } = await blockHarness(t, {
+    metrics,
+    account: guardedAccount(home),
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: weeklySnapshot(3),
+  });
+
+  // Blocked outright and outside the guard: the rule says what to use instead,
+  // which is the useful answer whatever the quota does next.
+  const blocked = await post(proxyUrl, JSON.stringify({ model: 'gpt-5.6-sol', input: [] }));
+  assert.equal(blocked.status, 403);
+  assert.match((await blocked.json()).error.message, /GPT 6/);
+  // Not blocked, but outside the guard: the guard's refusal.
+  const guarded = await post(proxyUrl, JSON.stringify({ model: 'gpt-6-sol', input: [] }));
+  assert.equal(guarded.status, 403);
+  assert.match((await guarded.json()).error.message, /3%/);
+  // Neither: through.
+  const allowed = await post(proxyUrl, JSON.stringify({ model: 'gpt-6-luna', input: [] }));
+  assert.equal(allowed.status, 200);
+  await allowed.text();
+  assert.equal(upstream.calls, 1);
+
+  await waitFor(() => metrics.rows.length >= 3 && metrics.rows);
+  assert.deepEqual(metrics.rows.slice(0, 2).map((row) => row.outcome), ['model_blocked', 'model_restricted']);
 });

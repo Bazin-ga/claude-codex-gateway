@@ -113,10 +113,28 @@ test('a body that is not a JSON object stops the scan immediately', async () => 
 test('a body that hides the model past the limit is bounded, not buffered whole', async () => {
   const req = fakeRequest();
   const reading = readCodexModelPrefix(req, { limitBytes: 1_024 });
-  req.write(`{"input":"${'x'.repeat(4_000)}","model":"gpt-5.6-luna"}`);
+  req.write(`{"input":"${'x'.repeat(4_000)}`);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  req.write(`${'x'.repeat(4_000)}","model":"gpt-5.6-luna"}`);
   const result = await reading;
   assert.equal(result.model, null, 'unreadable, and the caller will treat that as not allowed');
   assert.ok(result.bytes <= 8_192, `read ${result.bytes} bytes, which is not a bound`);
+});
+
+test('the scanner handed on has seen every byte handed back, so the tail stays in step', async () => {
+  const req = fakeRequest();
+  const reading = readCodexModelPrefix(req, { limitBytes: 1_024 });
+  // One read crossing the limit, ending mid-string: the part past the limit
+  // must still have been scanned, or the rest of the body parses as garbage.
+  req.write(`{"input":"${'x'.repeat(4_000)}`);
+  const result = await reading;
+  assert.equal(result.model, null);
+  assert.equal(result.head.length, result.bytes);
+  result.scanner.push(Buffer.from('","model":"gpt-5.6-luna"}'));
+  result.scanner.finish();
+  const { model, parseState } = result.scanner.snapshot();
+  assert.equal(model, 'gpt-5.6-luna');
+  assert.equal(parseState, 'complete');
 });
 
 test('a client that disappears mid-read is reported as aborted, not as a model', async () => {

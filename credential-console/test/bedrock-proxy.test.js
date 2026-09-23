@@ -381,3 +381,26 @@ test('the data plane and the registration route are closed when the flag is off'
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('a console-wide block rule refuses the pinned model too', async (t) => {
+  const seen = {};
+  const metrics = sink();
+  const store = {
+    ...storeFixture(bedrockAccount()),
+    modelBlockRules: () => [{
+      id: 'rule-astra',
+      enabled: true,
+      patterns: ['*gpt-6-astra'],
+      message_zh: '换一个模型。',
+      message_en: 'Use another model.',
+    }],
+  };
+  const { proxyUrl } = await startHarness(t, { store, requestMetrics: metrics, seen });
+
+  const response = await converse(proxyUrl);
+  assert.equal(response.status, 403);
+  assert.match((await response.json()).message, /Use another model/);
+  assert.equal(seen.method, undefined, 'the upstream must not be called');
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_blocked');
+});

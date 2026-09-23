@@ -65,6 +65,7 @@ import {
 } from './lib/codex-managed-domains.js';
 import {
   claudeAuthorizationView,
+  adminView,
   dashboardView,
   docsView,
   bedrockDeviceConfiguredView,
@@ -1384,6 +1385,59 @@ export async function createCredentialConsole(options = {}) {
         codexGatewayUrl,
         openMode,
       }));
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/admin') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      sendHtml(res, 200, adminView({
+        blockRules: store.modelBlockRules(),
+        csrf: session.csrf,
+        error: url.searchParams.get('error'),
+        openMode,
+      }));
+      return;
+    }
+
+    // Model block rules. Every logged-in member may change them, as with the
+    // low-quota guard; the store audits who did.
+    const blockRuleParams = routeMatch(path, '/admin/model-block-rules/:id');
+    const blockRuleDeleteParams = routeMatch(path, '/admin/model-block-rules/:id/delete');
+    if (req.method === 'POST'
+      && (path === '/admin/model-block-rules' || blockRuleParams || blockRuleDeleteParams)) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const actor = session.admin_identity ?? 'anonymous';
+      // An unchecked checkbox is simply absent from a form submission, so
+      // "off" arrives as a missing field rather than a false one.
+      const fields = {
+        patterns: form.patterns,
+        messageZh: form.message_zh,
+        messageEn: form.message_en,
+        enabled: form.enabled === '1',
+        actor,
+      };
+      try {
+        if (blockRuleDeleteParams) {
+          await store.deleteModelBlockRule(blockRuleDeleteParams.id, { actor });
+          log('model_block_rule_deleted', { rule_id: blockRuleDeleteParams.id, actor });
+        } else if (blockRuleParams) {
+          const rule = await store.updateModelBlockRule(blockRuleParams.id, fields);
+          log('model_block_rule_updated', { rule_id: rule.id, enabled: rule.enabled, actor });
+        } else {
+          const rule = await store.addModelBlockRule(fields);
+          log('model_block_rule_added', { rule_id: rule.id, enabled: rule.enabled, actor });
+        }
+        redirect(res, '/admin');
+      } catch (error) {
+        redirect(res, `/admin?error=${encodeURIComponent(error.message)}`);
+      }
       return;
     }
 
