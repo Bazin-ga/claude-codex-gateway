@@ -126,7 +126,7 @@ test('a count that no longer matches is refused rather than applied', async () =
       expectedCount: 3,
       actor: 'admin@example.com',
     }),
-    /the list changed: 4 devices are on that account now, not 3/,
+    /the list changed: 4 devices match that selection now, not 3/,
   );
   // Nothing moved: switching four when the screen said three is the mistake
   // this guard exists to prevent.
@@ -782,4 +782,40 @@ test('an account holding only some of the matched rows is still a destination', 
   const bulk = bulkForm(render(store, { memberFilter: 'alice@github' }));
   assert.ok(bulk.includes(first.id));
   assert.ok(bulk.includes(second.id));
+});
+
+// Regression, 2026-09-25 (SG): a machine group holding each machine's Claude and
+// Codex credentials could not be bulk-switched at all. The dashboard counted the
+// section on screen (the Claude rows) and sent that count; the store recounted
+// the whole group, Codex rows included, and refused every press as "the list
+// changed". The count is taken from the rendered form here, as the browser does.
+test('a group holding both Claude and Codex credentials moves its Claude ones in one press', async () => {
+  const store = await newStore();
+  const main = await claudeAccount(store, 'meetapro');
+  const target = await claudeAccount(store, 'metathinking');
+  const codex = await codexAccount(store, 'metathinking-codex');
+  const claudeRows = [await device(store, main.id, 'alpha-claude'), await device(store, main.id, 'beta-claude')];
+  const codexRows = [await device(store, codex.id, 'alpha-codex'), await device(store, codex.id, 'beta-codex')];
+  await store.createDeviceGroup('Atlas simple machine');
+  for (const row of [...claudeRows, ...codexRows]) await store.setDeviceGroups(row.id, ['Atlas simple machine']);
+
+  const form = bulkForm(render(store, {
+    groupFilter: 'Atlas simple machine',
+    providerFilter: 'claude',
+    deviceGroups: store.deviceGroups?.() ?? ['Atlas simple machine'],
+  }));
+  const expected = Number(/name="expected_count" value="(\d+)"/.exec(form)?.[1]);
+  assert.equal(expected, 2, 'the Claude section shows the two Claude credentials');
+  assert.match(form, new RegExp(`<option value="${target.id}">`), 'metathinking is offered');
+
+  const summary = await store.bulkConfigureDeviceAccount({
+    group: 'Atlas simple machine',
+    selectedAccountId: target.id,
+    expectedCount: expected,
+    actor: 'admin@example.com',
+  });
+  assert.deepEqual(summary.switched.sort(), claudeRows.map((row) => row.id).sort());
+  assert.deepEqual(summary.skipped, [], 'the Codex rows were never part of the move');
+  for (const row of claudeRows) assert.equal(store.resolveDeviceAccount(row.id).account.id, target.id);
+  for (const row of codexRows) assert.equal(store.resolveDeviceAccount(row.id).account.id, codex.id);
 });
