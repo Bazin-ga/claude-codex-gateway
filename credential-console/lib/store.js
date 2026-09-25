@@ -1414,19 +1414,34 @@ export class CredentialStore {
   }
 
   /**
+   * Which provider's client a device row belongs to: the provider of the
+   * account it has selected, or of the one it was issued against when the
+   * selection no longer resolves. The same rule the dashboard uses to put a row
+   * in its Claude or Codex section, so a count taken here and a count taken off
+   * that section agree.
+   */
+  #deviceProvider(device) {
+    return this.accountById(device.selected_account_id)?.provider
+      ?? this.accountById(device.account_id)?.provider
+      ?? null;
+  }
+
+  /**
    * Which active Claude devices currently answer to `accountId`.
    *
    * Rows whose policy will not resolve are excluded rather than guessed at: the
    * dashboard already shows them as invalid, and a bulk move must not silently
    * decide what a malformed row meant.
    */
-  devicesMatching({ accountId = null, memberLabel = null, group = null } = {}) {
+  devicesMatching({ accountId = null, memberLabel = null, group = null, provider = null } = {}) {
     const wantAccount = typeof accountId === 'string' && accountId ? accountId : null;
     const wantMember = typeof memberLabel === 'string' && memberLabel ? memberLabel : null;
     const wantGroup = typeof group === 'string' && group ? group : null;
+    const wantProvider = typeof provider === 'string' && provider ? provider : null;
     if (!wantAccount && !wantMember && !wantGroup) return [];
     return this.state.devices.filter((device) => {
       if (device.revoked_at) return false;
+      if (wantProvider && this.#deviceProvider(device) !== wantProvider) return false;
       if (wantMember && device.member_label !== wantMember) return false;
       // A machine can be in several groups, so this asks whether it is in this
       // one — not whether this one is its group.
@@ -1609,10 +1624,20 @@ export class CredentialStore {
         );
       }
 
-      const devices = this.devicesMatching({ accountId: fromAccountId, memberLabel, group });
+      // Only devices of the target's provider. A machine group or a member can
+      // hold both a Claude and a Codex credential, and the Codex one cannot move
+      // to a Claude account — so it is not part of the set being moved, and
+      // counting it would make every mixed group fail the count check below:
+      // the dashboard counts one provider's section, and it would never match.
+      const devices = this.devicesMatching({
+        accountId: fromAccountId,
+        memberLabel,
+        group,
+        provider: target.provider,
+      });
       if (expectedCount !== null && devices.length !== expectedCount) {
         throw storeError(
-          `the list changed: ${devices.length} devices are on that account now, not ${expectedCount}.`
+          `the list changed: ${devices.length} devices match that selection now, not ${expectedCount}.`
           + ' Re-check the filter and try again.',
           'DEVICE_CONFIGURATION_STALE',
         );
