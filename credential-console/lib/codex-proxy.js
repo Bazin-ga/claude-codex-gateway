@@ -17,6 +17,11 @@ import {
   normalizeCodexGuard,
 } from './codex-model-guard.js';
 import {
+  creditGuardRefusalBody,
+  includedQuotaExhaustion,
+  normalizeCodexCreditGuard,
+} from './codex-credit-guard.js';
+import {
   createModelGateTail,
   createModelJudge,
   modelHeadRefusal,
@@ -291,6 +296,35 @@ export async function handleCodexProxy(req, res, {
     return;
   }
   const inferenceRequest = upstreamPath === '/responses';
+
+  // The credit guard, ahead of everything else: once the included quota is
+  // gone, every request forwarded is paid for out of the account's credits, so
+  // an account that opted out is refused here — before the body is read, a
+  // credential is touched or anything reaches chatgpt.com. Only inference is
+  // stopped; the model catalog costs nothing.
+  if (inferenceRequest && normalizeCodexCreditGuard(account.codex_credit_guard).enabled) {
+    const exhaustion = includedQuotaExhaustion(
+      quotaSignal.merge(account.id, usageSnapshotFor(account.id)),
+      now(),
+    );
+    if (exhaustion) {
+      log('codex_proxy_credits_blocked', {
+        account_id: account.id,
+        device_id: device.id,
+        resets_at: Number.isFinite(exhaustion.resetsAtMs)
+          ? new Date(exhaustion.resetsAtMs).toISOString()
+          : null,
+      });
+      recordRejected(429, 'credits_blocked');
+      // Nothing of the body was read; closing is what stops the rest of an
+      // upload nobody will forward from being drained.
+      res.once('finish', () => {
+        if (!req.destroyed) req.destroy();
+      });
+      sendJson(res, 429, creditGuardRefusalBody(exhaustion), { Connection: 'close' });
+      return;
+    }
+  }
 
   // The model gate, evaluated before anything is acquired: no credential read,
   // no concurrency slot, no upstream socket. A request refused here has cost

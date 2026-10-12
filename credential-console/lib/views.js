@@ -7,6 +7,7 @@ import {
   CODEX_GUARD_MODEL_KEYWORD,
   normalizeCodexGuard,
 } from './codex-model-guard.js';
+import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { MODEL_BLOCK_MAX_MESSAGE_CHARS } from './model-block-rules.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
@@ -1056,6 +1057,29 @@ function codexModelGuardNote(account) {
   return `<div class="quota-guard muted tiny"><span data-i18n="codex-guard-active">Low-quota guard</span> ${escapeHtml(String(guard.threshold_percent))}% · <span data-i18n="codex-guard-luna-only">only ${escapeHtml(CODEX_GUARD_MODEL_KEYWORD)} models below that</span></div>`;
 }
 
+/**
+ * The switch that stops the gateway spending this account's credits.
+ *
+ * Says in the help line what it cannot do, because that is the part people
+ * get wrong: anyone holding the account's token directly still spends credits,
+ * and this console never sees those requests.
+ */
+function codexCreditGuardControl(account, csrf) {
+  if (account.provider !== 'codex') return '';
+  const guard = normalizeCodexCreditGuard(account.codex_credit_guard);
+  return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-credit-guard" class="guard-form">
+    <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+    <label class="guard-toggle"><input type="checkbox" name="enabled" value="1"${guard.enabled ? ' checked' : ''}><span data-i18n="codex-credit-guard-enable">Don't spend credits through the gateway</span></label>
+    <button class="secondary" type="submit" data-i18n="codex-credit-guard-save">Save credit setting</button>
+    <div class="muted tiny" data-i18n="codex-credit-guard-help">Once the included quota is used up, gateway requests are refused instead of paid for in credits. Clients that log in to the account directly are not affected.</div>
+  </form>`;
+}
+
+/** The credit balance, whole credits with separators; the decimals are noise. */
+function creditBalanceText(balance) {
+  return Math.floor(balance).toLocaleString('en-US');
+}
+
 function accountUsageView(account, { showAccount = false } = {}) {
   // Bedrock has no quota window to report — it is billed per token, not against
   // a rolling allowance. Saying so is the accurate answer; falling through
@@ -1082,6 +1106,9 @@ function accountUsageView(account, { showAccount = false } = {}) {
   const resetCredits = Number.isInteger(usage?.reset_credits) && usage.reset_credits > 0
     ? usage.reset_credits
     : null;
+  const creditBalance = Number.isFinite(usage?.credits?.balance) && usage.credits.balance >= 1
+    ? usage.credits.balance
+    : null;
   const quotaMeta = [
     updatedAt
       ? `<span><span data-i18n="usage-updated">Updated</span> ${escapeHtml(dateText(updatedAt))}</span>`
@@ -1091,6 +1118,10 @@ function accountUsageView(account, { showAccount = false } = {}) {
       : '',
     resetCredits
       ? `<span class="quota-reset-credits"><span data-i18n="usage-reset-credits">Reset credits left</span> ${escapeHtml(String(resetCredits))}</span>`
+      : '',
+    // Like reset credits, only a balance worth acting on earns a line.
+    creditBalance
+      ? `<span class="quota-credits"><span data-i18n="usage-credits">Credits</span> ${escapeHtml(creditBalanceText(creditBalance))}</span>`
       : '',
   ].filter(Boolean).join('');
   return `<div class="quota-account">
@@ -1102,6 +1133,7 @@ function accountUsageView(account, { showAccount = false } = {}) {
     ${message}
     ${quotaMeta ? `<div class="quota-meta">${quotaMeta}</div>` : ''}
     ${codexModelGuardNote(account)}
+    ${normalizeCodexCreditGuard(account.codex_credit_guard).enabled ? '<div class="quota-guard muted tiny" data-i18n="codex-credit-guard-active">No credits are spent through the gateway once the included quota is used up</div>' : ''}
   </div>`;
 }
 
@@ -3912,6 +3944,7 @@ export function dashboardView({
           ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}
           ${codexResetControl(account, csrf)}
           ${codexModelGuardControl(account, csrf)}
+          ${codexCreditGuardControl(account, csrf)}
         </div>`}
         ${(account.status === 'login_required' || account.provider === 'bedrock') && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">

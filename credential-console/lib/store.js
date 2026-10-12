@@ -18,6 +18,7 @@ import {
 } from './security.js';
 import { credentialSwitchBlock, externalAccountStatus } from './external-account-status.js';
 import { normalizeCodexGuard, parseCodexGuardInput } from './codex-model-guard.js';
+import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
 import {
   MODEL_BLOCK_MAX_RULES,
   normalizeModelBlockRules,
@@ -280,6 +281,7 @@ export class CredentialStore {
       external: account.external ? { kind: account.external.kind } : null,
       bedrock: account.bedrock ? { ...account.bedrock } : null,
       codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
+      codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
       active_devices: this.state.devices.filter((device) => {
         if (device.revoked_at) return false;
         try {
@@ -1115,6 +1117,33 @@ export class CredentialStore {
         previous_enabled: previous.enabled,
         previous_threshold_percent: previous.threshold_percent,
         actor: account.codex_guard.updated_by,
+      });
+      await this.persist();
+      return account;
+    });
+  }
+
+  /**
+   * Stop (or allow again) the gateway spending one Codex account's credits once
+   * its included quota is used up. Audited the same way as the low-quota guard,
+   * and for the same reason: it is a shared switch, and credits are money.
+   */
+  async setCodexCreditGuard(id, { enabled, actor = null }) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account) throw new Error('account not found');
+      if (account.provider !== 'codex') throw new Error('account is not a Codex account');
+      const previous = normalizeCodexCreditGuard(account.codex_credit_guard);
+      account.codex_credit_guard = {
+        enabled: enabled === true,
+        updated_at: nowIso(),
+        updated_by: typeof actor === 'string' && actor ? actor.slice(0, 160) : null,
+      };
+      this.audit('codex_credit_guard_updated', {
+        account_id: id,
+        enabled: account.codex_credit_guard.enabled,
+        previous_enabled: previous.enabled,
+        actor: account.codex_credit_guard.updated_by,
       });
       await this.persist();
       return account;
