@@ -673,6 +673,7 @@ export async function createCredentialConsole(options = {}) {
         // reach the page, so the guard control would render as permanently off
         // no matter what the account actually holds.
         codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
+        codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
         active_devices: account.active_devices,
       };
       return {
@@ -2290,6 +2291,27 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    const codexCreditGuardParams = routeMatch(path, '/accounts/:id/codex-credit-guard');
+    if (req.method === 'POST' && codexCreditGuardParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        await store.setCodexCreditGuard(codexCreditGuardParams.id, {
+          // An unchecked checkbox is absent from the form, not false.
+          enabled: form.enabled === '1',
+          actor: session.admin_identity ?? 'anonymous',
+        });
+        redirect(res, '/');
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
     const codexResetParams = routeMatch(path, '/accounts/:id/codex-reset');
     if (req.method === 'POST' && codexResetParams) {
       const session = requireSession(req, res);

@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { codexCreditBalance } from './codex-credit-guard.js';
 
 const CACHE_VERSION = 1;
 const DEFAULT_REFRESH_MS = 60 * 60_000;
@@ -149,6 +150,7 @@ export async function fetchCodexUsage({ accessToken, accountId, fetchImpl = fetc
     fetched_at: new Date().toISOString(),
     plan_type: typeof body.plan_type === 'string' ? body.plan_type : null,
     reset_credits: resetCreditCount(body.rate_limit_reset_credits),
+    credits: codexCreditBalance(body.credits),
     windows,
   };
 }

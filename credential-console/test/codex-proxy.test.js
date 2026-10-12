@@ -1433,3 +1433,153 @@ test('a finite budget is still enforced, and the request cap is off unless confi
   assert.equal(await read({ CREDENTIAL_CONSOLE_DEVICE_REQUEST_LIMIT_PER_MINUTE: '120' }), '120');
   assert.equal(await read({ CREDENTIAL_CONSOLE_DEVICE_REQUEST_LIMIT_PER_MINUTE: '' }), 'Infinity');
 });
+
+// --- the credit guard ------------------------------------------------------
+//
+// Past the included quota, chatgpt.com keeps answering and debits credits;
+// nothing in the request opts in or out. So the only proof that matters is
+// whether the request reached the upstream at all.
+
+function creditGuardedAccount(home, { enabled = true } = {}) {
+  return codexAccount(home, { codex_credit_guard: { enabled } });
+}
+
+function exhaustedSnapshot({ resetsAt = futureIso(3_600_000) } = {}) {
+  return () => ({
+    provider: 'codex',
+    status: 'available',
+    fetched_at: new Date().toISOString(),
+    windows: [{
+      kind: 'weekly',
+      position: 'primary',
+      used_percent: 100,
+      remaining_percent: 0,
+      resets_at: resetsAt,
+      duration_seconds: 7 * 24 * 60 * 60,
+    }],
+  });
+}
+
+test('with the credit guard on, a used-up account is refused before anything is spent', async (t) => {
+  const home = await credentialHome(t);
+  const metrics = sink();
+  let upstreamCalls = 0;
+  const resetsAt = futureIso(3_600_000);
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(creditGuardedAccount(home)),
+    upstreamHandler: (req, res) => { upstreamCalls += 1; res.writeHead(200); res.end(TURN_SSE); },
+    requestMetrics: metrics,
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: exhaustedSnapshot({ resetsAt }),
+  });
+
+  const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-6-luna', stream: true, input: [] }));
+
+  assert.equal(response.status, 429);
+  const body = await response.json();
+  assert.equal(body.error.type, 'usage_limit_reached', 'the CLI shows its own usage-limit message for this type');
+  assert.equal(body.error.resets_at, Math.floor(Date.parse(resetsAt) / 1000));
+  assert.equal(upstreamCalls, 0, 'a refused request never reaches chatgpt.com, so no credit is spent');
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'credits_blocked');
+  assert.equal(row.statusCode, 429);
+});
+
+test('with the credit guard on, an account with quota left is forwarded byte for byte', async (t) => {
+  const home = await credentialHome(t);
+  const seen = {};
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(creditGuardedAccount(home)),
+    upstreamHandler: sseUpstream(),
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: weeklySnapshot(1),
+    seen,
+  });
+  const sent = JSON.stringify({ model: 'gpt-6-sol', stream: true, input: [] });
+  const response = await post(proxyUrl, sent);
+  assert.equal(response.status, 200);
+  await response.text();
+  await waitFor(() => seen.body);
+  assert.equal(seen.body, sent);
+});
+
+test('with the credit guard off, a used-up account still goes through as before', async (t) => {
+  const home = await credentialHome(t);
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(creditGuardedAccount(home, { enabled: false })),
+    upstreamHandler: sseUpstream(),
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: exhaustedSnapshot(),
+  });
+  const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-6-luna', stream: true, input: [] }));
+  assert.equal(response.status, 200, 'off is the default, and off changes nothing');
+  await response.text();
+});
+
+test('a window past its reset time no longer blocks, before the next poll says so', async (t) => {
+  const home = await credentialHome(t);
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(creditGuardedAccount(home)),
+    upstreamHandler: sseUpstream(),
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: exhaustedSnapshot({ resetsAt: new Date(Date.now() - 1_000).toISOString() }),
+  });
+  const response = await post(proxyUrl, JSON.stringify({ model: 'gpt-6-luna', stream: true, input: [] }));
+  assert.equal(response.status, 200);
+  await response.text();
+});
+
+test('a response reporting the quota used up blocks the next request without waiting for the poll', async (t) => {
+  const home = await credentialHome(t);
+  const quotaSignal = new CodexQuotaSignal();
+  let upstreamCalls = 0;
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(creditGuardedAccount(home)),
+    upstreamHandler: (req, res) => {
+      upstreamCalls += 1;
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'x-codex-primary-used-percent': '100' });
+      res.end(TURN_SSE);
+    },
+    quotaSignal,
+    // The poll is an hour old and still thinks a tenth of the week is left.
+    usageSnapshotFor: () => ({
+      provider: 'codex',
+      status: 'available',
+      fetched_at: new Date(Date.now() - 3_600_000).toISOString(),
+      windows: [{
+        kind: 'weekly',
+        position: 'primary',
+        used_percent: 90,
+        remaining_percent: 10,
+        resets_at: futureIso(),
+        duration_seconds: 7 * 24 * 60 * 60,
+      }],
+    }),
+  });
+
+  const first = await post(proxyUrl, JSON.stringify({ model: 'gpt-6-luna', stream: true, input: [] }));
+  assert.equal(first.status, 200);
+  await first.text();
+  await waitFor(() => quotaSignal.observationFor(DEVICE.account_id));
+
+  const second = await post(proxyUrl, JSON.stringify({ model: 'gpt-6-luna', stream: true, input: [] }));
+  assert.equal(second.status, 429);
+  await second.text();
+  assert.equal(upstreamCalls, 1);
+});
+
+test('the credit guard leaves the model catalog alone', async (t) => {
+  const home = await credentialHome(t);
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(creditGuardedAccount(home)),
+    upstreamHandler: (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"models":[]}');
+    },
+    quotaSignal: new CodexQuotaSignal(),
+    usageSnapshotFor: exhaustedSnapshot(),
+  });
+  const response = await getModels(proxyUrl);
+  assert.equal(response.status, 200, 'listing models costs nothing');
+  await response.text();
+});
