@@ -24,7 +24,7 @@ import zlib from 'node:zlib';
  */
 
 /** How many backups one account may name. More would be a pool, not a list. */
-export const FAILOVER_MAX_BACKUPS = 4;
+export const FAILOVER_MAX_BACKUPS = 8;
 
 /**
  * How long an exhausted account is avoided when the refusal did not say when
@@ -270,6 +270,43 @@ export function chooseFailoverAccount({
     return candidate;
   }
   return null;
+}
+
+/**
+ * Apply one edit from the console to an account's failover policy.
+ *
+ * The console edits a chain one step at a time — switch it on or off, add a
+ * backup, remove one, move one earlier — rather than resubmitting a list, so a
+ * page listing a hundred accounts never has to render a hundred choices per
+ * row. Returns the new `{ enabled, backup_account_ids }`; the store validates
+ * it. Removing the last backup turns failover off, since a chain with nothing
+ * in it cannot be on.
+ */
+export function applyFailoverEdit(current, { op, accountId = null } = {}) {
+  const policy = normalizeAccountFailover(current);
+  let enabled = policy.enabled;
+  const ids = [...policy.backup_account_ids];
+  const index = accountId ? ids.indexOf(accountId) : -1;
+  if (op === 'enable') enabled = true;
+  else if (op === 'disable') enabled = false;
+  else if (op === 'add') {
+    if (!accountId) throw new Error('choose an account to add');
+    if (index !== -1) throw new Error('that account is already a backup');
+    if (ids.length >= FAILOVER_MAX_BACKUPS) {
+      throw new Error(`at most ${FAILOVER_MAX_BACKUPS} backup accounts`);
+    }
+    ids.push(accountId);
+  } else if (op === 'remove') {
+    if (index === -1) throw new Error('that account is not a backup');
+    ids.splice(index, 1);
+    if (ids.length === 0) enabled = false;
+  } else if (op === 'up') {
+    if (index === -1) throw new Error('that account is not a backup');
+    if (index > 0) [ids[index - 1], ids[index]] = [ids[index], ids[index - 1]];
+  } else {
+    throw new Error('unknown failover change');
+  }
+  return { enabled, backup_account_ids: ids };
 }
 
 /**

@@ -1292,7 +1292,7 @@ export class CredentialStore {
    * Put a failed-over device back on its home account. A device somebody has
    * since moved by hand has no marker any more and is left alone.
    */
-  async failbackDeviceAccount({ deviceId, reason = null }) {
+  async failbackDeviceAccount({ deviceId, reason = null, actor = 'gateway:quota-failover' }) {
     return this.serialized(async () => {
       const device = this.#deviceRecord(deviceId);
       const marker = device.account_failover;
@@ -1318,7 +1318,7 @@ export class CredentialStore {
           nextAccountId: home.id,
           outcome: 'success',
           reason,
-          actor: 'gateway:quota-failover',
+          actor,
         }));
       }
       try {
