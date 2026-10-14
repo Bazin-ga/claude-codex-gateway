@@ -231,6 +231,57 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .block-rule-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 10px; }
 .block-rule-state { font-weight: 800; }
 .block-rule-state.on { color: var(--red); }
+.failover-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.failover-row { position: relative; border: 1px solid var(--line); border-radius: var(--radius-md); background: #f8f9f5; padding: 14px 16px; }
+.failover-row.is-on { background: var(--card); border-color: #bcd8c9; box-shadow: inset 4px 0 0 var(--green); }
+.failover-row:target { outline: 2px solid var(--focus); outline-offset: 2px; }
+.failover-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; }
+.failover-name { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; min-width: 0; flex: 1 1 200px; }
+.failover-name strong { font-size: 15px; }
+.failover-facts { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; padding: 3px 9px; font-size: 12px; font-weight: 700; background: #e8eee9; color: var(--muted); white-space: nowrap; }
+.pill.ok { background: #dff2e8; color: var(--green); }
+.pill.low { background: #faecd7; color: var(--amber); }
+.pill.out { background: #f8e4e1; color: var(--red); }
+.pill.moved { background: #e5edf4; color: var(--blue); }
+.switch { display: inline-flex; align-items: center; gap: 8px; margin: 0; padding: 4px 2px; background: none; color: var(--muted); font-size: 12px; font-weight: 800; border-radius: 999px; min-width: 88px; }
+.switch:hover { background: none; color: var(--ink); }
+.switch:disabled { opacity: .5; }
+.switch-track { position: relative; flex: none; width: 38px; height: 22px; border-radius: 999px; background: #c9d1c9; transition: background .15s; }
+.switch-thumb { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: white; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: left .15s; }
+.switch.is-on { color: var(--green); }
+.switch.is-on .switch-track { background: var(--green); }
+.switch.is-on .switch-thumb { left: 19px; }
+.failover-chain { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; margin-top: 12px; padding-left: 102px; }
+.failover-chain-label { font-size: 12px; font-weight: 700; color: var(--muted); }
+.chain { list-style: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; padding: 0; }
+.chain-item { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: white; border-radius: 999px; padding: 3px 3px 3px 4px; font-size: 13px; font-weight: 700; }
+.chain-arrow { color: var(--muted); font-weight: 700; }
+.chain-index { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--ink); color: white; font-size: 11px; }
+.chain-quota { color: var(--muted); font-size: 11px; font-weight: 600; }
+.chain-item.is-out { background: #fbf3f2; }
+.chain-item.is-out .chain-index { background: var(--red); }
+.chain-item.is-out .chain-quota { color: var(--red); }
+.chain-btn { margin: 0; padding: 2px 7px; background: none; color: var(--muted); font-size: 14px; line-height: 1.2; border-radius: 999px; }
+.chain-btn:hover { background: #eef1ec; color: var(--ink); }
+.chain-btn.remove:hover { background: #f8e4e1; color: var(--red); }
+.chain-empty { font-size: 13px; color: var(--muted); }
+.chain-add { display: inline-flex; align-items: center; gap: 6px; }
+.chain-add input { width: 210px; margin: 0; padding: 6px 12px; border-radius: 999px; font-size: 13px; }
+.chain-add button { padding: 6px 12px; border-radius: 999px; font-size: 12px; }
+.failover-group { display: grid; gap: 10px; }
+.failover-group-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin-top: 6px; }
+.failover-group-head h3 { margin: 0; font-size: 16px; }
+.failover-group-head input[type="search"] { width: 220px; margin: 0 0 0 auto; padding: 7px 12px; border-radius: 999px; font-size: 13px; }
+.failover-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.failover-summary a { font-weight: 700; }
+@media (max-width: 720px) {
+  .failover-chain { padding-left: 0; }
+  .chain-btn { min-height: 30px; min-width: 30px; padding: 4px 8px; }
+  .chain-item { padding: 1px 2px 1px 4px; }
+  .chain-add input { width: 160px; }
+  .failover-group-head input[type="search"] { width: 100%; margin-left: 0; }
+}
 @media (max-width: 720px) { .block-rule-form { grid-template-columns: minmax(0, 1fr); } }
 .provider-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
 .provider-tab { display: inline-flex; align-items: center; gap: 8px; padding: 9px 15px; border: 1px solid var(--line); border-bottom: 0; border-radius: 11px 11px 0 0; margin-bottom: -1px; background: #f3f5f2; color: var(--muted); font-weight: 700; font-size: 14px; text-decoration: none; }
@@ -1077,30 +1128,20 @@ function codexCreditGuardControl(account, csrf) {
 }
 
 /**
- * Quota failover, on the account whose devices it moves.
- *
- * One select per slot rather than a multi-select, because the order is the
- * point: the first usable backup is the one traffic goes to.
+ * The failover chain in one line, on the account row. Editing lives on the
+ * Administration tab, where a chain is built one account at a time; this is
+ * only where people look first.
  */
-function accountFailoverControl(account, accounts, csrf) {
+function accountFailoverSummary(account, accounts) {
   if (!['claude', 'codex'].includes(account.provider)) return '';
   const policy = normalizeAccountFailover(account.failover);
-  const peers = accounts.filter((entry) => entry.provider === account.provider && entry.id !== account.id);
-  if (peers.length === 0) return '';
-  const slots = Array.from({ length: Math.min(FAILOVER_MAX_BACKUPS, peers.length) }, (_, index) => {
-    const chosen = policy.backup_account_ids[index] ?? '';
-    const options = peers.map((peer) => (
-      `<option value="${escapeHtml(peer.id)}"${peer.id === chosen ? ' selected' : ''}>${escapeHtml(peer.alias)}</option>`
-    )).join('');
-    return `<select name="backup_${index + 1}" aria-label="Backup ${index + 1} for ${escapeHtml(account.alias)}"><option value="">—</option>${options}</select>`;
-  }).join('');
-  return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/failover" class="guard-form">
-    <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-    <label class="guard-toggle"><input type="checkbox" name="enabled" value="1"${policy.enabled ? ' checked' : ''}><span data-i18n="failover-enable">Fail over when quota runs out</span></label>
-    ${slots}
-    <button class="secondary" type="submit" data-i18n="failover-save">Save failover</button>
-    <div class="muted tiny" data-i18n="failover-help">When the upstream refuses this account because its quota is used up, the request is resent on the first usable backup and the device moves there until this account resets. The client sees no error.</div>
-  </form>`;
+  const chain = policy.backup_account_ids
+    .map((id) => escapeHtml(accountForId(accounts, id)?.alias ?? id))
+    .join(' › ');
+  const link = `<a href="/admin#failover-${encodeURIComponent(account.id)}" data-i18n="failover-summary-edit">Set up on the Administration tab</a>`;
+  return policy.enabled
+    ? `<div class="failover-summary"><span class="pill ok" data-i18n="failover-summary-on">Failover on</span><span>${chain}</span>${link}</div>`
+    : `<div class="failover-summary"><span class="pill" data-i18n="failover-summary-off">Failover off</span>${link}</div>`;
 }
 
 /**
@@ -1111,7 +1152,7 @@ function deviceFailoverNote(device, accounts) {
   const marker = device.account_failover;
   if (!marker || device.revoked_at) return '';
   const home = accountForId(accounts, marker.home_account_id);
-  return `<div class="muted tiny" data-device-failover><span data-i18n="failover-device-moved">Moved by quota failover from</span> ${escapeHtml(home?.alias ?? marker.home_account_id ?? '—')}${marker.return_after ? ` · <span data-i18n="failover-device-returns">returns after</span> ${escapeHtml(dateText(marker.return_after))}` : ''}</div>`;
+  return `<div class="muted tiny" data-device-failover><span data-i18n="failover-device-moved">Moved by quota failover from</span> ${escapeHtml(home?.alias ?? marker.home_account_id ?? '—')}${marker.return_after ? ` · <span data-i18n="failover-device-returns">returns after</span> ${escapeHtml(dateText(marker.return_after))}` : ''} · <a href="/admin#failover-devices" data-i18n="failover-device-manage">manage</a></div>`;
 }
 
 /** The credit balance, whole credits with separators; the decimals are noise. */
@@ -3979,14 +4020,14 @@ export function dashboardView({
           <input name="member_label" aria-label="Member label for ${escapeHtml(account.alias)}" placeholder="member email/name" required maxlength="160">
           <button type="submit" data-i18n="enroll-device">Enroll device</button>
         </form>` : '<span class="muted tiny" data-i18n="owner-login-required">Account owner must authorize before member enrollment.</span>'}
-          ${accountFailoverControl(account, accounts, csrf)}
+          ${accountFailoverSummary(account, accounts)}
         </div>` : `<div class="stack">
           <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>
           ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}
           ${codexResetControl(account, csrf)}
           ${codexModelGuardControl(account, csrf)}
           ${codexCreditGuardControl(account, csrf)}
-          ${accountFailoverControl(account, accounts, csrf)}
+          ${accountFailoverSummary(account, accounts)}
         </div>`}
         ${(account.status === 'login_required' || account.provider === 'bedrock') && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
@@ -5285,8 +5326,168 @@ function blockRuleCard(rule, csrf) {
   </article>`;
 }
 
+/**
+ * The quota reading worth showing next to an account in a chain: the lowest of
+ * the windows every request draws on, and whether it is used up.
+ */
+function failoverQuota(usage) {
+  const windows = (Array.isArray(usage?.windows) ? usage.windows : [])
+    .filter((entry) => ['five_hour', 'weekly', 'primary', 'secondary'].includes(entry?.kind)
+      && Number.isFinite(entry.remaining_percent));
+  if (windows.length === 0) return null;
+  const lowest = windows.reduce((low, entry) => (entry.remaining_percent < low.remaining_percent ? entry : low));
+  const resetsAt = Date.parse(String(lowest.resets_at ?? ''));
+  const exhausted = lowest.remaining_percent <= 0 && (!Number.isFinite(resetsAt) || resetsAt > Date.now());
+  return { remaining: lowest.remaining_percent, resetsAt: lowest.resets_at ?? null, exhausted };
+}
+
+function failoverQuotaPill(quota) {
+  if (!quota) return '<span class="pill" data-i18n="failover-quota-unknown">Quota unknown</span>';
+  if (quota.exhausted) {
+    return `<span class="pill out"><span data-i18n="failover-quota-out">Used up</span>${quota.resetsAt ? ` · <span data-i18n="failover-resets">resets</span> ${escapeHtml(dateText(quota.resetsAt))}` : ''}</span>`;
+  }
+  const tone = quota.remaining <= 15 ? 'low' : 'ok';
+  return `<span class="pill ${tone}"><span data-i18n="failover-quota-left">Left</span> ${escapeHtml(String(quota.remaining))}%</span>`;
+}
+
+function failoverRow(account, { accounts, movedAway, csrf }) {
+  const policy = normalizeAccountFailover(account.failover);
+  const on = policy.enabled;
+  const id = encodeURIComponent(account.id);
+  const chainItems = policy.backup_account_ids.map((backupId, index) => {
+    const backup = accountForId(accounts, backupId);
+    const quota = failoverQuota(backup?.usage);
+    const value = escapeHtml(backupId);
+    return `${index > 0 ? '<li class="chain-arrow" aria-hidden="true">›</li>' : ''}<li class="chain-item${quota?.exhausted ? ' is-out' : ''}">
+        <span class="chain-index">${index + 1}</span>
+        <span class="chain-name">${escapeHtml(backup?.alias ?? backupId)}</span>
+        <span class="chain-quota">${quota ? (quota.exhausted ? '0%' : `${escapeHtml(String(quota.remaining))}%`) : '—'}</span>
+        ${index > 0 ? `<button type="submit" name="op" value="up:${value}" class="chain-btn"><span aria-hidden="true">←</span><span class="visually-hidden" data-i18n="failover-move-up">Move earlier</span></button>` : ''}
+        <button type="submit" name="op" value="remove:${value}" class="chain-btn remove"><span aria-hidden="true">×</span><span class="visually-hidden" data-i18n="failover-remove">Remove</span></button>
+      </li>`;
+  }).join('');
+  const canAdd = policy.backup_account_ids.length < FAILOVER_MAX_BACKUPS;
+  const moved = movedAway.get(account.id) ?? 0;
+  const empty = policy.backup_account_ids.length === 0;
+  // An account with no chain yet stays one line: with a hundred accounts most
+  // rows are this one, and the add box is all it needs.
+  const addControl = `<span class="chain-add">
+          <input name="add" list="failover-options-${escapeHtml(account.provider)}" autocomplete="off" spellcheck="false" placeholder="${empty ? 'Add a first backup…' : 'Add a backup…'}" data-placeholder-en="${empty ? 'Add a first backup…' : 'Add a backup…'}" data-placeholder-zh="${empty ? '添加第一个备用账号…' : '输入账号名添加备用…'}" aria-label="Add a backup for ${escapeHtml(account.alias)}">
+          <button type="submit" name="op" value="add" class="secondary" data-i18n="failover-add">Add</button>
+        </span>`;
+  return `<li class="failover-row${on ? ' is-on' : ''}" id="failover-${id}" data-failover-row data-search="${escapeHtml(`${account.alias} ${account.email_label ?? ''}`.toLowerCase())}">
+    <form method="post" action="/admin/failover/${id}">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <button type="submit" name="op" value="add" class="visually-hidden" tabindex="-1" aria-hidden="true">Add</button>
+      <div class="failover-head">
+        <button type="submit" name="op" value="${on ? 'disable' : 'enable'}" class="switch${on ? ' is-on' : ''}" role="switch" aria-checked="${on}"${!on && empty ? ' disabled' : ''}>
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+          ${on ? '<span data-i18n="failover-on">On</span>' : '<span data-i18n="failover-off">Off</span>'}
+        </button>
+        <div class="failover-name"><strong>${escapeHtml(account.alias)}</strong>${account.email_label ? `<span class="muted tiny">${escapeHtml(account.email_label)}</span>` : ''}</div>
+        <div class="failover-facts">
+          ${failoverQuotaPill(failoverQuota(account.usage))}
+          ${moved ? `<span class="pill moved">${moved} <span data-i18n="failover-moved-devices">device(s) moved to a backup</span></span>` : ''}
+        </div>
+        ${empty ? addControl : ''}
+      </div>
+      ${empty ? '' : `<div class="failover-chain">
+        <span class="failover-chain-label" data-i18n="failover-chain-label">Backups, in order</span>
+        <ol class="chain">${chainItems}</ol>
+        ${canAdd ? addControl : ''}
+      </div>`}
+    </form>
+  </li>`;
+}
+
+function failoverDevicesTable(devices, accounts, csrf) {
+  if (devices.length === 0) {
+    return '<p class="empty muted" data-i18n="failover-devices-none">No device is on a backup account right now.</p>';
+  }
+  const rows = devices.map((device) => {
+    const marker = device.account_failover;
+    const home = accountForId(accounts, marker.home_account_id);
+    const current = accountForId(accounts, device.selected_account_id);
+    return `<tr>
+      <td><strong>${escapeHtml(device.name)}</strong></td>
+      <td class="muted">${escapeHtml(device.member_label || '—')}</td>
+      <td>${escapeHtml(home?.alias ?? marker.home_account_id)} <span class="chain-arrow">→</span> <strong>${escapeHtml(current?.alias ?? device.selected_account_id ?? '—')}</strong></td>
+      <td>${escapeHtml(dateText(marker.at))}</td>
+      <td>${escapeHtml(dateText(marker.return_after))}</td>
+      <td><form method="post" action="/admin/failover/devices/${encodeURIComponent(device.id)}/failback" class="inline">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <button type="submit" class="secondary tiny" data-i18n="failover-failback">Return now</button>
+      </form></td>
+    </tr>`;
+  }).join('');
+  return `<div class="table-wrap"><table>
+    <thead><tr>
+      <th scope="col" data-i18n="failover-col-device">Device</th>
+      <th scope="col" data-i18n="failover-col-member">Member</th>
+      <th scope="col" data-i18n="failover-col-route">Home → now</th>
+      <th scope="col" data-i18n="failover-col-since">Moved</th>
+      <th scope="col" data-i18n="failover-col-returns">Returns after</th>
+      <th scope="col"><span class="visually-hidden" data-i18n="failover-col-action">Action</span></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+/**
+ * Quota failover, one row per account and grouped by provider. A chain is
+ * edited a step at a time — add by name, remove, move earlier — so a console
+ * with a hundred accounts renders a search box per row, not a hundred options.
+ */
+function failoverSection({ accounts, devices, csrf }) {
+  const movedAway = new Map();
+  for (const device of devices) {
+    const home = device.account_failover?.home_account_id;
+    if (home) movedAway.set(home, (movedAway.get(home) ?? 0) + 1);
+  }
+  const groups = [['claude', 'Claude Code'], ['codex', 'Codex']].map(([provider, label]) => {
+    // Switched on first, then those with a chain, then the rest by name: the
+    // accounts somebody configured are the ones people come back to.
+    const rank = (account) => {
+      const policy = normalizeAccountFailover(account.failover);
+      if (policy.enabled) return 0;
+      return policy.backup_account_ids.length ? 1 : 2;
+    };
+    const members = accounts
+      .filter((account) => account.provider === provider)
+      .sort((a, b) => rank(a) - rank(b) || a.alias.localeCompare(b.alias));
+    if (members.length === 0) return '';
+    const onCount = members.filter((account) => normalizeAccountFailover(account.failover).enabled).length;
+    const options = members.map((account) => (
+      `<option value="${escapeHtml(account.alias)}">${escapeHtml(account.email_label || account.alias)}</option>`
+    )).join('');
+    return `<div class="failover-group" data-failover-group>
+      <div class="failover-group-head">
+        <h3>${escapeHtml(label)}</h3>
+        <span class="muted tiny">${onCount} / ${members.length} <span data-i18n="failover-enabled-count">switched on</span></span>
+        ${members.length > 6 ? `<input type="search" data-failover-search placeholder="Filter accounts…" data-placeholder-en="Filter accounts…" data-placeholder-zh="筛选账号…" aria-label="Filter ${escapeHtml(label)} accounts">` : ''}
+      </div>
+      <datalist id="failover-options-${provider}">${options}</datalist>
+      <ul class="failover-list">${members.map((account) => failoverRow(account, { accounts, movedAway, csrf })).join('')}</ul>
+    </div>`;
+  }).join('');
+  return `<article class="card stack" id="failover">
+    <div>
+      <h2 data-i18n="failover-heading">Quota failover</h2>
+      <p class="muted" data-i18n="failover-intro">When the provider refuses an account because its subscription quota is used up, the gateway resends the same request on a backup account and the client sees no error. The device then stays on the backup and moves back by itself once its own account resets.</p>
+      <p class="muted tiny" data-i18n="failover-rules">The first usable backup in the order below is used; a backup that is used up too, has a broken credential, or is disabled is skipped. Only a used-up quota triggers a switch — an ordinary short rate limit does not.</p>
+    </div>
+    ${groups || '<p class="empty muted" data-i18n="failover-no-accounts">No Claude or Codex accounts are registered.</p>'}
+    <div class="stack" id="failover-devices">
+      <h3 data-i18n="failover-devices-heading">Devices on a backup right now</h3>
+      ${failoverDevicesTable(devices, accounts, csrf)}
+    </div>
+  </article>`;
+}
+
 export function adminView({
   blockRules = [],
+  failoverAccounts = [],
+  failoverDevices = [],
   csrf,
   error = null,
   openMode = false,
@@ -5300,6 +5501,7 @@ export function adminView({
         </div>
       </header>
       ${error ? `<div class="notice error" role="alert">${escapeHtml(error)}</div>` : ''}
+      ${failoverSection({ accounts: failoverAccounts, devices: failoverDevices, csrf })}
       <article class="card stack">
         <div>
           <h2 data-i18n="admin-block-heading">Blocked models</h2>

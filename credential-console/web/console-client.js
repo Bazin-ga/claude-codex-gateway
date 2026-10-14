@@ -62,11 +62,38 @@ const translations = {
   'codex-credit-guard-save': '保存 credits 设置',
   'codex-credit-guard-help': '订阅额度用完后，经网关的请求直接拒绝，不再扣 credits。直接登录该账号的客户端不受此开关影响。',
   'codex-credit-guard-active': '订阅额度用完后，网关不消耗 credits',
-  'failover-enable': '额度耗尽时自动切换到备用账号',
-  'failover-save': '保存切换设置',
-  'failover-help': '上游因额度用完拒绝该账号时，网关把同一请求改用第一个可用的备用账号重发，客户端不会看到报错；设备随之切到备用账号，到本账号额度重置后自动切回。',
+  'failover-heading': '额度耗尽自动切换',
+  'failover-intro': '账号的订阅额度用完、被上游拒绝时，网关会把同一个请求改用备用账号重发，客户端不会看到报错。该设备随之留在备用账号上，原账号额度重置后自动切回。',
+  'failover-rules': '按下面的顺序使用第一个可用的备用账号；额度同样用完、凭据失效或已停用的备用账号会被跳过。只有「额度用完」才会触发切换，普通的短时限流不会。',
+  'failover-on': '已开启',
+  'failover-off': '已关闭',
+  'failover-chain-label': '备用顺序',
+  'failover-chain-empty': '还没有备用账号，添加一个之后才能开启。',
+  'failover-add': '添加',
+  'failover-move-up': '前移',
+  'failover-remove': '移除',
+  'failover-quota-left': '剩余',
+  'failover-quota-out': '已用完',
+  'failover-resets': '重置于',
+  'failover-quota-unknown': '额度未知',
+  'failover-moved-devices': '台设备已切到备用账号',
+  'failover-enabled-count': '已开启',
+  'failover-no-accounts': '还没有登记任何 Claude 或 Codex 账号。',
+  'failover-devices-heading': '正在使用备用账号的设备',
+  'failover-devices-none': '目前没有设备在使用备用账号。',
+  'failover-col-device': '设备',
+  'failover-col-member': '成员',
+  'failover-col-route': '原账号 → 当前账号',
+  'failover-col-since': '切换时间',
+  'failover-col-returns': '预计切回',
+  'failover-col-action': '操作',
+  'failover-failback': '立即切回',
+  'failover-summary-on': '自动切换已开启',
+  'failover-summary-off': '自动切换未开启',
+  'failover-summary-edit': '在「管理」中设置',
   'failover-device-moved': '因额度耗尽临时切换自',
   'failover-device-returns': '预计切回时间',
+  'failover-device-manage': '管理',
   'codex-reset-quota-not-low': '只有余额低于 5% 时才提供重置。',
   'codex-reset-quota-unknown': '当前读不到额度，因此不提供重置。',
   'bedrock-description': '交进一个设备令牌，换出一次已计量的 Converse 调用。AWS key 留在服务端；每个账号固定一个区域和一个模型。',
@@ -767,6 +794,15 @@ function applyMachineSearch(input) {
 document.addEventListener('input', (event) => {
   const input = event.target.closest?.('[data-machine-search]');
   if (input) applyMachineSearch(input);
+});
+// Filters one provider's failover rows by account name or email.
+document.addEventListener('input', (event) => {
+  const input = event.target.closest?.('[data-failover-search]');
+  if (!input) return;
+  const query = input.value.trim().toLowerCase();
+  input.closest('[data-failover-group]')?.querySelectorAll('[data-failover-row]').forEach((row) => {
+    row.hidden = Boolean(query) && !(row.dataset.search || '').includes(query);
+  });
 });
 
 function sessionStateGet(key) {

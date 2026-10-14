@@ -24,6 +24,7 @@ import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
 import { codexQuotaSignal } from './lib/codex-quota-signal.js';
+import { applyFailoverEdit } from './lib/account-failover.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
@@ -674,6 +675,11 @@ export async function createCredentialConsole(options = {}) {
         // no matter what the account actually holds.
         codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
         codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
+        // The failover chain was missing here once, and every page showed it
+        // off while the gateway was moving devices by it.
+        failover: account.failover
+          ? { ...account.failover, backup_account_ids: [...(account.failover.backup_account_ids ?? [])] }
+          : null,
         active_devices: account.active_devices,
       };
       return {
@@ -1395,10 +1401,75 @@ export async function createCredentialConsole(options = {}) {
       if (!session) return;
       sendHtml(res, 200, adminView({
         blockRules: store.modelBlockRules(),
+        failoverAccounts: (await accountsWithExternalStatus())
+          .filter((account) => ['claude', 'codex'].includes(account.provider)),
+        failoverDevices: store.publicDevices()
+          .filter((device) => device.account_failover && !device.revoked_at),
         csrf: session.csrf,
         error: url.searchParams.get('error'),
         openMode,
       }));
+      return;
+    }
+
+    // Quota failover, edited one step at a time from the Administration tab.
+    // Like the block rules, every logged-in member may change it; the store
+    // audits who did.
+    const failoverEditParams = routeMatch(path, '/admin/failover/:id');
+    const failoverFailbackParams = routeMatch(path, '/admin/failover/devices/:id/failback');
+    if (req.method === 'POST' && (failoverEditParams || failoverFailbackParams)) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const actor = session.admin_identity ?? 'anonymous';
+      if (failoverFailbackParams) {
+        try {
+          const result = await store.failbackDeviceAccount({
+            deviceId: failoverFailbackParams.id,
+            reason: 'returned by hand from the console',
+            actor,
+          });
+          if (result.outcome !== 'success') {
+            throw new Error('the home account cannot take the device back right now');
+          }
+          redirect(res, '/admin#failover-devices');
+        } catch (error) {
+          redirect(res, `/admin?error=${encodeURIComponent(error.message)}#failover-devices`);
+        }
+        return;
+      }
+      const accountId = failoverEditParams.id;
+      const anchor = `#failover-${encodeURIComponent(accountId)}`;
+      try {
+        const account = store.accountById(accountId);
+        if (!account) throw new Error('account not found');
+        // "add:" carries what was typed into the search box: an alias or an id.
+        // Everything else names the backup it acts on by id.
+        const [op, ...rest] = String(form.op ?? '').split(':');
+        let target = rest.join(':') || null;
+        if (op === 'add') {
+          const typed = String(form.add ?? '').trim();
+          const match = store.state.accounts.find((entry) => entry.provider === account.provider
+            && (entry.id === typed || entry.alias.toLowerCase() === typed.toLowerCase()));
+          if (!typed) throw new Error('type the name of the account to add');
+          if (!match) throw new Error(`no ${account.provider} account is called "${typed.slice(0, 64)}"`);
+          if (match.id === account.id) throw new Error('an account cannot be its own backup');
+          target = match.id;
+        }
+        const next = applyFailoverEdit(account.failover, { op, accountId: target });
+        await store.setAccountFailover(accountId, {
+          enabled: next.enabled,
+          backupAccountIds: next.backup_account_ids,
+          actor,
+        });
+        redirect(res, `/admin${anchor}`);
+      } catch (error) {
+        redirect(res, `/admin?error=${encodeURIComponent(error.message)}${anchor}`);
+      }
       return;
     }
 
@@ -2324,7 +2395,7 @@ export async function createCredentialConsole(options = {}) {
       }
       try {
         // One select per slot, in order; an empty slot is simply skipped.
-        const backupAccountIds = [1, 2, 3, 4]
+        const backupAccountIds = [1, 2, 3, 4, 5, 6, 7, 8]
           .map((slot) => form[`backup_${slot}`])
           .filter((id) => typeof id === 'string' && id);
         await store.setAccountFailover(failoverParams.id, {
