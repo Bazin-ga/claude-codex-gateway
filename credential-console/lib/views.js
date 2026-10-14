@@ -254,16 +254,25 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .switch.is-on .switch-thumb { left: 19px; }
 .failover-chain { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; margin-top: 12px; padding-left: 102px; }
 .failover-chain-label { font-size: 12px; font-weight: 700; color: var(--muted); }
-.chain { list-style: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; padding: 0; }
-.chain-item { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: white; border-radius: 999px; padding: 3px 3px 3px 4px; font-size: 13px; font-weight: 700; }
+.chain { list-style: none; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; margin: 0; padding: 0; }
+.chain-item { position: relative; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: white; border-radius: 999px; padding: 3px 3px 3px 8px; font-size: 13px; font-weight: 700; cursor: grab; touch-action: none; user-select: none; transition: box-shadow .12s, transform .12s; }
+.chain-item:not(:first-child)::before { content: '›'; position: absolute; left: -15px; color: var(--muted); font-weight: 800; pointer-events: none; }
+.chain-item:hover { border-color: #b9c6bb; box-shadow: 0 2px 8px rgba(22,33,29,.08); }
+.chain-item.is-dragging { cursor: grabbing; transform: scale(1.04); box-shadow: 0 8px 20px rgba(22,33,29,.18); border-color: var(--green); z-index: 2; }
+.chain.is-sorting .chain-item:not(.is-dragging) { border-style: dashed; }
+.chain.is-saving { opacity: .6; pointer-events: none; }
+.chain-grip { color: #a7b2aa; font-size: 11px; letter-spacing: -2px; margin-right: 1px; }
+.chain-actions { display: inline-flex; align-items: center; }
+.chain-hint { font-weight: 600; color: #8a978f; }
 .chain-arrow { color: var(--muted); font-weight: 700; }
 .chain-index { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--ink); color: white; font-size: 11px; }
 .chain-quota { color: var(--muted); font-size: 11px; font-weight: 600; }
 .chain-item.is-out { background: #fbf3f2; }
 .chain-item.is-out .chain-index { background: var(--red); }
 .chain-item.is-out .chain-quota { color: var(--red); }
-.chain-btn { margin: 0; padding: 2px 7px; background: none; color: var(--muted); font-size: 14px; line-height: 1.2; border-radius: 999px; }
+.chain-btn { margin: 0; padding: 2px 6px; background: none; color: var(--muted); font-size: 13px; line-height: 1.2; border-radius: 999px; cursor: pointer; }
 .chain-btn:hover { background: #eef1ec; color: var(--ink); }
+.chain-btn:disabled { opacity: .25; background: none; }
 .chain-btn.remove:hover { background: #f8e4e1; color: var(--red); }
 .chain-empty { font-size: 13px; color: var(--muted); }
 .chain-add { display: inline-flex; align-items: center; gap: 6px; }
@@ -520,6 +529,7 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .accounts-table td:last-child input { min-width: 140px; }
 .accounts-table td:last-child .button { white-space: normal; }
 .page-tabs { position: sticky; top: 10px; z-index: 3; display: flex; gap: var(--space-2); flex-wrap: wrap; margin: -8px 0 24px; padding: 6px; border: 1px solid var(--line); border-radius: var(--radius-md); background: rgba(255,255,255,.94); box-shadow: 0 6px 18px rgba(22,33,29,.06); backdrop-filter: blur(8px); }
+.page-tabs[hidden] { display: none; }
 .page-tabs a { padding: 8px 12px; border-radius: 8px; color: var(--muted); font-size: 13px; font-weight: 750; text-decoration: none; }
 .page-tabs a:hover, .page-tabs a[aria-current="page"] { background: var(--ink); color: white; }
 .page-tabs a:focus-visible, button:focus-visible, a.button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
@@ -828,11 +838,11 @@ function layout(title, content, {
       </div>
     </header>
     ${activeTab ? `<nav class="page-tabs" aria-label="Primary navigation">
-      <a href="/" data-i18n="tab-overview"${activeTab === 'overview' ? ' aria-current="page"' : ''}>Overview</a>
-      <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''}>Usage &amp; metrics</a>
-      <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''}>Conversations</a>
-      <a href="/docs" data-i18n="tab-docs"${activeTab === 'docs' ? ' aria-current="page"' : ''}>Docs &amp; API</a>
-      <a href="/admin" data-i18n="tab-admin"${activeTab === 'admin' ? ' aria-current="page"' : ''}>Administration</a>
+      <a href="/" data-i18n="tab-overview"${activeTab === 'overview' ? ' aria-current="page"' : ''} data-tab="overview">Overview</a>
+      <a href="/metrics" data-i18n="tab-metrics"${activeTab === 'metrics' ? ' aria-current="page"' : ''} data-tab="metrics">Usage &amp; metrics</a>
+      <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''} data-tab="conversations">Conversations</a>
+      <a href="/docs" data-i18n="tab-docs"${activeTab === 'docs' ? ' aria-current="page"' : ''} data-tab="docs">Docs &amp; API</a>
+      <a href="/admin" data-i18n="tab-admin"${activeTab === 'admin' ? ' aria-current="page"' : ''} data-tab="admin">Administration</a>
     </nav>` : ''}
     <div data-page-content data-active-tab="${escapeHtml(activeTab ?? '')}">${PAGE_CONTENT_START}${openMode ? openBanner : ''}
     ${content}${PAGE_CONTENT_END}</div>
@@ -5358,12 +5368,18 @@ function failoverRow(account, { accounts, movedAway, csrf }) {
     const backup = accountForId(accounts, backupId);
     const quota = failoverQuota(backup?.usage);
     const value = escapeHtml(backupId);
-    return `${index > 0 ? '<li class="chain-arrow" aria-hidden="true">›</li>' : ''}<li class="chain-item${quota?.exhausted ? ' is-out' : ''}">
+    const last = index === policy.backup_account_ids.length - 1;
+    const titled = (en, zh) => `title="${en}" data-title-en="${en}" data-title-zh="${zh}"`;
+    return `<li class="chain-item${quota?.exhausted ? ' is-out' : ''}" data-chain-item="${value}" ${titled('Drag to reorder', '拖动调整顺序')}>
+        <span class="chain-grip" aria-hidden="true">⋮⋮</span>
         <span class="chain-index">${index + 1}</span>
         <span class="chain-name">${escapeHtml(backup?.alias ?? backupId)}</span>
         <span class="chain-quota">${quota ? (quota.exhausted ? '0%' : `${escapeHtml(String(quota.remaining))}%`) : '—'}</span>
-        ${index > 0 ? `<button type="submit" name="op" value="up:${value}" class="chain-btn"><span aria-hidden="true">←</span><span class="visually-hidden" data-i18n="failover-move-up">Move earlier</span></button>` : ''}
-        <button type="submit" name="op" value="remove:${value}" class="chain-btn remove"><span aria-hidden="true">×</span><span class="visually-hidden" data-i18n="failover-remove">Remove</span></button>
+        <span class="chain-actions">
+          <button type="submit" name="op" value="up:${value}" class="chain-btn"${index === 0 ? ' disabled' : ''} ${titled('Move earlier', '前移')}><span aria-hidden="true">←</span><span class="visually-hidden" data-i18n="failover-move-up">Move earlier</span></button>
+          <button type="submit" name="op" value="down:${value}" class="chain-btn"${last ? ' disabled' : ''} ${titled('Move later', '后移')}><span aria-hidden="true">→</span><span class="visually-hidden" data-i18n="failover-move-down">Move later</span></button>
+          <button type="submit" name="op" value="remove:${value}" class="chain-btn remove" ${titled('Remove', '移除')}><span aria-hidden="true">×</span><span class="visually-hidden" data-i18n="failover-remove">Remove</span></button>
+        </span>
       </li>`;
   }).join('');
   const canAdd = policy.backup_account_ids.length < FAILOVER_MAX_BACKUPS;
@@ -5392,8 +5408,8 @@ function failoverRow(account, { accounts, movedAway, csrf }) {
         ${empty ? addControl : ''}
       </div>
       ${empty ? '' : `<div class="failover-chain">
-        <span class="failover-chain-label" data-i18n="failover-chain-label">Backups, in order</span>
-        <ol class="chain">${chainItems}</ol>
+        <span class="failover-chain-label"><span data-i18n="failover-chain-label">Backups, in order</span>${policy.backup_account_ids.length > 1 ? ' <span class="chain-hint" data-i18n="failover-chain-hint">(drag to reorder)</span>' : ''}</span>
+        <ol class="chain" data-chain>${chainItems}</ol>
         ${canAdd ? addControl : ''}
       </div>`}
     </form>
@@ -5496,8 +5512,8 @@ export function adminView({
     <section class="stack">
       <header class="metrics-page-hero">
         <div>
-        <h1 data-i18n="admin-heading">Administration</h1>
-        <p class="muted" data-i18n="admin-intro">Settings that apply to the whole console rather than to one account or device. Every change here is recorded in the audit log with who made it.</p>
+        <h1 data-i18n="admin-page-heading">Administration</h1>
+        <p class="muted" data-i18n="admin-page-intro">Shared settings: how accounts back each other up when quota runs out, and which models the gateway refuses. Every change here is recorded in the audit log with who made it.</p>
         </div>
       </header>
       ${error ? `<div class="notice error" role="alert">${escapeHtml(error)}</div>` : ''}

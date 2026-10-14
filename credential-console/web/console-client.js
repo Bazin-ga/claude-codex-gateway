@@ -71,6 +71,9 @@ const translations = {
   'failover-chain-empty': '还没有备用账号，添加一个之后才能开启。',
   'failover-add': '添加',
   'failover-move-up': '前移',
+  'failover-move-down': '后移',
+  'failover-chain-hint': '（可拖动调整）',
+  'admin-page-intro': '共享设置：额度用完时账号之间如何互相顶替，以及网关拒绝哪些模型。这里的每次改动都会连同操作人一起记入审计日志。',
   'failover-remove': '移除',
   'failover-quota-left': '剩余',
   'failover-quota-out': '已用完',
@@ -227,8 +230,7 @@ const translations = {
   'metrics-filter-hours': '时间范围',
   'tab-docs': '文档与 API',
   'tab-admin': '管理',
-  'admin-heading': '管理',
-  'admin-intro': '作用于整个控制台、而不是某个账号或设备的设置。这里的每次改动都会连同操作人一起记入审计日志。',
+  'admin-page-heading': '管理',
   'admin-block-heading': '禁用模型',
   'admin-block-intro': '请求被禁用的模型时，网关会在请求到达任何账号之前直接拒绝，调用方看到的是下面填写的提示，而不是模型回答。对 Claude 和 Codex 网关上的所有账号、所有设备生效。',
   'admin-block-patterns': '每个名称都要和完整的模型 ID 一致才算命中，不区分大小写。* 代表任意字符：gpt-5.6* 能匹配 gpt-5.6-sol、gpt-5.6-luna；claude-opus-5 只匹配 claude-opus-5，不会误伤 claude-opus-5-5。多个名称用逗号分隔。',
@@ -721,6 +723,11 @@ function translateSubtree(root, selected) {
       ? (element.dataset.placeholderZh ?? element.dataset.placeholderEn)
       : element.dataset.placeholderEn;
   });
+  root.querySelectorAll('[data-title-en]').forEach((element) => {
+    element.title = selected === 'zh'
+      ? (element.dataset.titleZh ?? element.dataset.titleEn)
+      : element.dataset.titleEn;
+  });
 }
 function applyLanguage(language) {
   const selected = language === 'zh' ? 'zh' : 'en';
@@ -795,6 +802,73 @@ document.addEventListener('input', (event) => {
   const input = event.target.closest?.('[data-machine-search]');
   if (input) applyMachineSearch(input);
 });
+// Reorder a failover chain by dragging its chips, with a mouse or a finger.
+// Pointer events rather than HTML drag and drop, which does nothing on touch.
+// Dropping saves at once through the same form the arrow buttons use; without
+// scripting the arrows still work on their own.
+let chainDrag = null;
+function chainOrder(chain) {
+  return [...chain.querySelectorAll('[data-chain-item]')].map((chip) => chip.dataset.chainItem);
+}
+document.addEventListener('pointerdown', (event) => {
+  const chip = event.target.closest?.('[data-chain-item]');
+  if (!chip || event.button !== 0 || event.target.closest('button')) return;
+  const chain = chip.closest('[data-chain]');
+  if (!chain || chain.querySelectorAll('[data-chain-item]').length < 2) return;
+  chainDrag = {
+    chip,
+    chain,
+    pointerId: event.pointerId,
+    x: event.clientX,
+    y: event.clientY,
+    moved: false,
+    before: chainOrder(chain).join(','),
+  };
+  chip.setPointerCapture?.(event.pointerId);
+});
+document.addEventListener('pointermove', (event) => {
+  const drag = chainDrag;
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  if (!drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 5) return;
+  drag.moved = true;
+  drag.chip.classList.add('is-dragging');
+  drag.chain.classList.add('is-sorting');
+  event.preventDefault();
+  const under = document.elementFromPoint(event.clientX, event.clientY)?.closest?.('[data-chain-item]');
+  if (!under || under === drag.chip || under.closest('[data-chain]') !== drag.chain) return;
+  const rect = under.getBoundingClientRect();
+  const sameLine = event.clientY >= rect.top && event.clientY <= rect.bottom;
+  const after = sameLine ? event.clientX > rect.left + rect.width / 2 : event.clientY > rect.bottom;
+  under[after ? 'after' : 'before'](drag.chip);
+  drag.chain.querySelectorAll('[data-chain-item] .chain-index').forEach((badge, index) => {
+    badge.textContent = String(index + 1);
+  });
+});
+function endChainDrag(event) {
+  const drag = chainDrag;
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  chainDrag = null;
+  drag.chip.classList.remove('is-dragging');
+  drag.chain.classList.remove('is-sorting');
+  const order = chainOrder(drag.chain).join(',');
+  if (!drag.moved || order === drag.before || event.type === 'pointercancel') {
+    if (order !== drag.before) location.reload();
+    return;
+  }
+  const form = drag.chain.closest('form');
+  for (const [name, value] of [['op', 'order'], ['order', order]]) {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = name;
+    input.value = value;
+    form.append(input);
+  }
+  drag.chain.classList.add('is-saving');
+  form.submit();
+}
+document.addEventListener('pointerup', endChainDrag);
+document.addEventListener('pointercancel', endChainDrag);
+
 // Filters one provider's failover rows by account name or email.
 document.addEventListener('input', (event) => {
   const input = event.target.closest?.('[data-failover-search]');
@@ -1335,22 +1409,25 @@ async function navigateTo(url, { push = true, samePage: samePageOverride = null 
   }
 }
 
-const TAB_HREF_BY_NAME = { overview: '/', metrics: '/metrics', conversations: '/conversations', docs: '/docs' };
-
 function markActiveTab(activeTab) {
   // The server names the section; the client does not infer it. /conversations
   // and /conversation-turns are siblings, so no path rule relates them, and an
   // exact-match guess silently removed a highlight that was already correct.
-  const href = TAB_HREF_BY_NAME[activeTab];
+  // Each link carries its own section name: a separate table of them here
+  // missed the Administration tab when it was added, and navigating to it left
+  // the old tab highlighted.
   const nav = document.querySelector('.page-tabs');
   if (!nav) return;
+  const current = activeTab
+    ? [...nav.querySelectorAll('a[data-tab]')].find((link) => link.dataset.tab === activeTab)
+    : null;
   // The bar lives outside the swapped region, so a page the server renders
   // without one — an enrolment landing page, say — would otherwise inherit the
   // bar from wherever the reader came from and disagree with its own reload.
-  nav.hidden = !href;
-  if (!href) return;
+  nav.hidden = !current;
+  if (!current) return;
   nav.querySelectorAll('a').forEach((link) => {
-    if (link.getAttribute('href') === href) link.setAttribute('aria-current', 'page');
+    if (link === current) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
   });
 }
