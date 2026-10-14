@@ -282,7 +282,7 @@ export function chooseFailoverAccount({
  * it. Removing the last backup turns failover off, since a chain with nothing
  * in it cannot be on.
  */
-export function applyFailoverEdit(current, { op, accountId = null } = {}) {
+export function applyFailoverEdit(current, { op, accountId = null, order = null } = {}) {
   const policy = normalizeAccountFailover(current);
   let enabled = policy.enabled;
   const ids = [...policy.backup_account_ids];
@@ -298,11 +298,24 @@ export function applyFailoverEdit(current, { op, accountId = null } = {}) {
     ids.push(accountId);
   } else if (op === 'remove') {
     if (index === -1) throw new Error('that account is not a backup');
+    // Removing is the only edit that can leave nothing behind.
     ids.splice(index, 1);
     if (ids.length === 0) enabled = false;
   } else if (op === 'up') {
     if (index === -1) throw new Error('that account is not a backup');
     if (index > 0) [ids[index - 1], ids[index]] = [ids[index], ids[index - 1]];
+  } else if (op === 'down') {
+    if (index === -1) throw new Error('that account is not a backup');
+    if (index < ids.length - 1) [ids[index], ids[index + 1]] = [ids[index + 1], ids[index]];
+  } else if (op === 'order') {
+    // A whole new order, from dragging. It has to be the same accounts, just
+    // rearranged: a page that went stale must not add or drop one by accident.
+    const next = Array.isArray(order) ? order : [];
+    if (next.length !== ids.length || new Set(next).size !== next.length
+      || !next.every((id) => ids.includes(id))) {
+      throw new Error('the backup list changed meanwhile; reload and try again');
+    }
+    return { enabled, backup_account_ids: next };
   } else {
     throw new Error('unknown failover change');
   }

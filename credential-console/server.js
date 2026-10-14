@@ -1460,7 +1460,11 @@ export async function createCredentialConsole(options = {}) {
           if (match.id === account.id) throw new Error('an account cannot be its own backup');
           target = match.id;
         }
-        const next = applyFailoverEdit(account.failover, { op, accountId: target });
+        const next = applyFailoverEdit(account.failover, {
+          op,
+          accountId: target,
+          order: String(form.order ?? '').split(',').filter(Boolean),
+        });
         await store.setAccountFailover(accountId, {
           enabled: next.enabled,
           backupAccountIds: next.backup_account_ids,

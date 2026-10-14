@@ -59,11 +59,11 @@ const OPUS5 = {
 test('the Administration tab is in the navigation and opens an empty rule list', async (t) => {
   const app = await adminFixture(t);
   const overview = await app.page('/');
-  assert.match(overview.html, /<a href="\/admin" data-i18n="tab-admin">Administration<\/a>/);
+  assert.match(overview.html, /<a href="\/admin" data-i18n="tab-admin" data-tab="admin">Administration<\/a>/);
 
   const admin = await app.page();
   assert.equal(admin.status, 200);
-  assert.match(admin.html, /<a href="\/admin" data-i18n="tab-admin" aria-current="page">/);
+  assert.match(admin.html, /<a href="\/admin" data-i18n="tab-admin" aria-current="page"/);
   assert.match(admin.html, /data-i18n="admin-block-none"/);
   assert.match(admin.html, /action="\/admin\/model-block-rules"/, 'the add form is there');
 });
