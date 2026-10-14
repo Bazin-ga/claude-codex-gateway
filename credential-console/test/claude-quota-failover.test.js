@@ -484,3 +484,30 @@ test('an unreadable failover record reads as off', () => {
   const store = { accountById: () => ({ id: 'b', provider: 'claude', status: 'healthy' }) };
   assert.equal(chooseFailoverAccount({ store, homeAccount: { id: 'a', provider: 'claude', failover: null } }), null);
 });
+
+test('the upstream quota headers reach the client so it can say when the limit resets', { timeout: 20_000 }, async (t) => {
+  const { store, deviceToken } = await fleet({ backups: [] });
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+    await readBody(req);
+    res.writeHead(429, { ...exhaustedHeaders('seven_day'), 'x-internal-thing': 'not forwarded' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'limit reached' } }));
+  });
+
+  const response = await new Promise((resolve, reject) => {
+    const request = http.request(new URL(`${proxyUrl}/claude/v1/messages`), {
+      method: 'POST',
+      headers: { 'X-Api-Key': deviceToken, 'Content-Type': 'application/json', 'Content-Length': PAYLOAD.length },
+    }, (res) => {
+      res.resume();
+      res.once('end', () => resolve({ status: res.statusCode, headers: res.headers }));
+    });
+    request.once('error', reject);
+    request.end(PAYLOAD);
+  });
+
+  assert.equal(response.status, 429);
+  assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
+  assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'seven_day');
+  assert.equal(response.headers['anthropic-ratelimit-unified-reset'], String(RESET_SECONDS));
+  assert.equal(response.headers['x-internal-thing'], undefined, 'the allowlist still holds for everything else');
+});

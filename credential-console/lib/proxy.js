@@ -307,6 +307,14 @@ function forwardHeaders(headers) {
   );
 }
 
+// The subscription quota headers, forwarded whole. Claude Code reads them to
+// tell "your usage limit is reached, resets at 3am" from a transient server
+// limit; without them every exhausted-quota 429 was shown as "Server is
+// temporarily limiting requests (not your usage limit)" and retried. They
+// describe the account's allowance and nothing else — no credential, nothing
+// about other members' requests.
+const CLAUDE_QUOTA_HEADER_PREFIX = 'anthropic-ratelimit-unified-';
+
 function responseHeaders(headers) {
   const allowed = [
     'content-encoding',
@@ -315,11 +323,15 @@ function responseHeaders(headers) {
     'retry-after',
     'x-request-id',
   ];
-  return Object.fromEntries(
+  const forwarded = Object.fromEntries(
     allowed
       .filter((name) => headers[name] !== undefined)
       .map((name) => [name, headers[name]]),
   );
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.startsWith(CLAUDE_QUOTA_HEADER_PREFIX) && value !== undefined) forwarded[name] = value;
+  }
+  return forwarded;
 }
 
 export async function handleClaudeProxy(req, res, {
