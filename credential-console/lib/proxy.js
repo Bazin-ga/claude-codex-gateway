@@ -29,11 +29,9 @@ import {
   modelBlockMessage,
 } from './model-block-rules.js';
 import {
-  FAILOVER_UNKNOWN_RESET_MS,
-  chooseFailoverAccount,
+  beginFailover,
   claudeQuotaRejection,
   claudeRateLimitHeaders,
-  normalizeAccountFailover,
   quotaExhaustion,
 } from './account-failover.js';
 
@@ -496,73 +494,30 @@ export async function handleClaudeProxy(req, res, {
     }
   }
 
-  // Quota failover. The backup list that governs is the home account's: the
-  // one the device was on before the gateway moved it, if it did. A moved
-  // device whose home has since reset goes back first, and a device still
-  // pointed at an account another device has just found exhausted goes
-  // straight to a backup instead of collecting the same refusal again.
-  const failoverMarker = device.account_failover;
-  const markerHome = failoverMarker && failoverMarker.account_id === account.id
-    ? store.accountById(failoverMarker.home_account_id)
-    : null;
-  const homeAccount = markerHome?.provider === 'claude' ? markerHome : account;
-  const failoverEnabled = normalizeAccountFailover(homeAccount.failover).enabled;
-  // The account the device row points at, which is what a persistent move
-  // has to start from.
-  let deviceSelectedId = account.id;
-  if (markerHome && homeAccount === markerHome
-    && Date.parse(failoverMarker.return_after ?? '') <= Date.now()
-    && ['healthy', 'stored'].includes(markerHome.status)
-    && !exhaustion.exhausted(markerHome.id)
-    && !store.failoverCandidateProblem?.(markerHome)) {
-    log('claude_proxy_quota_failback', {
-      device_id: device.id,
-      from_account_id: account.id,
-      to_account_id: markerHome.id,
-    });
-    store.failbackDeviceAccount?.({ deviceId: device.id, reason: 'home account reset' })
-      ?.catch?.((error) => log('claude_proxy_failback_persist_failed', {
-        device_id: device.id,
-        code: error?.code ?? error?.name ?? 'unknown',
-      }));
-    account = markerHome;
-    deviceSelectedId = markerHome.id;
-  }
-  const triedAccountIds = [account.id];
-  // The account this request was moved off, once it has been.
-  let failedOverFrom = null;
+  // Quota failover: possibly back home, possibly straight to a backup. See
+  // beginFailover for the rules.
+  const failover = beginFailover({
+    store,
+    device,
+    account,
+    exhaustion,
+    usageSnapshotFor,
+    log,
+    logPrefix: 'claude_proxy',
+  });
+  account = failover.account;
+  // A backup whose credential cannot be read is skipped like an exhausted one.
   const backupWithCredential = () => {
-    while (true) {
-      const backup = chooseFailoverAccount({
-        store,
-        homeAccount,
-        exclude: triedAccountIds,
-        exhaustion,
-        usageSnapshotFor,
-      });
-      if (!backup) return null;
-      triedAccountIds.push(backup.id);
+    for (let backup = failover.nextBackup(); backup; backup = failover.nextBackup()) {
       try {
         const token = store.accountCredential(backup.id)?.oauth_token;
         if (token) return { backup, token };
       } catch {
-        // An unreadable backup is skipped like an exhausted one.
+        // Try the next one.
       }
     }
+    return null;
   };
-  if (failoverEnabled && exhaustion.exhausted(account.id)) {
-    const found = backupWithCredential();
-    if (found) {
-      log('claude_proxy_quota_failover', {
-        stage: 'preflight',
-        device_id: device.id,
-        from_account_id: account.id,
-        to_account_id: found.backup.id,
-      });
-      failedOverFrom = account;
-      account = found.backup;
-    }
-  }
 
   let credential;
   try {
@@ -669,7 +624,6 @@ export async function handleClaudeProxy(req, res, {
   // Each backup is tried at most once anyway; this bounds a long backup list.
   const MAX_FAILOVERS = 3;
   let failoversUsed = 0;
-  let failoverPersisted = false;
   const bodyFinishedWaiters = [];
   const RETRY_BASE_DELAY_MS = 250;
   const RETRY_MAX_DELAY_MS = 5000;
@@ -827,28 +781,6 @@ export async function handleClaudeProxy(req, res, {
     }, { accountId: fromAccount.id, deviceId: device.id });
   };
 
-  // Once a backup has answered, the device itself moves, so its next request
-  // goes straight there and the console shows where it is.
-  const persistFailover = () => {
-    if (failoverPersisted || !failedOverFrom || deviceSelectedId === account.id) return;
-    failoverPersisted = true;
-    const returnAfterMs = exhaustion.exhausted(homeAccount.id)?.until
-      ?? exhaustion.exhausted(failedOverFrom.id)?.until
-      ?? Date.now() + FAILOVER_UNKNOWN_RESET_MS;
-    store.failoverDeviceAccount?.({
-      deviceId: device.id,
-      homeAccountId: homeAccount.id,
-      fromAccountId: deviceSelectedId,
-      toAccountId: account.id,
-      returnAfterMs,
-      reason: `quota exhausted on ${failedOverFrom.alias}`,
-    })?.catch?.((error) => log('claude_proxy_failover_persist_failed', {
-      device_id: device.id,
-      to_account_id: account.id,
-      code: error?.code ?? error?.name ?? 'unknown',
-    }));
-  };
-
   const sendUpstream = (bodyBuffer) => {
     if (clientAborted || metricFinalized) return undefined;
     attemptsUsed += 1;
@@ -880,7 +812,7 @@ export async function handleClaudeProxy(req, res, {
         }
         if (rejection) {
           const entry = exhaustion.mark(account.id, rejection);
-          const found = failoverEnabled && !clientAborted && failoversUsed < MAX_FAILOVERS
+          const found = failover.enabled && !clientAborted && failoversUsed < MAX_FAILOVERS
             ? backupWithCredential()
             : null;
           if (found) {
@@ -896,7 +828,7 @@ export async function handleClaudeProxy(req, res, {
               claim: rejection.claim,
               resets_at: new Date(entry.until).toISOString(),
             });
-            failedOverFrom ??= exhausted;
+            failover.moveTo(found.backup);
             account = found.backup;
             headers.authorization = `Bearer ${found.token}`;
             upstreamRes.once('error', () => {});
@@ -944,7 +876,7 @@ export async function handleClaudeProxy(req, res, {
 
         attemptSettled = true;
         activeUpstreamRes = upstreamRes;
-        if (status >= 200 && status < 300) persistFailover();
+        if (status >= 200 && status < 300) failover.recordMove();
         upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
         upstreamStatus = status;
         const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];

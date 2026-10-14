@@ -1,3 +1,6 @@
+import { Buffer } from 'node:buffer';
+import zlib from 'node:zlib';
+
 /**
  * Quota-exhaustion failover: when an account's subscription allowance is used
  * up, carry on with a backup account instead of handing the 429 to the client.
@@ -88,6 +91,63 @@ export function claudeQuotaRejection(statusCode, headers) {
     claim: claim && /^[a-z0-9_]{1,40}$/i.test(claim) ? claim : null,
     resetsAtMs: resetMs(header(headers, `${CLAUDE_UNIFIED_PREFIX}reset`)),
   };
+}
+
+/** A small upstream error body, decoded; null when it cannot be read. */
+function decodeErrorBody(body, contentEncoding) {
+  const encoding = String(contentEncoding ?? '').trim().toLowerCase();
+  try {
+    if (!encoding || encoding === 'identity') return body.toString('utf8');
+    if (encoding === 'gzip') return zlib.gunzipSync(body).toString('utf8');
+    if (encoding === 'br') return zlib.brotliDecompressSync(body).toString('utf8');
+    if (encoding === 'deflate') return zlib.inflateSync(body).toString('utf8');
+    if (encoding === 'zstd' && typeof zlib.zstdDecompressSync === 'function') {
+      return zlib.zstdDecompressSync(body).toString('utf8');
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Whether a Codex 429 is chatgpt.com saying the account's included quota is
+ * used up. That refusal is a JSON body of type `usage_limit_reached` with the
+ * reset in epoch seconds — the shape the CLI shows as "usage limit reached,
+ * try again at …". The status line alone cannot tell it from a burst limit, so
+ * the body is read; it is a few hundred bytes.
+ */
+export function codexQuotaRejection(statusCode, body, { contentEncoding = null, now = Date.now() } = {}) {
+  if (statusCode !== 429 || !Buffer.isBuffer(body)) return null;
+  const text = decodeErrorBody(body, contentEncoding);
+  if (text === null) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const error = parsed?.error;
+  if (error?.type !== 'usage_limit_reached') return null;
+  let resetsAtMs = null;
+  const resetsAt = Number(error.resets_at);
+  const resetsIn = Number(error.resets_in_seconds);
+  if (Number.isFinite(resetsAt) && resetsAt > 0) resetsAtMs = Math.round(resetsAt * 1000);
+  else if (Number.isFinite(resetsIn) && resetsIn > 0) resetsAtMs = now + Math.round(resetsIn * 1000);
+  const code = typeof error.code === 'string' && /^[a-z0-9_]{1,60}$/i.test(error.code) ? error.code : null;
+  return { claim: code, resetsAtMs };
+}
+
+/** The quota headers chatgpt.com puts on a Codex 429, for the log line. */
+export function codexRateLimitHeaders(headers) {
+  const picked = {};
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    if (!name.startsWith('x-codex-') && name !== 'retry-after') continue;
+    if (name === 'x-codex-turn-state') continue;
+    const text = Array.isArray(value) ? value.join(',') : String(value);
+    picked[name] = text.slice(0, 200);
+  }
+  return picked;
 }
 
 /**
@@ -185,6 +245,8 @@ export function chooseFailoverAccount({
   exclude = [],
   exhaustion = quotaExhaustion,
   usageSnapshotFor = () => null,
+  exhaustedBy = usageShowsExhausted,
+  acceptCandidate = () => true,
   now = Date.now(),
 }) {
   const policy = normalizeAccountFailover(homeAccount?.failover);
@@ -203,8 +265,141 @@ export function chooseFailoverAccount({
     } catch {
       snapshot = null;
     }
-    if (usageShowsExhausted(snapshot, now)) continue;
+    if (exhaustedBy(snapshot, now)) continue;
+    if (!acceptCandidate(candidate)) continue;
     return candidate;
   }
   return null;
+}
+
+/**
+ * Everything a proxy decides about failover before it sends anything.
+ *
+ * The backup list that governs is the home account's: the one the device was
+ * on before the gateway moved it, if it did. A moved device whose home has
+ * since reset goes back first. A device still pointed at an account known to
+ * be exhausted — from a refusal another device just collected, or from the
+ * usage reading — goes straight to a backup instead of asking again.
+ *
+ * Returns the account to start with and a `nextBackup()` that hands out each
+ * remaining usable backup once, plus what `recordMove()` needs to move the
+ * device itself once a backup has answered.
+ */
+export function beginFailover({
+  store,
+  device,
+  account,
+  exhaustion = quotaExhaustion,
+  usageSnapshotFor = () => null,
+  exhaustedBy = usageShowsExhausted,
+  acceptCandidate = () => true,
+  log = () => {},
+  logPrefix,
+  now = Date.now,
+}) {
+  const marker = device.account_failover;
+  const markerHome = marker && marker.account_id === account.id
+    ? store.accountById(marker.home_account_id)
+    : null;
+  const homeAccount = markerHome?.provider === account.provider ? markerHome : account;
+  const enabled = normalizeAccountFailover(homeAccount.failover).enabled;
+  const snapshot = (id) => {
+    try {
+      return usageSnapshotFor(id);
+    } catch {
+      return null;
+    }
+  };
+  const knownExhausted = (id) => Boolean(exhaustion.exhausted(id, now()))
+    || exhaustedBy(snapshot(id), now());
+  let current = account;
+  // The account the device row points at, which is where a persistent move
+  // has to start from.
+  let deviceSelectedId = account.id;
+  if (markerHome && homeAccount === markerHome
+    && Date.parse(marker.return_after ?? '') <= now()
+    && ['healthy', 'stored'].includes(markerHome.status)
+    && !knownExhausted(markerHome.id)
+    && !store.failoverCandidateProblem?.(markerHome)) {
+    log(`${logPrefix}_quota_failback`, {
+      device_id: device.id,
+      from_account_id: account.id,
+      to_account_id: markerHome.id,
+    });
+    store.failbackDeviceAccount?.({ deviceId: device.id, reason: 'home account reset' })
+      ?.catch?.((error) => log(`${logPrefix}_failback_persist_failed`, {
+        device_id: device.id,
+        code: error?.code ?? error?.name ?? 'unknown',
+      }));
+    current = markerHome;
+    deviceSelectedId = markerHome.id;
+  }
+  const tried = [current.id];
+  const state = {
+    enabled,
+    homeAccount,
+    account: current,
+    // The account this request was moved off, once it has been.
+    failedOverFrom: null,
+    nextBackup() {
+      if (!enabled) return null;
+      const backup = chooseFailoverAccount({
+        store,
+        homeAccount,
+        exclude: tried,
+        exhaustion,
+        usageSnapshotFor: snapshot,
+        exhaustedBy,
+        acceptCandidate,
+        now: now(),
+      });
+      if (backup) tried.push(backup.id);
+      return backup;
+    },
+    /** Note that the request now runs on `backup` instead of the current account. */
+    moveTo(backup) {
+      state.failedOverFrom ??= state.account;
+      state.account = backup;
+    },
+    /**
+     * Once a backup has answered, move the device itself, so its next request
+     * goes straight there and the console shows where it is. Fire and forget:
+     * the answer is already on its way to the client.
+     */
+    recordMove() {
+      if (state.recorded || !state.failedOverFrom || deviceSelectedId === state.account.id) return;
+      state.recorded = true;
+      const returnAfterMs = exhaustion.exhausted(homeAccount.id, now())?.until
+        ?? exhaustion.exhausted(state.failedOverFrom.id, now())?.until
+        ?? now() + FAILOVER_UNKNOWN_RESET_MS;
+      store.failoverDeviceAccount?.({
+        deviceId: device.id,
+        homeAccountId: homeAccount.id,
+        fromAccountId: deviceSelectedId,
+        toAccountId: state.account.id,
+        returnAfterMs,
+        reason: `quota exhausted on ${state.failedOverFrom.alias}`,
+      })?.catch?.((error) => log(`${logPrefix}_failover_persist_failed`, {
+        device_id: device.id,
+        to_account_id: state.account.id,
+        code: error?.code ?? error?.name ?? 'unknown',
+      }));
+    },
+    recorded: false,
+    preflight: false,
+  };
+  if (enabled && knownExhausted(current.id)) {
+    const backup = state.nextBackup();
+    if (backup) {
+      log(`${logPrefix}_quota_failover`, {
+        stage: 'preflight',
+        device_id: device.id,
+        from_account_id: current.id,
+        to_account_id: backup.id,
+      });
+      state.moveTo(backup);
+      state.preflight = true;
+    }
+  }
+  return state;
 }
