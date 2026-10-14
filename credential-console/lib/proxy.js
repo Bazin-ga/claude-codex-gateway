@@ -28,6 +28,14 @@ import {
   anyModelBlockRuleEnabled,
   modelBlockMessage,
 } from './model-block-rules.js';
+import {
+  FAILOVER_UNKNOWN_RESET_MS,
+  chooseFailoverAccount,
+  claudeQuotaRejection,
+  claudeRateLimitHeaders,
+  normalizeAccountFailover,
+  quotaExhaustion,
+} from './account-failover.js';
 
 const ALLOWED_PATHS = new Set([
   '/v1/messages',
@@ -324,6 +332,8 @@ export async function handleClaudeProxy(req, res, {
   responseObservationFactory = createResponseObservationTee,
   responseUsageParserFactory = createResponseUsageParser,
   responseContentAssemblerFactory = createResponseContentAssembler,
+  usageSnapshotFor = () => null,
+  exhaustion = quotaExhaustion,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
   const upstreamPath = requestUrl.pathname.slice('/claude'.length);
@@ -486,6 +496,74 @@ export async function handleClaudeProxy(req, res, {
     }
   }
 
+  // Quota failover. The backup list that governs is the home account's: the
+  // one the device was on before the gateway moved it, if it did. A moved
+  // device whose home has since reset goes back first, and a device still
+  // pointed at an account another device has just found exhausted goes
+  // straight to a backup instead of collecting the same refusal again.
+  const failoverMarker = device.account_failover;
+  const markerHome = failoverMarker && failoverMarker.account_id === account.id
+    ? store.accountById(failoverMarker.home_account_id)
+    : null;
+  const homeAccount = markerHome?.provider === 'claude' ? markerHome : account;
+  const failoverEnabled = normalizeAccountFailover(homeAccount.failover).enabled;
+  // The account the device row points at, which is what a persistent move
+  // has to start from.
+  let deviceSelectedId = account.id;
+  if (markerHome && homeAccount === markerHome
+    && Date.parse(failoverMarker.return_after ?? '') <= Date.now()
+    && ['healthy', 'stored'].includes(markerHome.status)
+    && !exhaustion.exhausted(markerHome.id)
+    && !store.failoverCandidateProblem?.(markerHome)) {
+    log('claude_proxy_quota_failback', {
+      device_id: device.id,
+      from_account_id: account.id,
+      to_account_id: markerHome.id,
+    });
+    store.failbackDeviceAccount?.({ deviceId: device.id, reason: 'home account reset' })
+      ?.catch?.((error) => log('claude_proxy_failback_persist_failed', {
+        device_id: device.id,
+        code: error?.code ?? error?.name ?? 'unknown',
+      }));
+    account = markerHome;
+    deviceSelectedId = markerHome.id;
+  }
+  const triedAccountIds = [account.id];
+  // The account this request was moved off, once it has been.
+  let failedOverFrom = null;
+  const backupWithCredential = () => {
+    while (true) {
+      const backup = chooseFailoverAccount({
+        store,
+        homeAccount,
+        exclude: triedAccountIds,
+        exhaustion,
+        usageSnapshotFor,
+      });
+      if (!backup) return null;
+      triedAccountIds.push(backup.id);
+      try {
+        const token = store.accountCredential(backup.id)?.oauth_token;
+        if (token) return { backup, token };
+      } catch {
+        // An unreadable backup is skipped like an exhausted one.
+      }
+    }
+  };
+  if (failoverEnabled && exhaustion.exhausted(account.id)) {
+    const found = backupWithCredential();
+    if (found) {
+      log('claude_proxy_quota_failover', {
+        stage: 'preflight',
+        device_id: device.id,
+        from_account_id: account.id,
+        to_account_id: found.backup.id,
+      });
+      failedOverFrom = account;
+      account = found.backup;
+    }
+  }
+
   let credential;
   try {
     credential = store.accountCredential(account.id);
@@ -588,6 +666,11 @@ export async function handleClaudeProxy(req, res, {
   });
   const RETRYABLE_UPSTREAM_STATUS = new Set([529, 503]);
   const MAX_UPSTREAM_ATTEMPTS = 3;
+  // Each backup is tried at most once anyway; this bounds a long backup list.
+  const MAX_FAILOVERS = 3;
+  let failoversUsed = 0;
+  let failoverPersisted = false;
+  const bodyFinishedWaiters = [];
   const RETRY_BASE_DELAY_MS = 250;
   const RETRY_MAX_DELAY_MS = 5000;
   let responseObservation = null;
@@ -712,10 +795,67 @@ export async function handleClaudeProxy(req, res, {
     finalizeMetric(pendingOutcome ?? 'completed', res.statusCode);
   };
 
+  // The refused attempt gets its own row, on the account that refused it, so
+  // the dashboard shows the exhaustion and the move rather than only a turn
+  // that mysteriously ran on a different account.
+  const recordFailedOverAttempt = (fromAccount, statusCode) => {
+    let model = null;
+    try {
+      model = requestMetadata.snapshot()?.model ?? null;
+    } catch {
+      model = null;
+    }
+    enqueueMetricSafely(requestMetrics, {
+      startedAtMs,
+      method: req.method ?? 'UNKNOWN',
+      path: upstreamPath,
+      deviceId: device.id,
+      machineId: device.machine_id ?? null,
+      memberLabel: device.member_label,
+      accountId: fromAccount.id,
+      accountAlias: fromAccount.alias,
+      model,
+      stream: null,
+      statusCode,
+      outcome: 'quota_failover',
+      ttfbMs: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+      durationMs: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+      requestBytes: requestLimit.bytes(),
+      responseBytes: 0,
+      upstreamRequestId: null,
+      ...unavailableUsage(),
+    }, { accountId: fromAccount.id, deviceId: device.id });
+  };
+
+  // Once a backup has answered, the device itself moves, so its next request
+  // goes straight there and the console shows where it is.
+  const persistFailover = () => {
+    if (failoverPersisted || !failedOverFrom || deviceSelectedId === account.id) return;
+    failoverPersisted = true;
+    const returnAfterMs = exhaustion.exhausted(homeAccount.id)?.until
+      ?? exhaustion.exhausted(failedOverFrom.id)?.until
+      ?? Date.now() + FAILOVER_UNKNOWN_RESET_MS;
+    store.failoverDeviceAccount?.({
+      deviceId: device.id,
+      homeAccountId: homeAccount.id,
+      fromAccountId: deviceSelectedId,
+      toAccountId: account.id,
+      returnAfterMs,
+      reason: `quota exhausted on ${failedOverFrom.alias}`,
+    })?.catch?.((error) => log('claude_proxy_failover_persist_failed', {
+      device_id: device.id,
+      to_account_id: account.id,
+      code: error?.code ?? error?.name ?? 'unknown',
+    }));
+  };
+
   const sendUpstream = (bodyBuffer) => {
     if (clientAborted || metricFinalized) return undefined;
     attemptsUsed += 1;
     let attemptSettled = false;
+    // Set when this attempt is abandoned for a backup, so the teardown of its
+    // socket is not mistaken for a failure of the request.
+    let superseded = false;
 
     const upstreamReq = transport.request(
       upstream,
@@ -728,6 +868,56 @@ export async function handleClaudeProxy(req, res, {
       },
       (upstreamRes) => {
         const status = upstreamRes.statusCode ?? 502;
+
+        const rejection = claudeQuotaRejection(status, upstreamRes.headers);
+        if (status === 429) {
+          log('claude_proxy_upstream_rate_limited', {
+            account_id: account.id,
+            device_id: device.id,
+            quota_exhausted: Boolean(rejection),
+            headers: claudeRateLimitHeaders(upstreamRes.headers),
+          });
+        }
+        if (rejection) {
+          const entry = exhaustion.mark(account.id, rejection);
+          const found = failoverEnabled && !clientAborted && failoversUsed < MAX_FAILOVERS
+            ? backupWithCredential()
+            : null;
+          if (found) {
+            failoversUsed += 1;
+            superseded = true;
+            const exhausted = account;
+            recordFailedOverAttempt(exhausted, status);
+            log('claude_proxy_quota_failover', {
+              stage: 'response',
+              device_id: device.id,
+              from_account_id: exhausted.id,
+              to_account_id: found.backup.id,
+              claim: rejection.claim,
+              resets_at: new Date(entry.until).toISOString(),
+            });
+            failedOverFrom ??= exhausted;
+            account = found.backup;
+            headers.authorization = `Bearer ${found.token}`;
+            upstreamRes.once('error', () => {});
+            upstreamRes.resume();
+            if (!requestBodyFinished) {
+              // The upstream answered before the upload ended. Keep reading the
+              // client into the buffer, but stop feeding a request that has
+              // already been refused.
+              bodyAccumulator.unpipe(upstreamReq);
+              bodyAccumulator.resume();
+              upstreamReq.destroy();
+            }
+            const replay = () => {
+              if (clientAborted || metricFinalized) return;
+              sendUpstream(Buffer.concat(bodyChunks));
+            };
+            if (requestBodyFinished) replay();
+            else bodyFinishedWaiters.push(replay);
+            return;
+          }
+        }
 
         if (RETRYABLE_UPSTREAM_STATUS.has(status)
           && attemptsUsed < MAX_UPSTREAM_ATTEMPTS
@@ -754,6 +944,7 @@ export async function handleClaudeProxy(req, res, {
 
         attemptSettled = true;
         activeUpstreamRes = upstreamRes;
+        if (status >= 200 && status < 300) persistFailover();
         upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
         upstreamStatus = status;
         const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
@@ -855,7 +1046,7 @@ export async function handleClaudeProxy(req, res, {
     currentUpstreamReq = upstreamReq;
     upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('upstream request timed out')));
     upstreamReq.on('error', (error) => {
-      if (clientAborted || metricFinalized || upstreamEnded) return;
+      if (superseded || clientAborted || metricFinalized || upstreamEnded) return;
       if (error.code === 'ERR_REQUEST_BODY_TOO_LARGE') {
         pendingOutcome = 'request_too_large';
         if (!res.headersSent) {
@@ -944,10 +1135,21 @@ export async function handleClaudeProxy(req, res, {
       if (!req.destroyed) req.destroy();
     } else if (currentUpstreamReq && !currentUpstreamReq.destroyed) {
       currentUpstreamReq.destroy(error);
+    } else if (!res.headersSent) {
+      // A failover was waiting for this body to finish; there is no live
+      // upstream request left to carry the error, so answer here.
+      res.once('finish', () => {
+        if (!req.destroyed) req.destroy();
+      });
+      sendJson(res, 413, {
+        type: 'error',
+        error: { type: 'invalid_request_error', message: 'request body too large' },
+      }, { Connection: 'close' });
     }
   });
   bodyAccumulator.once('finish', () => {
     requestBodyFinished = true;
+    for (const waiter of bodyFinishedWaiters.splice(0)) waiter();
     finalizeCompletedWhenReady();
   });
 

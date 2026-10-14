@@ -1302,6 +1302,7 @@ export async function createCredentialConsole(options = {}) {
         store,
         upstreamBaseUrl: options.claudeUpstreamBaseUrl,
         requestMetrics,
+        usageSnapshotFor: (accountId) => usageMonitor.snapshotForAccount(accountId),
       });
       return;
     }
@@ -2304,6 +2305,32 @@ export async function createCredentialConsole(options = {}) {
         await store.setCodexCreditGuard(codexCreditGuardParams.id, {
           // An unchecked checkbox is absent from the form, not false.
           enabled: form.enabled === '1',
+          actor: session.admin_identity ?? 'anonymous',
+        });
+        redirect(res, '/');
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+    const failoverParams = routeMatch(path, '/accounts/:id/failover');
+    if (req.method === 'POST' && failoverParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        // One select per slot, in order; an empty slot is simply skipped.
+        const backupAccountIds = [1, 2, 3, 4]
+          .map((slot) => form[`backup_${slot}`])
+          .filter((id) => typeof id === 'string' && id);
+        await store.setAccountFailover(failoverParams.id, {
+          // An unchecked checkbox is absent from the form, not false.
+          enabled: form.enabled === '1',
+          backupAccountIds,
           actor: session.admin_identity ?? 'anonymous',
         });
         redirect(res, '/');
