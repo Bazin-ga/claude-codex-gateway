@@ -8,6 +8,7 @@ import {
   normalizeCodexGuard,
 } from './codex-model-guard.js';
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
+import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { MODEL_BLOCK_MAX_MESSAGE_CHARS } from './model-block-rules.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
@@ -1075,6 +1076,44 @@ function codexCreditGuardControl(account, csrf) {
   </form>`;
 }
 
+/**
+ * Quota failover, on the account whose devices it moves.
+ *
+ * One select per slot rather than a multi-select, because the order is the
+ * point: the first usable backup is the one traffic goes to.
+ */
+function accountFailoverControl(account, accounts, csrf) {
+  if (account.provider !== 'claude') return '';
+  const policy = normalizeAccountFailover(account.failover);
+  const peers = accounts.filter((entry) => entry.provider === account.provider && entry.id !== account.id);
+  if (peers.length === 0) return '';
+  const slots = Array.from({ length: Math.min(FAILOVER_MAX_BACKUPS, peers.length) }, (_, index) => {
+    const chosen = policy.backup_account_ids[index] ?? '';
+    const options = peers.map((peer) => (
+      `<option value="${escapeHtml(peer.id)}"${peer.id === chosen ? ' selected' : ''}>${escapeHtml(peer.alias)}</option>`
+    )).join('');
+    return `<select name="backup_${index + 1}" aria-label="Backup ${index + 1} for ${escapeHtml(account.alias)}"><option value="">—</option>${options}</select>`;
+  }).join('');
+  return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/failover" class="guard-form">
+    <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+    <label class="guard-toggle"><input type="checkbox" name="enabled" value="1"${policy.enabled ? ' checked' : ''}><span data-i18n="failover-enable">Fail over when quota runs out</span></label>
+    ${slots}
+    <button class="secondary" type="submit" data-i18n="failover-save">Save failover</button>
+    <div class="muted tiny" data-i18n="failover-help">When the upstream refuses this account because its quota is used up, the request is resent on the first usable backup and the device moves there until this account resets. The client sees no error.</div>
+  </form>`;
+}
+
+/**
+ * Where a failed-over device came from and when it goes back, on the device.
+ * Without it a device on an account nobody chose looks like a mistake.
+ */
+function deviceFailoverNote(device, accounts) {
+  const marker = device.account_failover;
+  if (!marker || device.revoked_at) return '';
+  const home = accountForId(accounts, marker.home_account_id);
+  return `<div class="muted tiny" data-device-failover><span data-i18n="failover-device-moved">Moved by quota failover from</span> ${escapeHtml(home?.alias ?? marker.home_account_id ?? '—')}${marker.return_after ? ` · <span data-i18n="failover-device-returns">returns after</span> ${escapeHtml(dateText(marker.return_after))}` : ''}</div>`;
+}
+
 /** The credit balance, whole credits with separators; the decimals are noise. */
 function creditBalanceText(balance) {
   return Math.floor(balance).toLocaleString('en-US');
@@ -1392,6 +1431,7 @@ function consoleCredentialRow(device, accounts, csrf, groupNames = []) {
     <td>${escapeHtml(dateText(device.last_seen_at))}</td>
     <td><div class="stack">
       ${accountSelectionDetails(selection, accounts)}
+      ${deviceFailoverNote(device, accounts)}
       ${deviceGroupControl(device, groupNames, csrf)}
       ${accountSwitchControl(device, selection, accounts, csrf)}
       ${device.revoked_at
@@ -3939,6 +3979,7 @@ export function dashboardView({
           <input name="member_label" aria-label="Member label for ${escapeHtml(account.alias)}" placeholder="member email/name" required maxlength="160">
           <button type="submit" data-i18n="enroll-device">Enroll device</button>
         </form>` : '<span class="muted tiny" data-i18n="owner-login-required">Account owner must authorize before member enrollment.</span>'}
+          ${accountFailoverControl(account, accounts, csrf)}
         </div>` : `<div class="stack">
           <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>
           ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}

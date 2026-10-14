@@ -19,6 +19,7 @@ import {
 import { credentialSwitchBlock, externalAccountStatus } from './external-account-status.js';
 import { normalizeCodexGuard, parseCodexGuardInput } from './codex-model-guard.js';
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
+import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
 import {
   MODEL_BLOCK_MAX_RULES,
   normalizeModelBlockRules,
@@ -282,6 +283,9 @@ export class CredentialStore {
       bedrock: account.bedrock ? { ...account.bedrock } : null,
       codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
       codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
+      failover: account.failover
+        ? { ...account.failover, backup_account_ids: [...normalizeAccountFailover(account.failover).backup_account_ids] }
+        : null,
       active_devices: this.state.devices.filter((device) => {
         if (device.revoked_at) return false;
         try {
@@ -477,6 +481,7 @@ export class CredentialStore {
         ? [...device.allowed_account_ids]
         : device.allowed_account_ids,
       selectedAccountId: device.selected_account_id,
+      accountFailover: device.account_failover ? { ...device.account_failover } : null,
       audit: [...this.state.audit],
     };
   }
@@ -486,6 +491,8 @@ export class CredentialStore {
     else delete device.allowed_account_ids;
     if (before.hasSelected) device.selected_account_id = before.selectedAccountId;
     else delete device.selected_account_id;
+    if (before.accountFailover) device.account_failover = before.accountFailover;
+    else delete device.account_failover;
     this.state.audit = before.audit;
   }
 
@@ -775,6 +782,9 @@ export class CredentialStore {
         allowed.push(...allowedAdded);
         device.allowed_account_ids = allowed;
         device.selected_account_id = selectedAccountId;
+        // A person choosing the account outranks the gateway's temporary move:
+        // without this the device would be switched back on its own later.
+        delete device.account_failover;
         const outcome = policy.selectedAccountId === selectedAccountId && allowedAdded.length === 0
           ? 'noop'
           : 'success';
@@ -844,6 +854,7 @@ export class CredentialStore {
         const outcome = policy.selectedAccountId === selectedAccountId ? 'noop' : 'success';
         device.allowed_account_ids = [...policy.allowedAccountIds];
         device.selected_account_id = selectedAccountId;
+        delete device.account_failover;
         this.audit('device_account_switched', this.#deviceAccountAudit({
           device,
           previousAccountId: policy.selectedAccountId,
@@ -1147,6 +1158,179 @@ export class CredentialStore {
       });
       await this.persist();
       return account;
+    });
+  }
+
+  /**
+   * Set which accounts the gateway may move this account's devices to once its
+   * allowance is used up, in the order they are tried. Audited like the
+   * guards: it decides whose allowance other people's traffic spends.
+   */
+  async setAccountFailover(id, { enabled, backupAccountIds = [], actor = null }) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account) throw new Error('account not found');
+      // Claude only for now: the Codex proxy streams the body straight through
+      // and keeps no copy to resend, so a Codex setting would promise a move
+      // that cannot happen.
+      if (account.provider !== 'claude') {
+        throw new Error('quota failover applies to Claude accounts only');
+      }
+      const backups = [];
+      for (const backupId of Array.isArray(backupAccountIds) ? backupAccountIds : []) {
+        if (typeof backupId !== 'string' || !backupId || backups.includes(backupId)) continue;
+        if (backupId === id) throw new Error('an account cannot be its own backup');
+        const backup = this.accountById(backupId);
+        if (!backup) throw new Error('backup account not found');
+        if (backup.provider !== account.provider) {
+          throw new Error('a backup account must use the same provider');
+        }
+        backups.push(backupId);
+      }
+      if (backups.length > FAILOVER_MAX_BACKUPS) {
+        throw new Error(`at most ${FAILOVER_MAX_BACKUPS} backup accounts`);
+      }
+      if (enabled === true && backups.length === 0) {
+        throw new Error('choose at least one backup account before turning failover on');
+      }
+      const previous = normalizeAccountFailover(account.failover);
+      account.failover = {
+        enabled: enabled === true,
+        backup_account_ids: backups,
+        updated_at: nowIso(),
+        updated_by: typeof actor === 'string' && actor ? actor.slice(0, 160) : null,
+      };
+      this.audit('account_failover_updated', {
+        account_id: id,
+        enabled: account.failover.enabled,
+        backup_account_ids: [...backups],
+        previous_enabled: previous.enabled,
+        previous_backup_account_ids: previous.backup_account_ids,
+        actor: account.failover.updated_by,
+      });
+      await this.persist();
+      return account;
+    });
+  }
+
+  /**
+   * Why an account cannot take failover traffic right now, or null if it can.
+   * The same row-level checks a manual switch makes, without throwing: the
+   * proxy asks this on the request path and simply skips a backup that fails.
+   */
+  failoverCandidateProblem(account) {
+    try {
+      this.#assertSwitchableAccount(account);
+      return null;
+    } catch (error) {
+      return error.code ?? 'ACCOUNT_UNAVAILABLE';
+    }
+  }
+
+  /**
+   * Move a device to a backup account because the account it was on ran out
+   * of allowance. Recorded on the device so the move can be undone once the
+   * home account resets, and audited as the gateway's doing, not a person's.
+   *
+   * Only moves a device that is still on `fromAccountId`: if somebody switched
+   * it in the meantime, their choice stands and this is a no-op.
+   */
+  async failoverDeviceAccount({
+    deviceId,
+    homeAccountId,
+    fromAccountId,
+    toAccountId,
+    returnAfterMs = null,
+    reason = null,
+  }) {
+    return this.serialized(async () => {
+      const device = this.#deviceRecord(deviceId);
+      if (device.revoked_at) return { outcome: 'revoked' };
+      const policy = this.#deviceAccountPolicy(device);
+      if (policy.selectedAccountId !== fromAccountId) return { outcome: 'moved_elsewhere' };
+      const from = this.accountById(fromAccountId);
+      const target = this.accountById(toAccountId);
+      this.#assertSwitchableAccount(target);
+      if (from?.provider !== target.provider) {
+        throw storeError('backup account uses a different provider', 'DEVICE_CONFIGURATION_INVALID');
+      }
+      const before = this.#captureDeviceAccountFields(device);
+      const previous = device.account_failover ?? null;
+      const allowed = [...policy.allowedAccountIds];
+      const allowedAdded = allowed.includes(toAccountId) ? [] : [toAccountId];
+      allowed.push(...allowedAdded);
+      device.allowed_account_ids = allowed;
+      device.selected_account_id = toAccountId;
+      device.account_failover = {
+        // A second move (backup also ran out) keeps the original home, so the
+        // eventual return goes back where the device started.
+        home_account_id: previous?.home_account_id ?? homeAccountId ?? fromAccountId,
+        account_id: toAccountId,
+        // Every account this chain added to the allowlist, so the return can
+        // take them back out instead of leaving the device a wider choice.
+        allowed_added: [...new Set([...(previous?.allowed_added ?? []), ...allowedAdded])],
+        at: nowIso(),
+        return_after: Number.isFinite(returnAfterMs) ? new Date(returnAfterMs).toISOString() : null,
+      };
+      this.audit('device_account_failover', this.#deviceAccountAudit({
+        device,
+        previousAccountId: fromAccountId,
+        nextAccountId: toAccountId,
+        outcome: 'success',
+        reason,
+        allowedAdded,
+        actor: 'gateway:quota-failover',
+      }));
+      try {
+        await this.persist();
+      } catch (error) {
+        this.#restoreDeviceAccountFields(device, before);
+        throw error;
+      }
+      return { outcome: 'success' };
+    });
+  }
+
+  /**
+   * Put a failed-over device back on its home account. A device somebody has
+   * since moved by hand has no marker any more and is left alone.
+   */
+  async failbackDeviceAccount({ deviceId, reason = null }) {
+    return this.serialized(async () => {
+      const device = this.#deviceRecord(deviceId);
+      const marker = device.account_failover;
+      if (!marker || device.revoked_at) return { outcome: 'noop' };
+      const before = this.#captureDeviceAccountFields(device);
+      const policy = this.#deviceAccountPolicy(device);
+      const home = this.accountById(marker.home_account_id);
+      const back = policy.selectedAccountId === marker.account_id
+        && home
+        && policy.allowedAccountIds.includes(home.id)
+        && !this.failoverCandidateProblem(home);
+      delete device.account_failover;
+      if (back) {
+        device.selected_account_id = home.id;
+        const added = Array.isArray(marker.allowed_added) ? marker.allowed_added : [];
+        const allowed = policy.allowedAccountIds.filter(
+          (id) => id === home.id || id === device.account_id || !added.includes(id),
+        );
+        device.allowed_account_ids = allowed;
+        this.audit('device_account_failback', this.#deviceAccountAudit({
+          device,
+          previousAccountId: policy.selectedAccountId,
+          nextAccountId: home.id,
+          outcome: 'success',
+          reason,
+          actor: 'gateway:quota-failover',
+        }));
+      }
+      try {
+        await this.persist();
+      } catch (error) {
+        this.#restoreDeviceAccountFields(device, before);
+        throw error;
+      }
+      return { outcome: back ? 'success' : 'cleared' };
     });
   }
 
@@ -1702,6 +1886,7 @@ export class CredentialStore {
             allowed.push(...allowedAdded);
             device.allowed_account_ids = allowed;
             device.selected_account_id = selectedAccountId;
+            delete device.account_failover;
             applied.push({ device, before, previousAccountId: policy.selectedAccountId, allowedAdded });
           } catch (error) {
             // One bad row must not sink the batch; it is reported instead.
