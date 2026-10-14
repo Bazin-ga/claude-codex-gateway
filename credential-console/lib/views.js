@@ -1083,7 +1083,7 @@ function codexCreditGuardControl(account, csrf) {
  * point: the first usable backup is the one traffic goes to.
  */
 function accountFailoverControl(account, accounts, csrf) {
-  if (account.provider !== 'claude') return '';
+  if (!['claude', 'codex'].includes(account.provider)) return '';
   const policy = normalizeAccountFailover(account.failover);
   const peers = accounts.filter((entry) => entry.provider === account.provider && entry.id !== account.id);
   if (peers.length === 0) return '';
@@ -3986,6 +3986,7 @@ export function dashboardView({
           ${codexResetControl(account, csrf)}
           ${codexModelGuardControl(account, csrf)}
           ${codexCreditGuardControl(account, csrf)}
+          ${accountFailoverControl(account, accounts, csrf)}
         </div>`}
         ${(account.status === 'login_required' || account.provider === 'bedrock') && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">

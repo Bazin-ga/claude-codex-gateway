@@ -1170,11 +1170,8 @@ export class CredentialStore {
     return this.serialized(async () => {
       const account = this.accountById(id);
       if (!account) throw new Error('account not found');
-      // Claude only for now: the Codex proxy streams the body straight through
-      // and keeps no copy to resend, so a Codex setting would promise a move
-      // that cannot happen.
-      if (account.provider !== 'claude') {
-        throw new Error('quota failover applies to Claude accounts only');
+      if (!['claude', 'codex'].includes(account.provider)) {
+        throw new Error('quota failover applies to Claude and Codex accounts only');
       }
       const backups = [];
       for (const backupId of Array.isArray(backupAccountIds) ? backupAccountIds : []) {

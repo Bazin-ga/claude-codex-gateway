@@ -444,9 +444,10 @@ test('the failover setting is validated and audited', async () => {
     store.setAccountFailover(accounts.home.id, { enabled: true, backupAccountIds: [codex.id] }),
     /same provider/,
   );
+  const bedrock = await store.addAccount({ provider: 'bedrock', alias: 'bedrock-peer', credential: { api_key: 'k' }, bedrock: { region: 'us-west-2', model_id: 'm' } });
   await assert.rejects(
-    store.setAccountFailover(codex.id, { enabled: false, backupAccountIds: [] }),
-    /Claude accounts only/,
+    store.setAccountFailover(bedrock.id, { enabled: false, backupAccountIds: [] }),
+    /Claude and Codex accounts only/,
   );
   await store.setAccountFailover(accounts.home.id, {
     enabled: true,

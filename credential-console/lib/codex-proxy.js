@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import http from 'node:http';
 import https from 'node:https';
 import { readFile } from 'node:fs/promises';
+import { PassThrough, Transform } from 'node:stream';
 import { sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
 import { createRequestMetadataTee, REQUEST_METADATA_PREFIX_BYTES } from './request-metadata.js';
@@ -33,6 +34,12 @@ import {
   modelBlockMessage,
 } from './model-block-rules.js';
 import { codexQuotaSignal as defaultQuotaSignal } from './codex-quota-signal.js';
+import {
+  beginFailover,
+  codexQuotaRejection,
+  codexRateLimitHeaders,
+  quotaExhaustion,
+} from './account-failover.js';
 import { createCodexResponseContentAssembler } from './codex-response-content.js';
 import { codexTurnMetadata, extractCodexPromptCandidate } from './codex-prompt-capture.js';
 import {
@@ -202,6 +209,7 @@ export async function handleCodexProxy(req, res, {
   credentialReader = readPublishedCodexCredential,
   quotaSignal = defaultQuotaSignal,
   usageSnapshotFor = () => null,
+  exhaustion = quotaExhaustion,
   now = Date.now,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
@@ -296,6 +304,34 @@ export async function handleCodexProxy(req, res, {
     return;
   }
   const inferenceRequest = upstreamPath === '/responses';
+
+  // Quota failover, decided before the credit guard below: with a usable
+  // backup, an account whose included quota is used up is moved off rather
+  // than refused or left to spend credits. A backup is only taken when its own
+  // included quota is left and its low-quota guard is not biting — the body is
+  // judged against the home account's gate, not the backup's.
+  const mergedUsage = (id) => quotaSignal.merge(id, usageSnapshotFor(id));
+  const failover = inferenceRequest
+    ? beginFailover({
+      store,
+      device,
+      account,
+      exhaustion,
+      usageSnapshotFor: mergedUsage,
+      exhaustedBy: (snapshot, at) => includedQuotaExhaustion(snapshot, at) !== null,
+      acceptCandidate: (candidate) => {
+        const candidateGuard = normalizeCodexGuard(candidate.codex_guard);
+        return !(candidateGuard.enabled && guardRestricts(
+          candidateGuard,
+          quotaSignal.weeklyRemainingPercent(candidate.id, usageSnapshotFor(candidate.id)),
+        ));
+      },
+      log,
+      logPrefix: 'codex_proxy',
+      now,
+    })
+    : null;
+  if (failover) account = failover.account;
 
   // The credit guard, ahead of everything else: once the included quota is
   // gone, every request forwarded is paid for out of the account's credits, so
@@ -646,160 +682,370 @@ export async function handleCodexProxy(req, res, {
     }
   };
 
-  const upstreamReq = transport.request(
-    upstream,
-    { method: req.method, headers, timeout: UPSTREAM_TIMEOUT_MS },
-    (upstreamRes) => {
-      const status = upstreamRes.statusCode ?? 502;
-      upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
-      upstreamStatus = status;
-      const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
-      upstreamRequestId = typeof requestId === 'string' ? requestId : null;
-      // Free, and an hour fresher than the usage poll: the upstream stamps the
-      // account's window usage on every answer. Taken here rather than from the
-      // streamed body so it is recorded even when a turn is abandoned halfway.
-      quotaSignal.observe(account.id, upstreamRes.headers, now());
-      res.writeHead(status, {
-        ...responseHeaders(upstreamRes.headers),
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-      });
+  // Only an account that can fail over pays for a copy of the body: it is what
+  // a backup is sent, and an account nobody configured keeps streaming
+  // straight through exactly as before.
+  const MAX_FAILOVERS = 3;
+  let failoversUsed = 0;
+  const bodyChunks = [];
+  const bodyFinishedWaiters = [];
+  let bodyCopyFinished = false;
+  const bodyCopy = failover?.enabled
+    ? new Transform({
+      transform(chunk, encoding, callback) {
+        bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        callback(null, chunk);
+      },
+    })
+    : null;
+  bodyCopy?.once('finish', () => {
+    bodyCopyFinished = true;
+    for (const waiter of bodyFinishedWaiters.splice(0)) waiter();
+  });
+  let currentUpstreamReq = null;
+  // A 429 is read to its end before anything is decided; it is a few hundred
+  // bytes. Past this it is not the refusal being looked for.
+  const QUOTA_BODY_MAX_BYTES = 256 * 1024;
 
-      // chatgpt.com returns a streamed turn with *no* content-type header at
-      // all — verified against the live endpoint. Gating the parser on that
-      // header, as the Claude proxy safely can, meant every Codex row was
-      // written with null tokens and usage_state 'unavailable'. Fall back to
-      // the parser's own sniffing, which reads the first bytes and yields
-      // 'unavailable' harmlessly for anything it cannot make sense of.
-      const responseFormat = inferenceRequest && status >= 200 && status < 400
-        ? (responseUsageFormat(upstreamRes.headers['content-type']) ?? 'auto')
-        : null;
-      const observers = [];
-      if (responseFormat && requestMetrics?.enqueueRequest) {
-        try {
-          observers.push(usageObserver(codexUsageParserFactory({ format: responseFormat })));
-        } catch (error) {
-          log('codex_usage_parser_init_failed', {
-            account_id: account.id,
-            device_id: device.id,
-            code: error?.code ?? error?.name ?? 'unknown',
-          });
-        }
-      }
-      if (responseFormat && capturePrompt) {
-        try {
-          observers.push(codexContentAssemblerFactory());
-        } catch (error) {
-          log('codex_content_parser_init_failed', {
-            account_id: account.id,
-            device_id: device.id,
-            code: error?.code ?? error?.name ?? 'unknown',
-          });
-        }
-      }
-      const observer = observers.length ? createCompositeResponseObserver(observers) : null;
-      observationFinished = false;
+  const handleUpstreamResponse = (upstreamRes) => {
+    const status = upstreamRes.statusCode ?? 502;
+    upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
+    upstreamStatus = status;
+    if (status >= 200 && status < 300) failover?.recordMove();
+    const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
+    upstreamRequestId = typeof requestId === 'string' ? requestId : null;
+    // Free, and an hour fresher than the usage poll: the upstream stamps the
+    // account's window usage on every answer. Taken here rather than from the
+    // streamed body so it is recorded even when a turn is abandoned halfway.
+    quotaSignal.observe(account.id, upstreamRes.headers, now());
+    res.writeHead(status, {
+      ...responseHeaders(upstreamRes.headers),
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+
+    // chatgpt.com returns a streamed turn with *no* content-type header at
+    // all — verified against the live endpoint. Gating the parser on that
+    // header, as the Claude proxy safely can, meant every Codex row was
+    // written with null tokens and usage_state 'unavailable'. Fall back to
+    // the parser's own sniffing, which reads the first bytes and yields
+    // 'unavailable' harmlessly for anything it cannot make sense of.
+    const responseFormat = inferenceRequest && status >= 200 && status < 400
+      ? (responseUsageFormat(upstreamRes.headers['content-type']) ?? 'auto')
+      : null;
+    const observers = [];
+    if (responseFormat && requestMetrics?.enqueueRequest) {
       try {
-        responseObservation = responseObservationFactory({
-          contentEncoding: upstreamRes.headers['content-encoding'],
-          observer,
-        });
+        observers.push(usageObserver(codexUsageParserFactory({ format: responseFormat })));
       } catch (error) {
-        log('response_observation_init_failed', {
+        log('codex_usage_parser_init_failed', {
           account_id: account.id,
           device_id: device.id,
           code: error?.code ?? error?.name ?? 'unknown',
         });
-        responseObservation = createResponseObservationTee();
       }
-      Promise.resolve(responseObservation.done).then(
-        () => { observationFinished = true; finalizeCompletedWhenReady(); },
-        () => { observationFinished = true; finalizeCompletedWhenReady(); },
-      );
-
-      upstreamRes.pipe(responseObservation.stream).pipe(res);
-      upstreamRes.on('end', () => {
-        upstreamEnded = true;
-        store.markDeviceSeen?.(device.id)?.catch?.(() => {});
-        if (status === 401 || status === 403 || status === 451) {
-          // 451 is how this upstream answers a dead or invalid subscription
-          // token; surfacing it as an account health fault is the whole point
-          // of routing Codex through here.
-          store.updateAccountHealth?.(account.id, {
-            success: false,
-            error: `upstream rejected the subscription credential (${status})`,
-          })?.catch?.(() => {});
-        } else if (status >= 200 && status < 400) {
-          store.updateAccountHealth?.(account.id, { success: true })?.catch?.(() => {});
-        }
-      });
-
-      const failResponse = (error) => {
-        if (upstreamEnded || clientAborted || metricFinalized) return;
-        pendingOutcome = 'upstream_error_after_headers';
-        log('codex_proxy_failed', {
+    }
+    if (responseFormat && capturePrompt) {
+      try {
+        observers.push(codexContentAssemblerFactory());
+      } catch (error) {
+        log('codex_content_parser_init_failed', {
           account_id: account.id,
           device_id: device.id,
-          code: error?.code ?? error?.name ?? 'upstream_response_incomplete',
-          duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+          code: error?.code ?? error?.name ?? 'unknown',
         });
-        finalizeMetric('upstream_error_after_headers', status);
-        if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
-      };
-      upstreamRes.once('aborted', () => failResponse(new Error('upstream response aborted')));
-      upstreamRes.once('error', failResponse);
-      upstreamRes.once('close', () => {
-        if (!upstreamEnded && !upstreamRes.complete) {
-          failResponse(new Error('upstream response closed before completion'));
-        }
-      });
-    },
-  );
-
-  upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('upstream request timed out')));
-  upstreamReq.on('error', (error) => {
-    if (clientAborted || metricFinalized || upstreamEnded) return;
-    if (error.code === 'ERR_REQUEST_BODY_TOO_LARGE') {
-      // Destroying the upstream request is how the size guard above surfaces
-      // here; answer the client with the real reason, not a generic 502.
-      pendingOutcome = 'request_too_large';
-      if (!res.headersSent) {
-        res.once('finish', () => {
-          if (!req.destroyed) req.destroy();
-        });
-        sendJson(res, 413, errorBody('invalid_request_error', 'request body too large'), {
-          Connection: 'close',
-        });
-      } else if (!res.destroyed) {
-        res.destroy(error);
       }
-      return;
     }
-    log('codex_proxy_upstream_error', {
-      account_id: account.id,
-      device_id: device.id,
-      code: error?.code ?? error?.name ?? 'unknown',
+    const observer = observers.length ? createCompositeResponseObserver(observers) : null;
+    observationFinished = false;
+    try {
+      responseObservation = responseObservationFactory({
+        contentEncoding: upstreamRes.headers['content-encoding'],
+        observer,
+      });
+    } catch (error) {
+      log('response_observation_init_failed', {
+        account_id: account.id,
+        device_id: device.id,
+        code: error?.code ?? error?.name ?? 'unknown',
+      });
+      responseObservation = createResponseObservationTee();
+    }
+    Promise.resolve(responseObservation.done).then(
+      () => { observationFinished = true; finalizeCompletedWhenReady(); },
+      () => { observationFinished = true; finalizeCompletedWhenReady(); },
+    );
+
+    upstreamRes.pipe(responseObservation.stream).pipe(res);
+    upstreamRes.on('end', () => {
+      upstreamEnded = true;
+      store.markDeviceSeen?.(device.id)?.catch?.(() => {});
+      if (status === 401 || status === 403 || status === 451) {
+        // 451 is how this upstream answers a dead or invalid subscription
+        // token; surfacing it as an account health fault is the whole point
+        // of routing Codex through here.
+        store.updateAccountHealth?.(account.id, {
+          success: false,
+          error: `upstream rejected the subscription credential (${status})`,
+        })?.catch?.(() => {});
+      } else if (status >= 200 && status < 400) {
+        store.updateAccountHealth?.(account.id, { success: true })?.catch?.(() => {});
+      }
     });
-    if (!res.headersSent) {
-      finalizeMetric('upstream_error', 502);
-      sendJson(res, 502, errorBody('api_error', 'upstream request failed'));
-      return;
+
+    const failResponse = (error) => {
+      if (upstreamEnded || clientAborted || metricFinalized) return;
+      pendingOutcome = 'upstream_error_after_headers';
+      log('codex_proxy_failed', {
+        account_id: account.id,
+        device_id: device.id,
+        code: error?.code ?? error?.name ?? 'upstream_response_incomplete',
+        duration_ms: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+      });
+      finalizeMetric('upstream_error_after_headers', status);
+      if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
+    };
+    upstreamRes.once('aborted', () => failResponse(new Error('upstream response aborted')));
+    upstreamRes.once('error', failResponse);
+    upstreamRes.once('close', () => {
+      if (!upstreamEnded && !upstreamRes.complete) {
+        failResponse(new Error('upstream response closed before completion'));
+      }
+    });
+  };
+
+  // The refused attempt gets its own row, on the account that refused it.
+  const recordFailedOverAttempt = (fromAccount, statusCode) => {
+    let model = null;
+    try {
+      model = requestMetadata.snapshot()?.model ?? null;
+    } catch {
+      model = null;
     }
-    finalizeMetric('upstream_error_after_headers');
-    if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
-  });
+    enqueueMetricSafely(requestMetrics, {
+      startedAtMs,
+      method: req.method ?? 'UNKNOWN',
+      path: upstreamPath,
+      deviceId: device.id,
+      machineId: device.machine_id ?? null,
+      memberLabel: device.member_label,
+      accountId: fromAccount.id,
+      accountAlias: fromAccount.alias,
+      model,
+      stream: null,
+      statusCode,
+      outcome: 'quota_failover',
+      ttfbMs: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+      durationMs: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
+      requestBytes: requestLimit.bytes(),
+      responseBytes: 0,
+      upstreamRequestId: null,
+      ...unavailableUsage(),
+    }, { accountId: fromAccount.id, deviceId: device.id });
+  };
+
+  // A backup whose credential cannot be read, or has lapsed, is skipped like
+  // an exhausted one.
+  const nextBackupWithCredential = async () => {
+    for (let backup = failover.nextBackup(); backup; backup = failover.nextBackup()) {
+      try {
+        const backupCredential = await credentialReader(backup);
+        if (backupCredential.expiresAtMs > now()) return { backup, credential: backupCredential };
+      } catch {
+        // Try the next one.
+      }
+    }
+    return null;
+  };
+
+  const sendUpstream = (bodyBuffer) => {
+    if (clientAborted || metricFinalized) return null;
+    // Set when this attempt is abandoned for a backup, so the teardown of its
+    // socket is not mistaken for a failure of the request.
+    let superseded = false;
+    const upstreamReq = transport.request(
+      upstream,
+      {
+        method: req.method,
+        headers: bodyBuffer ? { ...headers, 'content-length': String(bodyBuffer.length) } : headers,
+        timeout: UPSTREAM_TIMEOUT_MS,
+      },
+      (upstreamRes) => {
+        if (!failover?.enabled || upstreamRes.statusCode !== 429) {
+          if (upstreamRes.statusCode === 429) {
+            log('codex_proxy_upstream_rate_limited', {
+              account_id: account.id,
+              device_id: device.id,
+              quota_exhausted: null,
+              headers: codexRateLimitHeaders(upstreamRes.headers),
+            });
+          }
+          handleUpstreamResponse(upstreamRes);
+          return;
+        }
+        const chunks = [];
+        let size = 0;
+        let settled = false;
+        const failCollect = (error) => {
+          if (settled) return;
+          settled = true;
+          if (clientAborted || metricFinalized) return;
+          log('codex_proxy_upstream_error', {
+            account_id: account.id,
+            device_id: device.id,
+            code: error?.code ?? error?.name ?? 'upstream_response_incomplete',
+          });
+          finalizeMetric('upstream_error', 502);
+          if (!res.headersSent) sendJson(res, 502, errorBody('api_error', 'upstream request failed'));
+        };
+        const passThrough = (body, rest = null) => {
+          // What was read goes to the client as if it had streamed straight
+          // through: same status, same headers, same bytes.
+          const replayed = new PassThrough();
+          replayed.statusCode = upstreamRes.statusCode;
+          replayed.headers = upstreamRes.headers;
+          replayed.complete = rest === null;
+          handleUpstreamResponse(replayed);
+          replayed.write(body);
+          if (rest) {
+            rest.once('end', () => { replayed.complete = true; });
+            rest.pipe(replayed);
+          } else {
+            replayed.end();
+          }
+        };
+        const decide = async () => {
+          const body = Buffer.concat(chunks);
+          const rejection = codexQuotaRejection(upstreamRes.statusCode, body, {
+            contentEncoding: upstreamRes.headers['content-encoding'],
+            now: now(),
+          });
+          log('codex_proxy_upstream_rate_limited', {
+            account_id: account.id,
+            device_id: device.id,
+            quota_exhausted: Boolean(rejection),
+            headers: codexRateLimitHeaders(upstreamRes.headers),
+          });
+          quotaSignal.observe(account.id, upstreamRes.headers, now());
+          if (rejection) {
+            const entry = exhaustion.mark(account.id, rejection, now());
+            const found = failoversUsed < MAX_FAILOVERS ? await nextBackupWithCredential() : null;
+            if (clientAborted || metricFinalized) return;
+            if (found) {
+              failoversUsed += 1;
+              superseded = true;
+              const exhausted = account;
+              recordFailedOverAttempt(exhausted, upstreamRes.statusCode);
+              log('codex_proxy_quota_failover', {
+                stage: 'response',
+                device_id: device.id,
+                from_account_id: exhausted.id,
+                to_account_id: found.backup.id,
+                claim: rejection.claim,
+                resets_at: new Date(entry.until).toISOString(),
+              });
+              failover.moveTo(found.backup);
+              account = found.backup;
+              credential = found.credential;
+              headers.authorization = `Bearer ${credential.accessToken}`;
+              headers['chatgpt-account-id'] = credential.accountId;
+              // Turn affinity belongs to the account that issued it.
+              delete headers['x-codex-turn-state'];
+              if (!bodyCopyFinished) {
+                // Refused before the upload ended: keep reading the client into
+                // the copy, but stop feeding a request that is already refused.
+                bodyCopy.unpipe(upstreamReq);
+                bodyCopy.resume();
+                upstreamReq.destroy();
+              }
+              const replay = () => {
+                if (clientAborted || metricFinalized) return;
+                sendUpstream(Buffer.concat(bodyChunks));
+              };
+              if (bodyCopyFinished) replay();
+              else bodyFinishedWaiters.push(replay);
+              return;
+            }
+          }
+          passThrough(body);
+        };
+        upstreamRes.on('data', (chunk) => {
+          if (settled) return;
+          chunks.push(chunk);
+          size += chunk.length;
+          if (size > QUOTA_BODY_MAX_BYTES) {
+            // Too large to be the refusal; stop holding it back.
+            settled = true;
+            upstreamRes.removeAllListeners('data');
+            upstreamRes.pause();
+            passThrough(Buffer.concat(chunks), upstreamRes);
+          }
+        });
+        upstreamRes.once('end', () => {
+          if (settled) return;
+          settled = true;
+          decide().catch((error) => {
+            settled = false;
+            failCollect(error);
+          });
+        });
+        upstreamRes.once('aborted', () => failCollect(new Error('upstream response aborted')));
+        upstreamRes.once('error', failCollect);
+      },
+    );
+    currentUpstreamReq = upstreamReq;
+
+    upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('upstream request timed out')));
+    upstreamReq.on('error', (error) => {
+      if (superseded || clientAborted || metricFinalized || upstreamEnded) return;
+      if (error.code === 'ERR_REQUEST_BODY_TOO_LARGE') {
+        // Destroying the upstream request is how the size guard above surfaces
+        // here; answer the client with the real reason, not a generic 502.
+        pendingOutcome = 'request_too_large';
+        if (!res.headersSent) {
+          res.once('finish', () => {
+            if (!req.destroyed) req.destroy();
+          });
+          sendJson(res, 413, errorBody('invalid_request_error', 'request body too large'), {
+            Connection: 'close',
+          });
+        } else if (!res.destroyed) {
+          res.destroy(error);
+        }
+        return;
+      }
+      log('codex_proxy_upstream_error', {
+        account_id: account.id,
+        device_id: device.id,
+        code: error?.code ?? error?.name ?? 'unknown',
+      });
+      if (!res.headersSent) {
+        finalizeMetric('upstream_error', 502);
+        sendJson(res, 502, errorBody('api_error', 'upstream request failed'));
+        return;
+      }
+      finalizeMetric('upstream_error_after_headers');
+      if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
+    });
+
+    if (bodyBuffer) {
+      upstreamReq.write(bodyBuffer);
+      upstreamReq.end();
+    }
+    return upstreamReq;
+  };
 
   req.once('aborted', () => {
     clientAborted = true;
     finalizeMetric('client_aborted');
-    upstreamReq.destroy();
+    currentUpstreamReq?.destroy();
   });
 
   res.once('close', () => {
     if (!responseFinished && !metricFinalized) {
       clientAborted = true;
       finalizeMetric('client_disconnected');
-      upstreamReq.destroy();
+      currentUpstreamReq?.destroy();
     }
   });
   res.once('finish', () => {
@@ -831,8 +1077,17 @@ export async function handleCodexProxy(req, res, {
     if (res.writableFinished) {
       finalizeMetric(pendingOutcome, upstreamStatus);
       if (!req.destroyed) req.destroy();
-    } else if (!upstreamReq.destroyed) {
-      upstreamReq.destroy(error);
+    } else if (currentUpstreamReq && !currentUpstreamReq.destroyed) {
+      currentUpstreamReq.destroy(error);
+    } else if (!res.headersSent) {
+      // A failover was waiting for this body to finish; there is no live
+      // upstream request left to carry the error, so answer here.
+      res.once('finish', () => {
+        if (!req.destroyed) req.destroy();
+      });
+      sendJson(res, 413, errorBody('invalid_request_error', 'request body too large'), {
+        Connection: 'close',
+      });
     }
   });
 
@@ -841,7 +1096,10 @@ export async function handleCodexProxy(req, res, {
     finalizeCompletedWhenReady();
   });
 
-  requestMetadata.stream.pipe(requestLimit.stream).pipe(upstreamReq);
+  const initialUpstreamReq = sendUpstream(null);
+  const forwarded = requestMetadata.stream.pipe(requestLimit.stream);
+  if (bodyCopy) forwarded.pipe(bodyCopy).pipe(initialUpstreamReq);
+  else forwarded.pipe(initialUpstreamReq);
 
   // While the gate is closed on anything, the rest of the body is scanned on
   // its way past and a chunk is only forwarded once it has been cleared. A
@@ -863,7 +1121,7 @@ export async function handleCodexProxy(req, res, {
       // destruction raises finds the metric already written and stays quiet
       // instead of recording a 502.
       finalizeMetric(outcome, 403);
-      upstreamReq.destroy();
+      currentUpstreamReq?.destroy();
       requestMetadata.stream.destroy();
       if (!res.headersSent) {
         res.once('finish', () => {
