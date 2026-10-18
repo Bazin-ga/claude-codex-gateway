@@ -9,6 +9,8 @@ import { CredentialStore } from '../lib/store.js';
 import {
   QuotaExhaustion,
   chooseFailoverAccount,
+  knownExhausted,
+  usageExhaustedUntil,
   claudeQuotaRejection,
   normalizeAccountFailover,
   usageShowsExhausted,
@@ -510,4 +512,114 @@ test('the upstream quota headers reach the client so it can say when the limit r
   assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'seven_day');
   assert.equal(response.headers['anthropic-ratelimit-unified-reset'], String(RESET_SECONDS));
   assert.equal(response.headers['x-internal-thing'], undefined, 'the allowlist still holds for everything else');
+});
+
+// Chicago, 2026-10-18: claude-cheng was refused with a 19:30 reset, answered
+// again at 17:00, and was still being skipped as a backup at 18:02.
+test('an account that answers again is a backup again, whatever reset it announced', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken } = await fleet({ backups: ['backup'] });
+  const other = await store.issueDeviceCredential({ accountId: accounts.backup.id, memberLabel: 'o@example.com', deviceName: 'on-backup' });
+  const exhaustion = new QuotaExhaustion();
+  exhaustion.mark(accounts.backup.id, { resetsAtMs: Date.now() + 3 * 3_600_000 });
+  // Use up the probe slot, so only the success can be what makes it usable.
+  exhaustion.claimProbe(accounts.backup.id);
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store, exhaustion }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    if (bearer(req) === 'token-home') return refuse(res);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+
+  // A device already on the backup gets an answer from it...
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, other.token)).status, 200);
+  assert.equal(exhaustion.exhausted(accounts.backup.id), null, 'the success clears the belief');
+  // ...so the home account's next refusal moves there.
+  const response = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+  assert.equal(response.status, 200);
+  assert.deepEqual(tokens, ['token-backup', 'token-home', 'token-backup']);
+});
+
+test('a backup believed exhausted is still probed when nothing else is left, at most every few minutes', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken } = await fleet({ backups: ['backup'] });
+  const exhaustion = new QuotaExhaustion();
+  exhaustion.mark(accounts.backup.id, { resetsAtMs: Date.now() + 3 * 3_600_000 });
+  let backupRecovered = false;
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store, exhaustion }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    if (bearer(req) === 'token-home' || !backupRecovered) return refuse(res);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+
+  // First refusal: the backup is probed, is still exhausted, and that refusal
+  // reaches the client.
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 429);
+  // Within the interval it is not probed again.
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 429);
+  assert.deepEqual(tokens, ['token-home', 'token-backup', 'token-home']);
+
+  // Once the interval has passed and the backup has recovered, the probe wins.
+  exhaustion.probedAt.clear();
+  backupRecovered = true;
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 200);
+  assert.deepEqual(tokens.slice(3), ['token-home', 'token-backup']);
+  assert.equal(exhaustion.exhausted(accounts.backup.id), null);
+});
+
+test('before sending, only a backup believed usable is moved to', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken } = await fleet({ backups: ['backup'] });
+  const exhaustion = new QuotaExhaustion();
+  exhaustion.mark(accounts.home.id, { resetsAtMs: Date.now() + 3_600_000 });
+  exhaustion.mark(accounts.backup.id, { resetsAtMs: Date.now() + 3_600_000 });
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store, exhaustion }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+
+  const response = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(tokens, ['token-home'], 'the account the device is on is tried, not a guess at another');
+  assert.equal(exhaustion.exhausted(accounts.home.id), null, 'and its success is believed');
+});
+
+test('a usage reading older than the last success does not count as exhausted', () => {
+  const exhaustion = new QuotaExhaustion();
+  const later = new Date(Date.now() + 3_600_000).toISOString();
+  const snapshot = {
+    fetched_at: new Date(Date.now() - 60_000).toISOString(),
+    windows: [{ kind: 'five_hour', remaining_percent: 0, resets_at: later }],
+  };
+  assert.equal(knownExhausted('a', { exhaustion, snapshot }), true);
+  exhaustion.succeeded('a');
+  assert.equal(knownExhausted('a', { exhaustion, snapshot }), false);
+  assert.equal(usageExhaustedUntil(snapshot), Date.parse(later));
+});
+
+test('a device moved off an account the usage reading shows exhausted returns when that reading says', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken, deviceId } = await fleet({ backups: ['backup'] });
+  const resetsAt = new Date(Date.now() + 5 * 3_600_000);
+  resetsAt.setMilliseconds(0);
+  const usageSnapshotFor = (id) => (id === accounts.home.id
+    ? { fetched_at: new Date().toISOString(), windows: [{ kind: 'weekly', remaining_percent: 0, resets_at: resetsAt.toISOString() }] }
+    : null);
+  const { proxyUrl } = await harness(t, { store, usageSnapshotFor }, async (req, res) => {
+    await readBody(req);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+
+  await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+  await settled(store);
+
+  const device = store.state.devices.find((entry) => entry.id === deviceId);
+  assert.equal(device.selected_account_id, accounts.backup.id);
+  assert.equal(device.account_failover.return_after, resetsAt.toISOString(), 'not a guessed quarter of an hour');
 });
