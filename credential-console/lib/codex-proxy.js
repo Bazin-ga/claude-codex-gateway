@@ -711,7 +711,10 @@ export async function handleCodexProxy(req, res, {
     const status = upstreamRes.statusCode ?? 502;
     upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
     upstreamStatus = status;
-    if (status >= 200 && status < 300) failover?.recordMove();
+    if (status >= 200 && status < 300) {
+      if (inferenceRequest) exhaustion.succeeded(account.id, now());
+      failover?.recordMove();
+    }
     const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
     upstreamRequestId = typeof requestId === 'string' ? requestId : null;
     // Free, and an hour fresher than the usage poll: the upstream stamps the

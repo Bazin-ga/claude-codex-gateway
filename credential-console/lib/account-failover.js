@@ -33,6 +33,17 @@ export const FAILOVER_MAX_BACKUPS = 8;
  */
 export const FAILOVER_UNKNOWN_RESET_MS = 15 * 60_000;
 
+/**
+ * How often an account believed exhausted may still be tried as a backup when
+ * nothing better is left. The reset time a refusal announces is an upper
+ * bound, not a promise: on Chicago (2026-10-18) an account refused with a
+ * 19:30 reset was answering again at 17:00, and the gateway refused to use it
+ * for 70 minutes while another account's devices collected 49 errors. A probe
+ * that fails costs one quick 429 and gives the client the answer it would have
+ * had anyway.
+ */
+export const FAILOVER_PROBE_INTERVAL_MS = 3 * 60_000;
+
 /** The longest a refusal's reset time is believed: one weekly window. */
 const MAX_EXHAUSTION_MS = 8 * 24 * 60 * 60_000;
 
@@ -179,6 +190,10 @@ export function claudeRateLimitHeaders(headers) {
 export class QuotaExhaustion {
   constructor() {
     this.accounts = new Map();
+    // When each account last answered successfully, and when it was last
+    // tried as a backup while believed exhausted.
+    this.succeededAt = new Map();
+    this.probedAt = new Map();
   }
 
   mark(accountId, { resetsAtMs = null, claim = null } = {}, now = Date.now()) {
@@ -209,6 +224,82 @@ export class QuotaExhaustion {
   clear(accountId) {
     this.accounts.delete(accountId);
   }
+
+  /**
+   * The account just answered. Whatever a refusal or the last usage poll said,
+   * it is not exhausted now.
+   */
+  succeeded(accountId, now = Date.now()) {
+    if (typeof accountId !== 'string' || !accountId) return;
+    this.accounts.delete(accountId);
+    this.succeededAt.delete(accountId);
+    this.succeededAt.set(accountId, now);
+    while (this.succeededAt.size > MAX_TRACKED_ACCOUNTS) {
+      this.succeededAt.delete(this.succeededAt.keys().next().value);
+    }
+  }
+
+  /** Whether the account has answered since `sinceMs`. */
+  succeededSince(accountId, sinceMs) {
+    const at = this.succeededAt.get(accountId);
+    return Number.isFinite(at) && Number.isFinite(sinceMs) && at > sinceMs;
+  }
+
+  /**
+   * Whether an account believed exhausted may be tried now, at most once per
+   * FAILOVER_PROBE_INTERVAL_MS. Claims the slot when it says yes, so that
+   * concurrent requests do not all probe at once.
+   */
+  claimProbe(accountId, now = Date.now()) {
+    const last = this.probedAt.get(accountId);
+    if (Number.isFinite(last) && now - last < FAILOVER_PROBE_INTERVAL_MS) return false;
+    this.probedAt.delete(accountId);
+    this.probedAt.set(accountId, now);
+    while (this.probedAt.size > MAX_TRACKED_ACCOUNTS) {
+      this.probedAt.delete(this.probedAt.keys().next().value);
+    }
+    return true;
+  }
+}
+
+/** When a usage reading was taken, or null. */
+function snapshotTakenAt(snapshot) {
+  const at = Date.parse(String(snapshot?.observed_at ?? snapshot?.fetched_at ?? ''));
+  return Number.isFinite(at) ? at : null;
+}
+
+/**
+ * When the windows a reading shows used up reset — the latest of them, since
+ * the account is only usable once all have — or null if it shows none used up
+ * or does not say.
+ */
+export function usageExhaustedUntil(snapshot, now = Date.now()) {
+  const windows = Array.isArray(snapshot?.windows) ? snapshot.windows : [];
+  let until = null;
+  for (const entry of windows) {
+    if (!['five_hour', 'weekly', 'primary', 'secondary'].includes(entry?.kind)) continue;
+    if (!(Number.isFinite(entry.remaining_percent) && entry.remaining_percent <= 0)) continue;
+    const resetsAt = Date.parse(String(entry.resets_at ?? ''));
+    if (Number.isFinite(resetsAt) && resetsAt > now && (until === null || resetsAt > until)) until = resetsAt;
+  }
+  return until;
+}
+
+/**
+ * Whether an account counts as exhausted, from a refusal the gateway saw or
+ * from the usage reading — unless it has answered since that reading was
+ * taken, which outranks an hour-old poll.
+ */
+export function knownExhausted(accountId, {
+  exhaustion = quotaExhaustion,
+  snapshot = null,
+  exhaustedBy = usageShowsExhausted,
+  now = Date.now(),
+} = {}) {
+  if (exhaustion.exhausted(accountId, now)) return true;
+  if (!exhaustedBy(snapshot, now)) return false;
+  const takenAt = snapshotTakenAt(snapshot);
+  return !(takenAt !== null && exhaustion.succeededSince(accountId, takenAt));
 }
 
 export const quotaExhaustion = new QuotaExhaustion();
@@ -247,10 +338,14 @@ export function chooseFailoverAccount({
   usageSnapshotFor = () => null,
   exhaustedBy = usageShowsExhausted,
   acceptCandidate = () => true,
+  allowProbe = true,
   now = Date.now(),
 }) {
   const policy = normalizeAccountFailover(homeAccount?.failover);
   if (!policy.enabled) return null;
+  // Usable accounts that are only believed exhausted, in chain order: tried as
+  // a probe when nothing else is left.
+  const believedExhausted = [];
   for (const id of policy.backup_account_ids) {
     if (id === homeAccount.id || exclude.includes(id)) continue;
     const candidate = store.accountById(id);
@@ -258,18 +353,21 @@ export function chooseFailoverAccount({
     if (!['healthy', 'stored'].includes(candidate.status)) continue;
     if (typeof store.failoverCandidateProblem === 'function'
       && store.failoverCandidateProblem(candidate)) continue;
-    if (exhaustion.exhausted(candidate.id, now)) continue;
+    if (!acceptCandidate(candidate)) continue;
     let snapshot = null;
     try {
       snapshot = usageSnapshotFor(candidate.id);
     } catch {
       snapshot = null;
     }
-    if (exhaustedBy(snapshot, now)) continue;
-    if (!acceptCandidate(candidate)) continue;
+    if (knownExhausted(candidate.id, { exhaustion, snapshot, exhaustedBy, now })) {
+      believedExhausted.push(candidate);
+      continue;
+    }
     return candidate;
   }
-  return null;
+  if (!allowProbe) return null;
+  return believedExhausted.find((candidate) => exhaustion.claimProbe(candidate.id, now)) ?? null;
 }
 
 /**
@@ -360,8 +458,12 @@ export function beginFailover({
       return null;
     }
   };
-  const knownExhausted = (id) => Boolean(exhaustion.exhausted(id, now()))
-    || exhaustedBy(snapshot(id), now());
+  const isExhausted = (id) => knownExhausted(id, {
+    exhaustion,
+    snapshot: snapshot(id),
+    exhaustedBy,
+    now: now(),
+  });
   let current = account;
   // The account the device row points at, which is where a persistent move
   // has to start from.
@@ -369,7 +471,7 @@ export function beginFailover({
   if (markerHome && homeAccount === markerHome
     && Date.parse(marker.return_after ?? '') <= now()
     && ['healthy', 'stored'].includes(markerHome.status)
-    && !knownExhausted(markerHome.id)
+    && !isExhausted(markerHome.id)
     && !store.failoverCandidateProblem?.(markerHome)) {
     log(`${logPrefix}_quota_failback`, {
       device_id: device.id,
@@ -391,9 +493,10 @@ export function beginFailover({
     account: current,
     // The account this request was moved off, once it has been.
     failedOverFrom: null,
-    nextBackup() {
+    nextBackup({ allowProbe = true } = {}) {
       if (!enabled) return null;
       const backup = chooseFailoverAccount({
+        allowProbe,
         store,
         homeAccount,
         exclude: tried,
@@ -419,8 +522,12 @@ export function beginFailover({
     recordMove() {
       if (state.recorded || !state.failedOverFrom || deviceSelectedId === state.account.id) return;
       state.recorded = true;
+      // Prefer what the gateway saw, then what the usage reading says; a
+      // guessed quarter of an hour only when neither knows.
       const returnAfterMs = exhaustion.exhausted(homeAccount.id, now())?.until
+        ?? usageExhaustedUntil(snapshot(homeAccount.id), now())
         ?? exhaustion.exhausted(state.failedOverFrom.id, now())?.until
+        ?? usageExhaustedUntil(snapshot(state.failedOverFrom.id), now())
         ?? now() + FAILOVER_UNKNOWN_RESET_MS;
       store.failoverDeviceAccount?.({
         deviceId: device.id,
@@ -438,8 +545,11 @@ export function beginFailover({
     recorded: false,
     preflight: false,
   };
-  if (enabled && knownExhausted(current.id)) {
-    const backup = state.nextBackup();
+  if (enabled && isExhausted(current.id)) {
+    // Before anything is sent, only a backup believed usable is worth moving
+    // to: the current account is only believed exhausted too, and sending to
+    // it is as good a probe as sending to another such account.
+    const backup = state.nextBackup({ allowProbe: false });
     if (backup) {
       log(`${logPrefix}_quota_failover`, {
         stage: 'preflight',

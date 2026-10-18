@@ -888,7 +888,10 @@ export async function handleClaudeProxy(req, res, {
 
         attemptSettled = true;
         activeUpstreamRes = upstreamRes;
-        if (status >= 200 && status < 300) failover.recordMove();
+        if (status >= 200 && status < 300) {
+          exhaustion.succeeded(account.id);
+          failover.recordMove();
+        }
         upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
         upstreamStatus = status;
         const requestId = upstreamRes.headers['request-id'] ?? upstreamRes.headers['x-request-id'];
