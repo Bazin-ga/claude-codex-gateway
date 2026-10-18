@@ -3437,6 +3437,10 @@ test('a Bedrock member self-serves a token and the page tells them how to use it
     // The example must not teach the member to write the one call that is refused.
     assert.equal(configured.includes('/converse-stream"'), false);
     assert.match(configured, /may only invoke/);
+    // The pin names a GPT model and no Claude one: a Codex block, no Claude block.
+    assert.match(configured, /base_url = &quot;[^&]*\/bedrock\/openai\/v1&quot;/);
+    assert.match(configured, /web_search = &quot;disabled&quot;/);
+    assert.equal(configured.includes('CLAUDE_CODE_USE_BEDROCK'), false);
   } finally {
     await app.close();
   }

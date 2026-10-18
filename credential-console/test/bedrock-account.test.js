@@ -47,6 +47,18 @@ test('a Bedrock account stores its pin in the clear and its key encrypted', asyn
   assert.equal('credential' in published, false);
 });
 
+test('a Bedrock account can be pinned to a list of models, stored normalized', async (t) => {
+  const store = await newStore(t);
+  const account = await store.addAccount(bedrockInput({
+    bedrock: { region: 'us-west-2', modelId: 'us.anthropic.claude-opus-5-5,us.openai.gpt-6*\n us.anthropic.claude-opus-5-5' },
+  }));
+  assert.equal(account.bedrock.model_id, 'us.anthropic.claude-opus-5-5, us.openai.gpt-6*');
+  await assert.rejects(
+    store.addAccount(bedrockInput({ alias: 'bedrock-bad-list', bedrock: { region: 'us-west-2', modelId: 'ok.model, not ok!' } })),
+    /valid Bedrock model id/,
+  );
+});
+
 test('a Bedrock account without a region, model or key is refused at registration', async (t) => {
   const store = await newStore(t);
   await assert.rejects(
