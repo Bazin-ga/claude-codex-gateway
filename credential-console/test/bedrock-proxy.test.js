@@ -88,6 +88,7 @@ const CONVERSE_BODY = {
 async function startHarness(t, {
   store,
   requestMetrics = null,
+  controlBaseUrl = undefined,
   upstreamHandler = (req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(CONVERSE_BODY));
@@ -110,6 +111,7 @@ async function startHarness(t, {
     Promise.resolve(handleBedrockProxy(req, res, {
       store,
       upstreamBaseUrl: upstreamUrl,
+      ...(controlBaseUrl === undefined ? {} : { controlBaseUrl }),
       requestMetrics,
     })).catch((error) => {
       if (!res.headersSent) res.writeHead(500).end();
@@ -140,17 +142,27 @@ function converse(url, {
   });
 }
 
-test('only converse and converse-stream are recognised paths', () => {
+test('the converse, invoke, Responses and catalog paths are recognised and nothing else', () => {
   assert.deepEqual(parseBedrockPath('/model/us.openai.gpt-6-astra/converse'), {
+    kind: 'converse',
     modelId: 'us.openai.gpt-6-astra',
     streaming: false,
+    method: 'POST',
   });
   assert.deepEqual(parseBedrockPath('/model/us.openai.gpt-6-astra/converse-stream'), {
+    kind: 'converse-stream',
     modelId: 'us.openai.gpt-6-astra',
     streaming: true,
+    method: 'POST',
   });
-  assert.equal(parseBedrockPath('/model/us.openai.gpt-6-astra/invoke'), null);
+  assert.equal(parseBedrockPath('/model/us.anthropic.claude-opus-5-5/invoke').streaming, false);
+  assert.equal(parseBedrockPath('/model/us.anthropic.claude-opus-5-5/invoke-with-response-stream').streaming, true);
+  assert.equal(parseBedrockPath('/openai/v1/responses').kind, 'responses');
+  assert.equal(parseBedrockPath('/openai/v1/responses').modelId, null);
+  assert.equal(parseBedrockPath('/inference-profiles').method, 'GET');
   assert.equal(parseBedrockPath('/converse'), null);
+  assert.equal(parseBedrockPath('/openai/v1/chat/completions'), null);
+  assert.equal(parseBedrockPath('/model/%E0%A4%A/converse'), null);
   // A slash in the model segment would let a crafted path reach another route.
   assert.equal(parseBedrockPath('/model/a/b/converse'), null);
 });
@@ -205,7 +217,7 @@ test('a turn is forwarded with the account key and recorded with its token count
 
 // Forwarding a stream would work for the client and silently record every turn
 // as zero tokens, which defeats the one thing this gateway is for.
-test('streaming is refused with its reason rather than passed through unmetered', async (t) => {
+test('converse-stream is refused with its reason rather than passed through unmetered', async (t) => {
   const metrics = sink();
   const seen = {};
   const { proxyUrl } = await startHarness(t, {
@@ -218,7 +230,7 @@ test('streaming is refused with its reason rather than passed through unmetered'
     path: `/model/${encodeURIComponent(MODEL_ID)}/converse-stream`,
   });
   assert.equal(response.status, 501);
-  assert.match((await response.json()).message, /cannot be metered/);
+  assert.match((await response.json()).message, /cannot be metered.*invoke-with-response-stream/);
   assert.equal(seen.method, undefined, 'the upstream must not be called');
 
   const row = await waitFor(() => metrics.rows[0]);

@@ -11,6 +11,7 @@ import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { MODEL_BLOCK_MAX_MESSAGE_CHARS } from './model-block-rules.js';
+import { bedrockExampleModel } from './bedrock-models.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { sanitizeUrl } from './onboarding.js';
 import { derivePromptDisplay } from './prompt-display.js';
@@ -4281,7 +4282,7 @@ export function dashboardView({
           </article>
           ${bedrockAccounts.length ? `<article class="provider-card">
             <div class="provider-title"><h2>AWS Bedrock</h2>${bedrockUsableAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
-            <p class="muted" data-i18n="bedrock-description">A device token in, one metered Converse turn out. The AWS key stays on this server; each account is pinned to one region and one model.</p>
+            <p class="muted" data-i18n="bedrock-description">A device token in, metered Bedrock turns out — for Claude Code, Codex, or your own Converse calls. The AWS key stays on this server; each account is pinned to one region and a list of models.</p>
             ${bedrockUsableAccounts.length ? `<form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="bedrock-self-service">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <label><span data-i18n="team-account">Team account</span>
@@ -4293,7 +4294,7 @@ export function dashboardView({
               </label>
               <div><button type="submit" data-i18n="get-bedrock">Get Bedrock token</button></div>
             </form>
-            <p class="muted tiny" data-i18n="bedrock-scope-note">Only non-streaming <code>/converse</code> is proxied, and prompts are not archived on this path — per-turn token counts only.</p>` : `<div class="member-form">
+            <p class="muted tiny" data-i18n="bedrock-scope-note">Streaming Claude and Codex turns are carried. Prompts are not archived on this path — per-turn token counts only.</p>` : `<div class="member-form">
               <label><span data-i18n="team-account">Team account</span><select disabled><option data-i18n="no-account">No account available</option></select></label>
               <div><button type="button" disabled data-i18n="waiting-owner">Waiting for account owner</button></div>
             </div><p class="muted tiny" data-i18n="bedrock-unpinned">A registered Bedrock account needs a region, a model id and a key before it can be used.</p>`}
@@ -4365,8 +4366,8 @@ export function dashboardView({
               <label><span data-i18n="bedrock-region">AWS region</span>
                 <input name="region" required pattern="[a-z]{2}(-[a-z]+)+-[0-9]{1,2}" placeholder="us-west-2">
               </label>
-              <label><span data-i18n="bedrock-model-id">Model id (this account may invoke only this one)</span>
-                <input name="model_id" required pattern="[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" placeholder="us.openai.gpt-6-astra">
+              <label><span data-i18n="bedrock-model-id">Models this account may invoke (ids or * patterns, comma-separated)</span>
+                <input name="model_id" required maxlength="2700" placeholder="us.anthropic.claude-opus-5-5, us.anthropic.claude-haiku-5-5, us.openai.gpt-6*">
               </label>
               <label><span data-i18n="bedrock-api-key">Bedrock API key</span>
                 <input name="api_key" type="password" required autocomplete="off" maxlength="4096">
@@ -5157,30 +5158,57 @@ echo "Codex gateway profile '${profile}' installed. Start Codex with: codex-${pr
 }
 
 /**
- * The Bedrock counterpart, and the shortest of the three because there is no
- * client to configure.
+ * The Bedrock counterpart. One device token serves three clients, so the page
+ * hands over the token once and then one block per client: environment for
+ * Claude Code's Bedrock mode, a provider block for Codex, and a plain Converse
+ * call for anything else. Nothing is installed — each block is short enough to
+ * paste, and a Bedrock member may well use only one of them.
  *
- * Claude gets a launcher and Codex gets a config block; both exist because a
- * specific CLI has to be talked into using the gateway. A Bedrock member has no
- * such CLI in the picture — they hold a base URL and a bearer token and call
- * Converse from whatever they are writing. So this page hands over exactly
- * those two things plus one runnable example, and does not pretend to install
- * anything.
- *
- * The example is non-streaming for the same reason the proxy is: a
- * `converse-stream` call would be refused, and showing it here would teach the
- * member to write the one request that cannot work.
+ * The example models come from the account's own pin, so a block never names a
+ * model the gateway would refuse. A client whose models the pin does not name
+ * exactly gets no block rather than a guess.
  */
 export function bedrockDeviceConfiguredView({
   account, device, token, bedrockGatewayUrl, openMode = false,
 }) {
   const gateway = String(bedrockGatewayUrl ?? '').replace(/\/$/, '');
-  const modelId = account.bedrock?.model_id ?? '';
+  const pin = account.bedrock?.model_id ?? '';
+  const region = account.bedrock?.region ?? '';
+  const claudeModel = bedrockExampleModel(pin, (id) => /anthropic\.claude-(opus|fable|sonnet)/.test(id));
+  const claudeSmallModel = bedrockExampleModel(pin, (id) => /anthropic\.claude-haiku/.test(id));
+  const codexModel = bedrockExampleModel(pin, (id) => /(^|\.)openai\.gpt-/.test(id));
+  const converseModel = bedrockExampleModel(pin) ?? '';
   const tokenExport = `export BEDROCK_GATEWAY_TOKEN=${shellSingleQuote(token)}`;
-  const example = `curl -sS "${gateway}/model/${encodeURIComponent(modelId)}/converse" \\
+  const claudeEnv = claudeModel ? [
+    'export CLAUDE_CODE_USE_BEDROCK=1',
+    `export ANTHROPIC_BEDROCK_BASE_URL=${shellSingleQuote(gateway)}`,
+    'export AWS_BEARER_TOKEN_BEDROCK="$BEDROCK_GATEWAY_TOKEN"',
+    `export AWS_REGION=${shellSingleQuote(region)}`,
+    `export ANTHROPIC_MODEL=${shellSingleQuote(claudeModel)}`,
+    ...(claudeSmallModel ? [`export ANTHROPIC_DEFAULT_HAIKU_MODEL=${shellSingleQuote(claudeSmallModel)}`] : []),
+  ].join('\n') : '';
+  const codexConfig = codexModel ? [
+    `model = "${codexModel}"`,
+    'model_provider = "bedrock-gateway"',
+    '# Bedrock refuses the built-in web search tool, failing the whole turn.',
+    'web_search = "disabled"',
+    '',
+    '[model_providers.bedrock-gateway]',
+    'name = "AWS Bedrock via gateway"',
+    `base_url = "${gateway}/openai/v1"`,
+    'env_key = "BEDROCK_GATEWAY_TOKEN"',
+    'wire_api = "responses"',
+  ].join('\n') : '';
+  const example = `curl -sS "${gateway}/model/${encodeURIComponent(converseModel)}/converse" \\
   -H "Authorization: Bearer $BEDROCK_GATEWAY_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{"messages":[{"role":"user","content":[{"text":"hello"}]}],"inferenceConfig":{"maxTokens":64}}'`;
+  const block = (id, title, note, body) => `<h2>${title}</h2>
+      ${note}
+      <pre id="${id}">${escapeHtml(body)}</pre>
+      <div class="setup-actions">
+        <button type="button" class="secondary" data-copy-target="${id}">Copy</button>
+      </div>`;
   return layout('Bedrock device configured', `
     <section class="stack">
       <div class="notice success">Device <strong>${escapeHtml(device.name)}</strong> is enrolled for <strong>${escapeHtml(account.alias)}</strong>.</div>
@@ -5190,13 +5218,12 @@ export function bedrockDeviceConfiguredView({
       <div class="setup-actions">
         <button type="button" class="secondary" data-copy-target="bedrock-token">Copy token</button>
       </div>
-      ${gateway ? `<h2>Call it</h2>
-      <pre id="bedrock-example">${escapeHtml(example)}</pre>
-      <div class="setup-actions">
-        <button type="button" class="secondary" data-copy-target="bedrock-example">Copy example</button>
-      </div>
-      <div class="notice">This account may only invoke <code>${escapeHtml(modelId)}</code> in <code>${escapeHtml(account.bedrock?.region ?? '')}</code>. Any other model is refused here, because the AWS key behind this gateway is account-wide.</div>
-      <div class="notice">Only non-streaming <code>/converse</code> is proxied. <code>/converse-stream</code> is refused: its turns cannot be metered yet, and an unmetered turn would be recorded as zero tokens.</div>
+      ${gateway ? `${claudeEnv ? block('bedrock-claude', 'Claude Code',
+        '<p class="muted">Add to the shell profile after the token line, then run <code>claude</code>.</p>', claudeEnv) : ''}
+      ${codexConfig ? block('bedrock-codex', 'Codex',
+        '<p class="muted">Put in <code>~/.codex/config.toml</code> (or a separate <code>CODEX_HOME</code>), with the token line in the shell profile.</p>', codexConfig) : ''}
+      ${converseModel ? block('bedrock-example', 'Anything else', '', example) : ''}
+      <div class="notice">This account may only invoke <code>${escapeHtml(pin)}</code> in <code>${escapeHtml(region)}</code>. Any other model is refused here, because the AWS key behind this gateway is account-wide.</div>
       <div class="notice">Prompts and responses are <strong>not</strong> archived on this path — only per-turn token counts, the same as Codex traffic.</div>`
     : '<div class="notice error">The Bedrock gateway URL is not configured on this console, so no client configuration can be generated. Ask an administrator to set it.</div>'}
       <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>

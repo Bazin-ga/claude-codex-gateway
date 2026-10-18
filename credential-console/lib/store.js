@@ -20,6 +20,7 @@ import { credentialSwitchBlock, externalAccountStatus } from './external-account
 import { normalizeCodexGuard, parseCodexGuardInput } from './codex-model-guard.js';
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
+import { normalizeBedrockModelPin } from './bedrock-models.js';
 import {
   MODEL_BLOCK_MAX_RULES,
   normalizeModelBlockRules,
@@ -65,14 +66,14 @@ const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 export const GATEWAY_PROVIDERS = Object.freeze(['claude', 'codex', 'bedrock']);
 
 /**
- * A Bedrock account is pinned to exactly one region and one model.
+ * A Bedrock account is pinned to one region and a list of models.
  *
  * Not a convenience: the API key the console holds is an account-wide bearer,
  * so the pin is the only thing standing between a device token and every model
  * in the account. The proxy refuses any other model rather than forwarding it.
+ * The list's shape is in bedrock-models.js.
  */
 const BEDROCK_REGION_PATTERN = /^[a-z]{2}(?:-[a-z]+)+-\d{1,2}$/;
-const BEDROCK_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 function nowIso() {
   return new Date().toISOString();
@@ -918,9 +919,9 @@ export class CredentialStore {
       let bedrockPin = null;
       if (provider === 'bedrock') {
         const region = String(bedrock?.region ?? '').trim();
-        const modelId = String(bedrock?.modelId ?? bedrock?.model_id ?? '').trim();
+        const modelId = normalizeBedrockModelPin(bedrock?.modelId ?? bedrock?.model_id);
         if (!BEDROCK_REGION_PATTERN.test(region)) throw new Error('a valid AWS region is required');
-        if (!BEDROCK_MODEL_ID_PATTERN.test(modelId)) throw new Error('a valid Bedrock model id is required');
+        if (!modelId) throw new Error('a valid Bedrock model id or model list is required');
         if (!credential?.api_key) throw new Error('a Bedrock API key is required');
         bedrockPin = { region, model_id: modelId };
       } else if (bedrock) {
