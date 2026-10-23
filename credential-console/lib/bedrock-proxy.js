@@ -550,7 +550,7 @@ function jsonUsage(kind, body) {
  * reads a copy. Backpressure is honoured, so a slow client slows the upstream
  * read rather than growing this process's memory.
  */
-async function relayStream(res, upstreamResponse, { parser, clientGone, onDone, headers, status }) {
+export async function relayStream(res, upstreamResponse, { parser, clientGone, onDone, headers, status }) {
   let responseBytes = 0;
   let observing = true;
   const observe = (chunk) => {

@@ -188,6 +188,18 @@ button.danger, .button.danger { background: var(--red); }
 .delete-effect h2 { margin: 0 0 4px; font-size: 1.05rem; }
 .delete-effect p, .delete-effect ul { margin: 4px 0; }
 .delete-effect ul { padding-left: 1.2em; }
+.relay-models { display: grid; gap: 12px; }
+.relay-model-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.relay-model-head h3 { margin: 0; }
+.relay-model-head form { margin-left: auto; }
+.relay-price { margin: 6px 0 10px; }
+.relay-usage { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.relay-usage pre { margin: 4px 0; white-space: pre-wrap; }
+.relay-filter { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.relay-filter input { flex: 1 1 220px; width: auto; }
+.relay-filter select, .relay-filter button { flex: 0 0 auto; width: auto; }
+table.relay-catalog tr.relay-allowed td { background: #eef6f0; }
+table.relay-catalog tr.relay-placeholder td { color: #8a5a12; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; }
 .stack > .card { grid-column: auto; min-width: 0; }
@@ -5687,4 +5699,183 @@ export function accountDeleteView({ plan, accounts = [], csrf, error = null, ope
       </div>
     </section>
   `, { openMode });
+}
+
+const RELAY_TAB_ANCHOR = '<a href="/docs" data-i18n="tab-docs"';
+
+/**
+ * The third-party models tab exists only on a console that turned the platform
+ * on. Rather than thread that switch through every page's layout call, the
+ * server adds the tab to each rendered page in one place.
+ */
+export function withRelayTab(html) {
+  if (typeof html !== 'string' || !html.includes(RELAY_TAB_ANCHOR) || html.includes('data-tab="relay"')) return html;
+  const current = html.includes('data-relay-page') ? ' aria-current="page"' : '';
+  return html.replace(
+    RELAY_TAB_ANCHOR,
+    `<a href="/relay" data-i18n="tab-relay"${current} data-tab="relay">Third-party models</a>\n      ${RELAY_TAB_ANCHOR}`,
+  );
+}
+
+function usd(value, digits = 2) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  if (value !== 0 && Math.abs(value) < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(digits)}`;
+}
+
+function perMillion(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  return `$${value < 1 ? value.toFixed(3) : value.toFixed(2)}`;
+}
+
+function tokenCount(value) {
+  if (!Number.isFinite(value)) return '—';
+  if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+  return String(value);
+}
+
+/**
+ * The third-party models page: what the platform offers and at what price,
+ * which models members may use and how, and what they have spent.
+ */
+export function relayView({
+  settings,
+  catalog,
+  spend = null,
+  csrf,
+  gatewayBaseUrl,
+  query = '',
+  vendor = '',
+  error = null,
+  openMode = false,
+}) {
+  const rows = catalog?.rows ?? [];
+  const byModel = new Map(rows.map((row) => [row.model, row]));
+  const allowed = settings.allowed_models;
+  const plaintext = typeof settings.base_url === 'string' && settings.base_url.startsWith('http://');
+  const balance = catalog?.balance;
+  const relayBase = `${gatewayBaseUrl.replace(/\/$/, '')}/relay/v1`;
+  const supports = (row) => {
+    // No price list yet (or the model left it): show every route rather than
+    // telling members a model they were just given cannot be used.
+    if (!row) return { claude: true, codex: true, python: true };
+    const types = row.endpoints ?? [];
+    // Measured on this platform: models listed as OpenAI-only still answer
+    // the Anthropic and Responses routes, which the platform converts.
+    const openai = types.includes('openai');
+    return {
+      claude: types.includes('anthropic') || openai,
+      codex: types.includes('openai-response') || openai,
+      python: openai || types.includes('openai-response'),
+    };
+  };
+  const allowForm = (model, allow) => `<form method="post" action="/relay/models" class="inline">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <input type="hidden" name="model" value="${escapeHtml(model)}">
+      <input type="hidden" name="op" value="${allow ? 'allow' : 'disallow'}">
+      <button type="submit" class="${allow ? 'secondary' : 'danger'}" data-i18n="${allow ? 'relay-allow' : 'relay-disallow'}">${allow ? 'Allow' : 'Stop'}</button>
+    </form>`;
+
+  const allowedCards = allowed.length ? allowed.map((model) => {
+    const row = byModel.get(model);
+    const can = supports(row);
+    const python = `from openai import OpenAI\n\nclient = OpenAI(\n    api_key=open(TOKEN_FILE).read().strip(),  # your device token\n    base_url="${relayBase}",\n)\nreply = client.chat.completions.create(\n    model="${model}",\n    messages=[{"role": "user", "content": "你好"}],\n)\nprint(reply.choices[0].message.content)`;
+    return `<article class="card relay-model">
+      <div class="relay-model-head">
+        <h3><code>${escapeHtml(model)}</code></h3>
+        <div class="muted tiny">${escapeHtml(row?.vendor ?? '')}</div>
+        ${allowForm(model, false)}
+      </div>
+      <div class="relay-price"><span data-i18n="relay-input">Input</span> ${perMillion(row?.input_usd_per_m)} · <span data-i18n="relay-output">Output</span> ${perMillion(row?.output_usd_per_m)} · <span data-i18n="relay-cached">Cached input</span> ${perMillion(row?.cached_input_usd_per_m)} <span class="muted tiny" data-i18n="relay-per-million">per million tokens</span>${row?.placeholder ? ' <span class="badge unhealthy" data-i18n="relay-placeholder">placeholder price</span>' : ''}</div>
+      <div class="relay-usage">
+        <div><strong>Claude Code</strong> ${can.claude ? '' : '<span class="muted tiny" data-i18n="relay-unsupported">not supported</span>'}
+          ${can.claude ? `<pre>claude --model ${escapeHtml(model)}</pre><div class="muted tiny" data-i18n="relay-claude-hint">Any device already on the gateway. Inside a session: /model ${escapeHtml(model)}</div>` : ''}</div>
+        <div><strong>Codex</strong> ${can.codex ? '' : '<span class="muted tiny" data-i18n="relay-unsupported">not supported</span>'}
+          ${can.codex ? `<pre>codex -m ${escapeHtml(model)}</pre><div class="muted tiny" data-i18n="relay-codex-hint">Any Codex device already on the gateway.</div>` : ''}</div>
+        <div><strong>Python / OpenAI SDK</strong>
+          <pre>${escapeHtml(python)}</pre><div class="muted tiny" data-i18n="relay-python-hint">Any device token works (the .token file the installer wrote). Base URL ends in /relay/v1; /chat/completions, /responses and /messages are all available.</div></div>
+      </div>
+    </article>`;
+  }).join('') : '<p class="muted" data-i18n="relay-none-allowed">No model is allowed yet. Pick one in the catalog below.</p>';
+
+  const spendSection = spend ? (() => {
+    const modelRows = spend.models.map((entry) => `<tr><td><code>${escapeHtml(entry.model ?? '—')}</code></td><td>${entry.requestCount}</td><td>${tokenCount(entry.inputTokens)}</td><td>${tokenCount(entry.outputTokens)}</td><td>${usd(entry.costUsd)}</td></tr>`).join('');
+    const deviceRows = spend.devices.map((entry) => `<tr><td>${escapeHtml(entry.label)}</td><td><code>${escapeHtml(entry.model ?? '—')}</code></td><td>${entry.requestCount}</td><td>${tokenCount(entry.inputTokens)}</td><td>${tokenCount(entry.outputTokens)}</td><td>${usd(entry.costUsd)}</td></tr>`).join('');
+    return `<article class="card">
+      <h2 data-i18n="relay-spend-heading">Spend through the gateway</h2>
+      <p class="muted tiny"><span data-i18n="relay-spend-window">Last 30 days, estimated from recorded tokens × the catalog price.</span> <span data-i18n="relay-spend-total">Total</span>: <strong>${usd(spend.totalUsd)}</strong></p>
+      ${spend.models.length ? `<div class="table-wrap"><table><thead><tr><th data-i18n="relay-model">Model</th><th data-i18n="relay-requests">Requests</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cost">Est. cost</th></tr></thead><tbody>${modelRows}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th data-i18n="relay-device">Device</th><th data-i18n="relay-model">Model</th><th data-i18n="relay-requests">Requests</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cost">Est. cost</th></tr></thead><tbody>${deviceRows}</tbody></table></div>`
+        : '<p class="muted" data-i18n="relay-spend-none">No third-party turns yet.</p>'}
+    </article>`;
+  })() : '';
+
+  const needle = query.trim().toLowerCase();
+  const vendors = [...new Set(rows.map((row) => row.vendor).filter(Boolean))].sort();
+  const shown = rows.filter((row) => (!needle || row.model.toLowerCase().includes(needle))
+    && (!vendor || row.vendor === vendor));
+  const catalogRows = shown.map((row) => {
+    const isAllowed = allowed.includes(row.model);
+    const price = row.per_call_usd !== null
+      ? `<td colspan="3">${usd(row.per_call_usd, 4)} <span class="muted tiny" data-i18n="relay-per-call">per call</span></td>`
+      : `<td>${perMillion(row.input_usd_per_m)}</td><td>${perMillion(row.output_usd_per_m)}</td><td>${perMillion(row.cached_input_usd_per_m)}</td>`;
+    return `<tr class="${isAllowed ? 'relay-allowed' : ''}${row.placeholder ? ' relay-placeholder' : ''}">
+      <td><code>${escapeHtml(row.model)}</code>${isAllowed ? ' <span class="badge healthy" data-i18n="relay-allowed-badge">allowed</span>' : ''}${row.placeholder ? ' <span class="badge unhealthy" data-i18n="relay-placeholder">placeholder price</span>' : ''}</td>
+      <td>${escapeHtml(row.vendor || '—')}</td>
+      ${price}
+      <td class="muted tiny">${escapeHtml(row.endpoints.join(' / '))}</td>
+      <td>${isAllowed ? allowForm(row.model, false) : allowForm(row.model, true)}</td>
+    </tr>`;
+  }).join('');
+
+  const settingsForm = `<form method="post" action="/relay/settings" class="stack" autocomplete="off">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <label><span data-i18n="relay-platform-name">Platform name</span>
+        <input name="name" required maxlength="64" value="${escapeHtml(settings.name ?? '')}" placeholder="boyue"></label>
+      <label><span data-i18n="relay-platform-url">Platform address</span>
+        <input name="base_url" required maxlength="300" value="${escapeHtml(settings.base_url ?? '')}" placeholder="https://example.com/v1"></label>
+      <label><span data-i18n="relay-platform-key">Platform API key${settings.has_key ? ' (leave empty to keep the stored one)' : ''}</span>
+        <input name="api_key" type="password" autocomplete="off" maxlength="512" ${settings.has_key ? '' : 'required'}></label>
+      <button type="submit" data-i18n="relay-save">Save</button>
+    </form>`;
+
+  return layout('Third-party models', `
+    <section class="stack" data-relay-page>
+      <article class="card">
+        <h1 data-i18n="relay-heading">Third-party models</h1>
+        <p class="muted" data-i18n="relay-intro">Models from another provider, run through this gateway with the device you already have. Only the models allowed here can be used; every turn is billed to the shared platform key and recorded below.</p>
+        ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+        ${settings.base_url ? `<p><span data-i18n="relay-platform">Platform</span>: <strong>${escapeHtml(settings.name ?? '')}</strong> <span class="muted tiny">${escapeHtml(settings.base_url)}</span></p>` : '<div class="notice" data-i18n="relay-not-configured">No platform is configured yet. Fill in the settings at the bottom of this page.</div>'}
+        ${plaintext ? '<div class="notice error" data-i18n="relay-plaintext">This platform is reached over plain HTTP: the platform key and every prompt cross the internet unencrypted between this server and the platform. Do not send anything sensitive.</div>' : ''}
+        ${balance ? `<p><span data-i18n="relay-balance">Platform key spend</span>: <strong>${usd(balance.used_usd)}</strong> / ${usd(balance.limit_usd, 0)} <span class="muted tiny">(${escapeHtml(dateText(balance.fetched_at))})</span></p>` : ''}
+        ${catalog?.error && catalog.error !== 'not_configured' ? `<div class="notice error"><span data-i18n="relay-catalog-error">The price list could not be refreshed</span>: ${escapeHtml(catalog.error)}</div>` : ''}
+      </article>
+      <article class="card">
+        <h2 data-i18n="relay-allowed-heading">Allowed models</h2>
+        <div class="relay-models">${allowedCards}</div>
+      </article>
+      ${spendSection}
+      <article class="card">
+        <h2><span data-i18n="relay-catalog-heading">All models on the platform</span> <span class="muted tiny">(${shown.length}/${rows.length})</span></h2>
+        <p class="muted tiny" data-i18n="relay-catalog-hint">Dollars per million tokens, from the platform's own price list at the cheapest group it offers the model in. A placeholder price is the platform's default for a model it has not priced; what it actually bills may differ.</p>
+        <form method="get" action="/relay" class="relay-filter">
+          <input name="q" value="${escapeHtml(query)}" placeholder="deepseek, kimi, glm…" aria-label="Search models">
+          <select name="vendor" aria-label="Vendor"><option value="" data-i18n="relay-all-vendors">All vendors</option>${vendors.map((name) => `<option value="${escapeHtml(name)}"${name === vendor ? ' selected' : ''}>${escapeHtml(name)}</option>`).join('')}</select>
+          <button type="submit" class="secondary" data-i18n="relay-filter">Filter</button>
+        </form>
+        <div class="table-wrap"><table class="relay-catalog">
+          <thead><tr><th data-i18n="relay-model">Model</th><th data-i18n="relay-vendor">Vendor</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cached">Cached input</th><th data-i18n="relay-endpoints">Endpoints</th><th></th></tr></thead>
+          <tbody>${catalogRows || '<tr><td colspan="7" class="empty" data-i18n="relay-catalog-empty">Nothing to show.</td></tr>'}</tbody>
+        </table></div>
+        ${catalog?.fetched_at ? `<p class="muted tiny"><span data-i18n="relay-catalog-updated">Price list read</span> ${escapeHtml(dateText(catalog.fetched_at))}</p>` : ''}
+      </article>
+      <article class="card">
+        <details${settings.base_url ? '' : ' open'}>
+          <summary data-i18n="relay-settings">Platform settings</summary>
+          ${settingsForm}
+        </details>
+      </article>
+    </section>
+  `, { openMode, activeTab: 'relay' });
 }
