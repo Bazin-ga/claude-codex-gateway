@@ -970,52 +970,136 @@ export class CredentialStore {
   }
 
   /**
-   * Remove an account that never finished authorizing — a typo in the alias or the
-   * owner email, most often.
+   * What deleting this account would do to everything that points at it,
+   * without doing any of it. The confirmation page shows this, and
+   * `deleteAccount` applies exactly this plan, so the operator confirms the
+   * same effects that then happen.
    *
-   * Keyed off the stored credential, NOT off `status`. Status is derived and moves
-   * with health checks, so a row that is `unhealthy` today may well be holding a
-   * working credential; trusting it here would eventually delete something the
-   * operator cannot recreate, because they do not hold the upstream login. An
-   * imported codex home is refused for the same reason — the row is a pointer to
-   * real credential material living outside this store.
+   * A device whose traffic currently goes to the account is revoked rather
+   * than moved: picking another account for it decides whose allowance that
+   * device spends, and a deletion is not the place to make that choice. An
+   * operator who wants to keep the device switches it first, and the plan
+   * then shows it as rebound instead.
    */
-  async deleteAccount(id) {
+  accountDeletionPlan(id) {
+    const account = this.accountById(id);
+    if (!account) throw new Error('account not found');
+    const devicesRevoked = [];
+    const devicesRebound = [];
+    for (const device of this.state.devices) {
+      if (device.revoked_at) continue;
+      let policy;
+      try {
+        policy = this.#deviceAccountPolicy(device);
+      } catch {
+        // A device with a broken policy cannot be routed anywhere; if it
+        // names this account at all, revoking it loses nothing.
+        policy = { allowedAccountIds: [device.account_id], selectedAccountId: device.account_id };
+      }
+      const touches = device.account_id === id
+        || policy.selectedAccountId === id
+        || policy.allowedAccountIds.includes(id)
+        || device.account_failover?.home_account_id === id
+        || device.account_failover?.account_id === id;
+      if (!touches) continue;
+      const summary = { id: device.id, name: device.name, member_label: device.member_label };
+      if (policy.selectedAccountId === id || !this.accountById(policy.selectedAccountId)) {
+        devicesRevoked.push(summary);
+      } else {
+        devicesRebound.push({ ...summary, selected_account_id: policy.selectedAccountId });
+      }
+    }
+    const failoverPruned = [];
+    for (const other of this.state.accounts) {
+      if (other.id === id) continue;
+      const policy = normalizeAccountFailover(other.failover);
+      if (!policy.backup_account_ids.includes(id)) continue;
+      const remaining = policy.backup_account_ids.filter((backupId) => backupId !== id);
+      failoverPruned.push({
+        id: other.id,
+        alias: other.alias,
+        // An enabled chain with nothing left in it would be refused by
+        // setAccountFailover; turn it off the same way an emptied chain is.
+        disabled: policy.enabled && remaining.length === 0,
+      });
+    }
+    return {
+      account: {
+        id: account.id,
+        provider: account.provider,
+        alias: account.alias,
+        email_label: account.email_label,
+        holds_credential: Boolean(account.credential),
+        external: account.external ? { kind: account.external.kind } : null,
+      },
+      devices_revoked: devicesRevoked,
+      devices_rebound: devicesRebound,
+      failover_pruned: failoverPruned,
+    };
+  }
+
+  /**
+   * Remove an account, including one that holds a working or dead credential.
+   *
+   * Destructive in a way the operator may not be able to undo — a Claude OAuth
+   * token needs the account owner to authorize again — so the caller must
+   * repeat the alias back. Checked here rather than only in the route, because
+   * two copies of a "safe to delete" test drift apart.
+   *
+   * Applies `accountDeletionPlan`: devices on the account are revoked, devices
+   * that merely list it lose it from their allowlist, and failover chains drop
+   * it. An imported codex home is left on disk; the row was only a pointer to
+   * it and its refresh timer belongs to the host, not to this store.
+   */
+  async deleteAccount(id, { confirmAlias, actor = null } = {}) {
     return this.serialized(async () => {
       const account = this.accountById(id);
       if (!account) throw new Error('account not found');
-      // The rule above is about credentials the operator could not recreate: a
-      // Claude OAuth token needs the account owner to sit down and authorize
-      // again. A Bedrock key does not — the operator pasted it in from the AWS
-      // console and can paste it again. Applying the Claude rule to it made a
-      // mistyped region or model id permanent, since the row is `stored` from
-      // the moment it exists and so never offers the delete control either.
-      if (account.credential && account.provider !== 'bedrock') {
-        throw new Error('account holds a stored credential and cannot be deleted');
+      if (typeof confirmAlias !== 'string' || confirmAlias.trim() !== account.alias) {
+        throw new Error('type the account alias exactly to confirm deletion (请准确输入账号别名以确认删除)');
       }
-      if (account.external) {
-        throw new Error('account is an imported credential home and cannot be deleted here');
-      }
-      const attached = this.state.devices.filter(
-        (device) => device.account_id === id && !device.revoked_at,
-      ).length;
-      if (attached) {
-        throw new Error(`account still has ${attached} active device(s)`);
-      }
+      const plan = this.accountDeletionPlan(id);
+      const revokedIds = new Set(plan.devices_revoked.map((device) => device.id));
+      const actorLabel = typeof actor === 'string' && actor ? actor.slice(0, 160) : null;
       const stateBefore = structuredClone(this.state);
       try {
         const prunedPolicies = [];
+        const at = nowIso();
         for (const device of this.state.devices) {
+          if (revokedIds.has(device.id)) {
+            device.revoked_at = at;
+            delete device.account_failover;
+            this.audit('device_revoked', {
+              device_id: device.id,
+              account_id: device.account_id,
+              name: device.name,
+              reason: 'account_deleted',
+              deleted_account_id: id,
+              actor: actorLabel,
+            });
+          }
           const hasAllowed = Object.hasOwn(device, 'allowed_account_ids');
           const hasSelected = Object.hasOwn(device, 'selected_account_id');
+          if (!device.revoked_at && device.account_id === id) {
+            // The account a device was issued on is shown on every page that
+            // lists it; point it at where the device actually goes now.
+            device.account_id = device.selected_account_id;
+            prunedPolicies.push(device.id);
+          }
+          if (device.account_failover && !device.revoked_at) {
+            const marker = device.account_failover;
+            if (marker.home_account_id === id || marker.account_id === id) {
+              delete device.account_failover;
+            } else if (Array.isArray(marker.allowed_added) && marker.allowed_added.includes(id)) {
+              marker.allowed_added = marker.allowed_added.filter((accountId) => accountId !== id);
+            }
+          }
           if (!hasAllowed && !hasSelected) continue;
           if (device.selected_account_id === id) {
-            if (!device.revoked_at) {
-              throw new Error(`account is selected by active device ${device.id}; switch it before deleting`);
-            }
+            // Only a revoked device can still be here: an active one was in the plan.
             delete device.allowed_account_ids;
             delete device.selected_account_id;
-            prunedPolicies.push(device.id);
+            if (!prunedPolicies.includes(device.id)) prunedPolicies.push(device.id);
             continue;
           }
           if (Array.isArray(device.allowed_account_ids)
@@ -1026,8 +1110,28 @@ export class CredentialStore {
               delete device.allowed_account_ids;
               delete device.selected_account_id;
             }
-            prunedPolicies.push(device.id);
+            if (!prunedPolicies.includes(device.id)) prunedPolicies.push(device.id);
           }
+        }
+        for (const pruned of plan.failover_pruned) {
+          const other = this.accountById(pruned.id);
+          const previous = normalizeAccountFailover(other.failover);
+          const backups = previous.backup_account_ids.filter((backupId) => backupId !== id);
+          other.failover = {
+            enabled: previous.enabled && backups.length > 0,
+            backup_account_ids: backups,
+            updated_at: at,
+            updated_by: actorLabel,
+          };
+          this.audit('account_failover_updated', {
+            account_id: other.id,
+            enabled: other.failover.enabled,
+            backup_account_ids: [...backups],
+            previous_enabled: previous.enabled,
+            previous_backup_account_ids: previous.backup_account_ids,
+            actor: actorLabel,
+            reason: 'account_deleted',
+          });
         }
         this.state.accounts = this.state.accounts.filter((entry) => entry.id !== id);
         // Half-finished authorization sessions and unredeemed enrollment links for a
@@ -1039,7 +1143,12 @@ export class CredentialStore {
           account_id: id,
           provider: account.provider,
           alias: account.alias,
+          held_credential: Boolean(account.credential),
+          external_home: account.external?.home ?? null,
+          devices_revoked: [...revokedIds],
           device_account_policies_pruned: prunedPolicies,
+          failover_pruned: plan.failover_pruned.map((entry) => entry.id),
+          actor: actorLabel,
         });
         await this.persist();
         return account;

@@ -233,29 +233,35 @@ test('a Bedrock account can be corrected by deleting and re-registering it', asy
     bedrock: { region: 'us-west-2', modelId: 'us.openai.gpt-6-astrA-wrong' },
   }));
 
-  await store.deleteAccount(typo.id);
+  await store.deleteAccount(typo.id, { confirmAlias: 'bedrock-typo' });
   assert.equal(store.accountById(typo.id), null);
 
   const fixed = await store.addAccount(bedrockInput({ alias: 'bedrock-typo' }));
   assert.equal(fixed.bedrock.model_id, MODEL_ID);
 });
 
-// Deleting the row must not strand a device that is still pointed at it.
-test('a Bedrock account with an active device is still refused deletion', async (t) => {
+// Deleting the row must not strand a device that is still pointed at it: the
+// device goes with it, and the confirmation page says so beforehand.
+test('deleting a Bedrock account revokes the device still pointed at it', async (t) => {
   const store = await newStore(t);
   const account = await store.addAccount(bedrockInput());
-  await store.issueDeviceCredential({
+  const issued = await store.issueDeviceCredential({
     accountId: account.id,
     memberLabel: 'member@example.com',
     deviceName: 'laptop',
   });
 
-  await assert.rejects(store.deleteAccount(account.id), /active device/);
+  assert.deepEqual(
+    store.accountDeletionPlan(account.id).devices_revoked.map((device) => device.id),
+    [issued.device.id],
+  );
+  await store.deleteAccount(account.id, { confirmAlias: account.alias });
+  assert.ok(store.state.devices.find((device) => device.id === issued.device.id).revoked_at);
 });
 
-// A Claude account holding a real OAuth token stays undeletable: that rule is
-// the reason this one had to be narrowed rather than dropped.
-test('a Claude account holding a stored credential is still undeletable', async (t) => {
+// A Claude account holding a real OAuth token can only be deleted with its
+// alias typed back: the operator cannot recreate that token themselves.
+test('a Claude account holding a stored credential needs its alias to be deleted', async (t) => {
   const store = await newStore(t);
   const claude = await store.addAccount({
     provider: 'claude',
@@ -264,7 +270,9 @@ test('a Claude account holding a stored credential is still undeletable', async 
     credential: { oauth_token: 'sk-ant-oat01-test' },
   });
 
-  await assert.rejects(store.deleteAccount(claude.id), /cannot be deleted/);
+  await assert.rejects(store.deleteAccount(claude.id), /type the account alias/);
+  await store.deleteAccount(claude.id, { confirmAlias: 'claude-1' });
+  assert.equal(store.accountById(claude.id), null);
 });
 
 // The two consoles run one build, and only one of them is supposed to offer a
@@ -331,5 +339,5 @@ test('an account that exists is still listed for the operator when the flag is o
     bedrockEnabled: false,
   });
   assert.match(html, new RegExp(`data-account-row="${bedrock.id}"`));
-  assert.match(html, new RegExp(`action="/accounts/${bedrock.id}/delete"`), 'and can be removed');
+  assert.match(html, new RegExp(`href="/accounts/${bedrock.id}/delete"`), 'and can be removed');
 });

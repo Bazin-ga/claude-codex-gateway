@@ -76,6 +76,7 @@ import {
   enrollmentCreatedView,
   enrollmentView,
   messageView,
+  accountDeleteView,
   codexAuthorizationView,
   codexCredentialView,
   metricsView,
@@ -2681,10 +2682,30 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
-    // Removing an account that never finished authorizing. The store decides what
-    // is safe to delete; this route deliberately does not re-derive that rule,
+    // Deleting an account takes two steps: GET shows what the deletion would do,
+    // POST does it once the alias is typed back. The store checks the alias and
+    // computes the effects; this route deliberately does not re-derive either,
     // because two copies of a "safe to delete" test drift apart.
     const deleteAccountParams = routeMatch(path, '/accounts/:id/delete');
+    function accountDeletePage(id, session, error = null) {
+      return accountDeleteView({
+        plan: store.accountDeletionPlan(id),
+        accounts: store.publicAccounts(),
+        csrf: session.csrf,
+        error,
+        openMode,
+      });
+    }
+    if (req.method === 'GET' && deleteAccountParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      if (!store.accountById(deleteAccountParams.id)) {
+        sendHtml(res, 404, messageView('Not found', 'Account not found.', { error: true, openMode }));
+        return;
+      }
+      sendHtml(res, 200, accountDeletePage(deleteAccountParams.id, session));
+      return;
+    }
     if (req.method === 'POST' && deleteAccountParams) {
       const session = requireSession(req, res);
       if (!session) return;
@@ -2694,10 +2715,18 @@ export async function createCredentialConsole(options = {}) {
         return;
       }
       try {
-        await store.deleteAccount(deleteAccountParams.id);
+        await store.deleteAccount(deleteAccountParams.id, {
+          confirmAlias: form.confirm_alias,
+          actor: session.admin_identity ?? 'anonymous',
+        });
         redirect(res, '/');
       } catch (error) {
-        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+        if (!store.accountById(deleteAccountParams.id)) {
+          redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+          return;
+        }
+        // Back to the same page, so a mistyped alias costs a retype, not a hunt.
+        sendHtml(res, 400, accountDeletePage(deleteAccountParams.id, session, error.message));
       }
       return;
     }

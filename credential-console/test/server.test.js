@@ -2503,7 +2503,7 @@ test('P3 console and machine API switch only the authenticated device from the n
     await restored.arrayBuffer();
     assert.equal(app.upstreamRequests.at(-1).authorization, 'Bearer p3-primary-upstream-token');
     assert.equal(app.store.deviceByToken(first.token).id, first.device.id);
-    await app.store.deleteAccount(placeholder.id);
+    await app.store.deleteAccount(placeholder.id, { confirmAlias: placeholder.alias });
     assert.deepEqual(
       app.store.deviceAccountSummary(first.device.id).allowed_account_ids,
       [primary.id, secondary.id],
@@ -3273,7 +3273,7 @@ test('a Codex home nothing has enrolled against yet is not reported as unreadabl
   }
 });
 
-test('an unauthorized account row can be deleted from the console, a credentialed one cannot', async () => {
+test('deleting an account from the console takes a confirmation page and the typed alias', async () => {
   const app = await fixture({ adminAuth: 'open' });
   try {
     const pending = await app.store.addAccount({ provider: 'claude', alias: 'wrong-email' });
@@ -3282,42 +3282,77 @@ test('an unauthorized account row can be deleted from the console, a credentiale
       alias: 'in-use',
       credential: { oauth_token: 'sk-ant-oat01-keep-me' },
     });
+    const backup = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'backup',
+      credential: { oauth_token: 'sk-ant-oat01-backup' },
+    });
+    await app.store.setAccountFailover(backup.id, { enabled: true, backupAccountIds: [authorized.id] });
+    const issued = await app.store.issueDeviceCredential({
+      accountId: authorized.id,
+      memberLabel: 'member',
+      deviceName: 'laptop-on-in-use',
+    });
 
     const page = await fetch(`${app.baseUrl}/`);
     const cookie = cookieFrom(page);
     const html = await page.text();
-    const csrf = csrfFrom(html);
-    // Offered only for the row that has nothing to lose.
-    assert.match(html, new RegExp(`/accounts/${pending.id}/delete`));
-    assert.equal(html.includes(`/accounts/${authorized.id}/delete`), false);
+    // Every row offers the entry, and it is a link to the confirmation page,
+    // not a button that deletes on the spot.
+    for (const account of [pending, authorized]) {
+      assert.match(html, new RegExp(`<a class="button danger" href="/accounts/${account.id}/delete"`));
+    }
+    assert.equal(html.includes(`action="/accounts/${authorized.id}/delete"`), false);
 
-    const noCsrf = await fetch(`${app.baseUrl}/accounts/${pending.id}/delete`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({}),
+    const confirmPage = await fetch(`${app.baseUrl}/accounts/${authorized.id}/delete`, {
+      headers: { Cookie: cookie },
     });
+    assert.equal(confirmPage.status, 200);
+    const confirmHtml = await confirmPage.text();
+    const csrf = csrfFrom(confirmHtml);
+    assert.match(confirmHtml, /data-i18n="delete-account-credential"/);
+    assert.match(confirmHtml, /laptop-on-in-use/, 'the device that will be revoked is named');
+    assert.match(confirmHtml, /<strong>backup<\/strong>/, 'and so is the failover chain it leaves');
+    assert.match(confirmHtml, /name="confirm_alias"/);
+    assert.ok(app.store.accountById(authorized.id), 'showing the page deletes nothing');
+
+    const missing = await fetch(`${app.baseUrl}/accounts/no-such-account/delete`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(missing.status, 404);
+
+    const post = (id, body) => fetch(`${app.baseUrl}/accounts/${id}/delete`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(body),
+    });
+
+    const noCsrf = await post(pending.id, { confirm_alias: 'wrong-email' });
     assert.equal(noCsrf.status, 403);
     assert.ok(app.store.accountById(pending.id), 'a CSRF-less delete must change nothing');
 
-    const ok = await fetch(`${app.baseUrl}/accounts/${pending.id}/delete`, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ csrf }),
-    });
-    assert.equal(ok.status, 303);
-    assert.equal(app.store.accountById(pending.id), null);
+    // Without the alias, or with the wrong one, the same page comes back with the error.
+    for (const confirmAlias of [null, 'in-us', 'wrong-email']) {
+      const refused = await post(authorized.id, confirmAlias === null ? { csrf } : { csrf, confirm_alias: confirmAlias });
+      assert.equal(refused.status, 400);
+      assert.match(await refused.text(), /type the account alias exactly/);
+      assert.ok(app.store.accountCredential(authorized.id).oauth_token, 'the credential must survive');
+    }
 
-    // Forging the route against a credentialed account is refused by the store.
-    const forged = await fetch(`${app.baseUrl}/accounts/${authorized.id}/delete`, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ csrf }),
-    });
-    assert.equal(forged.status, 303);
-    assert.match(forged.headers.get('location'), /error=.*credential/);
-    assert.ok(app.store.accountCredential(authorized.id).oauth_token, 'the credential must survive');
+    const ok = await post(authorized.id, { csrf, confirm_alias: 'in-use' });
+    assert.equal(ok.status, 303);
+    assert.equal(app.store.accountById(authorized.id), null);
+    assert.ok(app.store.state.devices.find((device) => device.id === issued.device.id).revoked_at);
+    assert.deepEqual(app.store.accountById(backup.id).failover.backup_account_ids, []);
+
+    const gone = await post(authorized.id, { csrf, confirm_alias: 'in-use' });
+    assert.equal(gone.status, 303);
+    assert.match(gone.headers.get('location'), /error=account%20not%20found/);
+
+    const unauthorizedRow = await post(pending.id, { csrf, confirm_alias: 'wrong-email' });
+    assert.equal(unauthorizedRow.status, 303);
+    assert.equal(app.store.accountById(pending.id), null);
   } finally {
     await app.close();
   }
