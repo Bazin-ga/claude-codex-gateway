@@ -34,6 +34,7 @@ import {
   modelBlockMessage,
 } from './model-block-rules.js';
 import { codexQuotaSignal as defaultQuotaSignal } from './codex-quota-signal.js';
+import { isCodexApiKeyAccount, OPENAI_API_BASE_URL } from './codex-api-key.js';
 import {
   beginFailover,
   codexQuotaRejection,
@@ -201,6 +202,7 @@ export async function readPublishedCodexCredential(account, { readFileImpl = rea
 export async function handleCodexProxy(req, res, {
   store,
   upstreamBaseUrl = 'https://chatgpt.com/backend-api/codex',
+  openaiApiBaseUrl = OPENAI_API_BASE_URL,
   requestMetrics = null,
   metadataTeeFactory = createRequestMetadataTee,
   responseObservationFactory = createResponseObservationTee,
@@ -460,9 +462,24 @@ export async function handleCodexProxy(req, res, {
     }
   }
 
+  // An API-key row carries its key in the store, encrypted, and never expires;
+  // every other Codex row reads the credential its refresh home publishes.
+  const readCredential = async (target) => {
+    if (!isCodexApiKeyAccount(target)) return credentialReader(target);
+    const apiKey = store.accountCredential?.(target.id)?.api_key;
+    if (!apiKey) throw new CodexCredentialError('credential_unavailable');
+    return { apiKey, accountId: null, expiresAtMs: Number.POSITIVE_INFINITY };
+  };
+  // The two kinds of row talk to different upstreams with different auth.
+  const applyUpstreamAuth = (target, cred) => {
+    target.authorization = `Bearer ${cred.apiKey ?? cred.accessToken}`;
+    if (cred.accountId) target['chatgpt-account-id'] = cred.accountId;
+    else delete target['chatgpt-account-id'];
+  };
+
   let credential;
   try {
-    credential = await credentialReader(account);
+    credential = await readCredential(account);
   } catch (error) {
     const code = error instanceof CodexCredentialError ? error.code : 'credential_unavailable';
     log('codex_proxy_credential_unavailable', {
@@ -547,16 +564,16 @@ export async function handleCodexProxy(req, res, {
     return;
   }
 
+  const upstreamApiKey = isCodexApiKeyAccount(account);
   const upstream = new URL(
-    `${upstreamBaseUrl.replace(/\/$/, '')}${upstreamPath}${requestUrl.search}`,
+    `${(upstreamApiKey ? openaiApiBaseUrl : upstreamBaseUrl).replace(/\/$/, '')}${upstreamPath}${requestUrl.search}`,
   );
   const transport = upstream.protocol === 'http:' ? http : https;
   const headers = {
     ...forwardHeaders(req.headers),
-    authorization: `Bearer ${credential.accessToken}`,
-    'chatgpt-account-id': credential.accountId,
     host: upstream.host,
   };
+  applyUpstreamAuth(headers, credential);
   // The client authenticated with a device token; it must never reach upstream.
   // The allow-list above already excludes it and the assignments above override
   // any Authorization the client sent, so this is a second, independent barrier:
@@ -851,8 +868,11 @@ export async function handleCodexProxy(req, res, {
   // an exhausted one.
   const nextBackupWithCredential = async () => {
     for (let backup = failover.nextBackup(); backup; backup = failover.nextBackup()) {
+      // The retry reuses this request's upstream socket target, so a backup
+      // that lives on the other upstream cannot take it.
+      if (isCodexApiKeyAccount(backup) !== upstreamApiKey) continue;
       try {
-        const backupCredential = await credentialReader(backup);
+        const backupCredential = await readCredential(backup);
         if (backupCredential.expiresAtMs > now()) return { backup, credential: backupCredential };
       } catch {
         // Try the next one.
@@ -950,8 +970,7 @@ export async function handleCodexProxy(req, res, {
               failover.moveTo(found.backup);
               account = found.backup;
               credential = found.credential;
-              headers.authorization = `Bearer ${credential.accessToken}`;
-              headers['chatgpt-account-id'] = credential.accountId;
+              applyUpstreamAuth(headers, credential);
               // Turn affinity belongs to the account that issued it.
               delete headers['x-codex-turn-state'];
               if (!bodyCopyFinished) {

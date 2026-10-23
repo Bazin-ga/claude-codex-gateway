@@ -27,6 +27,7 @@ import { codexQuotaSignal } from './lib/codex-quota-signal.js';
 import { applyFailoverEdit } from './lib/account-failover.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
+import { isCodexGatewayAccount } from './lib/codex-api-key.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
 import { queryMetricsDataset } from './lib/metrics-page-query.js';
@@ -664,6 +665,9 @@ export async function createCredentialConsole(options = {}) {
         last_success_at: safeTimestamp(account.last_success_at),
         last_failure_at: safeTimestamp(account.last_failure_at),
         external: account.external ? { kind: account.external.kind } : null,
+        // Which kind of Codex row this is; without it an API-key account would
+        // look unauthorized on every page.
+        codex_auth: account.codex_auth ?? null,
         // Region and model id, not the key. This projection is an allow-list,
         // so anything omitted simply disappears before the page sees it: with
         // the pin missing the dashboard judged every Bedrock account unusable
@@ -1942,11 +1946,15 @@ export async function createCredentialConsole(options = {}) {
         if (provider === 'bedrock' && !credential.api_key) {
           throw new Error('a Bedrock API key is required');
         }
+        // A Codex row may skip OAuth entirely by carrying an OpenAI platform key;
+        // left empty, it is the usual row that waits for an owner to authorize.
+        const codexApiKey = provider === 'codex' ? String(form.openai_api_key ?? '').trim() : '';
         await store.addAccount({
           provider,
           alias: String(form.alias ?? '').trim(),
           emailLabel,
           ...(bedrock ? { bedrock, credential } : {}),
+          ...(codexApiKey ? { codexApiKey } : {}),
         });
         redirect(res, `/?draft_completed=${encodeURIComponent(`register-${provider}-account`)}`);
       } catch (error) {
@@ -2794,7 +2802,7 @@ export async function createCredentialConsole(options = {}) {
               account.provider === provider
               && account.status !== 'disabled'
               && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
-              && (provider !== 'codex' || account.external?.kind === 'codex-credential')
+              && (provider !== 'codex' || isCodexGatewayAccount(account))
             ))
             .map((account) => ({
               id: account.id,
