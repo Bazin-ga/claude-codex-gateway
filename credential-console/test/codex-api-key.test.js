@@ -73,6 +73,7 @@ test('the dashboard offers an API-key account to members and never renders the k
     csrf: 'csrf-token',
     adminIdentity: 'admin@example.com',
     deviceGroups: [],
+    codexApiKeyEnabled: true,
   });
   assert.equal(html.includes(API_KEY), false);
   assert.match(html, /data-i18n="codex-api-key-account"/);
@@ -127,4 +128,64 @@ test('requests on an API-key account go to the OpenAI API with the key, not to c
   assert.equal(seen[0].headers.authorization, `Bearer ${API_KEY}`);
   assert.equal(seen[0].headers['chatgpt-account-id'], undefined);
   assert.equal(seen[0].headers['content-encoding'], undefined, 'the OpenAI API is sent the body as the client wrote it');
+});
+
+test('a console without the API-key switch neither shows the field nor accepts it', async (t) => {
+  const { createCredentialConsole } = await import('../server.js');
+  for (const codexApiKeyEnabled of [false, true]) {
+    const { store } = await newStore(t);
+    const created = await createCredentialConsole({
+      store,
+      adminAuth: 'open',
+      cookieSecure: false,
+      publicBaseUrl: 'http://console.test',
+      codexApiKeyEnabled,
+      usageMonitor: { snapshotForAccount: () => null, refreshAccount: async () => null, stop() {} },
+      codexManagedRefresher: false,
+    });
+    await new Promise((resolve) => created.server.listen(0, '127.0.0.1', resolve));
+    t.after(async () => {
+      await new Promise((resolve) => created.server.close(resolve));
+      await created.stop?.();
+    });
+    const baseUrl = `http://127.0.0.1:${created.server.address().port}`;
+    const page = await fetch(`${baseUrl}/`);
+    const html = await page.text();
+    assert.equal(html.includes('name="openai_api_key"'), codexApiKeyEnabled);
+    assert.equal(html.includes('codex-api-key-optional'), codexApiKeyEnabled);
+    const cookie = page.headers.getSetCookie()[0].split(';')[0];
+    const csrf = /name="csrf" value="([^"]+)"/.exec(html)[1];
+    const registered = await fetch(`${baseUrl}/accounts`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ csrf, provider: 'codex', alias: 'sneaked-in', openai_api_key: API_KEY }),
+    });
+    assert.equal(registered.status, 303);
+    const added = store.publicAccounts().find((entry) => entry.alias === 'sneaked-in');
+    if (codexApiKeyEnabled) {
+      assert.equal(added?.codex_auth, 'api-key');
+    } else {
+      assert.match(decodeURIComponent(registered.headers.get('location')), /not enabled on this console/);
+      assert.equal(added, undefined);
+    }
+  }
+});
+
+test('the guard on an API-key account is a plain on/off switch', async (t) => {
+  const { store } = await newStore(t);
+  const account = await store.addAccount({ provider: 'codex', alias: 'openai-api-1', codexApiKey: API_KEY });
+  await store.setCodexModelGuard(account.id, { enabled: true, thresholdPercent: 10 });
+  const html = dashboardView({
+    accounts: store.publicAccounts(),
+    devices: [],
+    machines: [],
+    codexClients: [],
+    csrf: 'csrf-token',
+    adminIdentity: 'admin@example.com',
+    deviceGroups: [],
+  });
+  assert.match(html, /data-i18n="codex-api-guard-enable"/);
+  assert.match(html, /data-i18n="codex-api-guard-active"/);
+  assert.equal(html.includes(`/accounts/${account.id}/codex-credit-guard`), false);
 });
