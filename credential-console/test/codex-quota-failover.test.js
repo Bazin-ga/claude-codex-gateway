@@ -101,6 +101,8 @@ async function harness(t, { store, usageSnapshotFor, quotaSignal = new CodexQuot
     Promise.resolve(handleCodexProxy(req, res, {
       store,
       upstreamBaseUrl: upstreamUrl,
+      // Same server, told apart by path: an API-key account's requests land on /v1.
+      openaiApiBaseUrl: `${upstreamUrl}/v1`,
       exhaustion,
       quotaSignal,
       ...(usageSnapshotFor ? { usageSnapshotFor } : {}),
@@ -406,4 +408,90 @@ test('an oversized 429 body is streamed through untouched', { timeout: 20_000 },
   assert.equal(response.status, 429);
   assert.ok(response.body.equals(big));
   assert.deepEqual(tokens, ['access-home']);
+});
+
+const API_KEY = `sk-proj-${'k'.repeat(40)}`;
+
+async function fleetWithApiKeyTail({ guard = true } = {}) {
+  const built = await fleet({ backups: [] });
+  const { store, accounts } = built;
+  accounts.api = await store.addAccount({ provider: 'codex', alias: 'codex-api', codexApiKey: API_KEY });
+  if (guard) await store.setCodexModelGuard(accounts.api.id, { enabled: true, thresholdPercent: 10 });
+  await store.setAccountFailover(accounts.home.id, {
+    enabled: true,
+    backupAccountIds: [accounts.backup.id, accounts.api.id],
+    actor: 'test',
+  });
+  return built;
+}
+
+function apiKeyUpstream(seen) {
+  return async (req, res) => {
+    const body = await readBody(req);
+    seen.push({
+      url: req.url,
+      token: bearer(req),
+      account: req.headers['chatgpt-account-id'] ?? null,
+      encoding: req.headers['content-encoding'] ?? null,
+      body,
+    });
+    if (req.url.startsWith('/v1/')) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('data: {"type":"response.completed"}\n\n');
+      return;
+    }
+    refuse(res);
+  };
+}
+
+test('free accounts out of quota fail over to the API-key account at the end of the chain', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken, deviceId } = await fleetWithApiKeyTail();
+  const seen = [];
+  const { proxyUrl } = await harness(t, { store }, apiKeyUpstream(seen));
+
+  const response = await post(`${proxyUrl}/codex-api/responses`, deviceToken);
+  assert.equal(response.status, 200);
+  assert.deepEqual(seen.map((entry) => entry.url), ['/responses', '/responses', '/v1/responses']);
+  assert.deepEqual(seen.map((entry) => entry.token), ['access-home', 'access-backup', API_KEY]);
+  const api = seen.at(-1);
+  assert.equal(api.account, null, 'no chatgpt-account-id goes to the API');
+  assert.equal(api.encoding, null, 'and the replay is not zstd-encoded');
+  assert.deepEqual(api.body, PAYLOAD, 'the same body, byte for byte');
+  await settled(store);
+  assert.equal(store.resolveDeviceAccount(deviceId).effective_account_id, accounts.api.id);
+
+  // The next request skips the two refused accounts and goes straight to the API.
+  seen.length = 0;
+  const next = await post(`${proxyUrl}/codex-api/responses`, deviceToken);
+  assert.equal(next.status, 200);
+  assert.deepEqual(seen.map((entry) => entry.url), ['/v1/responses']);
+});
+
+test('the API-key tail never takes a model its guard refuses, mid-request or after', { timeout: 20_000 }, async (t) => {
+  const { store, deviceToken } = await fleetWithApiKeyTail();
+  const seen = [];
+  const { proxyUrl } = await harness(t, { store }, apiKeyUpstream(seen));
+  const sol = Buffer.from(JSON.stringify({ model: 'gpt-6.1-sol', input: [], stream: true, store: false }));
+
+  const response = await post(`${proxyUrl}/codex-api/responses`, deviceToken, { body: sol });
+  assert.equal(response.status, 429, 'the free accounts\' refusal comes back instead of a paid answer');
+  assert.equal(seen.some((entry) => entry.url.startsWith('/v1/')), false);
+
+  // Once both free accounts are known to be out, a Sol request is moved to the
+  // API account before it is sent — and refused there by its guard.
+  seen.length = 0;
+  const after = await post(`${proxyUrl}/codex-api/responses`, deviceToken, { body: sol });
+  assert.equal(seen.some((entry) => entry.url.startsWith('/v1/')), false);
+  assert.equal(after.status, 403);
+  assert.match(JSON.parse(after.body).error.message, /only "luna" models/);
+});
+
+test('with its guard off, the API-key tail takes whatever model failed over', { timeout: 20_000 }, async (t) => {
+  const { store, deviceToken } = await fleetWithApiKeyTail({ guard: false });
+  const seen = [];
+  const { proxyUrl } = await harness(t, { store }, apiKeyUpstream(seen));
+  const sol = Buffer.from(JSON.stringify({ model: 'gpt-6.1-sol', input: [], stream: true, store: false }));
+  const response = await post(`${proxyUrl}/codex-api/responses`, deviceToken, { body: sol });
+  assert.equal(response.status, 200);
+  assert.equal(seen.at(-1).url, '/v1/responses');
 });

@@ -35,7 +35,7 @@ import {
   modelBlockMessage,
 } from './model-block-rules.js';
 import { codexQuotaSignal as defaultQuotaSignal } from './codex-quota-signal.js';
-import { isCodexApiKeyAccount, OPENAI_API_BASE_URL } from './codex-api-key.js';
+import { API_KEY_GUARD_MESSAGE, isCodexApiKeyAccount, OPENAI_API_BASE_URL } from './codex-api-key.js';
 import {
   beginFailover,
   codexQuotaRejection,
@@ -399,7 +399,12 @@ export async function handleCodexProxy(req, res, {
     : [];
   let guardRemainingPercent = null;
   let guardBiting = false;
-  if (inferenceRequest && guard.enabled) {
+  // An API-key account has no included quota to read — every token is paid
+  // for — so a guard switched on there is always in force.
+  const guardAlwaysOn = isCodexApiKeyAccount(account);
+  if (inferenceRequest && guard.enabled && guardAlwaysOn) {
+    guardBiting = true;
+  } else if (inferenceRequest && guard.enabled) {
     const remainingPercent = quotaSignal.weeklyRemainingPercent(
       account.id,
       usageSnapshotFor(account.id),
@@ -425,6 +430,7 @@ export async function handleCodexProxy(req, res, {
       return errorBody('permission_error', modelBlockMessage(refusal.rule, refusal.model));
     }
     if (!guardBiting) return errorBody('permission_error', MODEL_POLICY_UNCHECKABLE_MESSAGE);
+    if (guardAlwaysOn) return errorBody('permission_error', API_KEY_GUARD_MESSAGE);
     return errorBody(
       'permission_error',
       `account weekly quota is ${guardRemainingPercent}% remaining, below this account's ${guard.threshold_percent}% guard; only "${CODEX_GUARD_MODEL_KEYWORD}" models are allowed until it recovers `
@@ -584,15 +590,22 @@ export async function handleCodexProxy(req, res, {
     return;
   }
 
-  const upstreamApiKey = isCodexApiKeyAccount(account);
-  const upstream = new URL(
-    `${(upstreamApiKey ? openaiApiBaseUrl : upstreamBaseUrl).replace(/\/$/, '')}${upstreamPath}${requestUrl.search}`,
-  );
-  const transport = upstream.protocol === 'http:' ? http : https;
-  const headers = {
-    ...forwardHeaders(req.headers),
-    host: upstream.host,
+  // Which upstream this attempt goes to. Not fixed for the request: a quota
+  // failover can move it from chatgpt.com to the OpenAI API, so the retry
+  // re-points all three before it is sent.
+  let upstreamApiKey;
+  let upstream;
+  let transport;
+  const headers = forwardHeaders(req.headers);
+  const pointUpstreamAt = (target) => {
+    upstreamApiKey = isCodexApiKeyAccount(target);
+    upstream = new URL(
+      `${(upstreamApiKey ? openaiApiBaseUrl : upstreamBaseUrl).replace(/\/$/, '')}${upstreamPath}${requestUrl.search}`,
+    );
+    transport = upstream.protocol === 'http:' ? http : https;
+    headers.host = upstream.host;
   };
+  pointUpstreamAt(account);
   applyUpstreamAuth(headers, credential);
   // The client authenticated with a device token; it must never reach upstream.
   // The allow-list above already excludes it and the assignments above override
@@ -916,9 +929,14 @@ export async function handleCodexProxy(req, res, {
   // an exhausted one.
   const nextBackupWithCredential = async () => {
     for (let backup = failover.nextBackup(); backup; backup = failover.nextBackup()) {
-      // The retry reuses this request's upstream socket target, so a backup
-      // that lives on the other upstream cannot take it.
-      if (isCodexApiKeyAccount(backup) !== upstreamApiKey) continue;
+      // The body has already been judged against the home account's gate, not
+      // this one's. A paid API-key backup with its guard on only takes a model
+      // the guard allows; a body whose model is not known yet is not sent.
+      if (isCodexApiKeyAccount(backup)
+        && normalizeCodexGuard(backup.codex_guard).enabled
+        && !codexGuardAllowsModel(requestMetadata.snapshot()?.model ?? null)) {
+        continue;
+      }
       try {
         const backupCredential = await readCredential(backup);
         if (backupCredential.expiresAtMs > now()) return { backup, credential: backupCredential };
@@ -934,12 +952,19 @@ export async function handleCodexProxy(req, res, {
     // Set when this attempt is abandoned for a backup, so the teardown of its
     // socket is not mistaken for a failure of the request.
     let superseded = false;
-    const payload = bodyBuffer && compressBody ? zlib.zstdCompressSync(bodyBuffer) : bodyBuffer;
+    // A replay that failed over to the API-key upstream goes uncompressed,
+    // like any request that started there.
+    const compressPayload = compressBody && !upstreamApiKey;
+    const payload = bodyBuffer && compressPayload ? zlib.zstdCompressSync(bodyBuffer) : bodyBuffer;
+    const attemptHeaders = payload ? { ...headers, 'content-length': String(payload.length) } : headers;
+    // Only a replay can get here with compression switched off after the fact,
+    // and a replay always carries its own copy of the headers.
+    if (compressBody && !compressPayload) delete attemptHeaders['content-encoding'];
     const upstreamReq = transport.request(
       upstream,
       {
         method: req.method,
-        headers: payload ? { ...headers, 'content-length': String(payload.length) } : headers,
+        headers: attemptHeaders,
         timeout: UPSTREAM_TIMEOUT_MS,
       },
       (upstreamRes) => {
@@ -1026,6 +1051,7 @@ export async function handleCodexProxy(req, res, {
               failover.moveTo(found.backup);
               account = found.backup;
               credential = found.credential;
+              pointUpstreamAt(account);
               applyUpstreamAuth(headers, credential);
               // Turn affinity belongs to the account that issued it.
               delete headers['x-codex-turn-state'];

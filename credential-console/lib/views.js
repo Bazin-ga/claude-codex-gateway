@@ -1098,6 +1098,17 @@ function codexModelGuardControl(account, csrf) {
   // control whose only possible outcome is an error.
   if (account.provider !== 'codex') return '';
   const guard = normalizeCodexGuard(account.codex_guard);
+  // An API-key account has no quota to fall below: there the guard is simply on
+  // or off, and the stored threshold rides along unchanged.
+  if (isCodexApiKeyAccount(account)) {
+    return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-model-guard" class="guard-form">
+    <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+    <input type="hidden" name="threshold_percent" value="${escapeHtml(String(guard.threshold_percent))}">
+    <label class="guard-toggle"><input type="checkbox" name="enabled" value="1"${guard.enabled ? ' checked' : ''}><span data-i18n="codex-api-guard-enable">Only allow luna models</span></label>
+    <button class="secondary" type="submit" data-i18n="codex-guard-save">Save guard</button>
+    <div class="muted tiny" data-i18n="codex-api-guard-help">Billed per token: while on, any model not named luna is refused, including when a free account fails over to this one.</div>
+  </form>`;
+  }
   return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-model-guard" class="guard-form">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
     <label class="guard-toggle"><input type="checkbox" name="enabled" value="1"${guard.enabled ? ' checked' : ''}><span data-i18n="codex-guard-enable">Low-quota guard</span></label>
@@ -1118,6 +1129,9 @@ function codexModelGuardControl(account, csrf) {
 function codexModelGuardNote(account) {
   const guard = normalizeCodexGuard(account.codex_guard);
   if (!guard.enabled) return '';
+  if (isCodexApiKeyAccount(account)) {
+    return '<div class="quota-guard muted tiny" data-i18n="codex-api-guard-active">Only luna models</div>';
+  }
   return `<div class="quota-guard muted tiny"><span data-i18n="codex-guard-active">Low-quota guard</span> ${escapeHtml(String(guard.threshold_percent))}% · <span data-i18n="codex-guard-luna-only">only ${escapeHtml(CODEX_GUARD_MODEL_KEYWORD)} models below that</span></div>`;
 }
 
@@ -1129,7 +1143,8 @@ function codexModelGuardNote(account) {
  * and this console never sees those requests.
  */
 function codexCreditGuardControl(account, csrf) {
-  if (account.provider !== 'codex') return '';
+  // Credits belong to a ChatGPT plan; an API key has none to protect.
+  if (account.provider !== 'codex' || isCodexApiKeyAccount(account)) return '';
   const guard = normalizeCodexCreditGuard(account.codex_credit_guard);
   return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/codex-credit-guard" class="guard-form">
     <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
@@ -3918,6 +3933,7 @@ export function dashboardView({
   groupFilter = null,
   providerFilter = null,
   bedrockEnabled = false,
+  codexApiKeyEnabled = false,
   deviceGroups = [],
   completedDraft = null,
   credentialAlerts = null,
@@ -4354,9 +4370,9 @@ export function dashboardView({
               <label><span data-i18n="account-email-optional">Account email label (optional, checked at authorization)</span>
                 <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160" data-draft-field>
               </label>
-              <label><span data-i18n="codex-api-key-optional">OpenAI API key (optional; instead of ChatGPT authorization, billed per token)</span>
+              ${codexApiKeyEnabled ? `<label><span data-i18n="codex-api-key-optional">OpenAI API key (optional; instead of ChatGPT authorization, billed per token)</span>
                 <input name="openai_api_key" type="password" autocomplete="off" maxlength="4096" placeholder="sk-...">
-              </label>
+              </label>` : ''}
               <button type="submit" data-i18n="register-account">Register account</button>
             </form>
           </article>

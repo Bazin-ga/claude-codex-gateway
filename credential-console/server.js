@@ -105,6 +105,9 @@ const ADMIN_AUTH = process.env.CREDENTIAL_CONSOLE_ADMIN_AUTH ?? 'tailscale';
 // that a paste-a-key login path exists at all, and an empty registration form
 // on the other one still announces the mechanism to everyone who can reach it.
 const BEDROCK_ENABLED = process.env.CREDENTIAL_CONSOLE_BEDROCK_ENABLED === '1';
+// The same rule for registering a Codex account with an OpenAI API key: only the
+// console that pays for one shows the field or accepts it.
+const CODEX_API_KEY_ENABLED = process.env.CREDENTIAL_CONSOLE_CODEX_API_KEY_ENABLED === '1';
 // CREDENTIAL_CONSOLE_CODEX_ENDPOINT, _CODEX_CERT_PIN and _CODEX_ENROLLMENT_KEY_FILE
 // are no longer read. They configured the console's side of dispenser
 // enrollment, which is retired (see the /codex/self-service route); leaving
@@ -438,6 +441,7 @@ export async function createCredentialConsole(options = {}) {
   const cookieSecure = options.cookieSecure ?? COOKIE_SECURE;
   const adminAuth = options.adminAuth ?? ADMIN_AUTH;
   const bedrockEnabled = options.bedrockEnabled ?? BEDROCK_ENABLED;
+  const codexApiKeyEnabled = options.codexApiKeyEnabled ?? CODEX_API_KEY_ENABLED;
   // Overridable only so a test can drive the eviction path without minting the real
   // ceiling's worth of sessions.
   const maxSessions = options.maxSessions ?? MAX_SESSIONS;
@@ -1854,6 +1858,7 @@ export async function createCredentialConsole(options = {}) {
         groupFilter: url.searchParams.get('group'),
         providerFilter: url.searchParams.get('provider'),
         bedrockEnabled,
+        codexApiKeyEnabled,
         completedDraft: COMPLETED_DRAFTS.has(completedDraft) ? completedDraft : null,
       }));
       return;
@@ -1966,6 +1971,9 @@ export async function createCredentialConsole(options = {}) {
         // A Codex row may skip OAuth entirely by carrying an OpenAI platform key;
         // left empty, it is the usual row that waits for an owner to authorize.
         const codexApiKey = provider === 'codex' ? String(form.openai_api_key ?? '').trim() : '';
+        if (codexApiKey && !codexApiKeyEnabled) {
+          throw new Error('OpenAI API key accounts are not enabled on this console');
+        }
         await store.addAccount({
           provider,
           alias: String(form.alias ?? '').trim(),
