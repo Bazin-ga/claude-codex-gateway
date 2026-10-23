@@ -13,7 +13,9 @@ import {
   usageExhaustedUntil,
   claudeQuotaRejection,
   normalizeAccountFailover,
+  recheckExhaustedAccounts,
   usageShowsExhausted,
+  usageShowsRecovered,
 } from '../lib/account-failover.js';
 
 // Large enough to span several chunks, so a replay that resent only part of
@@ -123,7 +125,7 @@ function post(url, token, body = PAYLOAD) {
     }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-      response.once('end', () => resolve({ status: response.statusCode, body: Buffer.concat(chunks) }));
+      response.once('end', () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) }));
       response.once('error', reject);
     });
     request.once('error', reject);
@@ -521,8 +523,6 @@ test('an account that answers again is a backup again, whatever reset it announc
   const other = await store.issueDeviceCredential({ accountId: accounts.backup.id, memberLabel: 'o@example.com', deviceName: 'on-backup' });
   const exhaustion = new QuotaExhaustion();
   exhaustion.mark(accounts.backup.id, { resetsAtMs: Date.now() + 3 * 3_600_000 });
-  // Use up the probe slot, so only the success can be what makes it usable.
-  exhaustion.claimProbe(accounts.backup.id);
   const tokens = [];
   const { proxyUrl } = await harness(t, { store, exhaustion }, async (req, res) => {
     await readBody(req);
@@ -541,33 +541,107 @@ test('an account that answers again is a backup again, whatever reset it announc
   assert.deepEqual(tokens, ['token-backup', 'token-home', 'token-backup']);
 });
 
-test('a backup believed exhausted is still probed when nothing else is left, at most every few minutes', { timeout: 20_000 }, async (t) => {
+test('a refused backup is not tried again until it resets, and the refusal is answered here', { timeout: 20_000 }, async (t) => {
   const { store, accounts, deviceToken } = await fleet({ backups: ['backup'] });
   const exhaustion = new QuotaExhaustion();
-  exhaustion.mark(accounts.backup.id, { resetsAtMs: Date.now() + 3 * 3_600_000 });
-  let backupRecovered = false;
+  exhaustion.mark(accounts.backup.id, { resetsAtMs: Date.now() + 3 * 3_600_000, claim: 'seven_day' });
   const tokens = [];
   const { proxyUrl } = await harness(t, { store, exhaustion }, async (req, res) => {
     await readBody(req);
     tokens.push(bearer(req));
-    if (bearer(req) === 'token-home' || !backupRecovered) return refuse(res);
+    if (bearer(req) === 'token-home') return refuse(res);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{}');
   });
 
-  // First refusal: the backup is probed, is still exhausted, and that refusal
-  // reaches the client.
+  // The home account is refused; the refused backup is not asked.
   assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 429);
-  // Within the interval it is not probed again.
-  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 429);
-  assert.deepEqual(tokens, ['token-home', 'token-backup', 'token-home']);
+  assert.deepEqual(tokens, ['token-home']);
 
-  // Once the interval has passed and the backup has recovered, the probe wins.
-  exhaustion.probedAt.clear();
-  backupRecovered = true;
-  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 200);
-  assert.deepEqual(tokens.slice(3), ['token-home', 'token-backup']);
+  // Now both are known refused: the next request is answered without a round
+  // trip, with the same rate-limit headers Claude Code reads.
+  const cached = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+  assert.equal(cached.status, 429);
+  assert.equal(cached.headers['x-gateway-cached-refusal'], '1');
+  assert.equal(cached.headers['anthropic-ratelimit-unified-status'], 'rejected');
+  assert.equal(cached.headers['anthropic-ratelimit-unified-reset'], String(RESET_SECONDS));
+  assert.equal(JSON.parse(cached.body).error.type, 'rate_limit_error');
+  assert.deepEqual(tokens, ['token-home'], 'nothing reached the upstream');
+
+  // A fresh usage reading shows the backup back early: it is used again.
+  await recheckExhaustedAccounts({
+    store,
+    exhaustion,
+    refreshUsage: async (id) => ({
+      status: 'available',
+      windows: [{ kind: 'weekly', remaining_percent: id === accounts.backup.id ? 40 : 0 }],
+    }),
+    now: Date.now() + 10 * 60_000,
+  });
   assert.equal(exhaustion.exhausted(accounts.backup.id), null);
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 200);
+  assert.deepEqual(tokens, ['token-home', 'token-backup'], 'the refused home account is not asked again either');
+});
+
+test('with failover off, a refused account is answered here until it resets', { timeout: 20_000 }, async (t) => {
+  const { store, deviceToken } = await fleet({ failoverEnabled: false });
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    refuse(res);
+  });
+
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 429);
+  const again = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+  assert.equal(again.status, 429);
+  assert.equal(again.headers['x-gateway-cached-refusal'], '1');
+  assert.deepEqual(tokens, ['token-home'], 'one refusal is enough to know');
+});
+
+test('a backup only the usage reading shows used up is still a last resort', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken } = await fleet({ backups: ['backup'] });
+  const usageSnapshotFor = (id) => (id === accounts.backup.id
+    ? { windows: [{ kind: 'weekly', remaining_percent: 0, resets_at: new Date(Date.now() + 3_600_000).toISOString() }] }
+    : null);
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store, usageSnapshotFor }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    if (bearer(req) === 'token-home') return refuse(res);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+
+  // An hour-old reading is not a refusal, and nothing better is left.
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken)).status, 200);
+  assert.deepEqual(tokens, ['token-home', 'token-backup']);
+});
+
+test('only a usage reading that clearly shows quota left clears a refusal', () => {
+  const available = (windows) => ({ status: 'available', windows });
+  assert.equal(usageShowsRecovered(available([{ kind: 'weekly', remaining_percent: 30 }]), { provider: 'claude', claim: 'seven_day' }), true);
+  assert.equal(usageShowsRecovered(available([{ kind: 'weekly', remaining_percent: 0.5 }]), { provider: 'claude', claim: 'seven_day' }), false, 'a rounding of the limit is not a recovery');
+  assert.equal(usageShowsRecovered(available([{ kind: 'weekly', remaining_percent: 30 }]), { provider: 'claude', claim: 'five_hour' }), false, 'the window that refused is the one that counts');
+  assert.equal(usageShowsRecovered(available([{ kind: 'weekly', remaining_percent: 30 }]), { provider: 'claude', claim: 'seven_day_opus' }), false, 'a claim the poll cannot see waits for its reset');
+  assert.equal(usageShowsRecovered({ status: 'stale', windows: [{ kind: 'weekly', remaining_percent: 30 }] }, { provider: 'claude', claim: 'seven_day' }), false);
+  assert.equal(usageShowsRecovered(available([{ kind: 'primary', remaining_percent: 12 }]), { provider: 'codex' }), true);
+  assert.equal(usageShowsRecovered(available([{ kind: 'weekly', remaining_percent: 0 }]), { provider: 'codex' }), false);
+});
+
+test('a refused account is re-checked at most every few minutes', async () => {
+  const exhaustion = new QuotaExhaustion();
+  const start = Date.now();
+  exhaustion.mark('a', { resetsAtMs: start + 3_600_000, claim: 'seven_day' }, start);
+  const reads = [];
+  const store = { accountById: (id) => ({ id, provider: 'claude' }) };
+  const refreshUsage = async (id) => { reads.push(id); return { status: 'available', windows: [{ kind: 'weekly', remaining_percent: 0 }] }; };
+  await recheckExhaustedAccounts({ store, exhaustion, refreshUsage, now: start + 60_000 });
+  assert.deepEqual(reads, [], 'not straight after the refusal');
+  await recheckExhaustedAccounts({ store, exhaustion, refreshUsage, now: start + 6 * 60_000 });
+  await recheckExhaustedAccounts({ store, exhaustion, refreshUsage, now: start + 7 * 60_000 });
+  assert.deepEqual(reads, ['a'], 'once per interval');
+  assert.ok(exhaustion.exhausted('a', start + 7 * 60_000), 'still used up, so still skipped');
 });
 
 test('before sending, only a backup believed usable is moved to', { timeout: 20_000 }, async (t) => {

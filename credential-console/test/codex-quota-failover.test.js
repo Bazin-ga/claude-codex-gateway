@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { zstdDecompressSync } from 'node:zlib';
 import { handleCodexProxy } from '../lib/codex-proxy.js';
 import { CodexQuotaSignal } from '../lib/codex-quota-signal.js';
 import { CredentialStore } from '../lib/store.js';
@@ -80,10 +81,12 @@ function close(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
+/** The body as the upstream reads it: the gateway zstd-compresses it on the way. */
 async function readBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks);
+  const raw = Buffer.concat(chunks);
+  return req.headers['content-encoding'] === 'zstd' ? zstdDecompressSync(raw) : raw;
 }
 
 async function harness(t, { store, usageSnapshotFor, quotaSignal = new CodexQuotaSignal() }, upstreamHandler) {
@@ -242,6 +245,24 @@ test('with Codex failover off the refusal passes straight through', { timeout: 2
   assert.equal(response.status, 429);
   assert.equal(JSON.parse(response.body).error.type, 'usage_limit_reached');
   assert.deepEqual(tokens, ['access-home']);
+});
+
+test('a refused Codex account is answered here with the refusal chatgpt.com sent', { timeout: 20_000 }, async (t) => {
+  const { store, deviceToken } = await fleet({ failoverEnabled: false });
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    refuse(res);
+  });
+
+  const first = await post(`${proxyUrl}/codex-api/responses`, deviceToken);
+  const second = await post(`${proxyUrl}/codex-api/responses`, deviceToken);
+
+  assert.equal(second.status, 429);
+  assert.equal(String(second.body), String(first.body), 'the CLI gets the same usage-limit error, reset time and all');
+  assert.equal(JSON.parse(second.body).error.resets_at, RESET_SECONDS);
+  assert.deepEqual(tokens, ['access-home'], 'and no second upload went to chatgpt.com');
 });
 
 test('when no backup is usable the refusal reaches the client unchanged', { timeout: 20_000 }, async (t) => {

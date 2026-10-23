@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { zstdDecompressSync } from 'node:zlib';
 import { MetricsStore } from '../lib/metrics.js';
 import {
   CodexCredentialError,
@@ -118,7 +119,14 @@ async function startHarness(t, {
     // one the client sent, including any prefix the guard read on the way past.
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => { seen.body = Buffer.concat(chunks).toString('utf8'); });
+    req.on('end', () => {
+      // What reached chatgpt.com, decoded: the gateway zstd-compresses an
+      // inference body on the way, and the bytes that matter are the ones the
+      // upstream reads after decoding.
+      seen.rawBody = Buffer.concat(chunks);
+      seen.encoding = req.headers['content-encoding'] ?? null;
+      seen.body = (seen.encoding === 'zstd' ? zstdDecompressSync(seen.rawBody) : seen.rawBody).toString('utf8');
+    });
     upstreamHandler(req, res);
   });
   const upstreamUrl = await listen(upstream);
@@ -1050,7 +1058,9 @@ function guardedHarness(t, { metrics = null } = {}) {
         const chunks = [];
         req.on('data', (chunk) => chunks.push(chunk));
         req.on('end', () => {
-          upstream.completeBodies.push(Buffer.concat(chunks).toString('utf8'));
+          const raw = Buffer.concat(chunks);
+          const body = req.headers['content-encoding'] === 'zstd' ? zstdDecompressSync(raw) : raw;
+          upstream.completeBodies.push(body.toString('utf8'));
           res.writeHead(200, { 'content-type': 'text/event-stream' });
           res.end(TURN_SSE);
         });
@@ -1200,7 +1210,9 @@ function blockHarness(t, { metrics = null, account = null, rules, ...extra } = {
         const chunks = [];
         req.on('data', (chunk) => chunks.push(chunk));
         req.on('end', () => {
-          upstream.completeBodies.push(Buffer.concat(chunks).toString('utf8'));
+          const raw = Buffer.concat(chunks);
+          const body = req.headers['content-encoding'] === 'zstd' ? zstdDecompressSync(raw) : raw;
+          upstream.completeBodies.push(body.toString('utf8'));
           res.writeHead(200, { 'content-type': 'text/event-stream' });
           res.end(TURN_SSE);
         });
@@ -1582,4 +1594,44 @@ test('the credit guard leaves the model catalog alone', async (t) => {
   const response = await getModels(proxyUrl);
   assert.equal(response.status, 200, 'listing models costs nothing');
   await response.text();
+});
+
+
+// --- request compression ---------------------------------------------------
+
+test('an inference body reaches chatgpt.com zstd-compressed and decodes to exactly what was sent', async (t) => {
+  const home = await credentialHome(t);
+  const seen = {};
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: sseUpstream(),
+    seen,
+  });
+  const sent = JSON.stringify({
+    model: 'gpt-6-luna',
+    stream: true,
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'context '.repeat(20_000) }] }],
+  });
+  const response = await post(proxyUrl, sent);
+  assert.equal(response.status, 200);
+  await response.text();
+  await waitFor(() => seen.body);
+  assert.equal(seen.encoding, 'zstd');
+  assert.equal(seen.headers['content-length'], undefined, 'the client\'s length no longer describes the body');
+  assert.ok(seen.rawBody.length * 10 < Buffer.byteLength(sent), 'a repetitive context shrinks many times over');
+  assert.equal(seen.body, sent);
+});
+
+test('the model catalog request is not touched by compression', async (t) => {
+  const home = await credentialHome(t);
+  const seen = {};
+  const { proxyUrl } = await startHarness(t, {
+    store: storeFixture(codexAccount(home)),
+    upstreamHandler: (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"models":[]}'); },
+    seen,
+  });
+  const response = await getModels(proxyUrl);
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(seen.headers['content-encoding'], undefined);
 });

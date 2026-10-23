@@ -1,3 +1,4 @@
+import zlib from 'node:zlib';
 import { Buffer } from 'node:buffer';
 import http from 'node:http';
 import https from 'node:https';
@@ -40,6 +41,7 @@ import {
   codexQuotaRejection,
   codexRateLimitHeaders,
   quotaExhaustion,
+  sendCachedRefusal,
 } from './account-failover.js';
 import { createCodexResponseContentAssembler } from './codex-response-content.js';
 import { codexTurnMetadata, extractCodexPromptCandidate } from './codex-prompt-capture.js';
@@ -335,6 +337,24 @@ export async function handleCodexProxy(req, res, {
     : null;
   if (failover) account = failover.account;
 
+  // The account was refused for quota and has not reset, and no backup can
+  // take the request: answer with that refusal now — the same body and headers
+  // chatgpt.com sent, so the CLI shows its usual "try again at" — instead of
+  // spending a round trip and an upload to collect it again.
+  if (failover?.refusal) {
+    log('codex_proxy_cached_refusal', {
+      account_id: account.id,
+      device_id: device.id,
+      resets_at: new Date(failover.refusal.until).toISOString(),
+    });
+    recordRejected(429, 'quota_exhausted_cached');
+    res.once('finish', () => {
+      if (!req.destroyed) req.destroy();
+    });
+    sendCachedRefusal(res, failover.refusal, now());
+    return;
+  }
+
   // The credit guard, ahead of everything else: once the included quota is
   // gone, every request forwarded is paid for out of the account's credits, so
   // an account that opted out is refused here — before the body is read, a
@@ -579,6 +599,34 @@ export async function handleCodexProxy(req, res, {
   // any Authorization the client sent, so this is a second, independent barrier:
   // widening that list later must not silently start forwarding the token.
   delete headers['x-api-key'];
+
+  // chatgpt.com takes a zstd-encoded body — the official CLI sends one whenever
+  // it talks to it directly — but a CLI pointed at this gateway sends its whole
+  // context as plain JSON on every turn. Compressed here, that upload shrinks
+  // several times over, and on a narrow uplink it was the slowest part of the
+  // turn. Only toward chatgpt.com (the API-key upstream is not known to take
+  // it) and only for a body the client did not already encode.
+  const compressBody = inferenceRequest
+    && !upstreamApiKey
+    && req.headers['content-encoding'] === undefined
+    && typeof zlib.createZstdCompress === 'function';
+  if (compressBody) {
+    delete headers['content-length'];
+    headers['content-encoding'] = 'zstd';
+  }
+  // Where the request body is written: the upstream request itself, or a
+  // compressor in front of it.
+  const bodySink = (upstreamReq) => {
+    if (!compressBody) return upstreamReq;
+    const compressor = zlib.createZstdCompress();
+    compressor.once('error', (error) => upstreamReq.destroy(error));
+    // Every path that abandons a request tears down the upstream request; the
+    // compressor in front of it goes with it.
+    upstreamReq.once('close', () => compressor.destroy());
+    compressor.pipe(upstreamReq);
+    upstreamReq.bodySink = compressor;
+    return compressor;
+  };
 
   const startedAtMs = now();
   const startedAtMonotonic = performance.now();
@@ -886,15 +934,18 @@ export async function handleCodexProxy(req, res, {
     // Set when this attempt is abandoned for a backup, so the teardown of its
     // socket is not mistaken for a failure of the request.
     let superseded = false;
+    const payload = bodyBuffer && compressBody ? zlib.zstdCompressSync(bodyBuffer) : bodyBuffer;
     const upstreamReq = transport.request(
       upstream,
       {
         method: req.method,
-        headers: bodyBuffer ? { ...headers, 'content-length': String(bodyBuffer.length) } : headers,
+        headers: payload ? { ...headers, 'content-length': String(payload.length) } : headers,
         timeout: UPSTREAM_TIMEOUT_MS,
       },
       (upstreamRes) => {
-        if (!failover?.enabled || upstreamRes.statusCode !== 429) {
+        // Every inference 429 is read, failover or not: whether it is a quota
+        // refusal decides whether the account is skipped until it resets.
+        if (!inferenceRequest || upstreamRes.statusCode !== 429) {
           if (upstreamRes.statusCode === 429) {
             log('codex_proxy_upstream_rate_limited', {
               account_id: account.id,
@@ -951,8 +1002,13 @@ export async function handleCodexProxy(req, res, {
           });
           quotaSignal.observe(account.id, upstreamRes.headers, now());
           if (rejection) {
-            const entry = exhaustion.mark(account.id, rejection, now());
-            const found = failoversUsed < MAX_FAILOVERS ? await nextBackupWithCredential() : null;
+            const entry = exhaustion.mark(account.id, {
+              ...rejection,
+              reply: { headers: responseHeaders(upstreamRes.headers), body },
+            }, now());
+            const found = failover?.enabled && failoversUsed < MAX_FAILOVERS
+              ? await nextBackupWithCredential()
+              : null;
             if (clientAborted || metricFinalized) return;
             if (found) {
               failoversUsed += 1;
@@ -976,7 +1032,8 @@ export async function handleCodexProxy(req, res, {
               if (!bodyCopyFinished) {
                 // Refused before the upload ended: keep reading the client into
                 // the copy, but stop feeding a request that is already refused.
-                bodyCopy.unpipe(upstreamReq);
+                bodyCopy.unpipe(upstreamReq.bodySink ?? upstreamReq);
+                upstreamReq.bodySink?.destroy();
                 bodyCopy.resume();
                 upstreamReq.destroy();
               }
@@ -1050,8 +1107,8 @@ export async function handleCodexProxy(req, res, {
       if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
     });
 
-    if (bodyBuffer) {
-      upstreamReq.write(bodyBuffer);
+    if (payload) {
+      upstreamReq.write(payload);
       upstreamReq.end();
     }
     return upstreamReq;
@@ -1120,8 +1177,8 @@ export async function handleCodexProxy(req, res, {
 
   const initialUpstreamReq = sendUpstream(null);
   const forwarded = requestMetadata.stream.pipe(requestLimit.stream);
-  if (bodyCopy) forwarded.pipe(bodyCopy).pipe(initialUpstreamReq);
-  else forwarded.pipe(initialUpstreamReq);
+  if (bodyCopy) forwarded.pipe(bodyCopy).pipe(bodySink(initialUpstreamReq));
+  else forwarded.pipe(bodySink(initialUpstreamReq));
 
   // While the gate is closed on anything, the rest of the body is scanned on
   // its way past and a chunk is only forwarded once it has been cleared. A
