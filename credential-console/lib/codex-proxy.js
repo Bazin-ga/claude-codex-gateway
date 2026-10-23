@@ -215,6 +215,7 @@ export async function handleCodexProxy(req, res, {
   usageSnapshotFor = () => null,
   exhaustion = quotaExhaustion,
   now = Date.now,
+  relay = null,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
   const upstreamPath = requestUrl.pathname.slice(CODEX_PROXY_PREFIX.length);
@@ -308,6 +309,16 @@ export async function handleCodexProxy(req, res, {
     return;
   }
   const inferenceRequest = upstreamPath === '/responses';
+
+  // A turn naming an allowed third-party model goes to that platform instead
+  // of to this account; any other turn carries on, with the bytes read to find
+  // out put back in front of the body by the gate code below.
+  let relayPrefix = null;
+  if (relay && inferenceRequest) {
+    const relayed = await relay.intercept(req, res, { device, kind: 'responses', path: upstreamPath });
+    if (relayed.handled) return;
+    relayPrefix = relayed.prefix;
+  }
 
   // Quota failover, decided before the credit guard below: with a usable
   // backup, an account whose included quota is used up is moved off rather
@@ -451,9 +462,9 @@ export async function handleCodexProxy(req, res, {
       threshold_percent: guardBiting ? guard.threshold_percent : null,
     });
   };
-  let gatePrefix = null;
+  let gatePrefix = relayPrefix;
   if (gated) {
-    gatePrefix = await readModelPrefix(req);
+    gatePrefix ??= await readModelPrefix(req);
     if (gatePrefix.aborted || res.destroyed) {
       log('codex_proxy_client_gone_during_model_read', {
         account_id: account.id,
@@ -1212,7 +1223,7 @@ export async function handleCodexProxy(req, res, {
   // this parser cannot follow is withheld: the upstream is left with an
   // incomplete body it cannot run, and is torn down here before it could.
   let gateTail = null;
-  if (gatePrefix && !gatePrefix.ended) {
+  if (gated && gatePrefix && !gatePrefix.ended) {
     gateTail = createModelGateTail(gatePrefix.scanner, judge);
     gateTail.once('error', (error) => {
       req.unpipe(gateTail);

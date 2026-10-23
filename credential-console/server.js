@@ -14,7 +14,7 @@ import {
   parseCookies,
   readForm,
   redirect,
-  sendHtml,
+  sendHtml as sendHtmlBase,
   sendJson,
   sendText,
   readBody,
@@ -28,6 +28,8 @@ import { applyFailoverEdit, quotaExhaustion, recheckExhaustedAccounts } from './
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { isCodexGatewayAccount } from './lib/codex-api-key.js';
+import { RELAY_ACCOUNT_ID, RELAY_PROXY_PREFIX, RelayCatalog, relayCostUsd } from './lib/relay.js';
+import { createRelay } from './lib/relay-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
 import { queryMetricsDataset } from './lib/metrics-page-query.js';
@@ -77,6 +79,8 @@ import {
   enrollmentView,
   messageView,
   accountDeleteView,
+  relayView,
+  withRelayTab,
   codexAuthorizationView,
   codexCredentialView,
   metricsView,
@@ -109,6 +113,9 @@ const BEDROCK_ENABLED = process.env.CREDENTIAL_CONSOLE_BEDROCK_ENABLED === '1';
 // The same rule for registering a Codex account with an OpenAI API key: only the
 // console that pays for one shows the field or accepts it.
 const CODEX_API_KEY_ENABLED = process.env.CREDENTIAL_CONSOLE_CODEX_API_KEY_ENABLED === '1';
+// And for third-party models: the tab, the routes and the in-channel hand-off
+// exist only where this is exactly "1".
+const RELAY_ENABLED = process.env.CREDENTIAL_CONSOLE_RELAY_ENABLED === '1';
 // CREDENTIAL_CONSOLE_CODEX_ENDPOINT, _CODEX_CERT_PIN and _CODEX_ENROLLMENT_KEY_FILE
 // are no longer read. They configured the console's side of dispenser
 // enrollment, which is retired (see the /codex/self-service route); leaving
@@ -443,6 +450,69 @@ export async function createCredentialConsole(options = {}) {
   const adminAuth = options.adminAuth ?? ADMIN_AUTH;
   const bedrockEnabled = options.bedrockEnabled ?? BEDROCK_ENABLED;
   const codexApiKeyEnabled = options.codexApiKeyEnabled ?? CODEX_API_KEY_ENABLED;
+  const relayEnabled = options.relayEnabled ?? RELAY_ENABLED;
+  const relayCatalog = relayEnabled
+    ? (options.relayCatalog ?? new RelayCatalog({ store, fetchImpl: options.relayFetch ?? fetch }).start())
+    : null;
+  const relay = relayEnabled
+    ? createRelay({ store, requestMetrics, enabled: true, fetchImpl: options.relayFetch ?? fetch })
+    : null;
+  /**
+   * Last 30 days of relay turns, by model and by device, priced at the
+   * catalog's rates. An estimate: the platform bills its own way, and the
+   * key's actual spend is shown beside it.
+   */
+  const relaySpend = () => {
+    if (!requestMetrics?.queryTokenBreakdown) return null;
+    try {
+      requestMetrics.flush?.();
+      const fromMs = Date.now() - 30 * 86_400_000;
+      const filters = { accountId: RELAY_ACCOUNT_ID, fromMs };
+      const devices = new Map(store.publicDevices().map((device) => [device.id, device]));
+      const cost = (model, row) => relayCostUsd(relayCatalog?.row(model), {
+        inputTokens: row.totalInputTokens ?? 0,
+        outputTokens: row.totalOutputTokens ?? 0,
+        cacheReadInputTokens: row.totalCacheReadInputTokens ?? 0,
+      });
+      const models = requestMetrics.queryTokenBreakdown({ by: 'model', ...filters }).map((row) => ({
+        model: row.groupValue,
+        requestCount: row.requestCount,
+        inputTokens: row.totalInputTokens,
+        outputTokens: row.totalOutputTokens,
+        costUsd: cost(row.groupValue, row),
+      }));
+      const deviceRows = models.flatMap((entry) => (entry.model
+        ? requestMetrics.queryTokenBreakdown({ by: 'device', ...filters, model: entry.model }).map((row) => {
+          const device = devices.get(row.groupValue);
+          return {
+            label: device ? `${device.name} · ${device.member_label}` : (row.groupValue ?? '—'),
+            model: entry.model,
+            requestCount: row.requestCount,
+            inputTokens: row.totalInputTokens,
+            outputTokens: row.totalOutputTokens,
+            costUsd: cost(entry.model, row),
+          };
+        })
+        : []));
+      return {
+        models,
+        devices: deviceRows.sort((a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0)),
+        totalUsd: models.reduce((sum, entry) => sum + (entry.costUsd ?? 0), 0),
+      };
+    } catch (error) {
+      log('relay_spend_query_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+      return null;
+    }
+  };
+
+  // Every page gets the third-party tab when the platform is switched on; no
+  // page has to know about it.
+  const sendHtml = (res, status, html, headers) => sendHtmlBase(
+    res,
+    status,
+    relayEnabled ? withRelayTab(html) : html,
+    headers,
+  );
   // Overridable only so a test can drive the eviction path without minting the real
   // ceiling's worth of sessions.
   const maxSessions = options.maxSessions ?? MAX_SESSIONS;
@@ -1335,7 +1405,18 @@ export async function createCredentialConsole(options = {}) {
         upstreamBaseUrl: options.claudeUpstreamBaseUrl,
         requestMetrics,
         usageSnapshotFor: (accountId) => usageMonitor.snapshotForAccount(accountId),
+        relay,
       });
+      return;
+    }
+
+    // The data plane only: `/relay` itself and its forms are console pages.
+    if (path.startsWith(`${RELAY_PROXY_PREFIX}/v1/`)) {
+      if (!relay) {
+        sendJson(res, 404, { error: { type: 'not_found_error', message: 'not found' } });
+        return;
+      }
+      await relay.handle(req, res);
       return;
     }
 
@@ -1346,6 +1427,7 @@ export async function createCredentialConsole(options = {}) {
         requestMetrics,
         quotaSignal: codexQuotaSignal,
         usageSnapshotFor: (accountId) => usageMonitor.snapshotForAccount(accountId),
+        relay,
       });
       return;
     }
@@ -1419,6 +1501,54 @@ export async function createCredentialConsole(options = {}) {
         codexGatewayUrl,
         openMode,
       }));
+      return;
+    }
+
+    // The third-party models tab. Off means absent: no page, no forms.
+    if (path === RELAY_PROXY_PREFIX || path.startsWith(`${RELAY_PROXY_PREFIX}/`)) {
+      if (!relayEnabled) {
+        sendHtml(res, 404, messageView('Not found', 'The requested page does not exist.', { error: true, openMode }));
+        return;
+      }
+      const session = requireSession(req, res);
+      if (!session) return;
+      if (req.method === 'GET' && path === RELAY_PROXY_PREFIX) {
+        sendHtml(res, 200, relayView({
+          settings: store.relaySettings(),
+          catalog: relayCatalog.snapshot(),
+          spend: relaySpend(),
+          csrf: session.csrf,
+          gatewayBaseUrl: publicBaseUrl,
+          query: url.searchParams.get('q') ?? '',
+          vendor: url.searchParams.get('vendor') ?? '',
+          error: url.searchParams.get('error'),
+          openMode,
+        }));
+        return;
+      }
+      const action = { [`${RELAY_PROXY_PREFIX}/settings`]: 'settings', [`${RELAY_PROXY_PREFIX}/models`]: 'models' }[path];
+      if (req.method !== 'POST' || !action) {
+        sendHtml(res, 404, messageView('Not found', 'The requested page does not exist.', { error: true, openMode }));
+        return;
+      }
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        const actor = session.admin_identity ?? 'anonymous';
+        if (action === 'settings') {
+          await store.setRelayPlatform({ name: form.name, baseUrl: form.base_url, apiKey: form.api_key, actor });
+          relayCatalog.refresh().catch(() => {});
+        } else {
+          if (!['allow', 'disallow'].includes(form.op)) throw new Error('unknown action');
+          await store.setRelayModelAllowed({ model: form.model, allowed: form.op === 'allow', actor });
+        }
+        redirect(res, RELAY_PROXY_PREFIX);
+      } catch (error) {
+        redirect(res, `${RELAY_PROXY_PREFIX}?error=${encodeURIComponent(error.message)}`);
+      }
       return;
     }
 
@@ -2981,6 +3111,7 @@ export async function createCredentialConsole(options = {}) {
     clearInterval(cleanupTimer);
     clearInterval(exhaustionRecheckTimer);
     usageMonitor.stop?.();
+    relayCatalog?.stop();
     codexManagedRefresher?.stop?.();
     try {
       const closing = metricsQueryService?.close?.();

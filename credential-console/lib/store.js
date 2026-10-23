@@ -21,6 +21,7 @@ import { normalizeCodexGuard, parseCodexGuardInput } from './codex-model-guard.j
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
 import { CODEX_API_KEY_AUTH, isCodexApiKeyAccount } from './codex-api-key.js';
+import { normalizeRelay, RELAY_MAX_ALLOWED_MODELS, relayBaseUrl, relayModelName } from './relay.js';
 import { normalizeBedrockModelPin } from './bedrock-models.js';
 import {
   MODEL_BLOCK_MAX_RULES,
@@ -1464,6 +1465,83 @@ export class CredentialStore {
    */
   modelBlockRules() {
     return normalizeModelBlockRules(this.state.model_block_rules);
+  }
+
+  /** The third-party platform's settings, without its key. */
+  relaySettings() {
+    return { ...normalizeRelay(this.state.relay), has_key: Boolean(this.state.relay?.credential) };
+  }
+
+  relayApiKey() {
+    const credential = this.state.relay?.credential;
+    if (!credential) return null;
+    try {
+      return decryptJson(this.masterKey, credential, 'relay:credential:v1')?.api_key ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Point the console at a third-party platform. The key is encrypted like an
+   * account credential and never rendered back; leaving it empty keeps the one
+   * already stored, so the address can be corrected without pasting it again.
+   */
+  async setRelayPlatform({ name, baseUrl, apiKey = '', actor = null }) {
+    return this.serialized(async () => {
+      const base = relayBaseUrl(baseUrl);
+      if (!base) throw new Error('a valid http(s) platform address is required');
+      const label = String(name ?? '').trim().slice(0, 64);
+      if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/.test(label)) {
+        throw new Error('a platform name of letters, digits, space, dot, dash or underscore is required');
+      }
+      const key = String(apiKey ?? '').trim();
+      const previous = this.state.relay ?? {};
+      if (!key && !previous.credential) throw new Error('a platform API key is required');
+      if (key && !/^[\x21-\x7e]{8,512}$/.test(key)) throw new Error('the platform API key looks malformed');
+      this.state.relay = {
+        ...previous,
+        name: label,
+        base_url: base,
+        credential: key ? encryptJson(this.masterKey, { api_key: key }, 'relay:credential:v1') : previous.credential,
+        allowed_models: normalizeRelay(previous).allowed_models,
+        updated_at: nowIso(),
+        updated_by: auditActor(actor),
+      };
+      this.audit('relay_platform_updated', {
+        name: label,
+        base_url: base,
+        key_replaced: Boolean(key),
+        previous_base_url: previous.base_url ?? null,
+        actor: auditActor(actor),
+      });
+      await this.persist();
+      return this.relaySettings();
+    });
+  }
+
+  /** Allow or stop one platform model. Audited: it decides what the shared key pays for. */
+  async setRelayModelAllowed({ model, allowed, actor = null }) {
+    return this.serialized(async () => {
+      const name = relayModelName(model);
+      if (!name) throw new Error('a valid model name is required');
+      if (!this.state.relay?.base_url) throw new Error('configure the platform first');
+      const current = normalizeRelay(this.state.relay).allowed_models;
+      const next = allowed
+        ? (current.includes(name) ? current : [...current, name])
+        : current.filter((entry) => entry !== name);
+      if (next.length > RELAY_MAX_ALLOWED_MODELS) {
+        throw new Error(`at most ${RELAY_MAX_ALLOWED_MODELS} models can be allowed`);
+      }
+      this.state.relay = { ...this.state.relay, allowed_models: next, updated_at: nowIso(), updated_by: auditActor(actor) };
+      this.audit(allowed ? 'relay_model_allowed' : 'relay_model_disallowed', {
+        model: name,
+        allowed_models: [...next],
+        actor: auditActor(actor),
+      });
+      await this.persist();
+      return this.relaySettings();
+    });
   }
 
   /**

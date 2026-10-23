@@ -355,6 +355,7 @@ export async function handleClaudeProxy(req, res, {
   responseContentAssemblerFactory = createResponseContentAssembler,
   usageSnapshotFor = () => null,
   exhaustion = quotaExhaustion,
+  relay = null,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
   const upstreamPath = requestUrl.pathname.slice('/claude'.length);
@@ -380,6 +381,16 @@ export async function handleClaudeProxy(req, res, {
     log('claude_proxy_auth_failed', { ip });
     sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'unauthorized' } });
     return;
+  }
+
+  // A turn naming an allowed third-party model goes to that platform instead
+  // of to an account. Any other turn carries on below, with the bytes read to
+  // find out put back in front of the body by the gate code.
+  let relayPrefix = null;
+  if (relay && upstreamPath === '/v1/messages') {
+    const relayed = await relay.intercept(req, res, { device, kind: 'messages', path: upstreamPath });
+    if (relayed.handled) return;
+    relayPrefix = relayed.prefix;
   }
 
   const authenticatedAtMs = Date.now();
@@ -481,9 +492,10 @@ export async function handleClaudeProxy(req, res, {
       stage,
     });
   };
-  let gatePrefix = null;
-  if (anyModelBlockRuleEnabled(blockRules)) {
-    gatePrefix = await readModelPrefix(req);
+  let gatePrefix = relayPrefix;
+  const gateRulesOn = anyModelBlockRuleEnabled(blockRules);
+  if (gateRulesOn) {
+    gatePrefix ??= await readModelPrefix(req);
     // This is the only await before the listeners that free resources are
     // registered, so a client that left while it was pending is caught here
     // or not at all. A body read to its end leaves `req.destroyed` true on
@@ -1144,7 +1156,7 @@ export async function handleClaudeProxy(req, res, {
   // request is torn down before it could. The body never finishes, so the
   // overload retry — which replays only a finished body — cannot resend it.
   let gateTail = null;
-  if (gatePrefix && !gatePrefix.ended) {
+  if (gateRulesOn && gatePrefix && !gatePrefix.ended) {
     gateTail = createModelGateTail(gatePrefix.scanner, judge);
     gateTail.once('error', (error) => {
       req.unpipe(gateTail);
