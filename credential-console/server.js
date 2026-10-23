@@ -24,7 +24,7 @@ import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
 import { codexQuotaSignal } from './lib/codex-quota-signal.js';
-import { applyFailoverEdit } from './lib/account-failover.js';
+import { applyFailoverEdit, quotaExhaustion, recheckExhaustedAccounts } from './lib/account-failover.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { isCodexGatewayAccount } from './lib/codex-api-key.js';
@@ -395,6 +395,23 @@ export async function createCredentialConsole(options = {}) {
     fetchImpl: options.usageFetchImpl,
     log,
   }).init();
+  // An account the upstream refused for quota is skipped until it resets. The
+  // reset it announced is only an upper bound, so the refused accounts are
+  // re-read from the free usage endpoint every few minutes, and one that has
+  // come back early is used again without a member's request having to find out.
+  let exhaustionRecheckRunning = false;
+  const exhaustionRecheckTimer = setInterval(() => {
+    if (exhaustionRecheckRunning) return;
+    exhaustionRecheckRunning = true;
+    recheckExhaustedAccounts({
+      store,
+      refreshUsage: (accountId) => usageMonitor.refreshAccount?.(accountId) ?? null,
+      exhaustion: options.quotaExhaustion ?? quotaExhaustion,
+      log,
+    }).catch((error) => log('quota_exhaustion_recheck_failed', { code: error?.code ?? error?.name ?? 'unknown' }))
+      .finally(() => { exhaustionRecheckRunning = false; });
+  }, options.exhaustionRecheckTickMs ?? 60_000);
+  exhaustionRecheckTimer.unref();
   const sessions = new Map();
   const metricsPageCache = new Map();
   const metricsPageInFlight = new Map();
@@ -2925,6 +2942,7 @@ export async function createCredentialConsole(options = {}) {
   }
   server.once('close', () => {
     clearInterval(cleanupTimer);
+    clearInterval(exhaustionRecheckTimer);
     usageMonitor.stop?.();
     codexManagedRefresher?.stop?.();
     try {

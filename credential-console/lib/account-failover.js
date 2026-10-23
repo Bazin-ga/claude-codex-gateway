@@ -34,15 +34,25 @@ export const FAILOVER_MAX_BACKUPS = 8;
 export const FAILOVER_UNKNOWN_RESET_MS = 15 * 60_000;
 
 /**
- * How often an account believed exhausted may still be tried as a backup when
- * nothing better is left. The reset time a refusal announces is an upper
- * bound, not a promise: on Chicago (2026-10-18) an account refused with a
- * 19:30 reset was answering again at 17:00, and the gateway refused to use it
- * for 70 minutes while another account's devices collected 49 errors. A probe
- * that fails costs one quick 429 and gives the client the answer it would have
- * had anyway.
+ * How often an account the upstream refused is re-checked for an early
+ * recovery, off the request path. The reset time a refusal announces is an
+ * upper bound, not a promise: on Chicago (2026-10-18) an account refused with a
+ * 19:30 reset was answering again at 17:00. That used to be found by spending
+ * a member's request on a probe every few minutes, which on a console whose
+ * accounts are all exhausted meant every request first collected one 429 per
+ * account. The usage endpoint answers the same question for free.
  */
-export const FAILOVER_PROBE_INTERVAL_MS = 3 * 60_000;
+export const EXHAUSTION_RECHECK_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * Remaining quota a usage reading has to show before a refused account is
+ * believed recovered. Above zero rather than at it: a window reported at 99.6%
+ * used is the reading the upstream refuses on, rounded.
+ */
+const RECOVERED_MIN_REMAINING_PERCENT = 2;
+
+/** The largest refusal body kept for replay; a real one is a few hundred bytes. */
+const MAX_REPLAY_BODY_BYTES = 16 * 1024;
 
 /** The longest a refusal's reset time is believed: one weekly window. */
 const MAX_EXHAUSTION_MS = 8 * 24 * 60 * 60_000;
@@ -190,18 +200,21 @@ export function claudeRateLimitHeaders(headers) {
 export class QuotaExhaustion {
   constructor() {
     this.accounts = new Map();
-    // When each account last answered successfully, and when it was last
-    // tried as a backup while believed exhausted.
+    // When each account last answered successfully.
     this.succeededAt = new Map();
-    this.probedAt = new Map();
   }
 
-  mark(accountId, { resetsAtMs = null, claim = null } = {}, now = Date.now()) {
+  /**
+   * Record a refusal. `reply` is the refusal itself — the status headers and
+   * body the upstream sent — kept so that later requests for this account can
+   * be answered with it here instead of being sent to collect it again.
+   */
+  mark(accountId, { resetsAtMs = null, claim = null, reply = null } = {}, now = Date.now()) {
     if (typeof accountId !== 'string' || !accountId) return null;
     const until = Number.isFinite(resetsAtMs) && resetsAtMs > now
       ? Math.min(resetsAtMs, now + MAX_EXHAUSTION_MS)
       : now + FAILOVER_UNKNOWN_RESET_MS;
-    const entry = { until, claim, markedAt: now };
+    const entry = { until, claim, markedAt: now, checkedAt: now, reply: replayableReply(reply) };
     this.accounts.delete(accountId);
     this.accounts.set(accountId, entry);
     while (this.accounts.size > MAX_TRACKED_ACCOUNTS) {
@@ -239,26 +252,111 @@ export class QuotaExhaustion {
     }
   }
 
+  /**
+   * The refused accounts due an early-recovery check, oldest check first.
+   * Claims each one, so overlapping sweeps do not check the same account twice.
+   */
+  dueForRecheck(now = Date.now(), intervalMs = EXHAUSTION_RECHECK_INTERVAL_MS) {
+    const due = [];
+    for (const [accountId, entry] of this.accounts) {
+      if (entry.until <= now) {
+        this.accounts.delete(accountId);
+        continue;
+      }
+      if (now - entry.checkedAt < intervalMs) continue;
+      entry.checkedAt = now;
+      due.push({ accountId, claim: entry.claim, until: entry.until });
+    }
+    return due;
+  }
+
   /** Whether the account has answered since `sinceMs`. */
   succeededSince(accountId, sinceMs) {
     const at = this.succeededAt.get(accountId);
     return Number.isFinite(at) && Number.isFinite(sinceMs) && at > sinceMs;
   }
+}
 
-  /**
-   * Whether an account believed exhausted may be tried now, at most once per
-   * FAILOVER_PROBE_INTERVAL_MS. Claims the slot when it says yes, so that
-   * concurrent requests do not all probe at once.
-   */
-  claimProbe(accountId, now = Date.now()) {
-    const last = this.probedAt.get(accountId);
-    if (Number.isFinite(last) && now - last < FAILOVER_PROBE_INTERVAL_MS) return false;
-    this.probedAt.delete(accountId);
-    this.probedAt.set(accountId, now);
-    while (this.probedAt.size > MAX_TRACKED_ACCOUNTS) {
-      this.probedAt.delete(this.probedAt.keys().next().value);
+/**
+ * A refusal worth replaying: a 429 with its headers and a small body. Anything
+ * else is not kept, and an account marked without one is still skipped as a
+ * backup — it is just not answered for locally.
+ */
+function replayableReply(reply) {
+  if (!reply || typeof reply !== 'object') return null;
+  const body = Buffer.isBuffer(reply.body) ? reply.body : null;
+  if (!body || body.length > MAX_REPLAY_BODY_BYTES) return null;
+  const headers = {};
+  for (const [name, value] of Object.entries(reply.headers ?? {})) {
+    // A request id names the request that was refused, not the one being
+    // answered; a length is recomputed when the body is sent.
+    if (['request-id', 'x-request-id', 'x-oai-request-id', 'content-length', 'x-codex-turn-state']
+      .includes(name)) continue;
+    if (typeof value === 'string' || (Array.isArray(value) && value.every((v) => typeof v === 'string'))) {
+      headers[name] = value;
     }
-    return true;
+  }
+  return { headers, body };
+}
+
+/**
+ * The windows a refusal's claim refers to, as the usage reader names them, or
+ * null when the claim cannot be matched to a polled window. Claude names the
+ * window it refused on; a Codex refusal names none, and any used-up window
+ * refuses it.
+ */
+function windowsForClaim(provider, claim) {
+  if (provider === 'codex') return ['five_hour', 'weekly', 'primary', 'secondary'];
+  if (claim === 'five_hour') return ['five_hour'];
+  if (claim === 'seven_day') return ['weekly'];
+  return null;
+}
+
+/**
+ * Whether a fresh usage reading shows a refused account usable again before
+ * the reset it announced. Conservative on purpose: a reading that failed, a
+ * claim the poll has no window for, or a window still at its limit all say no,
+ * and the account simply waits for its reset or for a member's request to be
+ * answered by it.
+ */
+export function usageShowsRecovered(snapshot, { provider, claim = null } = {}) {
+  if (snapshot?.status !== 'available' || !Array.isArray(snapshot.windows)) return false;
+  const kinds = windowsForClaim(provider, claim);
+  if (!kinds) return false;
+  const windows = snapshot.windows.filter((entry) => kinds.includes(entry?.kind));
+  if (!windows.length) return false;
+  return windows.every((entry) => Number.isFinite(entry.remaining_percent)
+    && entry.remaining_percent >= RECOVERED_MIN_REMAINING_PERCENT);
+}
+
+/**
+ * Check every refused account due for it against a fresh usage reading, and
+ * forget the refusal of any that has recovered early. Runs on a timer in the
+ * console, never on a member's request.
+ */
+export async function recheckExhaustedAccounts({
+  store,
+  refreshUsage,
+  exhaustion = quotaExhaustion,
+  log = () => {},
+  now = Date.now(),
+}) {
+  for (const { accountId, claim } of exhaustion.dueForRecheck(now)) {
+    const account = store.accountById(accountId);
+    if (!account) {
+      exhaustion.clear(accountId);
+      continue;
+    }
+    let snapshot = null;
+    try {
+      snapshot = await refreshUsage(accountId);
+    } catch {
+      snapshot = null;
+    }
+    if (usageShowsRecovered(snapshot, { provider: account.provider, claim })) {
+      exhaustion.clear(accountId);
+      log('quota_exhaustion_cleared', { account_id: accountId, reason: 'usage_recovered', claim });
+    }
   }
 }
 
@@ -338,14 +436,17 @@ export function chooseFailoverAccount({
   usageSnapshotFor = () => null,
   exhaustedBy = usageShowsExhausted,
   acceptCandidate = () => true,
-  allowProbe = true,
+  allowLastResort = true,
   now = Date.now(),
 }) {
   const policy = normalizeAccountFailover(homeAccount?.failover);
   if (!policy.enabled) return null;
-  // Usable accounts that are only believed exhausted, in chain order: tried as
-  // a probe when nothing else is left.
-  const believedExhausted = [];
+  // Accounts only the usage reading shows as used up, in chain order: tried
+  // when nothing else is left, because the reading can be an hour old and a
+  // Codex account past its included quota may still answer on credits. One the
+  // upstream itself refused is never among them: it is skipped until it resets
+  // or is seen to recover.
+  const lastResort = [];
   for (const id of policy.backup_account_ids) {
     if (id === homeAccount.id || exclude.includes(id)) continue;
     const candidate = store.accountById(id);
@@ -360,14 +461,14 @@ export function chooseFailoverAccount({
     } catch {
       snapshot = null;
     }
+    if (exhaustion.exhausted(candidate.id, now)) continue;
     if (knownExhausted(candidate.id, { exhaustion, snapshot, exhaustedBy, now })) {
-      believedExhausted.push(candidate);
+      lastResort.push(candidate);
       continue;
     }
     return candidate;
   }
-  if (!allowProbe) return null;
-  return believedExhausted.find((candidate) => exhaustion.claimProbe(candidate.id, now)) ?? null;
+  return allowLastResort ? lastResort[0] ?? null : null;
 }
 
 /**
@@ -493,10 +594,10 @@ export function beginFailover({
     account: current,
     // The account this request was moved off, once it has been.
     failedOverFrom: null,
-    nextBackup({ allowProbe = true } = {}) {
+    nextBackup({ allowLastResort = true } = {}) {
       if (!enabled) return null;
       const backup = chooseFailoverAccount({
-        allowProbe,
+        allowLastResort,
         store,
         homeAccount,
         exclude: tried,
@@ -544,12 +645,18 @@ export function beginFailover({
     },
     recorded: false,
     preflight: false,
+    // Set when the account this request would go to was refused by the
+    // upstream and has not reset: the refusal to answer with instead of
+    // sending the request to collect it again.
+    refusal: null,
   };
-  if (enabled && isExhausted(current.id)) {
-    // Before anything is sent, only a backup believed usable is worth moving
-    // to: the current account is only believed exhausted too, and sending to
-    // it is as good a probe as sending to another such account.
-    const backup = state.nextBackup({ allowProbe: false });
+  const refused = exhaustion.exhausted(current.id, now());
+  if (enabled && (refused || isExhausted(current.id))) {
+    // An account the upstream refused is certain to refuse again, so even a
+    // backup only the usage reading doubts is worth trying. One that is only
+    // doubted itself is as good a try as another doubted one, so then only a
+    // backup believed usable is moved to.
+    const backup = state.nextBackup({ allowLastResort: Boolean(refused) });
     if (backup) {
       log(`${logPrefix}_quota_failover`, {
         stage: 'preflight',
@@ -561,5 +668,30 @@ export function beginFailover({
       state.preflight = true;
     }
   }
+  // Only a refusal that was kept can be replayed; without one the request
+  // goes upstream as before and collects a fresh refusal to keep.
+  if (refused?.reply && state.account === current) state.refusal = refused;
   return state;
+}
+
+/**
+ * Answer a request with the refusal its account already collected, rather
+ * than sending it upstream to be refused again. `Retry-After` is recomputed
+ * from the reset the refusal announced, since the copied value counted from
+ * when it was first sent.
+ */
+export function sendCachedRefusal(res, refusal, now = Date.now()) {
+  const headers = { ...(refusal.reply?.headers ?? {}) };
+  const seconds = Math.max(1, Math.ceil((refusal.until - now) / 1000));
+  if ('retry-after' in headers) headers['retry-after'] = String(seconds);
+  const body = refusal.reply?.body ?? Buffer.from('{}');
+  res.writeHead(429, {
+    ...headers,
+    'content-length': String(body.length),
+    'cache-control': 'no-store',
+    // The request body was never read; closing stops the rest of the upload.
+    connection: 'close',
+    'x-gateway-cached-refusal': '1',
+  });
+  res.end(body);
 }

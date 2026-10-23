@@ -126,4 +126,5 @@ test('requests on an API-key account go to the OpenAI API with the key, not to c
   assert.equal(seen[0].url, '/v1/responses');
   assert.equal(seen[0].headers.authorization, `Bearer ${API_KEY}`);
   assert.equal(seen[0].headers['chatgpt-account-id'], undefined);
+  assert.equal(seen[0].headers['content-encoding'], undefined, 'the OpenAI API is sent the body as the client wrote it');
 });

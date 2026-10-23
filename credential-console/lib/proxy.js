@@ -33,7 +33,18 @@ import {
   claudeQuotaRejection,
   claudeRateLimitHeaders,
   quotaExhaustion,
+  sendCachedRefusal,
 } from './account-failover.js';
+
+/**
+ * The body a replayed refusal carries: the shape the Messages API refuses
+ * with. Claude Code decides what to tell the user from the
+ * `anthropic-ratelimit-unified-*` headers kept alongside it, not from this.
+ */
+const CLAUDE_REFUSAL_BODY = Buffer.from(JSON.stringify({
+  type: 'error',
+  error: { type: 'rate_limit_error', message: 'This account\'s usage limit has been reached; it resets at the time in the rate-limit headers.' },
+}));
 
 const ALLOWED_PATHS = new Set([
   '/v1/messages',
@@ -518,6 +529,24 @@ export async function handleClaudeProxy(req, res, {
     logPrefix: 'claude_proxy',
   });
   account = failover.account;
+  // The account was refused for quota and has not reset, and no backup can
+  // take the request: answer with that refusal now instead of spending a round
+  // trip to collect it again.
+  if (failover.refusal && upstreamPath === '/v1/messages') {
+    log('claude_proxy_cached_refusal', {
+      account_id: account.id,
+      device_id: device.id,
+      claim: failover.refusal.claim,
+      resets_at: new Date(failover.refusal.until).toISOString(),
+    });
+    recordRejected(429, 'quota_exhausted_cached');
+    // Nothing of the body is read; closing is what stops the rest of the upload.
+    res.once('finish', () => {
+      if (!req.destroyed) req.destroy();
+    });
+    sendCachedRefusal(res, failover.refusal);
+    return;
+  }
   // A backup whose credential cannot be read is skipped like an exhausted one.
   const backupWithCredential = () => {
     for (let backup = failover.nextBackup(); backup; backup = failover.nextBackup()) {
@@ -823,7 +852,13 @@ export async function handleClaudeProxy(req, res, {
           });
         }
         if (rejection) {
-          const entry = exhaustion.mark(account.id, rejection);
+          const replayHeaders = { ...responseHeaders(upstreamRes.headers), 'content-type': 'application/json' };
+          // The body is not the upstream's, so neither is its encoding.
+          delete replayHeaders['content-encoding'];
+          const entry = exhaustion.mark(account.id, {
+            ...rejection,
+            reply: { headers: replayHeaders, body: CLAUDE_REFUSAL_BODY },
+          });
           const found = failover.enabled && !clientAborted && failoversUsed < MAX_FAILOVERS
             ? backupWithCredential()
             : null;
