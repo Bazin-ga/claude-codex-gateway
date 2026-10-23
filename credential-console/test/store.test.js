@@ -834,40 +834,124 @@ test('a live Codex session is reported without decrypting its verifier', async (
   assert.equal(store.pendingCodexAuthorization({ accountId: account.id }), null);
 });
 
-test('an account that never authorized can be deleted, one holding a credential cannot', async () => {
+test('any account can be deleted, but only once its alias is typed back', async () => {
   const home = await mkdtemp(join(tmpdir(), 'credential-console-delete-'));
   const store = await new CredentialStore(home, { allowKeyInit: true }).init();
 
   const pending = await store.addAccount({ provider: 'claude', alias: 'typo-alias' });
   assert.equal(pending.status, 'login_required');
-  await store.deleteAccount(pending.id);
+  await assert.rejects(store.deleteAccount(pending.id), /type the account alias/);
+  await assert.rejects(
+    store.deleteAccount(pending.id, { confirmAlias: 'typo-alia' }),
+    /type the account alias/,
+  );
+  assert.ok(store.accountById(pending.id));
+  await store.deleteAccount(pending.id, { confirmAlias: ' typo-alias ' });
   assert.equal(store.accountById(pending.id), null);
   assert.equal(store.publicAccounts().some((entry) => entry.id === pending.id), false);
 
-  // Keyed off the stored credential, not `status`: a row whose health check has
-  // moved it to `unhealthy` is still holding something unrecoverable.
+  // A row holding a credential is deletable too: a dead login otherwise sits
+  // on every page for good. The typed alias is what stands in front of it.
   const authorized = await store.addAccount({
     provider: 'claude',
     alias: 'real-account',
     credential: { oauth_token: 'sk-ant-oat01-not-recreatable' },
   });
-  await store.updateAccountHealth(authorized.id, { success: false, error: 'upstream 500' });
-  assert.equal(store.accountById(authorized.id).status, 'unhealthy');
-  await assert.rejects(
-    store.deleteAccount(authorized.id),
-    /holds a stored credential/,
-    'an account holding a credential must never be deletable, whatever its status says',
-  );
+  await assert.rejects(store.deleteAccount(authorized.id), /type the account alias/);
   assert.ok(store.accountCredential(authorized.id).oauth_token);
+  assert.equal(store.accountDeletionPlan(authorized.id).account.holds_credential, true);
+  await store.deleteAccount(authorized.id, { confirmAlias: 'real-account', actor: 'ops@example' });
+  assert.equal(store.accountById(authorized.id), null);
+  const deletion = store.state.audit.findLast((event) => event.event === 'account_deleted');
+  assert.equal(deletion.held_credential, true);
+  assert.equal(deletion.actor, 'ops@example');
 
   const imported = await store.addAccount({
     provider: 'codex',
     alias: 'imported-home',
     external: { kind: 'codex-credential', home: '/var/lib/codex-credential' },
   });
-  await assert.rejects(store.deleteAccount(imported.id), /imported credential home/);
+  assert.deepEqual(store.accountDeletionPlan(imported.id).account.external, { kind: 'codex-credential' });
+  await store.deleteAccount(imported.id, { confirmAlias: 'imported-home' });
+  assert.equal(store.accountById(imported.id), null);
+  assert.equal(
+    store.state.audit.findLast((event) => event.event === 'account_deleted').external_home,
+    '/var/lib/codex-credential',
+  );
 
-  await assert.rejects(store.deleteAccount('no-such-id'), /account not found/);
+  await assert.rejects(store.deleteAccount('no-such-id', { confirmAlias: 'x' }), /account not found/);
+});
+
+test('deleting an account revokes the devices on it, rebinds the rest, and prunes failover chains', async () => {
+  const { store } = await newStore();
+  const dead = await store.addAccount({
+    provider: 'claude',
+    alias: 'dead-account',
+    credential: { oauth_token: 'dead-token' },
+  });
+  const live = await store.addAccount({
+    provider: 'claude',
+    alias: 'live-account',
+    credential: { oauth_token: 'live-token' },
+  });
+  const other = await store.addAccount({
+    provider: 'claude',
+    alias: 'other-account',
+    credential: { oauth_token: 'other-token' },
+  });
+  // Issued on the dead account but already routed elsewhere: survives.
+  const moved = await store.issueDeviceCredential({
+    accountId: dead.id,
+    memberLabel: 'm',
+    deviceName: 'moved-away',
+  });
+  await store.configureDeviceAccount({
+    deviceId: moved.device.id,
+    selectedAccountId: live.id,
+    actor: 'test',
+  });
+  // Still sending traffic to the dead account: revoked.
+  const stuck = await store.issueDeviceCredential({
+    accountId: dead.id,
+    memberLabel: 'm',
+    deviceName: 'still-on-it',
+  });
+  // Unrelated: untouched.
+  const bystander = await store.issueDeviceCredential({
+    accountId: other.id,
+    memberLabel: 'm',
+    deviceName: 'bystander',
+  });
+  await store.setAccountFailover(live.id, { enabled: true, backupAccountIds: [dead.id, other.id] });
+  await store.setAccountFailover(other.id, { enabled: true, backupAccountIds: [dead.id] });
+
+  const plan = store.accountDeletionPlan(dead.id);
+  assert.deepEqual(plan.devices_revoked.map((device) => device.id), [stuck.device.id]);
+  assert.deepEqual(
+    plan.devices_rebound.map((device) => [device.id, device.selected_account_id]),
+    [[moved.device.id, live.id]],
+  );
+  assert.deepEqual(
+    plan.failover_pruned.map((entry) => [entry.alias, entry.disabled]),
+    [['live-account', false], ['other-account', true]],
+  );
+
+  await store.deleteAccount(dead.id, { confirmAlias: 'dead-account', actor: 'ops' });
+  const row = (id) => store.state.devices.find((device) => device.id === id);
+  assert.ok(row(stuck.device.id).revoked_at);
+  assert.equal(row(moved.device.id).revoked_at ?? null, null);
+  assert.equal(row(moved.device.id).account_id, live.id);
+  assert.deepEqual(row(moved.device.id).allowed_account_ids, [live.id]);
+  assert.equal(store.resolveDeviceAccount(moved.device.id).effective_account_id, live.id);
+  assert.equal(row(bystander.device.id).revoked_at ?? null, null);
+  assert.equal(row(bystander.device.id).account_id, other.id);
+  assert.deepEqual(store.accountById(live.id).failover.backup_account_ids, [other.id]);
+  assert.equal(store.accountById(live.id).failover.enabled, true);
+  assert.deepEqual(store.accountById(other.id).failover.backup_account_ids, []);
+  assert.equal(store.accountById(other.id).failover.enabled, false);
+  const revoked = store.state.audit.findLast((event) => event.event === 'device_revoked');
+  assert.equal(revoked.reason, 'account_deleted');
+  assert.equal(revoked.device_id, stuck.device.id);
 });
 
 test('P3 policy fields are additive and switching is isolated to the exact device row', async () => {
@@ -1168,7 +1252,7 @@ test('deleting an unrelated account does not clear a malformed or partial device
   const row = store.state.devices.find((device) => device.id === issued.device.id);
   row.allowed_account_ids = 'malformed-policy';
   delete row.selected_account_id;
-  await store.deleteAccount(unrelated.id);
+  await store.deleteAccount(unrelated.id, { confirmAlias: 'p3-unrelated-pending' });
   assert.equal(store.accountById(unrelated.id), null);
   assert.equal(row.allowed_account_ids, 'malformed-policy');
   assert.equal(Object.hasOwn(row, 'selected_account_id'), false);
@@ -1203,14 +1287,19 @@ test('console can select login_required placeholder, machine switch requires usa
     }),
     (error) => error.message.includes('no stored credential') && error.code === 'ACCOUNT_UNAVAILABLE',
   );
-  await assert.rejects(store.deleteAccount(pending.id), /selected by active device/);
+  // Deleting now would revoke the device that is on it.
+  assert.deepEqual(
+    store.accountDeletionPlan(pending.id).devices_revoked.map((device) => device.id),
+    [issued.device.id],
+  );
 
   await store.configureDeviceAccount({
     deviceId: issued.device.id,
     selectedAccountId: good.id,
     actor: 'console-admin',
   });
-  await store.deleteAccount(pending.id);
+  assert.deepEqual(store.accountDeletionPlan(pending.id).devices_revoked, []);
+  await store.deleteAccount(pending.id, { confirmAlias: 'p3-pending-account' });
   assert.equal(store.accountById(pending.id), null);
   const after = store.state.devices.find((device) => device.id === issued.device.id);
   assert.deepEqual(after.allowed_account_ids, [good.id]);
@@ -1379,7 +1468,10 @@ test('deleteAccount restores account, policies, and audit when persistence fails
   const beforeDisk = await readFile(join(home, 'state.json'));
   const originalPersist = store.persist.bind(store);
   store.persist = async () => { throw new Error('synthetic delete persist failure'); };
-  await assert.rejects(store.deleteAccount(pending.id), /synthetic delete persist failure/);
+  await assert.rejects(
+    store.deleteAccount(pending.id, { confirmAlias: 'p3-delete-pending' }),
+    /synthetic delete persist failure/,
+  );
   store.persist = originalPersist;
 
   assert.deepEqual(store.state, beforeState);

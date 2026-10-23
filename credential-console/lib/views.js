@@ -184,7 +184,10 @@ button, .button { appearance: none; border: 0; border-radius: 10px; padding: 10p
 button:hover, .button:hover { background: var(--green-dark); }
 button:disabled, select:disabled, input:disabled { cursor: not-allowed; opacity: .58; }
 .button.secondary, button.secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-button.danger { background: var(--red); }
+button.danger, .button.danger { background: var(--red); }
+.delete-effect h2 { margin: 0 0 4px; font-size: 1.05rem; }
+.delete-effect p, .delete-effect ul { margin: 4px 0; }
+.delete-effect ul { padding-left: 1.2em; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; }
 .stack > .card { grid-column: auto; min-width: 0; }
@@ -4059,10 +4062,7 @@ export function dashboardView({
           ${codexCreditGuardControl(account, csrf)}
           ${accountFailoverSummary(account, accounts)}
         </div>`}
-        ${(account.status === 'login_required' || account.provider === 'bedrock') && !account.external ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="inline">
-          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-          <button class="danger" type="submit" data-i18n="delete-account">Delete account</button>
-        </form>` : ''}
+        <a class="button danger" href="/accounts/${encodeURIComponent(account.id)}/delete" data-i18n="delete-account">Delete account</a>
       </td>
     </tr>
   `;
@@ -5639,4 +5639,52 @@ export function docsView({
       </article>` : ''}
     </section>
   `, { openMode, activeTab: 'docs' });
+}
+
+/**
+ * The first of the two steps to delete an account: what will happen, and a
+ * form that only goes through once the operator types the alias back. Nothing
+ * here is decided by the page — it renders `accountDeletionPlan`, and the store
+ * applies the same plan and checks the alias again on submit.
+ */
+export function accountDeleteView({ plan, accounts = [], csrf, error = null, openMode = false }) {
+  const { account } = plan;
+  const aliasOf = (id) => accounts.find((entry) => entry.id === id)?.alias ?? id;
+  const deviceLine = (device, extra = '') => `<li><strong>${escapeHtml(device.name)}</strong> <span class="muted tiny">${escapeHtml(device.member_label ?? '')} · ${escapeHtml(device.id)}</span>${extra}</li>`;
+  const providerLabel = { claude: 'Claude', codex: 'Codex', bedrock: 'Bedrock' }[account.provider] ?? account.provider;
+  // One plain block per effect: inside the card's stack, a heading, hint and
+  // list each picked up the stack gap on top of their own margins.
+  const deleteSection = (key, heading, body) => `<div class="delete-effect">
+          <h2 data-i18n="${key}">${heading}</h2>
+          ${body || '<p class="muted" data-i18n="delete-account-none">None</p>'}
+        </div>`;
+  return layout('Delete account', `
+    <section class="login">
+      <div class="card stack">
+        <div><span class="badge unhealthy">${escapeHtml(providerLabel)}</span></div>
+        <h1 data-i18n="delete-account-heading">Delete this account?</h1>
+        <p><span data-i18n="team-account">Team account</span>: <strong>${escapeHtml(account.alias)}</strong>${account.email_label ? `<br><span data-i18n="owner-auth-account">Expected account</span>: <strong>${escapeHtml(account.email_label)}</strong>` : ''}</p>
+        ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+        ${account.holds_credential ? '<div class="notice error" data-i18n="delete-account-credential">The stored credential is destroyed with the account. Getting it back needs the account owner to authorize again.</div>' : ''}
+        ${account.external ? '<div class="notice" data-i18n="delete-account-external">This account points at a Codex credential home on the server. The home directory and its refresh timer are left in place; remove them on the host if they are no longer wanted.</div>' : ''}
+        ${deleteSection('delete-account-revoked', 'Devices that will be revoked', plan.devices_revoked.length
+          ? `<p class="muted tiny" data-i18n="delete-account-revoked-hint">These devices send their traffic to this account. To keep one, switch it to another account first, then come back.</p><ul>${plan.devices_revoked.map((device) => deviceLine(device)).join('')}</ul>`
+          : '')}
+        ${deleteSection('delete-account-rebound', 'Devices that keep working', plan.devices_rebound.length
+          ? `<p class="muted tiny" data-i18n="delete-account-rebound-hint">These devices list this account but currently use another one; it is removed from their allowed accounts.</p><ul>${plan.devices_rebound.map((device) => deviceLine(device, ` → ${escapeHtml(aliasOf(device.selected_account_id))}`)).join('')}</ul>`
+          : '')}
+        ${deleteSection('delete-account-failover', 'Failover chains it is removed from', plan.failover_pruned.length
+          ? `<ul>${plan.failover_pruned.map((entry) => `<li><strong>${escapeHtml(entry.alias)}</strong>${entry.disabled ? ' <span class="muted tiny" data-i18n="delete-account-failover-off">(chain becomes empty and is turned off)</span>' : ''}</li>`).join('')}</ul>`
+          : '')}
+        <form method="post" action="/accounts/${encodeURIComponent(account.id)}/delete" class="stack" autocomplete="off">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <label><span data-i18n="delete-account-confirm-label">Type the account alias to confirm</span>
+            <input name="confirm_alias" required autocomplete="off" spellcheck="false" placeholder="${escapeHtml(account.alias)}" aria-label="Type ${escapeHtml(account.alias)} to confirm">
+          </label>
+          <button class="danger" type="submit" data-i18n="delete-account-confirm">Delete permanently</button>
+        </form>
+        <a class="button secondary" href="/" data-i18n="cancel">Cancel</a>
+      </div>
+    </section>
+  `, { openMode });
 }
