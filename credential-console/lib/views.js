@@ -15,6 +15,7 @@ import { bedrockExampleModel } from './bedrock-models.js';
 import { classifyCredentialAlerts } from './credential-alerts.js';
 import { sanitizeUrl } from './onboarding.js';
 import { derivePromptDisplay } from './prompt-display.js';
+import { isCodexApiKeyAccount, isCodexGatewayAccount } from './codex-api-key.js';
 import {
   buildClaudeConversationHookEndpoint,
   CLAUDE_CONVERSATION_HOOK_UPDATER_FILENAME,
@@ -1373,7 +1374,7 @@ function accountCanReceiveDevice(account) {
     return Boolean(account.bedrock?.region && account.bedrock?.model_id)
       && ['stored', 'healthy'].includes(account.status);
   }
-  return account.external?.kind === 'codex-credential'
+  return isCodexGatewayAccount(account)
     && ['stored', 'healthy'].includes(account.status);
 }
 
@@ -3981,7 +3982,7 @@ export function dashboardView({
   // Every gateway-capable Codex account is offered on the panel, not just the
   // first — a member picks one exactly as they do for Claude.
   const codexGatewayAccounts = codexAccounts.filter((account) => (
-    account.external?.kind === 'codex-credential'
+    isCodexGatewayAccount(account)
     && ['stored', 'healthy'].includes(account.status)
     && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
   ));
@@ -4033,7 +4034,9 @@ export function dashboardView({
         </form>` : '<span class="muted tiny" data-i18n="owner-login-required">Account owner must authorize before member enrollment.</span>'}
           ${accountFailoverSummary(account, accounts)}
         </div>` : `<div class="stack">
-          <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>
+          ${isCodexApiKeyAccount(account)
+            ? '<span class="muted tiny" data-i18n="codex-api-key-account">OpenAI API key · billed per token</span>'
+            : `<a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>`}
           ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}
           ${codexResetControl(account, csrf)}
           ${codexModelGuardControl(account, csrf)}
@@ -4350,6 +4353,9 @@ export function dashboardView({
               </label>
               <label><span data-i18n="account-email-optional">Account email label (optional, checked at authorization)</span>
                 <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160" data-draft-field>
+              </label>
+              <label><span data-i18n="codex-api-key-optional">OpenAI API key (optional; instead of ChatGPT authorization, billed per token)</span>
+                <input name="openai_api_key" type="password" autocomplete="off" maxlength="4096" placeholder="sk-...">
               </label>
               <button type="submit" data-i18n="register-account">Register account</button>
             </form>

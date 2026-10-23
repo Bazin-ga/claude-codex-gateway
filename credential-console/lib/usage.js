@@ -292,6 +292,8 @@ export class UsageMonitor {
         });
       } else if (account.provider === 'codex') {
         const internal = this.store.accountById(account.id);
+        // A platform API key is billed per token; there is no plan window to read.
+        if (internal?.codex_auth === 'api-key') throw new UsageFetchError('usage_not_reported');
         if (internal?.external?.kind !== 'codex-credential') {
           // Registered but never authorized. That is the expected state of a row
           // the dashboard just created, not a failure to report in red.

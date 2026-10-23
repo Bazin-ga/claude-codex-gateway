@@ -576,6 +576,8 @@ const translations = {
   'enroll-device': '登记设备',
   'delete-account': '删除账号',
   'existing-codex-agent': '现有 Codex 代理',
+  'codex-api-key-account': 'OpenAI API key · 按 token 计费',
+  'codex-api-key-optional': 'OpenAI API key（可选；填了就不走 ChatGPT 授权，按 token 计费）',
   'status-healthy': '健康',
   'status-unhealthy': '异常',
   'status-expired': '已过期',

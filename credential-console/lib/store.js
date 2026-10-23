@@ -20,6 +20,7 @@ import { credentialSwitchBlock, externalAccountStatus } from './external-account
 import { normalizeCodexGuard, parseCodexGuardInput } from './codex-model-guard.js';
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
+import { CODEX_API_KEY_AUTH, isCodexApiKeyAccount } from './codex-api-key.js';
 import { normalizeBedrockModelPin } from './bedrock-models.js';
 import {
   MODEL_BLOCK_MAX_RULES,
@@ -281,6 +282,7 @@ export class CredentialStore {
       last_failure_at: account.last_failure_at ?? null,
       last_failure: account.last_failure ?? null,
       external: account.external ? { kind: account.external.kind } : null,
+      codex_auth: account.codex_auth ?? null,
       bedrock: account.bedrock ? { ...account.bedrock } : null,
       codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
       codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
@@ -574,6 +576,10 @@ export class CredentialStore {
       throw storeError('target account credential is expired', 'ACCOUNT_UNAVAILABLE');
     }
     if (account.provider === 'codex') {
+      if (isCodexApiKeyAccount(account)) {
+        if (!account.credential) throw storeError('target account has no stored API key', 'ACCOUNT_UNAVAILABLE');
+        return;
+      }
       if (account.external?.kind !== 'codex-credential' || !account.external.home) {
         throw storeError('target account has no managed credential home', 'ACCOUNT_UNAVAILABLE');
       }
@@ -685,7 +691,7 @@ export class CredentialStore {
         provider: account.provider,
         status: account.status,
         expires_at: account.expires_at ?? null,
-        has_credential: account.provider === 'codex'
+        has_credential: account.provider === 'codex' && !isCodexApiKeyAccount(account)
           ? account.external?.kind === 'codex-credential' && Boolean(account.external.home)
           : Boolean(account.credential),
       },
@@ -904,6 +910,7 @@ export class CredentialStore {
     expiresAt = null,
     external = null,
     bedrock = null,
+    codexApiKey = null,
   }) {
     return this.serialized(async () => {
       if (!GATEWAY_PROVIDERS.includes(provider)) throw new Error('unsupported provider');
@@ -927,6 +934,14 @@ export class CredentialStore {
       } else if (bedrock) {
         throw new Error('region and model pin are only meaningful for a Bedrock account');
       }
+      if (codexApiKey !== null) {
+        if (provider !== 'codex') throw new Error('an OpenAI API key is only meaningful for a Codex account');
+        if (external) throw new Error('a Codex account uses either a credential home or an API key, not both');
+        if (!/^sk-[A-Za-z0-9_-]{20,}$/.test(String(codexApiKey))) {
+          throw new Error('a valid OpenAI API key (sk-...) is required');
+        }
+        credential = { api_key: String(codexApiKey) };
+      }
       const id = randomToken(12);
       const account = {
         id,
@@ -940,6 +955,7 @@ export class CredentialStore {
           ? { credential: encryptJson(this.masterKey, credential, `account:${id}:credential:v1`) }
           : {}),
         ...(external ? { external } : {}),
+        ...(codexApiKey !== null ? { codex_auth: CODEX_API_KEY_AUTH } : {}),
         // Region and model id are not secret and must stay readable without the
         // master key: the proxy compares the requested model against them on
         // every turn, and an operator has to be able to see what a row is
@@ -2071,7 +2087,7 @@ export class CredentialStore {
       // a pointer to the home the refresh centre publishes into. Demanding
       // `credential` of both made Codex permanently unissuable, which is what
       // left the Codex gateway route unreachable in practice.
-      const usable = account.provider === 'codex'
+      const usable = account.provider === 'codex' && !isCodexApiKeyAccount(account)
         ? account.external?.kind === 'codex-credential'
         : Boolean(account.credential)
           && (account.provider !== 'bedrock'
