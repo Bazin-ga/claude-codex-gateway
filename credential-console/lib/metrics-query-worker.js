@@ -27,12 +27,14 @@ if (store) {
       parentPort.close();
       return;
     }
-    if (message?.type !== 'query' || !Number.isSafeInteger(message.id)) return;
+    if (!['query', 'api-spend'].includes(message?.type) || !Number.isSafeInteger(message.id)) return;
     try {
       parentPort.postMessage({
         type: 'result',
         id: message.id,
-        dataset: queryMetricsDataset(store, message.filters ?? {}),
+        dataset: message.type === 'api-spend'
+          ? store.queryApiSpendGroups(message.params ?? {})
+          : queryMetricsDataset(store, message.filters ?? {}),
       });
     } catch (error) {
       parentPort.postMessage({

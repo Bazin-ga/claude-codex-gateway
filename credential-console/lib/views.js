@@ -16,6 +16,7 @@ import { classifyCredentialAlerts } from './credential-alerts.js';
 import { sanitizeUrl } from './onboarding.js';
 import { derivePromptDisplay } from './prompt-display.js';
 import { isCodexApiKeyAccount, isCodexGatewayAccount } from './codex-api-key.js';
+import { OPENAI_PRICES_AS_OF } from './openai-api-pricing.js';
 import {
   buildClaudeConversationHookEndpoint,
   CLAUDE_CONVERSATION_HOOK_UPDATER_FILENAME,
@@ -235,6 +236,17 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .quota-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; margin-top: 8px; color: var(--muted); font-size: 11px; }
 .quota-fable, .quota-reset-credits { margin-left: auto; }
 .quota-guard { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.api-spend-heading { margin-bottom: 8px; font-size: 12px; font-weight: 800; color: var(--muted); }
+.api-spend-grid { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.api-spend-grid .quota-window { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 6px 10px; }
+.api-spend-grid .quota-window strong { margin: 0; }
+.api-spend-details { margin-top: 8px; font-size: 12px; }
+.api-spend-details summary { cursor: pointer; font-weight: 700; color: var(--blue); }
+.api-spend-list-head { margin-top: 10px; color: var(--muted); font-size: 11px; font-weight: 800; }
+.api-spend-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.api-spend-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 8px; padding: 5px 0; border-top: 1px dashed var(--line); }
+.api-spend-name { font-weight: 700; overflow-wrap: anywhere; }
+.api-spend-list small { grid-column: 1 / -1; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .guard-form { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 4px; }
 .guard-toggle, .guard-threshold { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
 .guard-threshold input { width: 62px; }
@@ -1215,6 +1227,8 @@ function accountUsageView(account, { showAccount = false } = {}) {
       <div class="quota-message"><span data-i18n="usage-per-token">Billed per token; no quota window</span></div>
     </div>`;
   }
+  // An API key has no allowance to report either; what it has is a bill.
+  if (isCodexApiKeyAccount(account)) return apiSpendView(account, { showAccount });
   const usage = account.usage;
   const message = usageMessage(usage);
   // `observed_at` outranks `fetched_at` because it is only ever set when a
@@ -1258,6 +1272,50 @@ function accountUsageView(account, { showAccount = false } = {}) {
     ${quotaMeta ? `<div class="quota-meta">${quotaMeta}</div>` : ''}
     ${codexModelGuardNote(account)}
     ${normalizeCodexCreditGuard(account.codex_credit_guard).enabled ? '<div class="quota-guard muted tiny" data-i18n="codex-credit-guard-active">No credits are spent through the gateway once the included quota is used up</div>' : ''}
+  </div>`;
+}
+
+/**
+ * The card of an OpenAI API-key account: what it has cost over the last day,
+ * week and month, and, folded away, the month by model and by device.
+ *
+ * Estimated from the tokens the gateway recorded at list price — a project key
+ * cannot read the organization's billing — so the card says so.
+ */
+function apiSpendView(account, { showAccount = false } = {}) {
+  const spend = account.api_spend;
+  const tile = (key, label, i18n) => `<div class="quota-window">
+      <span data-i18n="${i18n}">${label}</span>
+      <strong>${spend ? escapeHtml(usd(spend.totals[key])) : '—'}</strong>
+    </div>`;
+  // A list rather than a table: the card is a narrow column on a desktop, and
+  // a four-column table there wraps a model name one letter per line.
+  const list = (entries, i18n, heading) => `<div class="api-spend-list-head" data-i18n="${i18n}">${heading}</div>
+      <ul class="api-spend-list">${entries.map((entry) => `<li>
+        <span class="api-spend-name">${escapeHtml(entry.label ?? '—')}</span>
+        <strong>${escapeHtml(usd(entry.costUsd))}</strong>
+        <small>${entry.note ? `${escapeHtml(entry.note)} · ` : ''}${escapeHtml(String(entry.requests))} <span data-i18n="api-spend-requests">requests</span> · ${escapeHtml(tokenCount(entry.tokens))} <span data-i18n="api-spend-tokens">tokens</span></small>
+      </li>`).join('')}</ul>`;
+  const details = spend && spend.requests > 0 ? `<details class="api-spend-details">
+      <summary data-i18n="api-spend-breakdown">Last 30 days by model and device</summary>
+      ${list(spend.models, 'api-spend-by-model', 'By model')}
+      ${list(spend.devices, 'api-spend-by-device', 'By device')}
+      <p class="muted tiny"><span data-i18n="api-spend-basis">Recorded tokens × OpenAI list price as of</span> ${escapeHtml(OPENAI_PRICES_AS_OF)}<span data-i18n="api-spend-basis-tail">; cache reads and writes included, writes at the 30-minute rate; prompts over 272K tokens at the long-context rate.</span></p>
+      ${spend.without_usage > 0 ? `<p class="muted tiny"><span data-i18n="api-spend-no-usage">Requests with no recorded usage, not counted:</span> ${escapeHtml(String(spend.without_usage))}</p>` : ''}
+      ${spend.unpriced_models.length ? `<p class="muted tiny"><span data-i18n="api-spend-unpriced">No price known, counted as $0:</span> <code>${escapeHtml(spend.unpriced_models.join(', '))}</code></p>` : ''}
+    </details>` : '';
+  return `<div class="quota-account api-spend">
+    ${showAccount ? `<div class="quota-account-name"><strong>${escapeHtml(account.alias)}</strong></div>` : ''}
+    <div class="api-spend-heading" data-i18n="api-spend-heading">API spend (estimated)</div>
+    <div class="quota-grid api-spend-grid">
+      ${tile('day', '24 hours', 'api-spend-day')}
+      ${tile('week', '7 days', 'api-spend-week')}
+      ${tile('month', '30 days', 'api-spend-month')}
+    </div>
+    ${spend ? '' : '<div class="quota-message" data-i18n="api-spend-pending">Waiting for the first spend reading.</div>'}
+    ${details}
+    ${spend ? `<div class="quota-meta"><span><span data-i18n="usage-updated">Updated</span> ${escapeHtml(dateText(spend.computed_at))}</span></div>` : ''}
+    ${codexModelGuardNote(account)}
   </div>`;
 }
 
@@ -5737,6 +5795,7 @@ function perMillion(value) {
 
 function tokenCount(value) {
   if (!Number.isFinite(value)) return '—';
+  if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
   if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
   if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
   return String(value);

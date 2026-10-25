@@ -25,6 +25,8 @@ import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
 import { codexQuotaSignal } from './lib/codex-quota-signal.js';
 import { applyFailoverEdit, quotaExhaustion, recheckExhaustedAccounts } from './lib/account-failover.js';
+import { isCodexApiKeyAccount } from './lib/codex-api-key.js';
+import { OPENAI_LONG_CONTEXT_ABOVE, summarizeApiSpend } from './lib/openai-api-pricing.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { isCodexGatewayAccount } from './lib/codex-api-key.js';
@@ -440,8 +442,48 @@ export async function createCredentialConsole(options = {}) {
   };
   exhaustionRecheckTimer = setInterval(runExhaustionRecheck, options.exhaustionRecheckTickMs ?? 60_000);
   exhaustionRecheckTimer.unref();
+  // What each OpenAI API-key account has cost lately, for its card. Read in the
+  // background and kept here so a page never waits on it: a month of one busy
+  // account is a few hundred milliseconds of grouping, too long to spend on the
+  // gateway's event loop at every render.
+  const apiSpend = new Map();
+  let apiSpendPromise = null;
+  const refreshApiSpend = () => {
+    if (closing || apiSpendPromise || !requestMetrics?.queryApiSpendGroups) return apiSpendPromise;
+    const accounts = store.state.accounts.filter(isCodexApiKeyAccount);
+    for (const id of apiSpend.keys()) {
+      if (!accounts.some((account) => account.id === id)) apiSpend.delete(id);
+    }
+    // No worker means none could start; the metrics page refuses then too,
+    // rather than moving the grouping onto the event loop.
+    if (accounts.length === 0 || (enableMetricsQueryWorker && !metricsQueryService)) return null;
+    apiSpendPromise = (async () => {
+      requestMetrics.flush?.();
+      const devices = new Map(store.publicDevices().map((device) => [device.id, device]));
+      const describeDevice = (id) => {
+        const device = devices.get(id);
+        return device ? { label: device.name, note: device.member_label } : { label: id ?? '—' };
+      };
+      for (const account of accounts) {
+        if (closing) return;
+        const params = { accountId: account.id, nowMs: Date.now(), longContextAbove: OPENAI_LONG_CONTEXT_ABOVE };
+        try {
+          const groups = metricsQueryService
+            ? await metricsQueryService.apiSpendGroups(params)
+            : requestMetrics.queryApiSpendGroups(params);
+          apiSpend.set(account.id, summarizeApiSpend(groups, { describeDevice }));
+        } catch (error) {
+          log('api_spend_query_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+        }
+      }
+    })().finally(() => { apiSpendPromise = null; });
+    return apiSpendPromise;
+  };
+  const apiSpendTimer = setInterval(refreshApiSpend, options.apiSpendRefreshMs ?? 5 * 60_000);
+  apiSpendTimer.unref();
   const stopBackgroundRefreshes = () => {
-    const recheckDrain = stopExhaustionRechecks();
+    clearInterval(apiSpendTimer);
+    const recheckDrain = Promise.all([stopExhaustionRechecks(), apiSpendPromise]);
     let usageDrain;
     try {
       usageDrain = Promise.resolve(usageMonitor.stop?.());
@@ -617,6 +659,7 @@ export async function createCredentialConsole(options = {}) {
       });
     }
   }
+  refreshApiSpend();
   // Open mode has no login, so every rendered page has to say so.
   const openMode = adminAuth === 'open';
   // Both providers issue the same kind of device token but need different client
@@ -813,6 +856,8 @@ export async function createCredentialConsole(options = {}) {
         // merging at read time keeps the cached snapshot honest about what was
         // actually fetched.
         usage: codexQuotaSignal.merge(account.id, usageMonitor.snapshotForAccount(account.id)),
+        // Estimated from recorded tokens; the key itself cannot read billing.
+        api_spend: isCodexApiKeyAccount(account) ? apiSpend.get(account.id) ?? null : null,
       };
     }));
   }
@@ -3150,6 +3195,7 @@ export async function createCredentialConsole(options = {}) {
   server.once('close', () => {
     clearInterval(cleanupTimer);
     clearInterval(exhaustionRecheckTimer);
+    clearInterval(apiSpendTimer);
     usageMonitor.stop?.();
     relayCatalog?.stop();
     codexManagedRefresher?.stop?.();

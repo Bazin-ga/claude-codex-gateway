@@ -91,6 +91,15 @@ export class MetricsQueryService {
   }
 
   query(filters) {
+    return this.#send({ type: 'query', filters });
+  }
+
+  /** `MetricsStore.queryApiSpendGroups`, off the gateway's event loop. */
+  apiSpendGroups(params) {
+    return this.#send({ type: 'api-spend', params });
+  }
+
+  #send(message) {
     if (!this.ready || !this.worker || this.closed) {
       return Promise.reject(new Error('metrics query service is unavailable'));
     }
@@ -104,7 +113,7 @@ export class MetricsQueryService {
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {
-        this.worker.postMessage({ type: 'query', id, filters });
+        this.worker.postMessage({ ...message, id });
       } catch (error) {
         this.pending.delete(id);
         reject(error);
