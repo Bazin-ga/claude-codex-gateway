@@ -309,6 +309,10 @@ function windowsForClaim(provider, claim) {
   if (provider === 'codex') return ['five_hour', 'weekly', 'primary', 'secondary'];
   if (claim === 'five_hour') return ['five_hour'];
   if (claim === 'seven_day') return ['weekly'];
+  // An overage refusal is a spend-cap refusal, not proof that the base
+  // five-hour or weekly allowance is gone. Treat it like the base windows so
+  // a usage reading can clear it as soon as those windows have room again.
+  if (claim === 'overage') return ['five_hour', 'weekly'];
   return null;
 }
 
@@ -571,8 +575,11 @@ export function beginFailover({
   // The account the device row points at, which is where a persistent move
   // has to start from.
   let deviceSelectedId = account.id;
+  // The return_after stamp is only the reset the refusal announced. An
+  // account can answer again sooner, and a fresh usage reading (or a
+  // successful request) clears the exhaustion entry; when that happens the
+  // device should go home immediately, not wait for the announced reset.
   if (markerHome && homeAccount === markerHome
-    && Date.parse(marker.return_after ?? '') <= now()
     && ['healthy', 'stored'].includes(markerHome.status)
     && !isExhausted(markerHome.id)
     && !store.failoverCandidateProblem?.(markerHome)) {
