@@ -190,6 +190,77 @@ test('server close waits for in-flight usage refreshes and queued snapshot persi
   }
 });
 
+test('server close prevents a quota recheck loop from starting the next account refresh', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-recheck-close-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const [first, second] = await Promise.all(['recheck-close-first', 'recheck-close-second'].map((alias) => (
+    store.addAccount({
+      provider: 'claude',
+      alias,
+      credential: { oauth_token: `${alias}-test-token` },
+    })
+  )));
+  let firstFetchStarted;
+  const firstStarted = new Promise((resolve) => { firstFetchStarted = resolve; });
+  let releaseFetch;
+  const fetchGate = new Promise((resolve) => { releaseFetch = resolve; });
+  const fetchAccounts = [];
+  const usageMonitor = new UsageMonitor({
+    store,
+    home,
+    fetchImpl: async (_url, request) => {
+      const account = request.headers.Authorization.endsWith(`${first.alias}-test-token`)
+        ? first
+        : second;
+      fetchAccounts.push(account.id);
+      if (account.id === first.id) {
+        firstFetchStarted();
+        await fetchGate;
+      }
+      return new Response(JSON.stringify({
+        five_hour: { utilization: 100, resets_at: null },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    },
+  });
+  const { server } = await createCredentialConsole({
+    store,
+    usageMonitor,
+    requestMetrics: null,
+    adminAuth: 'open',
+    cookieSecure: false,
+    publicBaseUrl: 'http://credential-console.test',
+    exhaustionRecheckTickMs: 10,
+    quotaExhaustion: {
+      dueForRecheck: () => [
+        { accountId: first.id, claim: 'five_hour' },
+        { accountId: second.id, claim: 'five_hour' },
+      ],
+      clear() {},
+    },
+  });
+  await listen(server);
+
+  try {
+    await firstStarted;
+    let closeFinished = false;
+    const closed = new Promise((resolve) => server.close(() => {
+      closeFinished = true;
+      resolve();
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeFinished, false);
+    releaseFetch();
+    await closed;
+    await usageMonitor.stop();
+    assert.equal(closeFinished, true);
+    assert.deepEqual(fetchAccounts, [first.id]);
+  } finally {
+    releaseFetch();
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+    await usageMonitor.stop();
+  }
+});
+
 function cookieFrom(response) {
   return response.headers.get('set-cookie').split(';')[0];
 }

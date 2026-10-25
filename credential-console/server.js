@@ -414,19 +414,42 @@ export async function createCredentialConsole(options = {}) {
   // reset it announced is only an upper bound, so the refused accounts are
   // re-read from the free usage endpoint every few minutes, and one that has
   // come back early is used again without a member's request having to find out.
-  let exhaustionRecheckRunning = false;
-  const exhaustionRecheckTimer = setInterval(() => {
-    if (exhaustionRecheckRunning) return;
-    exhaustionRecheckRunning = true;
-    recheckExhaustedAccounts({
+  let closing = false;
+  let exhaustionRecheckPromise = null;
+  let exhaustionRecheckTimer = null;
+  const stopExhaustionRechecks = () => {
+    closing = true;
+    if (exhaustionRecheckTimer) clearInterval(exhaustionRecheckTimer);
+    exhaustionRecheckTimer = null;
+    return exhaustionRecheckPromise ?? Promise.resolve();
+  };
+  const runExhaustionRecheck = () => {
+    if (closing || exhaustionRecheckPromise) return;
+    const pending = recheckExhaustedAccounts({
       store,
-      refreshUsage: (accountId) => usageMonitor.refreshAccount?.(accountId) ?? null,
+      refreshUsage: (accountId) => closing
+        ? null
+        : usageMonitor.refreshAccount?.(accountId) ?? null,
       exhaustion: options.quotaExhaustion ?? quotaExhaustion,
       log,
-    }).catch((error) => log('quota_exhaustion_recheck_failed', { code: error?.code ?? error?.name ?? 'unknown' }))
-      .finally(() => { exhaustionRecheckRunning = false; });
-  }, options.exhaustionRecheckTickMs ?? 60_000);
+      shouldStop: () => closing,
+    });
+    exhaustionRecheckPromise = pending
+      .catch((error) => log('quota_exhaustion_recheck_failed', { code: error?.code ?? error?.name ?? 'unknown' }))
+      .finally(() => { exhaustionRecheckPromise = null; });
+  };
+  exhaustionRecheckTimer = setInterval(runExhaustionRecheck, options.exhaustionRecheckTickMs ?? 60_000);
   exhaustionRecheckTimer.unref();
+  const stopBackgroundRefreshes = () => {
+    const recheckDrain = stopExhaustionRechecks();
+    let usageDrain;
+    try {
+      usageDrain = Promise.resolve(usageMonitor.stop?.());
+    } catch (error) {
+      usageDrain = Promise.reject(error);
+    }
+    return Promise.all([recheckDrain, usageDrain]);
+  };
   const sessions = new Map();
   const metricsPageCache = new Map();
   const metricsPageInFlight = new Map();
@@ -3112,17 +3135,15 @@ export async function createCredentialConsole(options = {}) {
     server = http.createServer(handler);
   }
   const closeServer = server.close.bind(server);
-  const drainUsageMonitor = () => Promise.resolve()
-    .then(() => usageMonitor.stop?.())
-    .catch((error) => {
-      log('usage_monitor_close_failed', { code: error?.code ?? error?.name ?? 'unknown' });
-    });
+  const drainBackgroundRefreshes = () => stopBackgroundRefreshes().catch((error) => {
+    log('background_refresh_close_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+  });
   server.close = (callback) => {
-    // Stop scheduling as soon as shutdown starts, then drain again after all
-    // active requests have completed so request-triggered refreshes are included.
-    drainUsageMonitor();
+    // Stop recheck scheduling synchronously, then drain again after active
+    // requests finish so no recheck can enqueue another account refresh.
+    drainBackgroundRefreshes();
     const closeCallback = typeof callback === 'function'
-      ? (...args) => { drainUsageMonitor().then(() => callback(...args)); }
+      ? (...args) => { drainBackgroundRefreshes().then(() => callback(...args)); }
       : callback;
     return closeServer(closeCallback);
   };

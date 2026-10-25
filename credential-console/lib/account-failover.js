@@ -340,8 +340,10 @@ export async function recheckExhaustedAccounts({
   exhaustion = quotaExhaustion,
   log = () => {},
   now = Date.now(),
+  shouldStop = () => false,
 }) {
   for (const { accountId, claim } of exhaustion.dueForRecheck(now)) {
+    if (shouldStop()) return;
     const account = store.accountById(accountId);
     if (!account) {
       exhaustion.clear(accountId);
