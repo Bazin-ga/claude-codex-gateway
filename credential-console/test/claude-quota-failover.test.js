@@ -8,6 +8,7 @@ import { handleClaudeProxy } from '../lib/proxy.js';
 import { CredentialStore } from '../lib/store.js';
 import {
   QuotaExhaustion,
+  beginFailover,
   chooseFailoverAccount,
   knownExhausted,
   usageExhaustedUntil,
@@ -222,10 +223,38 @@ test('another device on a known-exhausted account fails over before sending anyt
   );
 });
 
-test('a 429 that is not quota exhaustion is passed through and moves nothing', { timeout: 20_000 }, async (t) => {
+test('a transient 429 is retried on a backup without moving the device', { timeout: 20_000 }, async (t) => {
   const { store, accounts, deviceToken, deviceId } = await fleet();
   const tokens = [];
   const { proxyUrl, exhaustion } = await harness(t, { store }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    if (bearer(req) === 'token-home') {
+      refuse(res, { 'content-type': 'application/json', 'retry-after': '5' });
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ served_by: bearer(req) }));
+  });
+
+  const response = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+
+  assert.equal(response.status, 200, 'the client must not see a transient 429 while a backup has room');
+  assert.equal(JSON.parse(response.body).served_by, 'token-backup');
+  assert.deepEqual(tokens, ['token-home', 'token-backup']);
+  assert.equal(exhaustion.exhausted(accounts.home.id), null, 'a burst limit is not quota exhaustion');
+  await settled(store);
+  assert.equal(
+    store.state.devices.find((entry) => entry.id === deviceId).selected_account_id,
+    accounts.home.id,
+    'a burst retry does not move the device',
+  );
+});
+
+test('a transient 429 is passed through when failover has no usable backup', { timeout: 20_000 }, async (t) => {
+  const { store, deviceToken } = await fleet({ backups: [] });
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
     await readBody(req);
     tokens.push(bearer(req));
     refuse(res, { 'content-type': 'application/json', 'retry-after': '5' });
@@ -235,9 +264,6 @@ test('a 429 that is not quota exhaustion is passed through and moves nothing', {
 
   assert.equal(response.status, 429);
   assert.deepEqual(tokens, ['token-home']);
-  assert.equal(exhaustion.exhausted(accounts.home.id), null);
-  await settled(store);
-  assert.equal(store.state.devices.find((entry) => entry.id === deviceId).selected_account_id, accounts.home.id);
 });
 
 test('with failover off the refusal reaches the client unchanged', { timeout: 20_000 }, async (t) => {
@@ -392,8 +418,10 @@ test('a failed-over device stays on the backup until the home account resets', {
     toAccountId: accounts.backup.id,
     returnAfterMs: Date.now() + 60_000,
   });
+  const exhaustion = new QuotaExhaustion();
+  exhaustion.mark(accounts.home.id, { resetsAtMs: Date.now() + 60_000, claim: 'five_hour' });
   const tokens = [];
-  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+  const { proxyUrl } = await harness(t, { store, exhaustion }, async (req, res) => {
     await readBody(req);
     tokens.push(bearer(req));
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -472,6 +500,56 @@ test('only an explicit rejected status counts as exhaustion', () => {
     claim: 'five_hour',
     resetsAtMs: RESET_SECONDS * 1000,
   });
+});
+
+test('an overage refusal is cleared when the base windows recover', async () => {
+  const exhaustion = new QuotaExhaustion();
+  exhaustion.mark('overage-account', { resetsAtMs: Date.now() + 7 * 86_400_000, claim: 'overage' });
+  const store = {
+    accountById: () => ({ id: 'overage-account', provider: 'claude', status: 'healthy' }),
+  };
+  await recheckExhaustedAccounts({
+    store,
+    exhaustion,
+    refreshUsage: async () => ({
+      status: 'available',
+      windows: [
+        { kind: 'five_hour', remaining_percent: 98, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
+        { kind: 'weekly', remaining_percent: 60, resets_at: new Date(Date.now() + 86_400_000).toISOString() },
+      ],
+    }),
+    now: Date.now() + 10 * 60_000,
+  });
+  assert.equal(exhaustion.exhausted('overage-account'), null,
+    'a spend-cap refusal must not pin the account until its far-future overage reset');
+});
+
+test('a device returns home as soon as the home account is no longer exhausted', async () => {
+  const { store, accounts, deviceId } = await fleet({ backups: ['backup'] });
+  await store.failoverDeviceAccount({
+    deviceId,
+    homeAccountId: accounts.home.id,
+    fromAccountId: accounts.home.id,
+    toAccountId: accounts.backup.id,
+    returnAfterMs: Date.now() + 7 * 86_400_000,
+    reason: 'test',
+  });
+  const device = store.state.devices.find((entry) => entry.id === deviceId);
+  const state = beginFailover({
+    store,
+    device,
+    account: store.accountById(accounts.backup.id),
+    exhaustion: new QuotaExhaustion(),
+    usageSnapshotFor: () => ({
+      status: 'available',
+      windows: [
+        { kind: 'five_hour', remaining_percent: 98 },
+        { kind: 'weekly', remaining_percent: 60 },
+      ],
+    }),
+  });
+  assert.equal(state.account.id, accounts.home.id,
+    'an early recovery outranks the reset the refusal announced');
 });
 
 test('a model-specific window does not disqualify a backup', () => {

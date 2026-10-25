@@ -675,7 +675,10 @@ export async function handleClaudeProxy(req, res, {
   const RETRYABLE_UPSTREAM_STATUS = new Set([529, 503]);
   const MAX_UPSTREAM_ATTEMPTS = 3;
   // Each backup is tried at most once anyway; this bounds a long backup list.
-  const MAX_FAILOVERS = 3;
+  // Eight is the largest backup list the console accepts (FAILOVER_MAX_BACKUPS).
+  // A transient 429 also walks this list, so a burst limit on one account can
+  // be answered by any other account with room instead of reaching the client.
+  const MAX_FAILOVERS = 8;
   let failoversUsed = 0;
   const bodyFinishedWaiters = [];
   const RETRY_BASE_DELAY_MS = 250;
@@ -896,6 +899,50 @@ export async function handleClaudeProxy(req, res, {
               // The upstream answered before the upload ended. Keep reading the
               // client into the buffer, but stop feeding a request that has
               // already been refused.
+              bodyAccumulator.unpipe(upstreamReq);
+              bodyAccumulator.resume();
+              upstreamReq.destroy();
+            }
+            const replay = () => {
+              if (clientAborted || metricFinalized) return;
+              sendUpstream(Buffer.concat(bodyChunks));
+            };
+            if (requestBodyFinished) replay();
+            else bodyFinishedWaiters.push(replay);
+            return;
+          }
+        }
+
+        // A bare 429 (no anthropic-ratelimit-unified-status: rejected) is a
+        // burst/concurrency limit, not proof the account's allowance is gone.
+        // Do not mark it exhausted or move the device, but do let another
+        // account with room answer this same request. The client only ever
+        // sees the final answer, so a transient limit on the bound account is
+        // invisible as long as any backup can serve it.
+        if (status === 429
+          && !rejection
+          && failover.enabled
+          && !clientAborted
+          && failoversUsed < MAX_FAILOVERS) {
+          const found = backupWithCredential();
+          if (found) {
+            failoversUsed += 1;
+            superseded = true;
+            const limited = account;
+            log('claude_proxy_burst_failover', {
+              stage: 'response',
+              device_id: device.id,
+              from_account_id: limited.id,
+              to_account_id: found.backup.id,
+            });
+            account = found.backup;
+            headers.authorization = `Bearer ${found.token}`;
+            upstreamRes.once('error', () => {});
+            upstreamRes.resume();
+            if (!requestBodyFinished) {
+              // The upstream answered before the upload ended. Keep reading
+              // the client into the buffer, but stop feeding a request that
+              // has already been refused.
               bodyAccumulator.unpipe(upstreamReq);
               bodyAccumulator.resume();
               upstreamReq.destroy();
