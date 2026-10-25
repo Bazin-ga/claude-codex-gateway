@@ -208,6 +208,7 @@ export class UsageMonitor {
     fetchImpl = fetch,
     refreshIntervalMs = DEFAULT_REFRESH_MS,
     claudeRefreshIntervalMs = null,
+    writeCache = writeAtomic,
     log = () => {},
   }) {
     this.store = store;
@@ -221,11 +222,13 @@ export class UsageMonitor {
       : Number.isFinite(Number(claudeRefreshIntervalMs))
         ? Math.max(MIN_REFRESH_MS, Number(claudeRefreshIntervalMs))
         : DEFAULT_REFRESH_MS;
+    this.writeCache = writeCache;
     this.log = log;
     this.snapshots = new Map();
     this.timer = null;
     this.claudeTimer = null;
     this.accountRefreshes = new Map();
+    this.refreshOperations = new Set();
     this.persistInFlight = Promise.resolve();
   }
 
@@ -252,30 +255,47 @@ export class UsageMonitor {
     return this;
   }
 
-  stop() {
+  async stop() {
     if (this.timer) clearInterval(this.timer);
     if (this.claudeTimer) clearInterval(this.claudeTimer);
     this.timer = null;
     this.claudeTimer = null;
+    await Promise.allSettled([...this.refreshOperations]);
+    await this.persistInFlight;
   }
 
   snapshotForAccount(accountId) {
     return this.snapshots.get(accountId) ?? null;
   }
 
-  async refresh(provider = null) {
+  refresh(provider = null) {
+    return this.#trackRefresh(this.#refresh(provider));
+  }
+
+  async #refresh(provider) {
     const accounts = this.store.publicAccounts().filter((account) => !provider || account.provider === provider);
     await Promise.all(accounts.map((account) => this.#refreshAccount(account)));
     this.#pruneDeletedSnapshots();
     await this.#persist();
   }
 
-  async refreshAccount(accountId) {
+  refreshAccount(accountId) {
+    return this.#trackRefresh(this.#refreshAccountAndPersist(accountId));
+  }
+
+  async #refreshAccountAndPersist(accountId) {
     const account = this.store.publicAccounts().find((entry) => entry.id === accountId);
     if (account) await this.#refreshAccount(account);
     this.#pruneDeletedSnapshots();
     await this.#persist();
     return this.snapshotForAccount(accountId);
+  }
+
+  #trackRefresh(operation) {
+    let tracked;
+    tracked = Promise.resolve(operation).finally(() => this.refreshOperations.delete(tracked));
+    this.refreshOperations.add(tracked);
+    return tracked;
   }
 
   #pruneDeletedSnapshots() {
@@ -370,7 +390,7 @@ export class UsageMonitor {
         version: CACHE_VERSION,
         accounts: Object.fromEntries(this.snapshots),
       };
-      await writeAtomic(this.cachePath, `${JSON.stringify(payload, null, 2)}\n`);
+      await this.writeCache(this.cachePath, `${JSON.stringify(payload, null, 2)}\n`);
     });
     this.persistInFlight = persist.catch(() => {});
     return persist;

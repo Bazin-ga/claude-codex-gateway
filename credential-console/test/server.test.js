@@ -9,6 +9,7 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 import { CredentialStore } from '../lib/store.js';
 import { queryMetricsDataset } from '../lib/metrics-page-query.js';
+import { UsageMonitor } from '../lib/usage.js';
 import { CredentialStore as CodexCredentialStore } from '../../codex-credential/refresh-center/lib/credential-store.js';
 import { CODEX_AGENT_ASSETS, createCredentialConsole } from '../server.js';
 import { syntheticCodexTokens } from './codex-token-fixture.js';
@@ -104,6 +105,90 @@ async function fixture({
     },
   };
 }
+
+test('server close waits for in-flight usage refreshes and queued snapshot persistence', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-close-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const accounts = await Promise.all(['usage-close-a', 'usage-close-b'].map((alias) => store.addAccount({
+    provider: 'claude',
+    alias,
+    credential: { oauth_token: `${alias}-test-token` },
+  })));
+  let started = 0;
+  let notifyStarted;
+  const allFetchesStarted = new Promise((resolve) => { notifyStarted = resolve; });
+  let releaseFetches;
+  const fetchGate = new Promise((resolve) => { releaseFetches = resolve; });
+  let cacheWrites = 0;
+  let notifyPersistStarted;
+  const firstPersistStarted = new Promise((resolve) => { notifyPersistStarted = resolve; });
+  let releasePersist;
+  const persistGate = new Promise((resolve) => { releasePersist = resolve; });
+  const usageMonitor = await new UsageMonitor({
+    store,
+    home,
+    claudeRefreshIntervalMs: 60_000,
+    fetchImpl: async () => {
+      started += 1;
+      if (started === accounts.length) notifyStarted();
+      await fetchGate;
+      return new Response(JSON.stringify({
+        five_hour: { utilization: 20, resets_at: null },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    },
+    writeCache: async (path, content) => {
+      cacheWrites += 1;
+      if (cacheWrites === 1) {
+        notifyPersistStarted();
+        await persistGate;
+      }
+      await writeFile(path, content, { encoding: 'utf8', mode: 0o600 });
+    },
+  }).init();
+  const startedRefreshes = usageMonitor.refreshOperations.size;
+  assert.equal(startedRefreshes, 1);
+  await allFetchesStarted;
+  // A concurrent refresh joins the same in-flight account polls but queues a
+  // second cache persistence behind the initial refresh's write.
+  const overlappingRefresh = usageMonitor.refresh('claude');
+  const { server } = await createCredentialConsole({
+    store,
+    usageMonitor,
+    requestMetrics: null,
+    adminAuth: 'open',
+    cookieSecure: false,
+    publicBaseUrl: 'http://credential-console.test',
+  });
+  await listen(server);
+
+  try {
+    let closeCallbackFinished = false;
+    const closed = new Promise((resolve) => server.close(() => {
+      closeCallbackFinished = true;
+      resolve();
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeCallbackFinished, false);
+    releaseFetches();
+    await firstPersistStarted;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cacheWrites, 1, 'the first cache write should hold the queued second write');
+    assert.equal(closeCallbackFinished, false);
+    releasePersist();
+    await closed;
+    await overlappingRefresh;
+    assert.equal(closeCallbackFinished, true);
+    assert.equal(usageMonitor.refreshOperations.size, 0);
+    assert.equal(cacheWrites, 2, 'server close should drain both queued cache writes');
+    const persisted = JSON.parse(await readFile(join(home, 'usage.json'), 'utf8'));
+    assert.deepEqual(Object.keys(persisted.accounts).sort(), accounts.map(({ id }) => id).sort());
+  } finally {
+    releaseFetches();
+    releasePersist();
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+    await usageMonitor.stop();
+  }
+});
 
 function cookieFrom(response) {
   return response.headers.get('set-cookie').split(';')[0];

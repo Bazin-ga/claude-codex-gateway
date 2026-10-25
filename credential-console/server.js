@@ -3111,6 +3111,21 @@ export async function createCredentialConsole(options = {}) {
   } else {
     server = http.createServer(handler);
   }
+  const closeServer = server.close.bind(server);
+  const drainUsageMonitor = () => Promise.resolve()
+    .then(() => usageMonitor.stop?.())
+    .catch((error) => {
+      log('usage_monitor_close_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+    });
+  server.close = (callback) => {
+    // Stop scheduling as soon as shutdown starts, then drain again after all
+    // active requests have completed so request-triggered refreshes are included.
+    drainUsageMonitor();
+    const closeCallback = typeof callback === 'function'
+      ? (...args) => { drainUsageMonitor().then(() => callback(...args)); }
+      : callback;
+    return closeServer(closeCallback);
+  };
   server.once('close', () => {
     clearInterval(cleanupTimer);
     clearInterval(exhaustionRecheckTimer);
