@@ -51,6 +51,13 @@ test('metrics query worker reads a live WAL database without owning writes', asy
   assert.equal(result.hourly.length, 1);
   assert.equal(result.memberRows[0].groupValue, 'worker-member');
   assert.equal(result.deviceTokenComparison.devices[0].deviceId, 'worker-device');
+  // The API-key spend card is read through the same worker.
+  const spend = await service.apiSpendGroups({
+    accountId: 'worker-account',
+    nowMs: BASE_MS + 60_000,
+    longContextAbove: 272_000,
+  });
+  assert.deepEqual(spend.map((row) => [row.model, row.period, row.requests, row.output_tokens]), [['worker-model', 0, 1, 6]]);
 
   // A later WAL write is visible without recreating the worker connection.
   assert.equal(writer.enqueueRequest({

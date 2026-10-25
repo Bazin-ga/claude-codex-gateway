@@ -3609,6 +3609,35 @@ export class MetricsStore {
     }));
   }
 
+  /**
+   * One account's last 30 days, grouped the way a per-token price needs them:
+   * by model, device, whether the prompt crossed `longContextAbove` (the whole
+   * request is then billed at the long-context rate), and window — 0 for the
+   * last day, 1 for the rest of the last week, 2 for older. Requests without a
+   * model (`GET /models`) are not inference and are left out.
+   */
+  queryApiSpendGroups({ accountId, nowMs = Date.now(), longContextAbove } = {}) {
+    if (typeof accountId !== 'string' || !accountId) throw new TypeError('accountId is required');
+    if (!Number.isSafeInteger(longContextAbove)) throw new TypeError('longContextAbove must be an integer');
+    const day = 86_400_000;
+    return this.#queryRows(
+      `SELECT model, device_id,
+         (COALESCE(input_tokens, 0) + COALESCE(cache_creation_input_tokens, 0)
+           + COALESCE(cache_read_input_tokens, 0)) > ? AS long_context,
+         CASE WHEN started_at_ms >= ? THEN 0 WHEN started_at_ms >= ? THEN 1 ELSE 2 END AS period,
+         COUNT(*) AS requests,
+         SUM(usage_state IS NULL OR usage_state NOT IN ('complete', 'partial')) AS without_usage,
+         SUM(COALESCE(input_tokens, 0)) AS input_tokens,
+         SUM(COALESCE(cache_creation_input_tokens, 0)) AS cache_write_tokens,
+         SUM(COALESCE(cache_read_input_tokens, 0)) AS cache_read_tokens,
+         SUM(COALESCE(output_tokens, 0)) AS output_tokens
+       FROM request_metrics
+       WHERE account_id = ? AND started_at_ms >= ? AND model IS NOT NULL
+       GROUP BY 1, 2, 3, 4`,
+      [longContextAbove, nowMs - day, nowMs - 7 * day, accountId, nowMs - 30 * day],
+    ).map((row) => ({ ...row }));
+  }
+
   queryConversationFacets(filters = {}) {
     try {
       return this.#queryConversationFacets(filters, { sessionsOnly: false });
