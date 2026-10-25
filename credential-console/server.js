@@ -133,6 +133,9 @@ const CODEX_MANAGED_REFRESH_INTERVAL_MS = Number(
 const USAGE_REFRESH_INTERVAL_MS = Number(
   process.env.CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS ?? 60 * 60_000,
 );
+const CLAUDE_USAGE_REFRESH_INTERVAL_MS = process.env.CREDENTIAL_CONSOLE_CLAUDE_USAGE_REFRESH_INTERVAL_MS === undefined
+  ? null
+  : Number(process.env.CREDENTIAL_CONSOLE_CLAUDE_USAGE_REFRESH_INTERVAL_MS);
 const SESSION_TTL_MS = 12 * 60 * 60_000;
 // Open mode mints a session for any visitor, so the map needs a ceiling that does
 // not depend on someone authenticating first. The main isolate is capped at 96
@@ -403,6 +406,7 @@ export async function createCredentialConsole(options = {}) {
     store,
     home: options.home ?? store.home ?? HOME,
     refreshIntervalMs: options.usageRefreshIntervalMs ?? USAGE_REFRESH_INTERVAL_MS,
+    claudeRefreshIntervalMs: options.claudeUsageRefreshIntervalMs ?? CLAUDE_USAGE_REFRESH_INTERVAL_MS,
     fetchImpl: options.usageFetchImpl,
     log,
   }).init();
@@ -1395,7 +1399,7 @@ export async function createCredentialConsole(options = {}) {
     const path = url.pathname;
 
     if (path.startsWith(MACHINE_CONTROL_PREFIX)) {
-      await handleMachineControl(req, res, { store, requestMetrics, log });
+      await handleMachineControl(req, res, { store, requestMetrics, usageMonitor, log });
       return;
     }
 
@@ -3107,6 +3111,21 @@ export async function createCredentialConsole(options = {}) {
   } else {
     server = http.createServer(handler);
   }
+  const closeServer = server.close.bind(server);
+  const drainUsageMonitor = () => Promise.resolve()
+    .then(() => usageMonitor.stop?.())
+    .catch((error) => {
+      log('usage_monitor_close_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+    });
+  server.close = (callback) => {
+    // Stop scheduling as soon as shutdown starts, then drain again after all
+    // active requests have completed so request-triggered refreshes are included.
+    drainUsageMonitor();
+    const closeCallback = typeof callback === 'function'
+      ? (...args) => { drainUsageMonitor().then(() => callback(...args)); }
+      : callback;
+    return closeServer(closeCallback);
+  };
   server.once('close', () => {
     clearInterval(cleanupTimer);
     clearInterval(exhaustionRecheckTimer);

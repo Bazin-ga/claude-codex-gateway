@@ -9,6 +9,7 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 import { CredentialStore } from '../lib/store.js';
 import { queryMetricsDataset } from '../lib/metrics-page-query.js';
+import { UsageMonitor } from '../lib/usage.js';
 import { CredentialStore as CodexCredentialStore } from '../../codex-credential/refresh-center/lib/credential-store.js';
 import { CODEX_AGENT_ASSETS, createCredentialConsole } from '../server.js';
 import { syntheticCodexTokens } from './codex-token-fixture.js';
@@ -104,6 +105,90 @@ async function fixture({
     },
   };
 }
+
+test('server close waits for in-flight usage refreshes and queued snapshot persistence', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-close-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const accounts = await Promise.all(['usage-close-a', 'usage-close-b'].map((alias) => store.addAccount({
+    provider: 'claude',
+    alias,
+    credential: { oauth_token: `${alias}-test-token` },
+  })));
+  let started = 0;
+  let notifyStarted;
+  const allFetchesStarted = new Promise((resolve) => { notifyStarted = resolve; });
+  let releaseFetches;
+  const fetchGate = new Promise((resolve) => { releaseFetches = resolve; });
+  let cacheWrites = 0;
+  let notifyPersistStarted;
+  const firstPersistStarted = new Promise((resolve) => { notifyPersistStarted = resolve; });
+  let releasePersist;
+  const persistGate = new Promise((resolve) => { releasePersist = resolve; });
+  const usageMonitor = await new UsageMonitor({
+    store,
+    home,
+    claudeRefreshIntervalMs: 60_000,
+    fetchImpl: async () => {
+      started += 1;
+      if (started === accounts.length) notifyStarted();
+      await fetchGate;
+      return new Response(JSON.stringify({
+        five_hour: { utilization: 20, resets_at: null },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    },
+    writeCache: async (path, content) => {
+      cacheWrites += 1;
+      if (cacheWrites === 1) {
+        notifyPersistStarted();
+        await persistGate;
+      }
+      await writeFile(path, content, { encoding: 'utf8', mode: 0o600 });
+    },
+  }).init();
+  const startedRefreshes = usageMonitor.refreshOperations.size;
+  assert.equal(startedRefreshes, 1);
+  await allFetchesStarted;
+  // A concurrent refresh joins the same in-flight account polls but queues a
+  // second cache persistence behind the initial refresh's write.
+  const overlappingRefresh = usageMonitor.refresh('claude');
+  const { server } = await createCredentialConsole({
+    store,
+    usageMonitor,
+    requestMetrics: null,
+    adminAuth: 'open',
+    cookieSecure: false,
+    publicBaseUrl: 'http://credential-console.test',
+  });
+  await listen(server);
+
+  try {
+    let closeCallbackFinished = false;
+    const closed = new Promise((resolve) => server.close(() => {
+      closeCallbackFinished = true;
+      resolve();
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeCallbackFinished, false);
+    releaseFetches();
+    await firstPersistStarted;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cacheWrites, 1, 'the first cache write should hold the queued second write');
+    assert.equal(closeCallbackFinished, false);
+    releasePersist();
+    await closed;
+    await overlappingRefresh;
+    assert.equal(closeCallbackFinished, true);
+    assert.equal(usageMonitor.refreshOperations.size, 0);
+    assert.equal(cacheWrites, 2, 'server close should drain both queued cache writes');
+    const persisted = JSON.parse(await readFile(join(home, 'usage.json'), 'utf8'));
+    assert.deepEqual(Object.keys(persisted.accounts).sort(), accounts.map(({ id }) => id).sort());
+  } finally {
+    releaseFetches();
+    releasePersist();
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+    await usageMonitor.stop();
+  }
+});
 
 function cookieFrom(response) {
   return response.headers.get('set-cookie').split(';')[0];
@@ -1929,6 +2014,94 @@ test('rejects CSRF bypass and unsupported gateway paths', async () => {
       headers: { Authorization: `Bearer ${token}` },
     });
     assert.equal(unsupported.status, 404);
+    assert.equal(app.upstreamRequests.length, 0);
+  } finally {
+    await app.close();
+  }
+});
+
+test('Claude quota endpoint authenticates one device and returns only its current cached snapshot', async () => {
+  const unsafeError = 'Bearer provider-secret /srv/private/account email@example.com';
+  const app = await fixture({
+    adminAuth: 'open',
+    usageSnapshot: (account) => account?.alias === 'quota-account'
+      ? {
+        provider: 'claude',
+        status: 'stale',
+        fetched_at: '2026-08-05T16:00:00Z',
+        attempted_at: '2026-08-05T16:01:00Z',
+        last_error: unsafeError,
+        oauth_token: 'must-not-leak',
+        windows: [
+          { kind: 'five_hour', remaining_percent: 61.5, resets_at: '2026-08-05T17:00:00Z', raw: unsafeError },
+          { kind: 'unknown-private-kind', remaining_percent: 3, resets_at: null },
+        ],
+      }
+      : null,
+  });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'quota-account',
+      credential: { oauth_token: 'server-only-provider-credential' },
+    });
+    const other = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'other-account',
+      credential: { oauth_token: 'other-server-only-provider-credential' },
+    });
+    const issued = await app.store.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'member',
+      deviceName: 'quota-device',
+    });
+    const headers = { Authorization: `Bearer ${issued.token}` };
+    const path = '/claude/control/v1/quota';
+
+    const unauthenticated = await fetch(`${app.baseUrl}${path}`);
+    assert.equal(unauthenticated.status, 401);
+    const method = await fetch(`${app.baseUrl}${path}`, { method: 'POST', headers });
+    assert.equal(method.status, 405);
+    const query = await fetch(`${app.baseUrl}${path}?account_id=${encodeURIComponent(other.id)}`, { headers });
+    assert.equal(query.status, 400);
+    assert.doesNotMatch(await query.text(), new RegExp(other.id));
+
+    const response = await fetch(`${app.baseUrl}${path}`, { headers });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.deepEqual(payload, {
+      version: 1,
+      account_id: account.id,
+      provider: 'claude',
+      usage: {
+        status: 'stale',
+        fetched_at: '2026-08-05T16:00:00.000Z',
+        windows: [{
+          kind: 'five_hour',
+          remaining_percent: 61.5,
+          resets_at: '2026-08-05T17:00:00.000Z',
+        }],
+      },
+    });
+    assert.doesNotMatch(JSON.stringify(payload), /secret|private|email@example|raw|last_error|token/i);
+    assert.equal(app.upstreamRequests.length, 0);
+
+    const switched = await app.store.failoverDeviceAccount({
+      deviceId: issued.device.id,
+      homeAccountId: account.id,
+      fromAccountId: account.id,
+      toAccountId: other.id,
+      reason: 'quota',
+    });
+    assert.equal(switched.outcome, 'success');
+    assert.equal(app.store.resolveDeviceAccount(issued.device.id).effective_account_id, other.id);
+    const afterFailover = await fetch(`${app.baseUrl}${path}`, { headers });
+    assert.deepEqual(await afterFailover.json(), {
+      version: 1,
+      account_id: other.id,
+      provider: 'claude',
+      usage: { status: 'unavailable', fetched_at: null, windows: [] },
+    });
     assert.equal(app.upstreamRequests.length, 0);
   } finally {
     await app.close();
