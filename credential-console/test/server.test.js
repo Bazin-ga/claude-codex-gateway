@@ -1935,6 +1935,94 @@ test('rejects CSRF bypass and unsupported gateway paths', async () => {
   }
 });
 
+test('Claude quota endpoint authenticates one device and returns only its current cached snapshot', async () => {
+  const unsafeError = 'Bearer provider-secret /srv/private/account email@example.com';
+  const app = await fixture({
+    adminAuth: 'open',
+    usageSnapshot: (account) => account?.alias === 'quota-account'
+      ? {
+        provider: 'claude',
+        status: 'stale',
+        fetched_at: '2026-08-05T16:00:00Z',
+        attempted_at: '2026-08-05T16:01:00Z',
+        last_error: unsafeError,
+        oauth_token: 'must-not-leak',
+        windows: [
+          { kind: 'five_hour', remaining_percent: 61.5, resets_at: '2026-08-05T17:00:00Z', raw: unsafeError },
+          { kind: 'unknown-private-kind', remaining_percent: 3, resets_at: null },
+        ],
+      }
+      : null,
+  });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'quota-account',
+      credential: { oauth_token: 'server-only-provider-credential' },
+    });
+    const other = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'other-account',
+      credential: { oauth_token: 'other-server-only-provider-credential' },
+    });
+    const issued = await app.store.issueDeviceCredential({
+      accountId: account.id,
+      memberLabel: 'member',
+      deviceName: 'quota-device',
+    });
+    const headers = { Authorization: `Bearer ${issued.token}` };
+    const path = '/claude/control/v1/quota';
+
+    const unauthenticated = await fetch(`${app.baseUrl}${path}`);
+    assert.equal(unauthenticated.status, 401);
+    const method = await fetch(`${app.baseUrl}${path}`, { method: 'POST', headers });
+    assert.equal(method.status, 405);
+    const query = await fetch(`${app.baseUrl}${path}?account_id=${encodeURIComponent(other.id)}`, { headers });
+    assert.equal(query.status, 400);
+    assert.doesNotMatch(await query.text(), new RegExp(other.id));
+
+    const response = await fetch(`${app.baseUrl}${path}`, { headers });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.deepEqual(payload, {
+      version: 1,
+      account_id: account.id,
+      provider: 'claude',
+      usage: {
+        status: 'stale',
+        fetched_at: '2026-08-05T16:00:00.000Z',
+        windows: [{
+          kind: 'five_hour',
+          remaining_percent: 61.5,
+          resets_at: '2026-08-05T17:00:00.000Z',
+        }],
+      },
+    });
+    assert.doesNotMatch(JSON.stringify(payload), /secret|private|email@example|raw|last_error|token/i);
+    assert.equal(app.upstreamRequests.length, 0);
+
+    const switched = await app.store.failoverDeviceAccount({
+      deviceId: issued.device.id,
+      homeAccountId: account.id,
+      fromAccountId: account.id,
+      toAccountId: other.id,
+      reason: 'quota',
+    });
+    assert.equal(switched.outcome, 'success');
+    assert.equal(app.store.resolveDeviceAccount(issued.device.id).effective_account_id, other.id);
+    const afterFailover = await fetch(`${app.baseUrl}${path}`, { headers });
+    assert.deepEqual(await afterFailover.json(), {
+      version: 1,
+      account_id: other.id,
+      provider: 'claude',
+      usage: { status: 'unavailable', fetched_at: null, windows: [] },
+    });
+    assert.equal(app.upstreamRequests.length, 0);
+  } finally {
+    await app.close();
+  }
+});
+
 test('request metrics page attributes the device label and excludes count_tokens from consumption', async () => {
   let metricsCacheNow = 1_700_000_000_000;
   const app = await fixture({

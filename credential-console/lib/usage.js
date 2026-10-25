@@ -207,6 +207,7 @@ export class UsageMonitor {
     home,
     fetchImpl = fetch,
     refreshIntervalMs = DEFAULT_REFRESH_MS,
+    claudeRefreshIntervalMs = null,
     log = () => {},
   }) {
     this.store = store;
@@ -215,10 +216,17 @@ export class UsageMonitor {
     this.refreshIntervalMs = Number.isFinite(Number(refreshIntervalMs))
       ? Math.max(MIN_REFRESH_MS, Number(refreshIntervalMs))
       : DEFAULT_REFRESH_MS;
+    this.claudeRefreshIntervalMs = claudeRefreshIntervalMs === null || claudeRefreshIntervalMs === undefined
+      ? null
+      : Number.isFinite(Number(claudeRefreshIntervalMs))
+        ? Math.max(MIN_REFRESH_MS, Number(claudeRefreshIntervalMs))
+        : DEFAULT_REFRESH_MS;
     this.log = log;
     this.snapshots = new Map();
     this.timer = null;
-    this.inFlight = null;
+    this.claudeTimer = null;
+    this.accountRefreshes = new Map();
+    this.persistInFlight = Promise.resolve();
   }
 
   async init() {
@@ -231,36 +239,40 @@ export class UsageMonitor {
       if (error.code !== 'ENOENT') this.log('usage_cache_read_failed', { code: error.code ?? 'invalid' });
     }
     this.timer = setInterval(() => {
-      this.refresh().catch(() => {});
+      this.refresh(this.claudeRefreshIntervalMs === null ? null : 'codex').catch(() => {});
     }, this.refreshIntervalMs);
     this.timer.unref();
+    if (this.claudeRefreshIntervalMs !== null) {
+      this.claudeTimer = setInterval(() => {
+        this.refresh('claude').catch(() => {});
+      }, this.claudeRefreshIntervalMs);
+      this.claudeTimer.unref();
+    }
     this.refresh().catch(() => {});
     return this;
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
+    if (this.claudeTimer) clearInterval(this.claudeTimer);
     this.timer = null;
+    this.claudeTimer = null;
   }
 
   snapshotForAccount(accountId) {
     return this.snapshots.get(accountId) ?? null;
   }
 
-  async refresh() {
-    if (this.inFlight) return this.inFlight;
-    this.inFlight = (async () => {
-      const accounts = this.store.publicAccounts();
-      await Promise.all(accounts.map((account) => this.#refreshAccount(account)));
-      const currentIds = new Set(accounts.map((account) => account.id));
+  async refresh(provider = null) {
+    const accounts = this.store.publicAccounts().filter((account) => !provider || account.provider === provider);
+    await Promise.all(accounts.map((account) => this.#refreshAccount(account)));
+    if (provider === null) {
+      const currentIds = new Set(this.store.publicAccounts().map((account) => account.id));
       for (const accountId of this.snapshots.keys()) {
         if (!currentIds.has(accountId)) this.snapshots.delete(accountId);
       }
-      await this.#persist();
-    })().finally(() => {
-      this.inFlight = null;
-    });
-    return this.inFlight;
+    }
+    await this.#persist();
   }
 
   async refreshAccount(accountId) {
@@ -272,6 +284,16 @@ export class UsageMonitor {
   }
 
   async #refreshAccount(account) {
+    const existing = this.accountRefreshes.get(account.id);
+    if (existing) return existing;
+    const refreshing = this.#refreshAccountOnce(account).finally(() => {
+      if (this.accountRefreshes.get(account.id) === refreshing) this.accountRefreshes.delete(account.id);
+    });
+    this.accountRefreshes.set(account.id, refreshing);
+    return refreshing;
+  }
+
+  async #refreshAccountOnce(account) {
     // Bedrock reports no quota to poll: it is billed per token rather than
     // against a rolling window. Leaving it out of the loop entirely, rather
     // than letting it fall through to `unsupported_provider`, keeps it from
@@ -335,11 +357,15 @@ export class UsageMonitor {
   }
 
   async #persist() {
-    const payload = {
-      version: CACHE_VERSION,
-      accounts: Object.fromEntries(this.snapshots),
-    };
-    await writeAtomic(this.cachePath, `${JSON.stringify(payload, null, 2)}\n`);
+    const persist = this.persistInFlight.then(async () => {
+      const payload = {
+        version: CACHE_VERSION,
+        accounts: Object.fromEntries(this.snapshots),
+      };
+      await writeAtomic(this.cachePath, `${JSON.stringify(payload, null, 2)}\n`);
+    });
+    this.persistInFlight = persist.catch(() => {});
+    return persist;
   }
 }
 

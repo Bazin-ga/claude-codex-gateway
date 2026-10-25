@@ -572,6 +572,7 @@ The machine control API lives under the same token-authenticated `/claude` runti
 GET  /claude/control/v1/status
 POST /claude/control/v1/account
      {"account_id":"<allowed-account-id>"}
+GET  /claude/control/v1/quota
 POST /claude/control/v1/conversation-hooks
      {"hook_event_name":"UserPromptSubmit|Stop|StopFailure|SessionEnd", ...}
 ```
@@ -580,8 +581,30 @@ It accepts the device's existing `Authorization: Bearer` or `X-Api-Key` token, c
 every call, derives the target device exclusively from that token, and never accepts a device ID in
 the URL or body. The status response is a safe device/account summary without tokens, digests,
 credentials or audit history. A machine may switch only among accounts already granted from the
-console. There is deliberately no machine-control enroll endpoint: a new machine still receives
-its first device token through the existing console self-service page.
+console. `GET /claude/control/v1/quota` returns a versioned, secret-free projection of the cached
+quota for the device's currently effective Claude account; it rejects query parameters and never
+polls the provider during the request. Its response is an allow-listed projection:
+
+```json
+{
+  "version": 1,
+  "account_id": "<current-account-id>",
+  "provider": "claude",
+  "usage": {
+    "status": "available",
+    "fetched_at": "<ISO-8601 timestamp or null>",
+    "windows": [
+      { "kind": "five_hour", "remaining_percent": 80, "resets_at": "<ISO-8601 timestamp or null>" }
+    ]
+  }
+}
+```
+
+`status` is `available`, `stale`, or `unavailable`; supported window kinds are `five_hour`,
+`weekly`, and `fable_weekly`. If no snapshot is available, it returns `unavailable` with an empty
+window list (unknown is not zero). A stale snapshot retains its last fetch timestamp and window
+values. There is deliberately no machine-control enroll endpoint: a new machine still receives its
+first device token through the existing console self-service page.
 
 The hook endpoint uses the same device authentication and accepts only a fixed projection of official
 Claude Code events. Transcript paths, cwd, tool payloads, error details, raw session/prompt IDs, and
@@ -677,7 +700,8 @@ retain an emergency service-stop and provider-token revocation procedure.
 | `CREDENTIAL_CONSOLE_CODEX_SEED_HOME` | — | `codex-credential` home a completed Codex authorization writes into. Unset means show the `auth.json` once instead; setting it makes the console a **writer** of that home |
 | `CREDENTIAL_CONSOLE_CODEX_MANAGED_ROOT` | — | Root for isolated, automatically refreshed homes of newly authorized Codex gateway accounts. Existing imports outside the root remain read-only |
 | `CREDENTIAL_CONSOLE_CODEX_MANAGED_REFRESH_INTERVAL_SECONDS` | `21600` | Interval for checking every console-managed Codex home; the refresh centre itself skips credentials that are not near expiry |
-| `CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS` | `3600000` | Provider quota refresh interval (minimum 60 seconds) |
+| `CREDENTIAL_CONSOLE_USAGE_REFRESH_INTERVAL_MS` | `3600000` | Existing quota refresh interval for all providers unless a Claude interval is configured; then it controls Codex only (minimum 60 seconds) |
+| `CREDENTIAL_CONSOLE_CLAUDE_USAGE_REFRESH_INTERVAL_MS` | unset | Independent Claude quota refresh interval (minimum 60 seconds); unset preserves the existing shared refresh behavior |
 | `CREDENTIAL_CONSOLE_DEVICE_CONCURRENCY_LIMIT` | — (no cap) | Optional ceiling on one device's in-flight gateway requests, counted across its Claude, Codex, and Bedrock routes together. Unset or `0` means unlimited; a device that exceeds a configured cap gets `429` with `Retry-After: 1` |
 | `CREDENTIAL_CONSOLE_DEVICE_REQUEST_LIMIT_PER_MINUTE` | — (no cap) | Optional ceiling on how many gateway requests one device may start per minute, counted across its Claude, Codex, and Bedrock routes together. Unset or `0` means unlimited; a device that exceeds a configured budget gets `429` with `Retry-After: 60`. Failed-authentication limiting by source IP (30 per minute) is always on |
 
@@ -686,7 +710,10 @@ surfaces; it does not submit a model turn. Normalized snapshots are stored in mo
 `usage.json`, never with an OAuth or device token. A provider may omit a window (a Codex response
 can contain a weekly window without a five-hour window); the UI reports that as not provided
 rather than estimating it. Failed refreshes retain and mark the last successful snapshot as
-stale.
+stale. Set `CREDENTIAL_CONSOLE_CLAUDE_USAGE_REFRESH_INTERVAL_MS=60000` for one-minute Claude
+sampling; the dashboard and device quota API can lag the provider by up to one polling interval,
+plus the time taken by that provider request. The quota API itself only reads the in-memory
+snapshot and performs no synchronous provider request.
 
 The recommended deployment uses Tailscale Serve on port 443 for the tailnet-only control plane
 and Tailscale Funnel on a different port for only the `/claude` gateway mount. The shipped

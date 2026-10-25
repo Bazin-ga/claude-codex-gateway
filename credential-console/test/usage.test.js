@@ -156,6 +156,83 @@ test('hourly monitor caches only normalized usage metadata', async () => {
   }
 });
 
+test('Claude has an independent poll timer while unset preserves the legacy shared schedule', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-timers-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const claude = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-default-interval',
+    credential: { oauth_token: 'default-only-test-token' },
+  });
+  const codex = await store.addAccount({ provider: 'codex', alias: 'codex-default-interval' });
+  const monitor = new UsageMonitor({
+    store,
+    home,
+    refreshIntervalMs: 60_000,
+    fetchImpl: async () => new Response(JSON.stringify({
+      five_hour: { utilization: 10, resets_at: null },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  });
+  assert.equal(monitor.claudeRefreshIntervalMs, null);
+  assert.equal(monitor.timer, null);
+  assert.equal(monitor.claudeTimer, null);
+  await monitor.refresh();
+  assert.equal(monitor.snapshotForAccount(claude.id).status, 'available');
+  assert.equal(monitor.snapshotForAccount(codex.id).status, 'authorization_required');
+
+  const independent = new UsageMonitor({
+    store,
+    home,
+    refreshIntervalMs: 60_000,
+    claudeRefreshIntervalMs: 60_000,
+    fetchImpl: async () => new Response(JSON.stringify({
+      five_hour: { utilization: 10, resets_at: null },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  });
+  await independent.init();
+  assert.ok(independent.timer);
+  assert.ok(independent.claudeTimer);
+  independent.stop();
+  assert.equal(independent.timer, null);
+  assert.equal(independent.claudeTimer, null);
+});
+
+test('concurrent provider refreshes share one per-account fetch and keep provider schedules separate', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-overlap-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const claude = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-overlap',
+    credential: { oauth_token: 'monitor-only-secret' },
+  });
+  await store.addAccount({ provider: 'codex', alias: 'codex-overlap' });
+  let fetchCount = 0;
+  let releaseFetch;
+  const fetchGate = new Promise((resolve) => { releaseFetch = resolve; });
+  const monitor = new UsageMonitor({
+    store,
+    home,
+    refreshIntervalMs: 60_000,
+    claudeRefreshIntervalMs: 60_000,
+    fetchImpl: async () => {
+      fetchCount += 1;
+      await fetchGate;
+      return new Response(JSON.stringify({
+        five_hour: { utilization: 20, resets_at: null },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    },
+  });
+  const claudeRefresh = monitor.refresh('claude');
+  const duplicateRefresh = monitor.refreshAccount(claude.id);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fetchCount, 1);
+  releaseFetch();
+  await Promise.all([claudeRefresh, duplicateRefresh]);
+  assert.equal(fetchCount, 1);
+  assert.equal(monitor.snapshotForAccount(claude.id).status, 'available');
+  monitor.stop();
+});
+
 test('a Codex account awaiting authorization is not reported as a usage failure', async () => {
   const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-codex-'));
   const store = await new CredentialStore(home, { allowKeyInit: true }).init();

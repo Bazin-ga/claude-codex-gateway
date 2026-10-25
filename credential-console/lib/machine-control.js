@@ -12,6 +12,7 @@ import {
 
 export const MACHINE_STATUS_PATH = '/claude/control/v1/status';
 export const MACHINE_ACCOUNT_PATH = '/claude/control/v1/account';
+export const CLAUDE_QUOTA_PATH = '/claude/control/v1/quota';
 export const CONVERSATION_HOOK_PATH = '/claude/control/v1/conversation-hooks';
 export const MACHINE_CONTROL_PREFIX = '/claude/control/v1/';
 export const MACHINE_CONTROL_BODY_LIMIT = 16 * 1024;
@@ -190,6 +191,7 @@ function errorResponse(res, error, req = null) {
     AUTHENTICATION_REQUIRED: [401, 'authentication_error', 'unauthorized'],
     DEVICE_AUTHENTICATION_FAILED: [401, 'authentication_error', 'unauthorized'],
     AUTHENTICATION_RATE_LIMITED: [429, 'rate_limit_error', 'too many authentication failures'],
+    QUERY_NOT_ALLOWED: [400, 'invalid_request_error', 'query parameters are not allowed'],
     DEVICE_RATE_LIMITED: [429, 'rate_limit_error', 'device control request limit exceeded'],
     BODY_INVALID: [400, 'invalid_request_error', 'invalid machine control request body'],
     BODY_TOO_LARGE: [400, 'invalid_request_error', 'machine control request body too large'],
@@ -298,6 +300,36 @@ function methodError() {
   return error;
 }
 
+const QUOTA_WINDOW_KINDS = new Set(['five_hour', 'weekly', 'fable_weekly']);
+
+function quotaSnapshot(accountId, snapshot) {
+  const status = snapshot?.status === 'available'
+    ? 'available'
+    : snapshot?.status === 'stale' ? 'stale' : 'unavailable';
+  const windows = status === 'unavailable' || !Array.isArray(snapshot?.windows)
+    ? []
+    : snapshot.windows.flatMap((window) => {
+      if (!QUOTA_WINDOW_KINDS.has(window?.kind)
+        || !Number.isFinite(window?.remaining_percent)) return [];
+      return [{
+        kind: window.kind,
+        remaining_percent: Math.min(100, Math.max(0, window.remaining_percent)),
+        resets_at: typeof window.resets_at === 'string' && Number.isFinite(Date.parse(window.resets_at))
+          ? new Date(window.resets_at).toISOString()
+          : null,
+      }];
+    });
+  const fetchedAt = typeof snapshot?.fetched_at === 'string' && Number.isFinite(Date.parse(snapshot.fetched_at))
+    ? new Date(snapshot.fetched_at).toISOString()
+    : null;
+  return {
+    version: 1,
+    account_id: accountId,
+    provider: 'claude',
+    usage: { status, fetched_at: fetchedAt, windows },
+  };
+}
+
 /**
  * Handle exactly the machine-control endpoints. Returns false for an unrelated
  * route so server.js can continue its normal routing; any path below the
@@ -306,16 +338,19 @@ function methodError() {
 export async function handleMachineControl(req, res, {
   store,
   requestMetrics = null,
+  usageMonitor = null,
   log = () => {},
 } = {}) {
   const url = new URL(req.url, 'https://credential-console.invalid');
   const path = url.pathname;
   const recognized = path === MACHINE_STATUS_PATH
     || path === MACHINE_ACCOUNT_PATH
+    || path === CLAUDE_QUOTA_PATH
     || path === CONVERSATION_HOOK_PATH;
   if (!recognized && !path.startsWith(MACHINE_CONTROL_PREFIX)) return false;
   if (path !== MACHINE_STATUS_PATH
     && path !== MACHINE_ACCOUNT_PATH
+    && path !== CLAUDE_QUOTA_PATH
     && path !== CONVERSATION_HOOK_PATH) {
     errorResponse(res, new MachineControlError('NOT_FOUND'));
     return true;
@@ -340,6 +375,20 @@ export async function handleMachineControl(req, res, {
       } catch {}
       throw new MachineControlError('DEVICE_RATE_LIMITED');
     }
+    if (path === CLAUDE_QUOTA_PATH) {
+      if (req.method !== 'GET') throw methodError();
+      if (url.search) throw new MachineControlError('QUERY_NOT_ALLOWED');
+      if (typeof store.resolveDeviceAccount !== 'function') {
+        throw new MachineControlError('DEVICE_CONFIGURATION_INVALID');
+      }
+      const resolved = store.resolveDeviceAccount(device);
+      const accountId = resolved?.effective_account_id;
+      const account = store.publicAccounts().find((entry) => entry.id === accountId);
+      if (!account || account.provider !== 'claude') throw new MachineControlError('NOT_FOUND');
+      sendJson(res, 200, quotaSnapshot(account.id, usageMonitor?.snapshotForAccount?.(account.id)));
+      return true;
+    }
+
     if (path === MACHINE_STATUS_PATH) {
       if (req.method !== 'GET') throw methodError();
       if (typeof store.deviceAccountSummary !== 'function') {
