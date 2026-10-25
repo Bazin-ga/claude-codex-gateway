@@ -117,6 +117,25 @@ test('a bad edit is refused with a message and changes nothing', async (t) => {
   assert.equal(app.policy('home') ?? null, null);
 });
 
+test('an off switch with no backups explains itself instead of ignoring the click', async (t) => {
+  const app = await fixture(t);
+  const switchOf = (html) => {
+    const row = rowOf(html, app.accounts.home.id);
+    return row.slice(row.indexOf('class="switch'), row.indexOf('class="failover-name"'));
+  };
+
+  // A disabled button swallows the click, which reads as a broken switch.
+  let head = switchOf((await app.page('/admin')).html);
+  assert.doesNotMatch(head, /\sdisabled[\s>]/);
+  assert.match(head, /aria-disabled="true"/);
+  assert.match(head, /data-failover-needs-backup/);
+  assert.match(head, /data-failover-hint hidden>.*data-i18n="failover-chain-empty"/);
+
+  await app.post(`/admin/failover/${app.accounts.home.id}`, { op: 'add', add: 'claude-backup' });
+  head = switchOf((await app.page('/admin')).html);
+  assert.doesNotMatch(head, /aria-disabled|data-failover-needs-backup|data-failover-hint/);
+});
+
 test('the pages show the chain that is stored', async (t) => {
   const app = await fixture(t);
   await app.store.setAccountFailover(app.accounts.home.id, {

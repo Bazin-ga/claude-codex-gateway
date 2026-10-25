@@ -68,7 +68,7 @@ const translations = {
   'failover-on': '已开启',
   'failover-off': '已关闭',
   'failover-chain-label': '备用顺序',
-  'failover-chain-empty': '还没有备用账号，添加一个之后才能开启。',
+  'failover-chain-empty': '请先添加至少一个备用账号，才能开启自动切换。',
   'failover-add': '添加',
   'failover-move-up': '前移',
   'failover-move-down': '后移',
@@ -930,6 +930,31 @@ function endChainDrag(event) {
 }
 document.addEventListener('pointerup', endChainDrag);
 document.addEventListener('pointercancel', endChainDrag);
+
+// An off switch with no backups behind it explains itself instead of submitting:
+// a bubble under it, and the cursor in the box that fixes it.
+let failoverHintTimer = null;
+function hideFailoverHints() {
+  clearTimeout(failoverHintTimer);
+  document.querySelectorAll('[data-failover-hint]').forEach((hint) => { hint.hidden = true; });
+}
+document.addEventListener('click', (event) => {
+  const toggle = event.target.closest?.('[data-failover-needs-backup]');
+  if (!toggle) {
+    if (!event.target.closest?.('[data-failover-hint]')) hideFailoverHints();
+    return;
+  }
+  event.preventDefault();
+  hideFailoverHints();
+  const row = toggle.closest('[data-failover-row]');
+  const hint = row?.querySelector('[data-failover-hint]');
+  if (hint) hint.hidden = false;
+  row?.querySelector('input[name="add"]')?.focus();
+  failoverHintTimer = setTimeout(hideFailoverHints, 5000);
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') hideFailoverHints();
+});
 
 // Filters one provider's failover rows by account name or email.
 document.addEventListener('input', (event) => {

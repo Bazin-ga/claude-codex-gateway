@@ -263,7 +263,9 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .pill.moved { background: #e5edf4; color: var(--blue); }
 .switch { display: inline-flex; align-items: center; gap: 8px; margin: 0; padding: 4px 2px; background: none; color: var(--muted); font-size: 12px; font-weight: 800; border-radius: 999px; min-width: 88px; }
 .switch:hover { background: none; color: var(--ink); }
-.switch:disabled { opacity: .5; }
+.switch:disabled, .switch[aria-disabled="true"] { opacity: .5; }
+.failover-hint { position: absolute; z-index: 5; top: calc(100% - 8px); left: 12px; max-width: min(340px, calc(100% - 24px)); margin: 0; padding: 8px 12px; border-radius: var(--radius-md); background: var(--ink); color: white; font-size: 12px; font-weight: 700; line-height: 1.4; box-shadow: 0 6px 18px rgba(22,33,29,.22); }
+.failover-hint::before { content: ''; position: absolute; top: -5px; left: 22px; width: 10px; height: 10px; background: var(--ink); transform: rotate(45deg); }
 .switch-track { position: relative; flex: none; width: 38px; height: 22px; border-radius: 999px; background: #c9d1c9; transition: background .15s; }
 .switch-thumb { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: white; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: left .15s; }
 .switch.is-on { color: var(--green); }
@@ -5446,6 +5448,10 @@ function failoverRow(account, { accounts, movedAway, csrf }) {
   const canAdd = policy.backup_account_ids.length < FAILOVER_MAX_BACKUPS;
   const moved = movedAway.get(account.id) ?? 0;
   const empty = policy.backup_account_ids.length === 0;
+  // Not a disabled button: that swallows the click, and an off switch that
+  // ignores you reads as a broken feature. Clicking it explains instead; without
+  // scripting the server refuses the same way.
+  const needsBackup = !on && empty;
   // An account with no chain yet stays one line: with a hundred accounts most
   // rows are this one, and the add box is all it needs.
   const addControl = `<span class="chain-add">
@@ -5457,10 +5463,11 @@ function failoverRow(account, { accounts, movedAway, csrf }) {
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
       <button type="submit" name="op" value="add" class="visually-hidden" tabindex="-1" aria-hidden="true">Add</button>
       <div class="failover-head">
-        <button type="submit" name="op" value="${on ? 'disable' : 'enable'}" class="switch${on ? ' is-on' : ''}" role="switch" aria-checked="${on}"${!on && empty ? ' disabled' : ''}>
+        <button type="submit" name="op" value="${on ? 'disable' : 'enable'}" class="switch${on ? ' is-on' : ''}" role="switch" aria-checked="${on}"${needsBackup ? ` aria-disabled="true" aria-describedby="failover-hint-${id}" data-failover-needs-backup` : ''}>
           <span class="switch-track"><span class="switch-thumb"></span></span>
           ${on ? '<span data-i18n="failover-on">On</span>' : '<span data-i18n="failover-off">Off</span>'}
         </button>
+        ${needsBackup ? `<p class="failover-hint" id="failover-hint-${id}" role="status" data-failover-hint hidden><span data-i18n="failover-chain-empty">Add at least one backup account before turning this on.</span></p>` : ''}
         <div class="failover-name"><strong>${escapeHtml(account.alias)}</strong>${account.email_label ? `<span class="muted tiny">${escapeHtml(account.email_label)}</span>` : ''}</div>
         <div class="failover-facts">
           ${failoverQuotaPill(failoverQuota(account.usage))}
