@@ -266,21 +266,27 @@ export class UsageMonitor {
   async refresh(provider = null) {
     const accounts = this.store.publicAccounts().filter((account) => !provider || account.provider === provider);
     await Promise.all(accounts.map((account) => this.#refreshAccount(account)));
-    if (provider === null) {
-      const currentIds = new Set(this.store.publicAccounts().map((account) => account.id));
-      for (const accountId of this.snapshots.keys()) {
-        if (!currentIds.has(accountId)) this.snapshots.delete(accountId);
-      }
-    }
+    this.#pruneDeletedSnapshots();
     await this.#persist();
   }
 
   async refreshAccount(accountId) {
     const account = this.store.publicAccounts().find((entry) => entry.id === accountId);
-    if (!account) return null;
-    await this.#refreshAccount(account);
+    if (account) await this.#refreshAccount(account);
+    this.#pruneDeletedSnapshots();
     await this.#persist();
     return this.snapshotForAccount(accountId);
+  }
+
+  #pruneDeletedSnapshots() {
+    const currentIds = new Set(this.store.publicAccounts().map((account) => account.id));
+    for (const accountId of this.snapshots.keys()) {
+      if (!currentIds.has(accountId)) this.snapshots.delete(accountId);
+    }
+  }
+
+  #accountStillExists(accountId) {
+    return this.store.publicAccounts().some((account) => account.id === accountId);
   }
 
   async #refreshAccount(account) {
@@ -335,6 +341,7 @@ export class UsageMonitor {
       } else {
         throw new UsageFetchError('unsupported_provider');
       }
+      if (!this.#accountStillExists(account.id)) return;
       this.snapshots.set(account.id, snapshot);
       this.log('account_usage_refreshed', {
         account_id: account.id,
@@ -347,6 +354,7 @@ export class UsageMonitor {
         : error.name === 'TimeoutError' || error.name === 'AbortError'
           ? 'timeout'
           : 'fetch_failed';
+      if (!this.#accountStillExists(account.id)) return;
       this.snapshots.set(account.id, unavailableSnapshot(account, code, previous));
       this.log('account_usage_refresh_failed', {
         account_id: account.id,
