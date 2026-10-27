@@ -35,7 +35,7 @@ import {
   modelBlockMessage,
 } from './model-block-rules.js';
 import { codexQuotaSignal as defaultQuotaSignal } from './codex-quota-signal.js';
-import { API_KEY_GUARD_MESSAGE, isCodexApiKeyAccount, OPENAI_API_BASE_URL } from './codex-api-key.js';
+import { API_KEY_DEFAULT_MODELS, apiKeyAllowsModel, apiKeyGuardMessage, isCodexApiKeyAccount, OPENAI_API_BASE_URL } from './codex-api-key.js';
 import {
   beginFailover,
   codexQuotaRejection,
@@ -216,6 +216,7 @@ export async function handleCodexProxy(req, res, {
   exhaustion = quotaExhaustion,
   now = Date.now,
   relay = null,
+  apiKeyModels = API_KEY_DEFAULT_MODELS,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
   const upstreamPath = requestUrl.pathname.slice(CODEX_PROXY_PREFIX.length);
@@ -428,7 +429,9 @@ export async function handleCodexProxy(req, res, {
   const gated = guardBiting || anyModelBlockRuleEnabled(blockRules);
   const judge = createModelJudge({
     rules: blockRules,
-    guardAllows: guardBiting ? codexGuardAllowsModel : null,
+    guardAllows: guardBiting
+      ? (guardAlwaysOn ? (model) => apiKeyAllowsModel(model, apiKeyModels) : codexGuardAllowsModel)
+      : null,
   });
   // A block rule speaks for itself. Anything else the gate refuses — a model
   // outside the guard, or a body it cannot vouch for — is the guard's refusal
@@ -441,7 +444,7 @@ export async function handleCodexProxy(req, res, {
       return errorBody('permission_error', modelBlockMessage(refusal.rule, refusal.model));
     }
     if (!guardBiting) return errorBody('permission_error', MODEL_POLICY_UNCHECKABLE_MESSAGE);
-    if (guardAlwaysOn) return errorBody('permission_error', API_KEY_GUARD_MESSAGE);
+    if (guardAlwaysOn) return errorBody('permission_error', apiKeyGuardMessage(apiKeyModels));
     return errorBody(
       'permission_error',
       `account weekly quota is ${guardRemainingPercent}% remaining, below this account's ${guard.threshold_percent}% guard; only "${CODEX_GUARD_MODEL_KEYWORD}" models are allowed until it recovers `
@@ -945,7 +948,7 @@ export async function handleCodexProxy(req, res, {
       // the guard allows; a body whose model is not known yet is not sent.
       if (isCodexApiKeyAccount(backup)
         && normalizeCodexGuard(backup.codex_guard).enabled
-        && !codexGuardAllowsModel(requestMetadata.snapshot()?.model ?? null)) {
+        && !apiKeyAllowsModel(requestMetadata.snapshot()?.model ?? null, apiKeyModels)) {
         continue;
       }
       try {

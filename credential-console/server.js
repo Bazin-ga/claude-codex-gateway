@@ -25,7 +25,7 @@ import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
 import { codexQuotaSignal } from './lib/codex-quota-signal.js';
 import { applyFailoverEdit, quotaExhaustion, recheckExhaustedAccounts } from './lib/account-failover.js';
-import { isCodexApiKeyAccount } from './lib/codex-api-key.js';
+import { isCodexApiKeyAccount, parseApiKeyModels } from './lib/codex-api-key.js';
 import { OPENAI_LONG_CONTEXT_ABOVE, summarizeApiSpend } from './lib/openai-api-pricing.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
@@ -115,6 +115,9 @@ const BEDROCK_ENABLED = process.env.CREDENTIAL_CONSOLE_BEDROCK_ENABLED === '1';
 // The same rule for registering a Codex account with an OpenAI API key: only the
 // console that pays for one shows the field or accepts it.
 const CODEX_API_KEY_ENABLED = process.env.CREDENTIAL_CONSOLE_CODEX_API_KEY_ENABLED === '1';
+// Which model families an API-key account may be spent on while its guard is on
+// (comma-separated substrings, e.g. "luna,terra"). Unset means Luna only.
+const CODEX_API_KEY_MODELS = parseApiKeyModels(process.env.CREDENTIAL_CONSOLE_CODEX_API_KEY_MODELS);
 // And for third-party models: the tab, the routes and the in-channel hand-off
 // exist only where this is exactly "1".
 const RELAY_ENABLED = process.env.CREDENTIAL_CONSOLE_RELAY_ENABLED === '1';
@@ -1504,6 +1507,7 @@ export async function createCredentialConsole(options = {}) {
         quotaSignal: codexQuotaSignal,
         usageSnapshotFor: (accountId) => usageMonitor.snapshotForAccount(accountId),
         relay,
+        apiKeyModels: CODEX_API_KEY_MODELS,
       });
       return;
     }
