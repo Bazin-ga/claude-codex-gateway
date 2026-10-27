@@ -30,12 +30,18 @@ const PAYLOAD = Buffer.from(JSON.stringify({
 
 const RESET_SECONDS = Math.floor(Date.now() / 1000) + 3600;
 
+// Shaped like the account-wide refusals the upstream sends: the window that
+// ran out is reported rejected next to the other one.
 function exhaustedHeaders(claim = 'seven_day') {
+  const [fiveHour, sevenDay] = { five_hour: ['rejected', 'allowed'], seven_day: ['allowed', 'rejected'] }[claim]
+    ?? ['rejected', 'rejected'];
   return {
     'content-type': 'application/json',
     'anthropic-ratelimit-unified-status': 'rejected',
     'anthropic-ratelimit-unified-representative-claim': claim,
     'anthropic-ratelimit-unified-reset': String(RESET_SECONDS),
+    'anthropic-ratelimit-unified-5h-status': fiveHour,
+    'anthropic-ratelimit-unified-7d-status': sevenDay,
   };
 }
 
@@ -531,8 +537,20 @@ test('a refusal with both base windows open is scoped to the model', () => {
     'anthropic-ratelimit-unified-5h-status': 'allowed',
     'anthropic-ratelimit-unified-7d-status': 'rejected',
   }).scope, 'account');
-  // A spend-cap refusal that reports no base window is the whole account.
-  assert.equal(claudeQuotaRejection(429, exhaustedHeaders('overage')).scope, 'account');
+  // Judged on usage credits alone: claude-atropos refused Fable this way
+  // (claim `overage`, no 5h/7d status) while it kept answering Opus.
+  assert.equal(claudeQuotaRejection(429, {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-representative-claim': 'overage',
+    'anthropic-ratelimit-unified-reset': String(RESET_SECONDS),
+    'anthropic-ratelimit-unified-overage-status': 'rejected',
+    'anthropic-ratelimit-unified-overage-disabled-reason': 'org_spend_cap_reached',
+  }).scope, 'model');
+  assert.equal(claudeQuotaRejection(429, {
+    ...exhaustedHeaders('five_hour'),
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-overage-status': 'rejected',
+  }).scope, 'account', 'one base window reported rejected is the account');
   assert.equal(claudeModelFamily('claude-fable-5-1'), 'fable');
   assert.equal(claudeModelFamily('claude-opus-5-5[1m]'), 'opus');
   assert.equal(claudeModelFamily('deepseek-v4-flash'), null);

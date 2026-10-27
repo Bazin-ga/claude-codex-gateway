@@ -108,7 +108,10 @@ function resetMs(value) {
  * `allowed`, Chicago 2026-10-25) — and the account still answers every other
  * model. Taking that for the whole account took claude-shawn out of every
  * failover chain until Fable's reset five days later, with its five-hour
- * window unused.
+ * window unused. So is one that reports neither window: the request was
+ * judged on usage credits alone, which is how an organization plan that does
+ * not include a model refuses it once its spend cap is reached (claude-atropos
+ * refused only Fable that way, claim `overage`, while answering Opus).
  */
 export function claudeQuotaRejection(statusCode, headers) {
   if (statusCode !== 429) return null;
@@ -119,10 +122,11 @@ export function claudeQuotaRejection(statusCode, headers) {
   const baseWindows = ['5h', '7d'].map((name) => header(headers, `${CLAUDE_UNIFIED_PREFIX}${name}-status`)
     ?.trim().toLowerCase());
   const baseOpen = baseWindows.every((status) => status && status !== 'rejected');
+  const baseUnreported = baseWindows.every((status) => !status);
   return {
     claim: claim && /^[a-z0-9_]{1,40}$/i.test(claim) ? claim : null,
     resetsAtMs: resetMs(header(headers, `${CLAUDE_UNIFIED_PREFIX}reset`)),
-    scope: baseOpen ? 'model' : 'account',
+    scope: baseOpen || baseUnreported ? 'model' : 'account',
   };
 }
 
