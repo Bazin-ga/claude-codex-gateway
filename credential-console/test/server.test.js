@@ -36,6 +36,7 @@ async function fixture({
   metricsQueryService = false,
   usageSnapshot = () => null,
   bedrockEnabled = false,
+  claudeWebSearchEnabled = false,
 } = {}) {
   const upstreamRequests = [];
   const upstream = http.createServer(async (req, res) => {
@@ -80,6 +81,7 @@ async function fixture({
     ...(metricsPageClock === undefined ? {} : { metricsPageClock }),
     metricsQueryService,
     bedrockEnabled,
+    claudeWebSearchEnabled,
     publicBaseUrl: 'http://credential-console.test',
     claudeUpstreamBaseUrl: upstreamUrl,
     codexUpstreamBaseUrl: upstreamUrl,
@@ -3720,6 +3722,40 @@ test('a Bedrock member self-serves a token and the page tells them how to use it
     assert.match(configured, /base_url = &quot;[^&]*\/bedrock\/openai\/v1&quot;/);
     assert.match(configured, /web_search = &quot;disabled&quot;/);
     assert.equal(configured.includes('CLAUDE_CODE_USE_BEDROCK'), false);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a console with Claude web search on hands out installers outside gateway mode', async () => {
+  const app = await fixture({
+    codex: { claudeGatewayUrl: 'https://public-gateway.example:10000/claude' },
+    claudeWebSearchEnabled: true,
+  });
+  try {
+    const account = await app.store.addAccount({
+      provider: 'claude',
+      alias: 'claude-web-search',
+      credential: { oauth_token: 'web-search-master-token' },
+    });
+    const page = await fetch(`${app.baseUrl}/`, { headers: { 'Tailscale-User-Login': 'admin@example.com' } });
+    const html = await page.text();
+    const selfService = await fetch(`${app.baseUrl}/self-service`, {
+      method: 'POST',
+      headers: {
+        Cookie: cookieFrom(page),
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Tailscale-User-Login': 'admin@example.com',
+      },
+      body: new URLSearchParams({ csrf: csrfFrom(html), account_id: account.id, device_name: 'search-laptop' }),
+    });
+    assert.equal(selfService.status, 200);
+    const installer = await selfService.text();
+    assert.match(installer, /unset CLAUDE_CODE_USE_GATEWAY/);
+    assert.match(installer, /Remove-Item Env:CLAUDE_CODE_USE_GATEWAY -ErrorAction SilentlyContinue/);
+    assert.equal(installer.includes('export CLAUDE_CODE_USE_GATEWAY=1'), false);
+    assert.equal(installer.includes('$env:CLAUDE_CODE_USE_GATEWAY=&#39;1&#39;'), false);
+    assert.match(installer, /ANTHROPIC_BASE_URL=&#39;https:\/\/public-gateway\.example:10000\/claude&#39;/);
   } finally {
     await app.close();
   }

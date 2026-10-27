@@ -253,6 +253,12 @@ uses `ANTHROPIC_AUTH_TOKEN`; registering both makes Claude Code warn about ambig
 The helper output and the launcher's `ANTHROPIC_AUTH_TOKEN` are the console's per-device token,
 not an Anthropic token. `CLAUDE_CODE_USE_GATEWAY=1` prevents current Claude Code releases from
 performing only the gateway health probe and then routing model requests to Anthropic directly.
+Gateway mode also switches off Claude Code's WebSearch tool. A console started with
+`CREDENTIAL_CONSOLE_CLAUDE_WEB_SEARCH_ENABLED=1` writes `unset CLAUDE_CODE_USE_GATEWAY` instead, so
+WebSearch runs as the server tool it is, on the account's subscription, through this gateway.
+Claude Code 2.1.296 was checked that way: every model request still went to `ANTHROPIC_BASE_URL`,
+and its direct calls to api.anthropic.com (MCP registry listing, telemetry, the WebFetch domain
+check that gateway mode makes too) carried no credential.
 `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5` keeps Claude Code's `opus` alias and default model on
 Opus 5; Claude Code 2.1.223 otherwise resolves that alias to Opus 4.7 even though the same account
 and gateway can successfully use the exact `claude-opus-5` model ID.
