@@ -110,7 +110,16 @@ test('requests on an API-key account go to the OpenAI API with the key, not to c
     }).catch(() => res.destroy());
   });
   const proxyUrl = await listen(proxy);
-  t.after(() => { proxy.close(); upstream.close(); });
+  // Same teardown as below: sockets and the store's late seen-write first.
+  const shutdown = async () => {
+    upstream.closeAllConnections?.();
+    proxy.closeAllConnections?.();
+    await Promise.all([proxy, upstream].map((server) => (server.listening
+      ? new Promise((resolve) => server.close(resolve))
+      : null)));
+    await store.serialized(async () => {});
+  };
+  t.after(shutdown);
 
   const response = await fetch(`${proxyUrl}/codex-api/responses`, {
     method: 'POST',
@@ -128,6 +137,7 @@ test('requests on an API-key account go to the OpenAI API with the key, not to c
   assert.equal(seen[0].headers.authorization, `Bearer ${API_KEY}`);
   assert.equal(seen[0].headers['chatgpt-account-id'], undefined);
   assert.equal(seen[0].headers['content-encoding'], undefined, 'the OpenAI API is sent the body as the client wrote it');
+  await shutdown();
 });
 
 test('a console without the API-key switch neither shows the field nor accepts it', async (t) => {
@@ -227,7 +237,18 @@ test('a guarded API-key account takes exactly the configured model families', as
     }).catch(() => res.destroy());
   });
   const proxyUrl = await listen(proxy);
-  t.after(() => { proxy.close(); upstream.close(); });
+  // The proxy marks the device seen after it answers, through the store's
+  // serialized writer: wait for that and for every socket before the store
+  // home is removed, or the cleanup races a late write.
+  const shutdown = async () => {
+    upstream.closeAllConnections?.();
+    proxy.closeAllConnections?.();
+    await Promise.all([proxy, upstream].map((server) => (server.listening
+      ? new Promise((resolve) => server.close(resolve))
+      : null)));
+    await store.serialized(async () => {});
+  };
+  t.after(shutdown);
   const send = async (model) => {
     const response = await fetch(`${proxyUrl}/codex-api/responses`, {
       method: 'POST',
@@ -248,4 +269,5 @@ test('a guarded API-key account takes exactly the configured model families', as
   assert.equal(sol.status, 403);
   assert.match(sol.text, /only \\"luna\\", \\"terra\\" models|only "luna", "terra" models/);
   assert.deepEqual(seen, ['gpt-6.1-terra', 'gpt-6-luna'], 'only allowed models reach the paid API');
+  await shutdown();
 });
