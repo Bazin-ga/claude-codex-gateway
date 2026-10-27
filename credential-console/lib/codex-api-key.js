@@ -20,6 +20,34 @@ export const API_KEY_GUARD_MESSAGE = 'this Codex account is billed per token thr
   + 'only "luna" models are allowed on it '
   + '(该账号走 OpenAI API key 按 token 计费，仅允许含 luna 的模型)';
 
+/**
+ * The model families an API-key account accepts while its guard is on, as
+ * case-insensitive substrings of the model id. Luna alone unless the console
+ * is told otherwise (`CREDENTIAL_CONSOLE_CODEX_API_KEY_MODELS=luna,terra`):
+ * every token on such an account is paid for, so widening it is a deliberate,
+ * per-deployment decision, and an empty or unreadable value fails closed to Luna.
+ */
+export const API_KEY_DEFAULT_MODELS = Object.freeze(['luna']);
+
+export function parseApiKeyModels(value) {
+  const list = String(value ?? '').split(',').map((s) => s.trim().toLowerCase())
+    .filter((s) => /^[a-z0-9][a-z0-9._-]{0,63}$/.test(s));
+  return list.length ? [...new Set(list)] : [...API_KEY_DEFAULT_MODELS];
+}
+
+export function apiKeyAllowsModel(model, allowed = API_KEY_DEFAULT_MODELS) {
+  if (typeof model !== 'string' || !model) return false;
+  const id = model.toLowerCase();
+  return allowed.some((family) => id.includes(family));
+}
+
+export function apiKeyGuardMessage(allowed = API_KEY_DEFAULT_MODELS) {
+  if (allowed.length === 1 && allowed[0] === 'luna') return API_KEY_GUARD_MESSAGE;
+  return 'this Codex account is billed per token through an OpenAI API key; '
+    + `only ${allowed.map((f) => `"${f}"`).join(', ')} models are allowed on it `
+    + `(该账号走 OpenAI API key 按 token 计费，仅允许含 ${allowed.join(' / ')} 的模型)`;
+}
+
 export function isCodexApiKeyAccount(account) {
   return account?.provider === 'codex' && account?.codex_auth === CODEX_API_KEY_AUTH;
 }

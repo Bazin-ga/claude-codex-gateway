@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { handleCodexProxy } from '../lib/codex-proxy.js';
-import { isCodexGatewayAccount } from '../lib/codex-api-key.js';
+import { apiKeyAllowsModel, isCodexGatewayAccount, parseApiKeyModels } from '../lib/codex-api-key.js';
 import { CredentialStore } from '../lib/store.js';
 import { dashboardView } from '../lib/views.js';
 
@@ -188,4 +188,64 @@ test('the guard on an API-key account is a plain on/off switch', async (t) => {
   assert.match(html, /data-i18n="codex-api-guard-enable"/);
   assert.match(html, /data-i18n="codex-api-guard-active"/);
   assert.equal(html.includes(`/accounts/${account.id}/codex-credit-guard`), false);
+});
+
+test('the API-key model list is configurable and fails closed to Luna', () => {
+  assert.deepEqual(parseApiKeyModels(undefined), ['luna']);
+  assert.deepEqual(parseApiKeyModels(''), ['luna']);
+  assert.deepEqual(parseApiKeyModels(' , ;; '), ['luna']);
+  assert.deepEqual(parseApiKeyModels('luna, Terra,terra'), ['luna', 'terra']);
+  assert.equal(apiKeyAllowsModel('gpt-6.1-terra', ['luna', 'terra']), true);
+  assert.equal(apiKeyAllowsModel('gpt-6.1-sol', ['luna', 'terra']), false);
+  assert.equal(apiKeyAllowsModel('gpt-6.1-terra'), false, 'the default still allows Luna only');
+  assert.equal(apiKeyAllowsModel(null, ['luna', 'terra']), false);
+});
+
+test('a guarded API-key account takes exactly the configured model families', async (t) => {
+  const { store } = await newStore(t);
+  const account = await store.addAccount({ provider: 'codex', alias: 'openai-api-1', codexApiKey: API_KEY });
+  await store.setCodexModelGuard(account.id, { enabled: true, thresholdPercent: 10 });
+  const issued = await store.issueDeviceCredential({ accountId: account.id, memberLabel: 'member', deviceName: 'laptop' });
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      seen.push(JSON.parse(body).model);
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('data: {"type":"response.completed","response":{"id":"r","usage":{"input_tokens":1,"output_tokens":1}}}\n\n');
+    });
+  });
+  const upstreamUrl = await listen(upstream);
+  let apiKeyModels;
+  const proxy = http.createServer((req, res) => {
+    handleCodexProxy(req, res, {
+      store,
+      openaiApiBaseUrl: `${upstreamUrl}/v1`,
+      credentialReader: () => { throw new Error('the credential home must not be read'); },
+      ...(apiKeyModels ? { apiKeyModels } : {}),
+    }).catch(() => res.destroy());
+  });
+  const proxyUrl = await listen(proxy);
+  t.after(() => { proxy.close(); upstream.close(); });
+  const send = async (model) => {
+    const response = await fetch(`${proxyUrl}/codex-api/responses`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${issued.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model, stream: true, store: false, input: [] }),
+    });
+    return { status: response.status, text: await response.text() };
+  };
+
+  const before = await send('gpt-6.1-terra');
+  assert.equal(before.status, 403, 'without configuration Terra is refused as before');
+  assert.match(before.text, /only \\"luna\\" models|only "luna" models/);
+
+  apiKeyModels = ['luna', 'terra'];
+  assert.equal((await send('gpt-6.1-terra')).status, 200);
+  assert.equal((await send('gpt-6-luna')).status, 200);
+  const sol = await send('gpt-6.1-sol');
+  assert.equal(sol.status, 403);
+  assert.match(sol.text, /only \\"luna\\", \\"terra\\" models|only "luna", "terra" models/);
+  assert.deepEqual(seen, ['gpt-6.1-terra', 'gpt-6-luna'], 'only allowed models reach the paid API');
 });
