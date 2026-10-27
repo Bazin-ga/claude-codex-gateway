@@ -118,6 +118,9 @@ const CODEX_API_KEY_ENABLED = process.env.CREDENTIAL_CONSOLE_CODEX_API_KEY_ENABL
 // And for third-party models: the tab, the routes and the in-channel hand-off
 // exist only where this is exactly "1".
 const RELAY_ENABLED = process.env.CREDENTIAL_CONSOLE_RELAY_ENABLED === '1';
+// And for Claude Code's own WebSearch: the Claude installer leaves Claude Code
+// out of its gateway mode, where WebSearch is switched off, only here.
+const CLAUDE_WEB_SEARCH_ENABLED = process.env.CREDENTIAL_CONSOLE_CLAUDE_WEB_SEARCH_ENABLED === '1';
 // CREDENTIAL_CONSOLE_CODEX_ENDPOINT, _CODEX_CERT_PIN and _CODEX_ENROLLMENT_KEY_FILE
 // are no longer read. They configured the console's side of dispenser
 // enrollment, which is retired (see the /codex/self-service route); leaving
@@ -520,6 +523,7 @@ export async function createCredentialConsole(options = {}) {
   const bedrockEnabled = options.bedrockEnabled ?? BEDROCK_ENABLED;
   const codexApiKeyEnabled = options.codexApiKeyEnabled ?? CODEX_API_KEY_ENABLED;
   const relayEnabled = options.relayEnabled ?? RELAY_ENABLED;
+  const claudeWebSearch = options.claudeWebSearchEnabled ?? CLAUDE_WEB_SEARCH_ENABLED;
   const relayCatalog = relayEnabled
     ? (options.relayCatalog ?? new RelayCatalog({ store, fetchImpl: options.relayFetch ?? fetch }).start())
     : null;
@@ -674,7 +678,7 @@ export async function createCredentialConsole(options = {}) {
     if (result.account?.provider === 'bedrock') {
       return bedrockDeviceConfiguredView({ ...result, bedrockGatewayUrl, openMode });
     }
-    return deviceConfiguredView({ ...result, claudeGatewayUrl, openMode });
+    return deviceConfiguredView({ ...result, claudeGatewayUrl, openMode, webSearch: claudeWebSearch });
   };
   const deleteMetricsPageCache = (key) => {
     const entry = metricsPageCache.get(key);

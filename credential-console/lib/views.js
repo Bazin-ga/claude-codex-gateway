@@ -4968,8 +4968,20 @@ export function codexConfiguredView({
   `, { openMode, completedDraft: 'codex-self-service' });
 }
 
-export function deviceConfiguredView({ account, device, token, claudeGatewayUrl, openMode = false }) {
+export function deviceConfiguredView({ account, device, token, claudeGatewayUrl, openMode = false, webSearch = false }) {
   const gateway = claudeGatewayUrl.replace(/\/$/, '');
+  // Claude Code switches its WebSearch tool off in gateway mode
+  // (CLAUDE_CODE_USE_GATEWAY). The tool is a server tool the upstream runs, and
+  // this gateway forwards to the upstream, so outside gateway mode it works on
+  // the account's subscription. Claude Code 2.1.296 checked on Chicago
+  // (2026-10-27): every model request still goes to ANTHROPIC_BASE_URL, and
+  // what it sends to api.anthropic.com directly — the MCP registry listing,
+  // telemetry, the WebFetch domain check gateway mode makes too — carries no
+  // credential.
+  const unixGatewayMode = webSearch ? 'unset CLAUDE_CODE_USE_GATEWAY' : 'export CLAUDE_CODE_USE_GATEWAY=1';
+  const windowsGatewayMode = webSearch
+    ? 'Remove-Item Env:CLAUDE_CODE_USE_GATEWAY -ErrorAction SilentlyContinue'
+    : "$env:CLAUDE_CODE_USE_GATEWAY='1'";
   const profile = account.alias.replace(/[^A-Za-z0-9._-]/g, '-');
   const hookEndpoint = buildClaudeConversationHookEndpoint(gateway);
   const hookUpdater = renderClaudeConversationHookUpdaterSource({ endpoint: hookEndpoint });
@@ -5003,7 +5015,7 @@ export ANTHROPIC_BASE_URL=${shellSingleQuote(gateway)}
 export ${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${shellSingleQuote(CLIENT_CONFIG_VERSION)}
 export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5'
 export CLAUDE_CODE_API_KEY_HELPER_TTL_MS=300000
-export CLAUDE_CODE_USE_GATEWAY=1
+${unixGatewayMode}
 export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
 unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 PROFILE
@@ -5046,7 +5058,7 @@ $tokenFile = [IO.Path]::Combine($HOME, '.config', 'claude-codex-gateway', 'claud
 $env:ANTHROPIC_BASE_URL=${powerShellSingleQuote(gateway)}
 $env:${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${powerShellSingleQuote(CLIENT_CONFIG_VERSION)}
 $env:ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5'
-$env:CLAUDE_CODE_USE_GATEWAY='1'
+${windowsGatewayMode}
 $env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB='1'
 Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
 Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
