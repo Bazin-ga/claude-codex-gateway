@@ -30,6 +30,7 @@ import {
 } from './model-block-rules.js';
 import {
   beginFailover,
+  claudeModelFamily,
   claudeQuotaRejection,
   claudeRateLimitHeaders,
   quotaExhaustion,
@@ -529,6 +530,9 @@ export async function handleClaudeProxy(req, res, {
     }
   }
 
+  // The model, when the relay or the gate has already read it: a model whose
+  // own allowance is gone on this account can go to a backup before sending.
+  const prefixModel = gatePrefix ? gatePrefix.scanner.snapshot().model ?? gatePrefix.model : null;
   // Quota failover: possibly back home, possibly straight to a backup. See
   // beginFailover for the rules.
   const failover = beginFailover({
@@ -537,6 +541,7 @@ export async function handleClaudeProxy(req, res, {
     account,
     exhaustion,
     usageSnapshotFor,
+    family: claudeModelFamily(prefixModel),
     log,
     logPrefix: 'claude_proxy',
   });
@@ -560,8 +565,8 @@ export async function handleClaudeProxy(req, res, {
     return;
   }
   // A backup whose credential cannot be read is skipped like an exhausted one.
-  const backupWithCredential = () => {
-    for (let backup = failover.nextBackup(); backup; backup = failover.nextBackup()) {
+  const backupWithCredential = (options) => {
+    for (let backup = failover.nextBackup(options); backup; backup = failover.nextBackup(options)) {
       try {
         const token = store.accountCredential(backup.id)?.oauth_token;
         if (token) return { backup, token };
@@ -661,6 +666,13 @@ export async function handleClaudeProxy(req, res, {
   // Piping does not tell the tee that its source died; without this an aborted
   // upload keeps its share of the shared pool forever.
   requestMetadata.trackSource(req);
+  const requestModel = () => {
+    try {
+      return requestMetadata.snapshot()?.model ?? prefixModel;
+    } catch {
+      return prefixModel;
+    }
+  };
   const requestLimit = passthroughCounter({ maxBytes: MAX_REQUEST_BYTES });
   // The request body still streams to the upstream exactly as before; this
   // Transform only records a side-copy so a transient upstream overload
@@ -858,11 +870,15 @@ export async function handleClaudeProxy(req, res, {
         const status = upstreamRes.statusCode ?? 502;
 
         const rejection = claudeQuotaRejection(status, upstreamRes.headers);
+        // By the time the upstream answers, the body has usually gone past the
+        // metadata tee, so the model is known even when no prefix was read.
+        const family = claudeModelFamily(requestModel());
         if (status === 429) {
           log('claude_proxy_upstream_rate_limited', {
             account_id: account.id,
             device_id: device.id,
             quota_exhausted: Boolean(rejection),
+            ...(rejection ? { scope: rejection.scope, model_family: family } : {}),
             headers: claudeRateLimitHeaders(upstreamRes.headers),
           });
         }
@@ -870,27 +886,34 @@ export async function handleClaudeProxy(req, res, {
           const replayHeaders = { ...responseHeaders(upstreamRes.headers), 'content-type': 'application/json' };
           // The body is not the upstream's, so neither is its encoding.
           delete replayHeaders['content-encoding'];
-          const entry = exhaustion.mark(account.id, {
-            ...rejection,
-            reply: { headers: replayHeaders, body: CLAUDE_REFUSAL_BODY },
-          });
+          const refusal = { ...rejection, reply: { headers: replayHeaders, body: CLAUDE_REFUSAL_BODY } };
+          // A model's own allowance running out says nothing about the
+          // account's other models: only that model is avoided there, and the
+          // device stays put. A model the gateway cannot name is not recorded.
+          const accountWide = rejection.scope !== 'model';
+          const entry = accountWide
+            ? exhaustion.mark(account.id, refusal)
+            : exhaustion.markModel(account.id, family, refusal);
           const found = failover.enabled && !clientAborted && failoversUsed < MAX_FAILOVERS
-            ? backupWithCredential()
+            ? backupWithCredential({ family })
             : null;
           if (found) {
             failoversUsed += 1;
             superseded = true;
             const exhausted = account;
             recordFailedOverAttempt(exhausted, status);
+            const resetsAtMs = entry?.until ?? rejection.resetsAtMs;
             log('claude_proxy_quota_failover', {
               stage: 'response',
               device_id: device.id,
               from_account_id: exhausted.id,
               to_account_id: found.backup.id,
               claim: rejection.claim,
-              resets_at: new Date(entry.until).toISOString(),
+              scope: rejection.scope,
+              ...(accountWide ? {} : { model_family: family }),
+              resets_at: Number.isFinite(resetsAtMs) ? new Date(resetsAtMs).toISOString() : null,
             });
-            failover.moveTo(found.backup);
+            failover.moveTo(found.backup, { accountWide });
             account = found.backup;
             headers.authorization = `Bearer ${found.token}`;
             upstreamRes.once('error', () => {});
@@ -924,7 +947,7 @@ export async function handleClaudeProxy(req, res, {
           && failover.enabled
           && !clientAborted
           && failoversUsed < MAX_FAILOVERS) {
-          const found = backupWithCredential();
+          const found = backupWithCredential({ family });
           if (found) {
             failoversUsed += 1;
             superseded = true;
@@ -983,7 +1006,7 @@ export async function handleClaudeProxy(req, res, {
         attemptSettled = true;
         activeUpstreamRes = upstreamRes;
         if (status >= 200 && status < 300) {
-          exhaustion.succeeded(account.id);
+          exhaustion.succeeded(account.id, Date.now(), { family });
           failover.recordMove();
         }
         upstreamTtfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));

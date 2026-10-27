@@ -12,6 +12,7 @@ import {
   chooseFailoverAccount,
   knownExhausted,
   usageExhaustedUntil,
+  claudeModelFamily,
   claudeQuotaRejection,
   normalizeAccountFailover,
   recheckExhaustedAccounts,
@@ -36,6 +37,21 @@ function exhaustedHeaders(claim = 'seven_day') {
     'anthropic-ratelimit-unified-representative-claim': claim,
     'anthropic-ratelimit-unified-reset': String(RESET_SECONDS),
   };
+}
+
+// The refusal Chicago saw on 2026-10-25/26 when an account's Fable weekly
+// allowance was used up: rejected, yet both base windows report `allowed`.
+function modelExhaustedHeaders() {
+  return {
+    ...exhaustedHeaders('seven_day_overage_included'),
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+    'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
+  };
+}
+
+function messagesBody(model) {
+  return Buffer.from(JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }));
 }
 
 function refuse(res, headers = exhaustedHeaders()) {
@@ -499,7 +515,27 @@ test('only an explicit rejected status counts as exhaustion', () => {
   assert.deepEqual(claudeQuotaRejection(429, exhaustedHeaders('five_hour')), {
     claim: 'five_hour',
     resetsAtMs: RESET_SECONDS * 1000,
+    scope: 'account',
   });
+});
+
+test('a refusal with both base windows open is scoped to the model', () => {
+  assert.equal(claudeQuotaRejection(429, modelExhaustedHeaders()).scope, 'model');
+  assert.equal(claudeQuotaRejection(429, {
+    ...exhaustedHeaders('five_hour'),
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+  }).scope, 'account');
+  assert.equal(claudeQuotaRejection(429, {
+    ...exhaustedHeaders('seven_day'),
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-status': 'rejected',
+  }).scope, 'account');
+  // A spend-cap refusal that reports no base window is the whole account.
+  assert.equal(claudeQuotaRejection(429, exhaustedHeaders('overage')).scope, 'account');
+  assert.equal(claudeModelFamily('claude-fable-5-1'), 'fable');
+  assert.equal(claudeModelFamily('claude-opus-5-5[1m]'), 'opus');
+  assert.equal(claudeModelFamily('deepseek-v4-flash'), null);
 });
 
 test('an overage refusal is cleared when the base windows recover', async () => {
@@ -774,4 +810,126 @@ test('a device moved off an account the usage reading shows exhausted returns wh
   const device = store.state.devices.find((entry) => entry.id === deviceId);
   assert.equal(device.selected_account_id, accounts.backup.id);
   assert.equal(device.account_failover.return_after, resetsAt.toISOString(), 'not a guessed quarter of an hour');
+});
+
+// Chicago, 2026-10-25 14:17: one Fable request refused on claude-shawn
+// (`seven_day_overage_included`, Fable's weekly allowance) was taken for the
+// whole account, so shawn was skipped as everybody's backup until 10-31 with
+// its five-hour window unused — and on 10-26 a device whose account ran out of
+// its five-hour window had nowhere left to go.
+test('a model-scoped refusal moves only that request and leaves the account a backup', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken, deviceId } = await fleet({ backups: ['backup'] });
+  await store.setAccountFailover(accounts.backup.id, {
+    enabled: true, backupAccountIds: [accounts.home.id], actor: 'test',
+  });
+  const onBackup = await store.issueDeviceCredential({
+    accountId: accounts.backup.id, memberLabel: 'o@example.com', deviceName: 'on-backup',
+  });
+  const seen = [];
+  const { proxyUrl, exhaustion } = await harness(t, { store }, async (req, res) => {
+    const { model } = JSON.parse(await readBody(req));
+    seen.push(`${bearer(req)}:${model}`);
+    if (bearer(req) === 'token-backup' && /fable/.test(model)) return refuse(res, modelExhaustedHeaders());
+    if (bearer(req) === 'token-home' && /opus/.test(model) && seen.length > 2) return refuse(res, {
+      ...exhaustedHeaders('five_hour'),
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'anthropic-ratelimit-unified-7d-status': 'allowed',
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ served_by: bearer(req) }));
+  });
+
+  // A Fable turn on the backup's own device is refused there: that is all
+  // that is known, and only Fable is avoided on it.
+  const fable = await post(`${proxyUrl}/claude/v1/messages`, onBackup.token, messagesBody('claude-fable-5-1'));
+  assert.equal(fable.status, 200, 'the Fable turn is carried by an account with Fable left');
+  assert.equal(JSON.parse(fable.body).served_by, 'token-home');
+  assert.equal(exhaustion.exhausted(accounts.backup.id), null, 'the account itself is not exhausted');
+  assert.ok(exhaustion.modelExhausted(accounts.backup.id, 'fable'));
+  await settled(store);
+  const backupDevice = store.state.devices.find((entry) => entry.id === onBackup.device.id);
+  assert.equal(backupDevice.selected_account_id, accounts.backup.id, 'a model refusal does not move the device');
+  assert.equal(backupDevice.account_failover ?? null, null);
+
+  // The backup still answers other models...
+  const opusOnBackup = await post(`${proxyUrl}/claude/v1/messages`, onBackup.token, messagesBody('claude-opus-5-5'));
+  assert.equal(JSON.parse(opusOnBackup.body).served_by, 'token-backup');
+
+  // ...so when the home account's five-hour window runs out, the backup takes over.
+  const moved = await post(`${proxyUrl}/claude/v1/messages`, deviceToken, messagesBody('claude-opus-5-5'));
+  assert.equal(moved.status, 200);
+  assert.equal(JSON.parse(moved.body).served_by, 'token-backup');
+  assert.deepEqual(seen, [
+    'token-backup:claude-fable-5-1',
+    'token-home:claude-fable-5-1',
+    'token-backup:claude-opus-5-5',
+    'token-home:claude-opus-5-5',
+    'token-backup:claude-opus-5-5',
+  ]);
+  await settled(store);
+  const device = store.state.devices.find((entry) => entry.id === deviceId);
+  assert.equal(device.selected_account_id, accounts.backup.id, 'an account-wide refusal still moves the device');
+});
+
+test('a model refusal with nowhere to go is replayed for that model only', { timeout: 20_000 }, async (t) => {
+  const { store, deviceToken } = await fleet({ failoverEnabled: false });
+  const seen = [];
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+    const { model } = JSON.parse(await readBody(req));
+    seen.push(model);
+    if (/fable/.test(model)) return refuse(res, modelExhaustedHeaders());
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken, messagesBody('claude-fable-5-1'))).status, 429);
+  assert.equal((await post(`${proxyUrl}/claude/v1/messages`, deviceToken, messagesBody('claude-sonnet-5-5'))).status, 200,
+    'the account keeps answering other models');
+  assert.deepEqual(seen, ['claude-fable-5-1', 'claude-sonnet-5-5']);
+});
+
+test('a request whose model is known goes around a model refusal before sending', async () => {
+  const { store, accounts, deviceId } = await fleet({ backups: ['backup', 'spare'] });
+  const exhaustion = new QuotaExhaustion();
+  exhaustion.markModel(accounts.home.id, 'fable', {
+    resetsAtMs: Date.now() + 86_400_000,
+    reply: { headers: modelExhaustedHeaders(), body: Buffer.from('{}') },
+  });
+  const device = store.state.devices.find((entry) => entry.id === deviceId);
+  const later = new Date(Date.now() + 86_400_000).toISOString();
+  const usageSnapshotFor = (id) => (id === accounts.backup.id
+    ? { status: 'available', windows: [{ kind: 'fable_weekly', remaining_percent: 0, resets_at: later }] }
+    : null);
+  const begin = (family) => beginFailover({
+    store, device, account: store.accountById(accounts.home.id), exhaustion, usageSnapshotFor, family,
+  });
+
+  const fable = begin('fable');
+  assert.equal(fable.account.id, accounts.spare.id, 'a backup whose usage shows no Fable left is passed over');
+  assert.equal(fable.accountWide, false);
+  assert.equal(fable.refusal, null);
+  fable.recordMove();
+  await settled(store);
+  assert.equal(store.state.devices.find((entry) => entry.id === deviceId).selected_account_id, accounts.home.id,
+    'the device is not moved for one model');
+
+  assert.equal(begin('opus').account.id, accounts.home.id, 'other models stay on the account');
+});
+
+test('a model refusal is cleared once its own window shows room again', async () => {
+  const exhaustion = new QuotaExhaustion();
+  exhaustion.markModel('acct', 'fable', { resetsAtMs: Date.now() + 5 * 86_400_000, claim: 'seven_day_overage_included' });
+  const store = { accountById: () => ({ id: 'acct', provider: 'claude', status: 'healthy' }) };
+  const reading = (fable) => async () => ({
+    status: 'available',
+    windows: [
+      { kind: 'five_hour', remaining_percent: 100 },
+      { kind: 'weekly', remaining_percent: 40 },
+      { kind: 'fable_weekly', remaining_percent: fable },
+    ],
+  });
+  await recheckExhaustedAccounts({ store, exhaustion, refreshUsage: reading(0), now: Date.now() + 10 * 60_000 });
+  assert.ok(exhaustion.modelExhausted('acct', 'fable'), 'the base windows having room says nothing about Fable');
+  await recheckExhaustedAccounts({ store, exhaustion, refreshUsage: reading(30), now: Date.now() + 20 * 60_000 });
+  assert.equal(exhaustion.modelExhausted('acct', 'fable'), null);
 });

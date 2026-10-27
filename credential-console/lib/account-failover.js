@@ -101,6 +101,14 @@ function resetMs(value) {
  * Claude Code itself reads `anthropic-ratelimit-unified-status: rejected` as
  * hard exhaustion, so the gateway uses the same signal. The representative
  * claim names the window that ran out (`five_hour`, `seven_day`, ...).
+ *
+ * `scope` says what ran out. A refusal whose five-hour and seven-day windows
+ * are both reported open is a narrower limit — a model's own weekly allowance
+ * (Fable's, refused as `seven_day_overage_included` with 5h and 7d
+ * `allowed`, Chicago 2026-10-25) — and the account still answers every other
+ * model. Taking that for the whole account took claude-shawn out of every
+ * failover chain until Fable's reset five days later, with its five-hour
+ * window unused.
  */
 export function claudeQuotaRejection(statusCode, headers) {
   if (statusCode !== 429) return null;
@@ -108,10 +116,24 @@ export function claudeQuotaRejection(statusCode, headers) {
     return null;
   }
   const claim = header(headers, `${CLAUDE_UNIFIED_PREFIX}representative-claim`)?.trim() || null;
+  const baseWindows = ['5h', '7d'].map((name) => header(headers, `${CLAUDE_UNIFIED_PREFIX}${name}-status`)
+    ?.trim().toLowerCase());
+  const baseOpen = baseWindows.every((status) => status && status !== 'rejected');
   return {
     claim: claim && /^[a-z0-9_]{1,40}$/i.test(claim) ? claim : null,
     resetsAtMs: resetMs(header(headers, `${CLAUDE_UNIFIED_PREFIX}reset`)),
+    scope: baseOpen ? 'model' : 'account',
   };
+}
+
+/**
+ * The model family a Claude model id belongs to (`claude-fable-5-1` → fable),
+ * which is what a model's own allowance is counted against; null when the id
+ * names none the gateway knows.
+ */
+export function claudeModelFamily(model) {
+  const match = /(fable|opus|sonnet|haiku)/i.exec(String(model ?? ''));
+  return match ? match[1].toLowerCase() : null;
 }
 
 /** A small upstream error body, decoded; null when it cannot be read. */
@@ -200,6 +222,9 @@ export function claudeRateLimitHeaders(headers) {
 export class QuotaExhaustion {
   constructor() {
     this.accounts = new Map();
+    // Refusals of one model family on an account, keyed by modelKey(): the
+    // account itself still answers every other model.
+    this.models = new Map();
     // When each account last answered successfully.
     this.succeededAt = new Map();
   }
@@ -209,42 +234,44 @@ export class QuotaExhaustion {
    * body the upstream sent — kept so that later requests for this account can
    * be answered with it here instead of being sent to collect it again.
    */
-  mark(accountId, { resetsAtMs = null, claim = null, reply = null } = {}, now = Date.now()) {
+  mark(accountId, refusal = {}, now = Date.now()) {
     if (typeof accountId !== 'string' || !accountId) return null;
-    const until = Number.isFinite(resetsAtMs) && resetsAtMs > now
-      ? Math.min(resetsAtMs, now + MAX_EXHAUSTION_MS)
-      : now + FAILOVER_UNKNOWN_RESET_MS;
-    const entry = { until, claim, markedAt: now, checkedAt: now, reply: replayableReply(reply) };
-    this.accounts.delete(accountId);
-    this.accounts.set(accountId, entry);
-    while (this.accounts.size > MAX_TRACKED_ACCOUNTS) {
-      this.accounts.delete(this.accounts.keys().next().value);
-    }
-    return entry;
+    return remember(this.accounts, accountId, refusal, now);
+  }
+
+  /** Record a refusal that only covers one model family on the account. */
+  markModel(accountId, family, refusal = {}, now = Date.now()) {
+    if (typeof accountId !== 'string' || !accountId || !family) return null;
+    return remember(this.models, modelKey(accountId, family), refusal, now);
   }
 
   /** The entry while it is still in force, otherwise null (and forgotten). */
   exhausted(accountId, now = Date.now()) {
-    const entry = this.accounts.get(accountId);
-    if (!entry) return null;
-    if (entry.until <= now) {
-      this.accounts.delete(accountId);
-      return null;
-    }
-    return entry;
+    return inForce(this.accounts, accountId, now);
+  }
+
+  /** The model-family refusal on an account while it is in force, otherwise null. */
+  modelExhausted(accountId, family, now = Date.now()) {
+    if (!family) return null;
+    return inForce(this.models, modelKey(accountId, family), now);
   }
 
   clear(accountId) {
     this.accounts.delete(accountId);
   }
 
+  clearModel(accountId, family) {
+    this.models.delete(modelKey(accountId, family));
+  }
+
   /**
    * The account just answered. Whatever a refusal or the last usage poll said,
-   * it is not exhausted now.
+   * it is not exhausted now — and nor is the model family it answered for.
    */
-  succeeded(accountId, now = Date.now()) {
+  succeeded(accountId, now = Date.now(), { family = null } = {}) {
     if (typeof accountId !== 'string' || !accountId) return;
     this.accounts.delete(accountId);
+    if (family) this.models.delete(modelKey(accountId, family));
     this.succeededAt.delete(accountId);
     this.succeededAt.set(accountId, now);
     while (this.succeededAt.size > MAX_TRACKED_ACCOUNTS) {
@@ -258,14 +285,21 @@ export class QuotaExhaustion {
    */
   dueForRecheck(now = Date.now(), intervalMs = EXHAUSTION_RECHECK_INTERVAL_MS) {
     const due = [];
-    for (const [accountId, entry] of this.accounts) {
-      if (entry.until <= now) {
-        this.accounts.delete(accountId);
-        continue;
+    for (const [map, isModel] of [[this.accounts, false], [this.models, true]]) {
+      for (const [key, entry] of map) {
+        if (entry.until <= now) {
+          map.delete(key);
+          continue;
+        }
+        if (now - entry.checkedAt < intervalMs) continue;
+        entry.checkedAt = now;
+        due.push({
+          accountId: isModel ? entry.accountId : key,
+          family: isModel ? entry.family : null,
+          claim: entry.claim,
+          until: entry.until,
+        });
       }
-      if (now - entry.checkedAt < intervalMs) continue;
-      entry.checkedAt = now;
-      due.push({ accountId, claim: entry.claim, until: entry.until });
     }
     return due;
   }
@@ -275,6 +309,34 @@ export class QuotaExhaustion {
     const at = this.succeededAt.get(accountId);
     return Number.isFinite(at) && Number.isFinite(sinceMs) && at > sinceMs;
   }
+}
+
+function modelKey(accountId, family) {
+  return `${accountId}\n${family}`;
+}
+
+function remember(map, key, { resetsAtMs = null, claim = null, reply = null } = {}, now = Date.now()) {
+  const until = Number.isFinite(resetsAtMs) && resetsAtMs > now
+    ? Math.min(resetsAtMs, now + MAX_EXHAUSTION_MS)
+    : now + FAILOVER_UNKNOWN_RESET_MS;
+  const [accountId, family = null] = key.split('\n');
+  const entry = { accountId, family, until, claim, markedAt: now, checkedAt: now, reply: replayableReply(reply) };
+  map.delete(key);
+  map.set(key, entry);
+  while (map.size > MAX_TRACKED_ACCOUNTS) {
+    map.delete(map.keys().next().value);
+  }
+  return entry;
+}
+
+function inForce(map, key, now) {
+  const entry = map.get(key);
+  if (!entry) return null;
+  if (entry.until <= now) {
+    map.delete(key);
+    return null;
+  }
+  return entry;
 }
 
 /**
@@ -305,7 +367,9 @@ function replayableReply(reply) {
  * window it refused on; a Codex refusal names none, and any used-up window
  * refuses it.
  */
-function windowsForClaim(provider, claim) {
+function windowsForClaim(provider, claim, family = null) {
+  // A model family's own allowance is the usage reading's `<family>_weekly`.
+  if (family) return [`${family}_weekly`];
   if (provider === 'codex') return ['five_hour', 'weekly', 'primary', 'secondary'];
   if (claim === 'five_hour') return ['five_hour'];
   if (claim === 'seven_day') return ['weekly'];
@@ -323,9 +387,9 @@ function windowsForClaim(provider, claim) {
  * and the account simply waits for its reset or for a member's request to be
  * answered by it.
  */
-export function usageShowsRecovered(snapshot, { provider, claim = null } = {}) {
+export function usageShowsRecovered(snapshot, { provider, claim = null, family = null } = {}) {
   if (snapshot?.status !== 'available' || !Array.isArray(snapshot.windows)) return false;
-  const kinds = windowsForClaim(provider, claim);
+  const kinds = windowsForClaim(provider, claim, family);
   if (!kinds) return false;
   const windows = snapshot.windows.filter((entry) => kinds.includes(entry?.kind));
   if (!windows.length) return false;
@@ -346,11 +410,12 @@ export async function recheckExhaustedAccounts({
   now = Date.now(),
   shouldStop = () => false,
 }) {
-  for (const { accountId, claim } of exhaustion.dueForRecheck(now)) {
+  for (const { accountId, family, claim } of exhaustion.dueForRecheck(now)) {
     if (shouldStop()) return;
+    const forget = () => (family ? exhaustion.clearModel(accountId, family) : exhaustion.clear(accountId));
     const account = store.accountById(accountId);
     if (!account) {
-      exhaustion.clear(accountId);
+      forget();
       continue;
     }
     let snapshot = null;
@@ -359,9 +424,14 @@ export async function recheckExhaustedAccounts({
     } catch {
       snapshot = null;
     }
-    if (usageShowsRecovered(snapshot, { provider: account.provider, claim })) {
-      exhaustion.clear(accountId);
-      log('quota_exhaustion_cleared', { account_id: accountId, reason: 'usage_recovered', claim });
+    if (usageShowsRecovered(snapshot, { provider: account.provider, claim, family })) {
+      forget();
+      log('quota_exhaustion_cleared', {
+        account_id: accountId,
+        reason: 'usage_recovered',
+        claim,
+        ...(family ? { model_family: family } : {}),
+      });
     }
   }
 }
@@ -427,6 +497,22 @@ export function usageShowsExhausted(snapshot, now = Date.now()) {
 }
 
 /**
+ * Whether the usage reading shows a model family's own allowance (its
+ * `<family>_weekly` window) used up on the account. Only that model is
+ * stopped by it; see usageShowsExhausted for the windows that stop everything.
+ */
+export function usageShowsModelExhausted(snapshot, family, now = Date.now()) {
+  if (!family) return false;
+  const windows = Array.isArray(snapshot?.windows) ? snapshot.windows : [];
+  return windows.some((entry) => {
+    if (entry?.kind !== `${family}_weekly`) return false;
+    if (!(Number.isFinite(entry.remaining_percent) && entry.remaining_percent <= 0)) return false;
+    const resetsAt = Date.parse(String(entry.resets_at ?? ''));
+    return !Number.isFinite(resetsAt) || resetsAt > now;
+  });
+}
+
+/**
  * The account a device should fail over to, or null when no backup is usable.
  *
  * `homeAccount` is the account whose backup list governs: the one the device
@@ -443,6 +529,9 @@ export function chooseFailoverAccount({
   exhaustedBy = usageShowsExhausted,
   acceptCandidate = () => true,
   allowLastResort = true,
+  // The model family the request is for, when known: a backup whose own
+  // allowance for it is gone cannot answer it either.
+  family = null,
   now = Date.now(),
 }) {
   const policy = normalizeAccountFailover(homeAccount?.failover);
@@ -468,7 +557,9 @@ export function chooseFailoverAccount({
       snapshot = null;
     }
     if (exhaustion.exhausted(candidate.id, now)) continue;
-    if (knownExhausted(candidate.id, { exhaustion, snapshot, exhaustedBy, now })) {
+    if (exhaustion.modelExhausted(candidate.id, family, now)) continue;
+    if (knownExhausted(candidate.id, { exhaustion, snapshot, exhaustedBy, now })
+      || usageShowsModelExhausted(snapshot, family, now)) {
       lastResort.push(candidate);
       continue;
     }
@@ -548,6 +639,9 @@ export function beginFailover({
   usageSnapshotFor = () => null,
   exhaustedBy = usageShowsExhausted,
   acceptCandidate = () => true,
+  // The Claude model family the request is for, when the gateway has read it
+  // already; see claudeModelFamily.
+  family = null,
   log = () => {},
   logPrefix,
   now = Date.now,
@@ -603,10 +697,15 @@ export function beginFailover({
     account: current,
     // The account this request was moved off, once it has been.
     failedOverFrom: null,
-    nextBackup({ allowLastResort = true } = {}) {
+    // Whether any move was for the account as a whole. Only such a move is
+    // made the device's own: one made because a single model's allowance ran
+    // out leaves every other model on the account the device is on.
+    accountWide: false,
+    nextBackup({ allowLastResort = true, family: requestFamily = family } = {}) {
       if (!enabled) return null;
       const backup = chooseFailoverAccount({
         allowLastResort,
+        family: requestFamily,
         store,
         homeAccount,
         exclude: tried,
@@ -620,8 +719,9 @@ export function beginFailover({
       return backup;
     },
     /** Note that the request now runs on `backup` instead of the current account. */
-    moveTo(backup) {
+    moveTo(backup, { accountWide = true } = {}) {
       state.failedOverFrom ??= state.account;
+      state.accountWide ||= accountWide;
       state.account = backup;
     },
     /**
@@ -630,7 +730,8 @@ export function beginFailover({
      * the answer is already on its way to the client.
      */
     recordMove() {
-      if (state.recorded || !state.failedOverFrom || deviceSelectedId === state.account.id) return;
+      if (state.recorded || !state.failedOverFrom || !state.accountWide
+        || deviceSelectedId === state.account.id) return;
       state.recorded = true;
       // Prefer what the gateway saw, then what the usage reading says; a
       // guessed quarter of an hour only when neither knows.
@@ -660,26 +761,32 @@ export function beginFailover({
     refusal: null,
   };
   const refused = exhaustion.exhausted(current.id, now());
-  if (enabled && (refused || isExhausted(current.id))) {
+  const refusedForModel = exhaustion.modelExhausted(current.id, family, now());
+  const accountDoubted = Boolean(refused) || isExhausted(current.id);
+  const modelDoubted = Boolean(refusedForModel)
+    || usageShowsModelExhausted(snapshot(current.id), family, now());
+  if (enabled && (accountDoubted || modelDoubted)) {
     // An account the upstream refused is certain to refuse again, so even a
     // backup only the usage reading doubts is worth trying. One that is only
     // doubted itself is as good a try as another doubted one, so then only a
     // backup believed usable is moved to.
-    const backup = state.nextBackup({ allowLastResort: Boolean(refused) });
+    const backup = state.nextBackup({ allowLastResort: Boolean(refused || refusedForModel) });
     if (backup) {
       log(`${logPrefix}_quota_failover`, {
         stage: 'preflight',
         device_id: device.id,
         from_account_id: current.id,
         to_account_id: backup.id,
+        ...(accountDoubted ? {} : { model_family: family }),
       });
-      state.moveTo(backup);
+      state.moveTo(backup, { accountWide: accountDoubted });
       state.preflight = true;
     }
   }
   // Only a refusal that was kept can be replayed; without one the request
   // goes upstream as before and collects a fresh refusal to keep.
-  if (refused?.reply && state.account === current) state.refusal = refused;
+  const replay = refused ?? refusedForModel;
+  if (replay?.reply && state.account === current) state.refusal = replay;
   return state;
 }
 
