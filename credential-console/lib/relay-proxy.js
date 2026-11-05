@@ -19,7 +19,7 @@ import { readModelPrefix } from './model-gate.js';
 import { relayStream } from './bedrock-proxy.js';
 import { createCodexUsageParser, parseCodexUsage } from './codex-usage.js';
 import { createResponseUsageParser, parseResponseUsage } from './response-usage.js';
-import { RELAY_ACCOUNT_ID, RELAY_PROXY_PREFIX } from './relay.js';
+import { RELAY_ACCOUNT_ID, RELAY_PROXY_PREFIX, relayBaseUrl } from './relay.js';
 
 /**
  * Carries a device's turn to the third-party platform.
@@ -151,6 +151,27 @@ async function readRest(stream, already, limit) {
   return Buffer.concat(chunks);
 }
 
+/**
+ * Fixed routes beside the platform: `model=url` entries (comma-, semicolon- or
+ * newline-separated) from `CREDENTIAL_CONSOLE_RELAY_ROUTES`. A routed model goes
+ * to its own OpenAI/Anthropic-compatible endpoint — typically a self-hosted
+ * server reachable only from this host — with no platform key, and is allowed
+ * because the deployment named it. Malformed entries are skipped, never
+ * widened into something else; an unset value means no routes.
+ */
+export function parseRelayRoutes(value) {
+  const routes = new Map();
+  for (const entry of String(value ?? '').split(/[,;\n]/)) {
+    const at = entry.indexOf('=');
+    if (at < 1) continue;
+    const model = entry.slice(0, at).trim();
+    const baseUrl = relayBaseUrl(entry.slice(at + 1).trim());
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(model) || !baseUrl) continue;
+    routes.set(model, { base_url: baseUrl, alias: 'direct' });
+  }
+  return routes;
+}
+
 export function createRelay({
   store,
   catalog = null,
@@ -158,14 +179,17 @@ export function createRelay({
   enabled = false,
   fetchImpl = fetch,
   now = Date.now,
+  routes = new Map(),
 }) {
   const settings = () => store.relaySettings();
-  const active = () => {
-    if (!enabled) return false;
+  const platformActive = () => {
     const current = settings();
     return Boolean(current.base_url && current.has_key && current.allowed_models.length);
   };
-  const allows = (model) => typeof model === 'string' && settings().allowed_models.includes(model);
+  const active = () => enabled && (routes.size > 0 || platformActive());
+  const allows = (model) => typeof model === 'string'
+    && (routes.has(model) || (platformActive() && settings().allowed_models.includes(model)));
+  const allowedModels = () => [...(platformActive() ? settings().allowed_models : []), ...routes.keys()];
   const platformAlias = () => `relay:${settings().name ?? 'platform'}`;
 
   /**
@@ -174,6 +198,7 @@ export function createRelay({
    */
   async function forward(req, res, { device, kind, head = null, ended = false, path, authenticatedAtMs = now() }) {
     const authenticatedAtMonotonic = performance.now();
+    let accountAlias = platformAlias();
     const record = ({
       statusCode,
       outcome,
@@ -193,7 +218,7 @@ export function createRelay({
         machineId: device.machine_id ?? null,
         memberLabel: device.member_label,
         accountId: RELAY_ACCOUNT_ID,
-        accountAlias: platformAlias(),
+        accountAlias,
         model,
         stream,
         statusCode,
@@ -259,15 +284,17 @@ export function createRelay({
       sendJson(res, 403, errorBody(
         kind,
         'permission_error',
-        `model "${model ?? ''}" is not allowed on the third-party platform; allowed: ${settings().allowed_models.join(', ') || 'none'} `
-          + `(第三方模型平台只允许：${settings().allowed_models.join('、') || '无'})`,
+        `model "${model ?? ''}" is not allowed on the third-party platform; allowed: ${allowedModels().join(', ') || 'none'} `
+          + `(第三方模型平台只允许：${allowedModels().join('、') || '无'})`,
       ));
       return;
     }
 
-    const current = settings();
-    const apiKey = store.relayApiKey();
-    if (!current.base_url || !apiKey) {
+    const route = routes.get(model) ?? null;
+    if (route) accountAlias = `relay:${route.alias}`;
+    const current = route ?? settings();
+    const apiKey = route ? null : store.relayApiKey();
+    if (!current.base_url || (!route && !apiKey)) {
       record({ statusCode: 503, outcome: 'rejected', model, stream: streaming, requestBytes: body.length });
       sendJson(res, 503, errorBody(kind, 'api_error', 'third-party platform is not configured'));
       return;
@@ -277,9 +304,9 @@ export function createRelay({
       if (typeof req.headers[name] === 'string') headers[name] = req.headers[name];
     }
     headers['content-type'] ??= 'application/json';
-    headers.authorization = `Bearer ${apiKey}`;
+    if (apiKey) headers.authorization = `Bearer ${apiKey}`;
     if (kind === 'messages') {
-      headers['x-api-key'] = apiKey;
+      if (apiKey) headers['x-api-key'] = apiKey;
       headers['anthropic-version'] ??= '2023-06-01';
     }
 
@@ -391,7 +418,7 @@ export function createRelay({
       const created = Math.floor(now() / 1000);
       sendJson(res, 200, {
         object: 'list',
-        data: (active() ? settings().allowed_models : []).map((id) => ({ id, object: 'model', created, owned_by: settings().name ?? 'relay' })),
+        data: (active() ? allowedModels() : []).map((id) => ({ id, object: 'model', created, owned_by: routes.has(id) ? 'direct' : (settings().name ?? 'relay') })),
       });
       return;
     }

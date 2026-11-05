@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { CredentialStore } from '../lib/store.js';
+import { parseRelayRoutes } from '../lib/relay-proxy.js';
 import { relayBaseUrl, relayCatalogFromPricing, relayCostUsd } from '../lib/relay.js';
 import { withRelayTab } from '../lib/views.js';
 
@@ -17,7 +18,8 @@ const SSE_MESSAGES = [
 
 async function newStore(t) {
   const home = await mkdtemp(join(tmpdir(), 'relay-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  // A late seen-write from the proxy can land while the home is being removed; retry then.
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   return { home, store: await new CredentialStore(home, { allowKeyInit: true }).init() };
 }
 
@@ -85,9 +87,9 @@ test('the tab is added once, and marked current only on the relay page', () => {
   assert.match(withRelayTab(`${page}<section data-relay-page>`), /href="\/relay"[^>]*aria-current="page"/);
 });
 
-async function relayConsole(t, { relayEnabled = true } = {}) {
+async function relayConsole(t, { relayEnabled = true, routeModel = null } = {}) {
   const { store } = await newStore(t);
-  const seen = { platform: [], claude: [], codex: [] };
+  const seen = { platform: [], claude: [], codex: [], route: [] };
   const platform = http.createServer(async (req, res) => {
     const body = await readJson(req);
     seen.platform.push({ url: req.url, headers: req.headers, body: body.json });
@@ -105,7 +107,14 @@ async function relayConsole(t, { relayEnabled = true } = {}) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ id: 'm', type: 'message', content: [], usage: { input_tokens: 1, output_tokens: 1 } }));
   });
-  const [platformUrl, anthropicUrl] = await Promise.all([listen(platform), listen(anthropic)]);
+  // A self-hosted endpoint reached through a fixed route, not the platform.
+  const routeServer = http.createServer(async (req, res) => {
+    const body = await readJson(req);
+    seen.route.push({ url: req.url, headers: req.headers, body: body.json });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(SSE_MESSAGES);
+  });
+  const [platformUrl, anthropicUrl, routeUrl] = await Promise.all([listen(platform), listen(anthropic), listen(routeServer)]);
   const claude = await store.addAccount({ provider: 'claude', alias: 'claude-1', emailLabel: 'o@example.com', credential: { oauth_token: 'sk-ant-oat01-real' } });
   const issued = await store.issueDeviceCredential({ accountId: claude.id, memberLabel: 'm', deviceName: 'laptop' });
   await store.setRelayPlatform({ name: 'boyue', baseUrl: `${platformUrl}/v1`, apiKey: PLATFORM_KEY });
@@ -118,6 +127,7 @@ async function relayConsole(t, { relayEnabled = true } = {}) {
     cookieSecure: false,
     publicBaseUrl: 'http://console.test',
     relayEnabled,
+    ...(routeModel ? { relayRoutes: new Map([[routeModel, { base_url: routeUrl, alias: 'direct' }]]) } : {}),
     relayCatalog: { snapshot: () => ({ rows: [], balance: null, fetched_at: null, error: null }), row: () => null, refresh: async () => {}, stop() {} },
     claudeUpstreamBaseUrl: anthropicUrl,
     requestMetrics: { enqueueRequest: (row) => { metrics.push(row); } },
@@ -126,15 +136,22 @@ async function relayConsole(t, { relayEnabled = true } = {}) {
   });
   await new Promise((resolve) => created.server.listen(0, '127.0.0.1', resolve));
   const baseUrl = `http://127.0.0.1:${created.server.address().port}`;
-  t.after(async () => {
-    await new Promise((resolve) => created.server.close(resolve));
-    await created.stop?.();
+  let closed = null;
+  // Sockets first, then the servers, then the store's serialized writer, so
+  // nothing is still writing into the store home when it is removed.
+  const shutdown = () => closed ??= (async () => {
+    created.server.closeAllConnections?.();
     platform.closeAllConnections?.();
     anthropic.closeAllConnections?.();
-    platform.close();
-    anthropic.close();
-  });
-  return { baseUrl, token: issued.token, seen, metrics, store };
+    routeServer.closeAllConnections?.();
+    await Promise.all([created.server, platform, anthropic, routeServer].map((server) => (server.listening
+      ? new Promise((resolve) => server.close(resolve))
+      : null)));
+    await created.stop?.();
+    await store.serialized(async () => {});
+  })();
+  t.after(shutdown);
+  return { baseUrl, token: issued.token, seen, metrics, store, shutdown };
 }
 
 function postJson(url, token, body, headers = {}) {
@@ -227,4 +244,45 @@ test('the relay page renders the allow-list, usage and catalog, and changes are 
   assert.equal((await post({ model: 'kimi-k3', op: 'allow' })).status, 403);
   assert.equal((await post({ csrf, model: 'kimi-k3', op: 'allow' })).status, 303);
   assert.deepEqual(store.relaySettings().allowed_models, ['deepseek-v4-flash', 'kimi-k3']);
+});
+
+test('relay routes parse model=url entries and skip malformed ones', () => {
+  const routes = parseRelayRoutes(' DeepSeek-V4.1-Flash=http://127.0.0.1:18540/v1 ; bad name=http://x , =http://y, ok=ftp://z, qwen=https://h.example/');
+  assert.deepEqual([...routes.keys()], ['DeepSeek-V4.1-Flash', 'qwen']);
+  assert.equal(routes.get('DeepSeek-V4.1-Flash').base_url, 'http://127.0.0.1:18540');
+  assert.equal(routes.get('qwen').base_url, 'https://h.example');
+  assert.equal(parseRelayRoutes(undefined).size, 0);
+});
+
+test('a routed model goes to its own endpoint without the platform key; the platform and accounts are untouched', { timeout: 20_000 }, async (t) => {
+  const { baseUrl, token, seen, metrics, shutdown } = await relayConsole(t, { routeModel: 'DeepSeek-V4.1-Flash' });
+
+  const routed = await postJson(`${baseUrl}/claude/v1/messages`, token, { model: 'DeepSeek-V4.1-Flash', max_tokens: 10, stream: true, messages: [] }, { 'anthropic-version': '2023-06-01' });
+  assert.equal(routed.status, 200);
+  assert.equal(await routed.text(), SSE_MESSAGES);
+  assert.equal(seen.route.length, 1);
+  assert.equal(seen.route[0].url, '/v1/messages');
+  assert.equal(seen.route[0].headers.authorization, undefined, 'the platform key never leaves for a routed endpoint');
+  assert.equal(seen.route[0].headers['x-api-key'], undefined);
+  assert.equal(seen.platform.length, 0);
+  assert.equal(seen.claude.length, 0);
+  const row = metrics.find((entry) => entry.model === 'DeepSeek-V4.1-Flash');
+  assert.equal(row.accountAlias, 'relay:direct');
+  assert.equal(row.inputTokens, 11);
+
+  const platformTurn = await postJson(`${baseUrl}/claude/v1/messages`, token, { model: 'deepseek-v4-flash', max_tokens: 10, stream: true, messages: [] }, { 'anthropic-version': '2023-06-01' });
+  assert.equal(platformTurn.status, 200);
+  await platformTurn.text();
+  assert.equal(seen.platform.length, 1);
+  assert.equal(seen.platform[0].headers.authorization, `Bearer ${PLATFORM_KEY}`);
+
+  const account = await postJson(`${baseUrl}/claude/v1/messages`, token, { model: 'claude-opus-5-5', max_tokens: 10, messages: [] });
+  assert.equal(account.status, 200);
+  await account.text();
+  assert.equal(seen.claude.length, 1);
+  assert.equal(seen.route.length, 1);
+
+  const models = await fetch(`${baseUrl}/relay/v1/models`, { headers: { authorization: `Bearer ${token}` } });
+  assert.deepEqual((await models.json()).data.map((entry) => entry.id), ['deepseek-v4-flash', 'DeepSeek-V4.1-Flash']);
+  await shutdown();
 });

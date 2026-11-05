@@ -31,7 +31,7 @@ import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { isCodexGatewayAccount } from './lib/codex-api-key.js';
 import { RELAY_ACCOUNT_ID, RELAY_PROXY_PREFIX, RelayCatalog, relayCostUsd } from './lib/relay.js';
-import { createRelay } from './lib/relay-proxy.js';
+import { createRelay, parseRelayRoutes } from './lib/relay-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
 import { queryMetricsDataset } from './lib/metrics-page-query.js';
@@ -121,6 +121,9 @@ const CODEX_API_KEY_MODELS = parseApiKeyModels(process.env.CREDENTIAL_CONSOLE_CO
 // And for third-party models: the tab, the routes and the in-channel hand-off
 // exist only where this is exactly "1".
 const RELAY_ENABLED = process.env.CREDENTIAL_CONSOLE_RELAY_ENABLED === '1';
+// Fixed `model=url` routes beside the platform (e.g. a self-hosted model only this host
+// can reach). Only read where the relay is on; unset means none.
+const RELAY_ROUTES = parseRelayRoutes(process.env.CREDENTIAL_CONSOLE_RELAY_ROUTES);
 // And for Claude Code's own WebSearch: the Claude installer leaves Claude Code
 // out of its gateway mode, where WebSearch is switched off, only here.
 const CLAUDE_WEB_SEARCH_ENABLED = process.env.CREDENTIAL_CONSOLE_CLAUDE_WEB_SEARCH_ENABLED === '1';
@@ -531,7 +534,7 @@ export async function createCredentialConsole(options = {}) {
     ? (options.relayCatalog ?? new RelayCatalog({ store, fetchImpl: options.relayFetch ?? fetch }).start())
     : null;
   const relay = relayEnabled
-    ? createRelay({ store, requestMetrics, enabled: true, fetchImpl: options.relayFetch ?? fetch })
+    ? createRelay({ store, requestMetrics, enabled: true, fetchImpl: options.relayFetch ?? fetch, routes: options.relayRoutes ?? RELAY_ROUTES })
     : null;
   /**
    * Last 30 days of relay turns, by model and by device, priced at the
