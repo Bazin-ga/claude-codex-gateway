@@ -252,6 +252,81 @@ export function sendJson(res, status, body, headers = {}) {
   sendBuffer(res, status, payload, 'application/json; charset=utf-8', headers);
 }
 
+/**
+ * How long a refused request's body may keep arriving before the connection is
+ * closed on it anyway. A real client finishes a multi-megabyte upload well
+ * inside this even on a slow uplink; a body still trickling in after it is not
+ * one worth waiting for.
+ */
+export const REFUSAL_DRAIN_TIMEOUT_MS = 60_000;
+
+/**
+ * Send a refusal for a request whose body will never be used, once the client
+ * has finished sending that body.
+ *
+ * Closing the socket while the client is still uploading makes the kernel
+ * answer the unread bytes with a reset, and a reset that lands before the
+ * client has read the response throws the response away with it. A client that
+ * only reads once its upload is done — Claude Code on a Mac, over a real
+ * network, is one — then sees `ECONNRESET` instead of the refusal, and retries
+ * it as a network failure for minutes before giving up with a message that
+ * says nothing about why. So the rest of the body is read and discarded first,
+ * and the refusal goes out when nothing is left unread.
+ *
+ * Draining is bounded: past `limitBytes` of discarded body, or `timeoutMs`
+ * without the body ending, the refusal is sent and the connection closed under
+ * the client, as it was before. If the client leaves first nothing is sent.
+ */
+export function refuseAfterDraining(req, res, send, {
+  limitBytes,
+  timeoutMs = REFUSAL_DRAIN_TIMEOUT_MS,
+} = {}) {
+  let drained = 0;
+  let settled = false;
+  let timer = null;
+  const cleanup = () => {
+    settled = true;
+    clearTimeout(timer);
+    req.off('data', onData);
+    req.off('end', onEnd);
+    req.off('error', onGone);
+    req.off('aborted', onGone);
+    res.off('close', onGone);
+  };
+  const settle = (bodyFinished) => {
+    if (settled) return;
+    cleanup();
+    if (res.destroyed || res.headersSent) return;
+    if (!bodyFinished) {
+      res.once('finish', () => {
+        if (!req.destroyed) req.destroy();
+      });
+    }
+    send();
+  };
+  function onData(chunk) {
+    drained += chunk.length;
+    if (Number.isFinite(limitBytes) && drained > limitBytes) settle(false);
+  }
+  function onEnd() {
+    settle(true);
+  }
+  function onGone() {
+    if (!settled) cleanup();
+  }
+  if (req.readableEnded) {
+    settle(true);
+    return;
+  }
+  req.on('data', onData);
+  req.once('end', onEnd);
+  req.once('error', onGone);
+  req.once('aborted', onGone);
+  res.once('close', onGone);
+  timer = setTimeout(() => settle(false), timeoutMs);
+  req.resume();
+}
+
 export function sendText(res, status, body, contentType = 'text/plain; charset=utf-8', headers = {}) {
   sendBuffer(res, status, Buffer.from(body, 'utf8'), contentType, headers);
 }

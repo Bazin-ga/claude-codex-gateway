@@ -4,7 +4,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { readFile } from 'node:fs/promises';
 import { PassThrough, Transform } from 'node:stream';
-import { sendJson } from './http.js';
+import { refuseAfterDraining, sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
 import { createRequestMetadataTee, REQUEST_METADATA_PREFIX_BYTES } from './request-metadata.js';
 import {
@@ -360,10 +360,11 @@ export async function handleCodexProxy(req, res, {
       resets_at: new Date(failover.refusal.until).toISOString(),
     });
     recordRejected(429, 'quota_exhausted_cached');
-    res.once('finish', () => {
-      if (!req.destroyed) req.destroy();
-    });
-    sendCachedRefusal(res, failover.refusal, now());
+    // Drained before the refusal goes out, so the CLI reads the 429 instead of
+    // a reset.
+    refuseAfterDraining(req, res, () => {
+      sendCachedRefusal(res, failover.refusal, now());
+    }, { limitBytes: MAX_REQUEST_BYTES });
     return;
   }
 
@@ -386,12 +387,12 @@ export async function handleCodexProxy(req, res, {
           : null,
       });
       recordRejected(429, 'credits_blocked');
-      // Nothing of the body was read; closing is what stops the rest of an
-      // upload nobody will forward from being drained.
-      res.once('finish', () => {
-        if (!req.destroyed) req.destroy();
-      });
-      sendJson(res, 429, creditGuardRefusalBody(exhaustion), { Connection: 'close' });
+      // Nothing of the body was read. It is drained and dropped before the
+      // refusal goes out: closing on an upload still in flight resets the
+      // connection, and the reset loses the refusal.
+      refuseAfterDraining(req, res, () => {
+        sendJson(res, 429, creditGuardRefusalBody(exhaustion), { Connection: 'close' });
+      }, { limitBytes: MAX_REQUEST_BYTES });
       return;
     }
   }
@@ -491,13 +492,13 @@ export async function handleCodexProxy(req, res, {
         requestBytes: gatePrefix.bytes,
       });
       // The body was only read far enough to find the model, so the rest of
-      // an upload nobody will forward is still arriving. Closing the
-      // connection is what stops it; keeping it alive would leave the server
-      // draining megabytes for a request it has already refused.
-      res.once('finish', () => {
-        if (!req.destroyed) req.destroy();
-      });
-      sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+      // an upload nobody will forward is still arriving. It is drained (up to
+      // the request size limit) before the refusal goes out: closing on it
+      // would reset the connection, and a client still writing loses the
+      // refusal to the reset and retries it as a network error.
+      refuseAfterDraining(req, res, () => {
+        sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+      }, { limitBytes: MAX_REQUEST_BYTES });
       return;
     }
   }
@@ -1243,10 +1244,9 @@ export async function handleCodexProxy(req, res, {
       currentUpstreamReq?.destroy();
       requestMetadata.stream.destroy();
       if (!res.headersSent) {
-        res.once('finish', () => {
-          if (!req.destroyed) req.destroy();
-        });
-        sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+        refuseAfterDraining(req, res, () => {
+          sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+        }, { limitBytes: MAX_REQUEST_BYTES });
       } else if (!res.destroyed) {
         res.destroy();
       }
