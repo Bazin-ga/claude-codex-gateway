@@ -158,9 +158,20 @@ replacement for this live link. A human must explicitly authorize any local exec
 secret-bearing generated installer; after authorization an AI may run it locally, but must never
 paste the installer or its output into the conversation.
 
-There is no third mode and nothing to bootstrap: the console has no administrator credential, so
-neither deployment needs a password file or a setup command. Confirm the mode a running service
-actually resolved before exposing it:
+`tailscale` and `open` have nothing to bootstrap: the console has no administrator credential, so
+neither needs a password file or a setup command. `password` mode (members by default,
+administrators sign in) needs one administrator created while the service is stopped:
+
+```bash
+sudo systemctl stop credential-console
+sudo -u credential-console env CREDENTIAL_CONSOLE_HOME=/var/lib/credential-console \
+  node /opt/numen-kit/credential-console/cli.js admin add <username>
+# then set CREDENTIAL_CONSOLE_ADMIN_AUTH=password and start the service
+```
+
+Until one exists every visitor stays a member and the log says
+`admin_password_mode_without_administrator`. Confirm the mode a running service actually resolved
+before exposing it:
 
 ```bash
 curl -fsS http://127.0.0.1:9080/health

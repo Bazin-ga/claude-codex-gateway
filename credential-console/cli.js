@@ -17,12 +17,78 @@ function usage() {
   node cli.js init-key
   node cli.js import-codex --alias <alias> --home <path> [--email <label>]
   node cli.js checkpoint-metrics
-  node cli.js list`);
+  node cli.js list
+  node cli.js admin list
+  node cli.js admin add <username> [--password-stdin]
+  node cli.js admin passwd <username> [--password-stdin]
+  node cli.js admin delete <username>`);
   process.exitCode = 2;
+}
+
+// Never from argv, where it would sit in shell history and the process list:
+// typed twice at a terminal with echo off, or one line on stdin.
+async function readPassword() {
+  if (process.argv.includes('--password-stdin') || !process.stdin.isTTY) {
+    let input = '';
+    for await (const chunk of process.stdin) input += chunk;
+    return input.replace(/\r?\n$/, '');
+  }
+  const ask = (prompt) => new Promise((resolveAnswer, reject) => {
+    process.stderr.write(prompt);
+    let answer = '';
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+    const onData = (char) => {
+      if (char === '\u0003') {
+        process.stdin.setRawMode(false);
+        process.stdin.off('data', onData);
+        reject(new Error('cancelled'));
+      } else if (char === '\r' || char === '\n') {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdin.off('data', onData);
+        process.stderr.write('\n');
+        resolveAnswer(answer);
+      } else if (char === '\u007f') {
+        answer = answer.slice(0, -1);
+      } else {
+        answer += char;
+      }
+    };
+    process.stdin.on('data', onData);
+  });
+  const first = await ask('Password: ');
+  const second = await ask('Repeat password: ');
+  if (first !== second) throw new Error('the two passwords differ');
+  return first;
 }
 
 async function main() {
   const command = process.argv[2];
+
+  if (command === 'admin') {
+    const action = process.argv[3];
+    const username = process.argv[4];
+    if (action === 'list') {
+      const store = await new CredentialStore(HOME).init();
+      console.log(JSON.stringify(store.adminUsers(), null, 2));
+      return;
+    }
+    if (!['add', 'passwd', 'delete'].includes(action) || !username) return usage();
+    const password = action === 'delete' ? null : await readPassword();
+    const lock = await acquireHomeLock(HOME, { role: `cli:admin-${action}` });
+    try {
+      const store = await new CredentialStore(HOME).init();
+      if (action === 'add') await store.addAdminUser({ username, password, actor: 'cli' });
+      else if (action === 'passwd') await store.setAdminPassword(username, password, { actor: 'cli' });
+      else await store.deleteAdminUser(username, { actor: 'cli' });
+      console.log(`administrator ${username}: ${action} done`);
+    } finally {
+      await lock.release();
+    }
+    return;
+  }
 
   if (!['init-key', 'import-codex', 'checkpoint-metrics'].includes(command)) {
     if (command === 'list') {

@@ -199,6 +199,7 @@ function errorResponse(res, error, req = null) {
     CONVERSATION_HOOK_BUSY: [429, 'rate_limit_error', 'conversation capture is busy'],
     CONVERSATION_HOOK_UNAVAILABLE: [503, 'api_error', 'conversation capture unavailable'],
     ACCOUNT_NOT_ALLOWED: [403, 'permission_error', 'account is not allowed for this device'],
+    ACCOUNT_RESTRICTED: [403, 'permission_error', 'account is reserved for other machines'],
     DEVICE_SCOPE: [403, 'permission_error', 'device is outside the authenticated scope'],
     ACCOUNT_UNAVAILABLE: [409, 'conflict_error', 'account is unavailable'],
     DEVICE_CONFIGURATION_INVALID: [409, 'conflict_error', 'device account configuration is invalid'],

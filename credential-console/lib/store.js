@@ -24,6 +24,18 @@ import { CODEX_API_KEY_AUTH, isCodexApiKeyAccount } from './codex-api-key.js';
 import { normalizeRelay, RELAY_MAX_ALLOWED_MODELS, relayBaseUrl, relayModelName } from './relay.js';
 import { normalizeBedrockModelPin } from './bedrock-models.js';
 import {
+  accountUsableByDevice,
+  isRestrictedAccount,
+  normalizeAccountRestriction,
+  RESTRICTION_MAX_MACHINES,
+} from './account-restriction.js';
+import {
+  assertAdminPassword,
+  assertAdminUsername,
+  hashAdminPassword,
+  verifyAdminPassword,
+} from './admin-users.js';
+import {
   MODEL_BLOCK_MAX_RULES,
   normalizeModelBlockRules,
   parseModelBlockRuleInput,
@@ -289,6 +301,9 @@ export class CredentialStore {
       codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
       failover: account.failover
         ? { ...account.failover, backup_account_ids: [...normalizeAccountFailover(account.failover).backup_account_ids] }
+        : null,
+      restriction: account.restriction
+        ? { ...account.restriction, ...normalizeAccountRestriction(account.restriction) }
         : null,
       active_devices: this.state.devices.filter((device) => {
         if (device.revoked_at) return false;
@@ -567,6 +582,12 @@ export class CredentialStore {
     if (device.revoked_at) throw storeError('device is revoked', 'DEVICE_CONFIGURATION_INVALID');
   }
 
+  #assertAccountUsableByDevice(account, device) {
+    if (!accountUsableByDevice(account, device)) {
+      throw storeError('account is reserved for other machines', 'ACCOUNT_RESTRICTED');
+    }
+  }
+
   #assertSwitchableAccount(account) {
     if (!account) throw storeError('target account not found', 'DEVICE_CONFIGURATION_INVALID');
     if (!GATEWAY_PROVIDERS.includes(account.provider)) {
@@ -662,6 +683,9 @@ export class CredentialStore {
         'DEVICE_CONFIGURATION_INVALID',
       );
     }
+    // The last line of the private-account rule: whatever moved this device
+    // here, nothing is forwarded for an account reserved for other machines.
+    this.#assertAccountUsableByDevice(account, device);
     return {
       device,
       account,
@@ -682,7 +706,11 @@ export class CredentialStore {
       member_label: resolved.device.member_label,
       device_name: resolved.device.name,
       original_account_id: resolved.original_account_id,
-      allowed_account_ids: resolved.allowed_account_ids,
+      // A private account this machine is not listed on stays in the policy
+      // when it is the original account, but is not offered as a choice.
+      allowed_account_ids: resolved.allowed_account_ids.filter(
+        (id) => accountUsableByDevice(this.accountById(id), resolved.device),
+      ),
       selected_account_id: resolved.selected_account_id,
       effective_account_id: resolved.effective_account_id,
       source: resolved.source,
@@ -762,6 +790,7 @@ export class CredentialStore {
         if (!GATEWAY_PROVIDERS.includes(account.provider)) {
           throw storeError('target account is not a gateway account', 'DEVICE_CONFIGURATION_INVALID');
         }
+        this.#assertAccountUsableByDevice(account, device);
         // Unlike Claude, an unbound Codex or Bedrock row has nothing in this
         // store that could become usable later on the same route. Selecting one
         // would cut the device over to a guaranteed 503, so refuse before the
@@ -858,6 +887,7 @@ export class CredentialStore {
         }
         const account = this.accountById(selectedAccountId);
         this.#assertSwitchableAccount(account);
+        this.#assertAccountUsableByDevice(account, device);
         await this.#assertSwitchableCredentialHealth(account);
         const outcome = policy.selectedAccountId === selectedAccountId ? 'noop' : 'success';
         device.allowed_account_ids = [...policy.allowedAccountIds];
@@ -1309,6 +1339,11 @@ export class CredentialStore {
         if (backup.provider !== account.provider) {
           throw new Error('a backup account must use the same provider');
         }
+        // One way only: a private account may borrow from shared ones, a shared
+        // account never hands its devices to a private one.
+        if (isRestrictedAccount(backup) && !isRestrictedAccount(account)) {
+          throw new Error('a private account cannot back up a shared account');
+        }
         backups.push(backupId);
       }
       if (backups.length > FAILOVER_MAX_BACKUPS) {
@@ -1342,7 +1377,8 @@ export class CredentialStore {
    * The same row-level checks a manual switch makes, without throwing: the
    * proxy asks this on the request path and simply skips a backup that fails.
    */
-  failoverCandidateProblem(account) {
+  failoverCandidateProblem(account, device = null) {
+    if (device && !accountUsableByDevice(account, device)) return 'ACCOUNT_RESTRICTED';
     try {
       this.#assertSwitchableAccount(account);
       return null;
@@ -1375,6 +1411,7 @@ export class CredentialStore {
       const from = this.accountById(fromAccountId);
       const target = this.accountById(toAccountId);
       this.#assertSwitchableAccount(target);
+      this.#assertAccountUsableByDevice(target, device);
       if (from?.provider !== target.provider) {
         throw storeError('backup account uses a different provider', 'DEVICE_CONFIGURATION_INVALID');
       }
@@ -1430,7 +1467,7 @@ export class CredentialStore {
       const back = policy.selectedAccountId === marker.account_id
         && home
         && policy.allowedAccountIds.includes(home.id)
-        && !this.failoverCandidateProblem(home);
+        && !this.failoverCandidateProblem(home, device);
       delete device.account_failover;
       if (back) {
         device.selected_account_id = home.id;
@@ -2069,6 +2106,7 @@ export class CredentialStore {
           try {
             this.#assertDeviceMutable(device);
             const policy = this.#deviceAccountPolicy(device);
+            this.#assertAccountUsableByDevice(target, device);
             if (policy.selectedAccountId === selectedAccountId) {
               // Already there. Filtering by member can catch devices spread over
               // several accounts, and counting a no-op as a move would overstate
@@ -2208,6 +2246,11 @@ export class CredentialStore {
     return this.serialized(async () => {
       const account = this.accountById(accountId);
       if (!account) throw new Error('account not found');
+      // A code is redeemed without a machine name, so the device it makes could
+      // never be on a private account's list.
+      if (isRestrictedAccount(account)) {
+        throw new Error('a private account is issued from the setup form with a machine name, not by enrollment code');
+      }
       const code = randomToken(24);
       const record = {
         id: randomToken(12),
@@ -2234,7 +2277,7 @@ export class CredentialStore {
     return this.state.enrollments.find((record) => record.code_sha256 === digest) ?? null;
   }
 
-  async redeemEnrollment({ code, deviceName, machineId = null }) {
+  async redeemEnrollment({ code, deviceName, machineId = null, admitMachine = false }) {
     return this.serialized(async () => {
       const enrollment = this.enrollmentByCode(code);
       if (!enrollment) throw new Error('enrollment code not found');
@@ -2249,6 +2292,7 @@ export class CredentialStore {
         deviceName,
         machineId,
       });
+      this.#admitIssuedDevice(account, device, admitMachine);
       enrollment.used_at = nowIso();
       enrollment.device_id = device.id;
       this.state.devices.push(device);
@@ -2264,7 +2308,13 @@ export class CredentialStore {
     });
   }
 
-  async issueDeviceCredential({ accountId, memberLabel, deviceName, machineId = null }) {
+  async issueDeviceCredential({
+    accountId,
+    memberLabel,
+    deviceName,
+    machineId = null,
+    admitMachine = false,
+  }) {
     return this.serialized(async () => {
       const account = this.accountById(accountId);
       if (!account) throw new Error('account not found');
@@ -2300,6 +2350,7 @@ export class CredentialStore {
         deviceName,
         machineId,
       });
+      this.#admitIssuedDevice(account, device, admitMachine);
       this.state.devices.push(device);
       this.audit('device_self_enrolled', {
         device_id: device.id,
@@ -2311,6 +2362,260 @@ export class CredentialStore {
       await this.persist();
       return { account, device, token };
     });
+  }
+
+  /**
+   * A new credential on a private account. Issued by an administrator
+   * (`admitMachine`), the machine is added to the account's list, since
+   * choosing to issue it there is the decision. Otherwise the machine has to be
+   * on the list already. Mutates before the caller persists, like the device
+   * push beside it.
+   */
+  #admitIssuedDevice(account, device, admitMachine) {
+    if (accountUsableByDevice(account, device)) return;
+    if (!admitMachine) throw storeError('account is reserved for other machines', 'ACCOUNT_RESTRICTED');
+    if (!device.machine_id) {
+      throw storeError('a private account needs a machine name to issue on', 'ACCOUNT_RESTRICTED');
+    }
+    const restriction = normalizeAccountRestriction(account.restriction);
+    if (restriction.machine_ids.length >= RESTRICTION_MAX_MACHINES) {
+      throw new Error(`a private account takes at most ${RESTRICTION_MAX_MACHINES} machines`);
+    }
+    account.restriction = {
+      ...account.restriction,
+      ...restriction,
+      machine_ids: [...restriction.machine_ids, device.machine_id],
+    };
+    this.audit('account_restriction_machine_admitted', {
+      account_id: account.id,
+      machine_id: device.machine_id,
+      device_id: device.id,
+    });
+  }
+
+  /**
+   * What making `id` private for `machineIds` would do: the active devices on
+   * it (or failed over away from it) that are not on the list and so have to
+   * move. Nothing for a public account or one being made public.
+   */
+  accountRestrictionPlan(id, { enabled, machineIds = [] }) {
+    const account = this.accountById(id);
+    if (!account) throw new Error('account not found');
+    if (!GATEWAY_PROVIDERS.includes(account.provider)) {
+      throw new Error('only gateway accounts can be made private');
+    }
+    const next = normalizeAccountRestriction({ enabled: enabled === true, machine_ids: machineIds });
+    if (Array.isArray(machineIds) && next.machine_ids.length !== new Set(machineIds).size) {
+      throw new Error('a machine id is not valid');
+    }
+    if (next.machine_ids.length > RESTRICTION_MAX_MACHINES) {
+      throw new Error(`a private account takes at most ${RESTRICTION_MAX_MACHINES} machines`);
+    }
+    const proposed = { ...account, restriction: next };
+    const affected = !next.enabled ? [] : this.state.devices.filter((device) => {
+      if (device.revoked_at || accountUsableByDevice(proposed, device)) return false;
+      let selected = device.account_id;
+      try {
+        selected = this.#deviceAccountPolicy(device).selectedAccountId;
+      } catch {}
+      return selected === id || device.account_failover?.home_account_id === id;
+    });
+    return { account, next, affected };
+  }
+
+  /**
+   * Make an account private to a list of machines, change the list, or make it
+   * public again, in one write:
+   *
+   *   - devices the plan says must move go to `migrateToAccountId`, a person's
+   *     choice that also drops any failover marker that would bring them back;
+   *   - the account leaves the allowlist of every device not on the list,
+   *     except where it is the device's original account (the policy keeps
+   *     that one; the gateway refuses it all the same);
+   *   - it leaves every shared account's backup chain, and a chain left empty
+   *     is switched off. Made public, it drops private backups of its own.
+   */
+  async setAccountRestriction(id, { enabled, machineIds = [], migrateToAccountId = null, actor = null }) {
+    return this.serialized(async () => {
+      const { account, next, affected } = this.accountRestrictionPlan(id, { enabled, machineIds });
+      let target = null;
+      if (affected.length > 0) {
+        target = this.accountById(migrateToAccountId);
+        if (!target) throw new Error('choose an account to move the affected devices to');
+        if (target.id === id) throw new Error('the devices cannot stay on the account being made private');
+        if (target.provider !== account.provider) {
+          throw new Error('the devices must move to an account of the same provider');
+        }
+        this.#assertSwitchableAccount(target);
+        if (affected.some((device) => !accountUsableByDevice(target, device))) {
+          throw new Error('that account is reserved for other machines');
+        }
+      }
+      const snapshot = structuredClone({
+        accounts: this.state.accounts,
+        devices: this.state.devices,
+        audit: this.state.audit,
+      });
+      try {
+        const previous = normalizeAccountRestriction(account.restriction);
+        account.restriction = {
+          ...next,
+          updated_at: nowIso(),
+          updated_by: auditActor(actor),
+        };
+        for (const device of affected) {
+          const policy = this.#deviceAccountPolicy(device);
+          const allowed = policy.allowedAccountIds.filter(
+            (accountId) => accountId !== id || accountId === device.account_id,
+          );
+          if (!allowed.includes(target.id)) allowed.push(target.id);
+          device.allowed_account_ids = allowed;
+          device.selected_account_id = target.id;
+          delete device.account_failover;
+          this.audit('device_account_configured', this.#deviceAccountAudit({
+            device,
+            previousAccountId: policy.selectedAccountId,
+            nextAccountId: target.id,
+            outcome: 'success',
+            reason: 'account made private',
+            actor,
+          }));
+        }
+        if (next.enabled) {
+          for (const device of this.state.devices) {
+            if (device.revoked_at || accountUsableByDevice(account, device)) continue;
+            if (!Array.isArray(device.allowed_account_ids) || device.account_id === id
+              || device.selected_account_id === id) continue;
+            device.allowed_account_ids = device.allowed_account_ids.filter((accountId) => accountId !== id);
+          }
+        }
+        for (const other of this.state.accounts) {
+          const shared = other.id === id ? !next.enabled : !isRestrictedAccount(other);
+          if (!shared || !other.failover) continue;
+          const chain = normalizeAccountFailover(other.failover);
+          const kept = chain.backup_account_ids.filter((backupId) => (
+            other.id === id ? !isRestrictedAccount(this.accountById(backupId)) : backupId !== id
+          ));
+          if (kept.length === chain.backup_account_ids.length) continue;
+          other.failover = {
+            ...other.failover,
+            enabled: chain.enabled && kept.length > 0,
+            backup_account_ids: kept,
+            updated_at: nowIso(),
+            updated_by: auditActor(actor),
+          };
+          this.audit('account_failover_updated', {
+            account_id: other.id,
+            enabled: other.failover.enabled,
+            backup_account_ids: [...kept],
+            previous_enabled: chain.enabled,
+            previous_backup_account_ids: chain.backup_account_ids,
+            reason: 'account made private',
+            actor: auditActor(actor),
+          });
+        }
+        this.audit('account_restriction_updated', {
+          account_id: id,
+          enabled: next.enabled,
+          machine_ids: [...next.machine_ids],
+          previous_enabled: previous.enabled,
+          previous_machine_ids: previous.machine_ids,
+          moved_device_ids: affected.map((device) => device.id),
+          moved_to_account_id: target?.id ?? null,
+          actor: auditActor(actor),
+        });
+        await this.persist();
+      } catch (error) {
+        this.state.accounts = snapshot.accounts;
+        this.state.devices = snapshot.devices;
+        this.state.audit = snapshot.audit;
+        throw error;
+      }
+      return { account: this.accountById(id), moved: affected.map((device) => device.id) };
+    });
+  }
+
+  adminUsers() {
+    return (Array.isArray(this.state.admin_users) ? this.state.admin_users : []).map((user) => ({
+      username: user.username,
+      created_at: user.created_at ?? null,
+      created_by: user.created_by ?? null,
+      password_changed_at: user.password_changed_at ?? null,
+    }));
+  }
+
+  async addAdminUser({ username, password, actor = null }) {
+    assertAdminUsername(username);
+    assertAdminPassword(password);
+    const digest = await hashAdminPassword(password);
+    return this.serialized(async () => {
+      this.state.admin_users ??= [];
+      if (this.state.admin_users.some((user) => user.username.toLowerCase() === username.toLowerCase())) {
+        throw new Error(`administrator ${username} already exists`);
+      }
+      this.state.admin_users.push({
+        username,
+        password: digest,
+        created_at: nowIso(),
+        created_by: auditActor(actor),
+        password_changed_at: nowIso(),
+      });
+      this.audit('admin_user_added', { username, actor: auditActor(actor) });
+      try {
+        await this.persist();
+      } catch (error) {
+        this.state.admin_users = this.state.admin_users.filter((user) => user.username !== username);
+        throw error;
+      }
+      return this.adminUsers().find((user) => user.username === username);
+    });
+  }
+
+  async deleteAdminUser(username, { actor = null } = {}) {
+    return this.serialized(async () => {
+      const users = Array.isArray(this.state.admin_users) ? this.state.admin_users : [];
+      const index = users.findIndex((user) => user.username === username);
+      if (index < 0) throw new Error('administrator not found');
+      // With none left the console could only be administered by stopping it
+      // and using the command line.
+      if (users.length === 1) throw new Error('the last administrator cannot be deleted');
+      const [removed] = users.splice(index, 1);
+      this.audit('admin_user_deleted', { username, actor: auditActor(actor) });
+      try {
+        await this.persist();
+      } catch (error) {
+        users.splice(index, 0, removed);
+        throw error;
+      }
+    });
+  }
+
+  async setAdminPassword(username, password, { actor = null } = {}) {
+    assertAdminPassword(password);
+    const digest = await hashAdminPassword(password);
+    return this.serialized(async () => {
+      const user = (this.state.admin_users ?? []).find((entry) => entry.username === username);
+      if (!user) throw new Error('administrator not found');
+      const before = { password: user.password, password_changed_at: user.password_changed_at };
+      user.password = digest;
+      user.password_changed_at = nowIso();
+      this.audit('admin_password_changed', { username, actor: auditActor(actor) });
+      try {
+        await this.persist();
+      } catch (error) {
+        Object.assign(user, before);
+        throw error;
+      }
+    });
+  }
+
+  /** The administrator's name when the password matches, otherwise null. */
+  async verifyAdminLogin(username, password) {
+    const user = typeof username === 'string'
+      ? (this.state.admin_users ?? []).find((entry) => entry.username === username)
+      : null;
+    const ok = await verifyAdminPassword(user?.password ?? null, password);
+    return ok && user ? user.username : null;
   }
 
   deviceByToken(token) {

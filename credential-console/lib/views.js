@@ -9,6 +9,7 @@ import {
 } from './codex-model-guard.js';
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
+import { isRestrictedAccount, normalizeAccountRestriction } from './account-restriction.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { MODEL_BLOCK_MAX_MESSAGE_CHARS } from './model-block-rules.js';
 import { bedrockExampleModel } from './bedrock-models.js';
@@ -273,6 +274,12 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .pill.low { background: #faecd7; color: var(--amber); }
 .pill.out { background: #f8e4e1; color: var(--red); }
 .pill.moved { background: #e5edf4; color: var(--blue); }
+.restriction-control summary { cursor: pointer; }
+.viewer-chip { align-self: center; white-space: nowrap; }
+.restriction-control form { margin-top: 8px; }
+label.check { display: flex; align-items: center; gap: 6px; font-weight: 400; font-size: 12px; margin-bottom: 4px; }
+label.check input { width: auto; min-height: 0; margin: 0; }
+.restriction-machines { max-height: 180px; overflow-y: auto; }
 .switch { display: inline-flex; align-items: center; gap: 8px; margin: 0; padding: 4px 2px; background: none; color: var(--muted); font-size: 12px; font-weight: 800; border-radius: 999px; min-width: 88px; }
 .switch:hover { background: none; color: var(--ink); }
 .switch:disabled, .switch[aria-disabled="true"] { opacity: .5; }
@@ -337,6 +344,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .member-form.codex-form { grid-template-columns: 1fr auto; }
 .member-form.with-label { grid-template-columns: 1fr 1fr 1fr auto; }
 .member-form.codex-form.with-label { grid-template-columns: 1fr 1fr auto; }
+.member-form.with-machine { grid-template-columns: 1fr 1fr; }
+.member-form.with-machine.with-label { grid-template-columns: 1fr 1fr 1fr; }
 .member-form label { margin-bottom: 0; }
 .admin-zone { border-top: 1px solid var(--line); padding-top: 28px; margin-top: 12px; }
 .admin-heading { margin-bottom: 18px; }
@@ -812,6 +821,7 @@ h1, h2, h3, [id], [tabindex], input, select, textarea, button, a.button, summary
   .identity-chip { white-space: normal; }
   .provider-grid, .member-form, .member-form.codex-form,
   .member-form.with-label, .member-form.codex-form.with-label,
+  .member-form.with-machine, .member-form.with-machine.with-label,
   .merge-form, .metrics-filters, .metrics-chart-grid, .metrics-token-summary,
   .conversation-snippets, .conversation-result-snippets { grid-template-columns: 1fr; }
   .conversation-filters { grid-template-columns: 1fr; }
@@ -1198,6 +1208,37 @@ function accountFailoverSummary(account, accounts) {
   return policy.enabled
     ? `<div class="failover-summary"><span class="pill ok" data-i18n="failover-summary-on">Failover on</span><span>${chain}</span>${link}</div>`
     : `<div class="failover-summary"><span class="pill" data-i18n="failover-summary-off">Failover off</span>${link}</div>`;
+}
+
+/**
+ * Make an account private to a list of machines. Only machines that reported a
+ * handle can be listed; a legacy credential has to be merged into one first.
+ */
+function accountRestrictionControl(account, machines, csrf) {
+  if (!GATEWAY_PROVIDERS.includes(account.provider)) return '';
+  const restriction = normalizeAccountRestriction(account.restriction);
+  const known = new Map();
+  for (const machine of machines) {
+    if (!machine.machine_id || (machine.active_devices === 0 && !restriction.machine_ids.includes(machine.machine_id))) continue;
+    known.set(machine.machine_id, [
+      (machine.names ?? []).join(', ') || machine.machine_id,
+      (machine.member_labels ?? []).join(', '),
+    ].filter(Boolean).join(' · '));
+  }
+  for (const id of restriction.machine_ids) if (!known.has(id)) known.set(id, id);
+  const boxes = [...known].map(([id, label]) => `<label class="check"><input type="checkbox" name="machine:${escapeHtml(id)}" value="1"${restriction.machine_ids.includes(id) ? ' checked' : ''}> <span>${escapeHtml(label)}</span></label>`).join('');
+  return `<details class="restriction-control" data-account-restriction="${escapeHtml(account.id)}">
+    <summary>${restriction.enabled
+    ? `<span class="pill low" data-i18n="restriction-summary-private">Private</span> <span class="tiny">${restriction.machine_ids.length} <span data-i18n="restriction-summary-machines">machines</span></span>`
+    : '<span class="pill" data-i18n="restriction-summary-shared">Shared with everyone</span>'}</summary>
+    <form method="post" action="/accounts/${encodeURIComponent(account.id)}/restriction" class="stack">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <label class="check"><input type="checkbox" name="enabled" value="1"${restriction.enabled ? ' checked' : ''}> <span data-i18n="restriction-enabled">Private: only the machines ticked below may use this account</span></label>
+      <div class="restriction-machines">${boxes || '<span class="muted tiny" data-i18n="restriction-no-machines">No machine has reported a name yet.</span>'}</div>
+      <p class="muted tiny" data-i18n="restriction-note">A private account is hidden from members, cannot be chosen or failed over to by any other machine, and the gateway refuses it for them. A credential issued without a machine name cannot be listed: merge it into a machine first.</p>
+      <div><button type="submit" class="secondary" data-i18n="restriction-save">Save access</button></div>
+    </form>
+  </details>`;
 }
 
 /**
@@ -3994,6 +4035,8 @@ export function conversationDetailView({
 export function dashboardView({
   accounts,
   devices,
+  // False for a member in password mode: the page is the self-service area only.
+  adminArea = true,
   machines = [],
   codexClients = [],
   codexUnavailable = [],
@@ -4028,8 +4071,9 @@ export function dashboardView({
     && ['stored', 'healthy'].includes(account.status)
     && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
   ));
+  const privateMark = (account) => (isRestrictedAccount(account) ? ' · private' : '');
   const selfServiceOptions = selfServiceAccounts.map((account) => (
-    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
+    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}${privateMark(account)}</option>`
   )).join('');
   const claudeHookProfiles = accounts
     .filter((account) => account.provider === 'claude')
@@ -4078,7 +4122,7 @@ export function dashboardView({
     && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
   ));
   const codexGatewayOptions = codexGatewayAccounts.map((account) => (
-    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</option>`
+    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}${privateMark(account)}</option>`
   )).join('');
   // The whole Bedrock surface is derived from this list, so a console with no
   // Bedrock account registered renders exactly what it rendered before — the
@@ -4107,8 +4151,8 @@ export function dashboardView({
       ?? alerts.accounts.find((entry) => entry.alias === account.alias)
       ?? null;
     return `
-    <tr data-account-row="${escapeHtml(account.id)}">
-      <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(providerLabel(account.provider))} · ${escapeHtml(account.email_label || 'No email label')}</div></td>
+    <tr data-account-row="${escapeHtml(account.id)}" id="account-${escapeHtml(account.id)}">
+      <td><strong>${escapeHtml(account.alias)}</strong>${isRestrictedAccount(account) ? ' <span class="pill low" data-i18n="restriction-summary-private">Private</span>' : ''}<div class="muted tiny">${escapeHtml(providerLabel(account.provider))} · ${escapeHtml(account.email_label || 'No email label')}</div></td>
       <td><div class="account-status-stack">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}</div>
         ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}
         <div class="muted tiny"><span data-i18n="devices">Devices</span>: <span data-account-device-count>${escapeHtml(account.active_devices ?? '—')}</span></div></td>
@@ -4118,12 +4162,13 @@ export function dashboardView({
       <td>
         ${account.provider === 'claude' ? `<div class="stack">
           <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/claude-authorization" data-i18n="owner-authorization">Owner authorization</a>
-          ${available ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/enrollments" class="inline">
+          ${available && isRestrictedAccount(account) ? '<span class="muted tiny" data-i18n="restriction-no-enrollment">Private: issue from the setup form above with a machine name.</span>' : available ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/enrollments" class="inline">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
           <input name="member_label" aria-label="Member label for ${escapeHtml(account.alias)}" placeholder="member email/name" required maxlength="160">
           <button type="submit" data-i18n="enroll-device">Enroll device</button>
         </form>` : '<span class="muted tiny" data-i18n="owner-login-required">Account owner must authorize before member enrollment.</span>'}
           ${accountFailoverSummary(account, accounts)}
+          ${accountRestrictionControl(account, machines, csrf)}
         </div>` : `<div class="stack">
           ${isCodexApiKeyAccount(account)
             ? '<span class="muted tiny" data-i18n="codex-api-key-account">OpenAI API key · billed per token</span>'
@@ -4133,6 +4178,7 @@ export function dashboardView({
           ${codexModelGuardControl(account, csrf)}
           ${codexCreditGuardControl(account, csrf)}
           ${accountFailoverSummary(account, accounts)}
+          ${accountRestrictionControl(account, machines, csrf)}
         </div>`}
         <a class="button danger" href="/accounts/${encodeURIComponent(account.id)}/delete" data-i18n="delete-account">Delete account</a>
       </td>
@@ -4331,12 +4377,15 @@ export function dashboardView({
             <div class="provider-title"><h2>Claude Code</h2>${selfServiceAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
             <p class="muted" data-i18n="claude-description">Get a public-internet configuration scoped to this member and device. The provider OAuth token never leaves the server.</p>
             ${selfServiceAccounts.length ? `<div class="quota-list">${claudeUsage}</div>` : ''}
-            ${selfServiceAccounts.length ? `<form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="claude-self-service">
+            ${selfServiceAccounts.length ? `<form method="post" action="/self-service" class="member-form with-machine${memberFormClass}" data-persist-draft="claude-self-service">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <label><span data-i18n="team-account">Team account</span>
                 <select name="account_id" required data-draft-field>${selfServiceOptions}</select>
               </label>
               ${memberLabelField}
+              <label><span data-i18n="machine-optional">Machine (optional)</span>
+                <input name="machine" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-macbook" maxlength="64" data-draft-field>
+              </label>
               <label><span data-i18n="device-name">Device name</span>
                 <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-macbook" maxlength="64" data-draft-field>
               </label>
@@ -4351,7 +4400,7 @@ export function dashboardView({
             <div class="provider-title"><h2>Codex</h2>${codexGatewayAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
             <p class="muted" data-i18n="codex-description">The refresh center holds each account's credential. Turns route through this console, which meters every device and records the conversation — the same as Claude.</p>
             ${codexGatewayAccounts.length ? `<div class="quota-list">${codexUsage}</div>` : ''}
-            ${codexGatewayAccounts.length ? `<form method="post" action="/self-service" class="member-form${memberFormClass}" data-persist-draft="codex-gateway-self-service">
+            ${codexGatewayAccounts.length ? `<form method="post" action="/self-service" class="member-form with-machine${memberFormClass}" data-persist-draft="codex-gateway-self-service">
               <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
               <label><span data-i18n="team-account">Team account</span>
                 <select name="account_id" required data-draft-field>${codexGatewayOptions}</select>
@@ -4394,7 +4443,7 @@ export function dashboardView({
         ${openMode ? '<p class="muted tiny" data-i18n="member-label-note">Nobody checks the label. It only keeps two members\' device names apart.</p>' : ''}
       </section>` : ''}
 
-      <section class="admin-zone">
+      ${adminArea ? `<section class="admin-zone">
         <div class="admin-heading">
           <span class="badge stored" data-i18n="admin-zone">Administrator area</span>
           <h2 data-i18n="admin-heading">Accounts, devices, and exceptional enrollment</h2>
@@ -4582,7 +4631,7 @@ export function dashboardView({
             </details>` : ''}
           </article>
         </section>
-      </section>
+      </section>` : ''}
     </div>
   `, { openMode, activeTab: 'overview', completedDraft });
 }
@@ -5645,6 +5694,9 @@ export function adminView({
   csrf,
   error = null,
   openMode = false,
+  // Password mode only: the console's administrators, and who is signed in.
+  adminUsers = null,
+  currentAdmin = null,
 } = {}) {
   return layout('Administration', `
     <section class="stack">
@@ -5656,6 +5708,7 @@ export function adminView({
       </header>
       ${error ? `<div class="notice error" role="alert">${escapeHtml(error)}</div>` : ''}
       ${failoverSection({ accounts: failoverAccounts, devices: failoverDevices, csrf })}
+      ${adminUsers ? adminUsersSection({ adminUsers, currentAdmin, csrf }) : ''}
       <article class="card stack">
         <div>
           <h2 data-i18n="admin-block-heading">Blocked models</h2>
@@ -5679,6 +5732,109 @@ export function adminView({
       </article>
     </section>
   `, { openMode, activeTab: 'admin' });
+}
+
+function adminUsersSection({ adminUsers, currentAdmin, csrf }) {
+  const rows = adminUsers.map((user) => `<tr>
+    <td><strong>${escapeHtml(user.username)}</strong>${user.username === currentAdmin ? ' <span class="pill ok" data-i18n="admin-users-you">You</span>' : ''}</td>
+    <td class="tiny">${escapeHtml(dateText(user.created_at))}${user.created_by ? ` · ${escapeHtml(user.created_by)}` : ''}</td>
+    <td>${user.username === currentAdmin || adminUsers.length === 1 ? '' : `<form method="post" action="/admin/users/${encodeURIComponent(user.username)}/delete" class="inline">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <button type="submit" class="danger" data-i18n="admin-users-delete">Delete</button>
+    </form>`}</td>
+  </tr>`).join('');
+  return `<article class="card stack" id="administrators">
+    <div>
+      <h2 data-i18n="admin-users-heading">Administrators</h2>
+      <p class="muted" data-i18n="admin-users-intro">Members see only the self-service area, usage and docs. These accounts sign in to see and change everything else.</p>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th scope="col" data-i18n="admin-users-name">Username</th><th scope="col" data-i18n="admin-users-created">Added</th><th scope="col"></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <form method="post" action="/admin/users" class="inline">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <input name="username" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" maxlength="64" autocomplete="off" aria-label="Username" data-placeholder-en="username" data-placeholder-zh="用户名" placeholder="username">
+      <input name="password" type="password" required minlength="10" maxlength="256" autocomplete="new-password" aria-label="Password" data-placeholder-en="password (10+ characters)" data-placeholder-zh="密码（至少 10 位）" placeholder="password (10+ characters)">
+      <button type="submit" data-i18n="admin-users-add">Add administrator</button>
+    </form>
+    ${currentAdmin ? `<form method="post" action="/admin/password" class="inline">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <input name="current_password" type="password" required autocomplete="current-password" aria-label="Current password" data-placeholder-en="current password" data-placeholder-zh="当前密码" placeholder="current password">
+      <input name="password" type="password" required minlength="10" maxlength="256" autocomplete="new-password" aria-label="New password" data-placeholder-en="new password" data-placeholder-zh="新密码" placeholder="new password">
+      <button type="submit" class="secondary" data-i18n="admin-users-change-password">Change my password</button>
+    </form>` : ''}
+  </article>`;
+}
+
+export function adminLoginView({ csrf, next = '/', username = '', error = null }) {
+  return layout('Administrator sign-in', `
+    <section class="login">
+      <div class="card stack">
+        <h1 data-i18n="admin-login-heading">Administrator sign-in</h1>
+        <p class="muted" data-i18n="admin-login-intro">Members can set up devices and read usage without signing in. Sign in to manage accounts, devices and settings.</p>
+        ${error ? `<div class="notice error" role="alert">${escapeHtml(error)}</div>` : ''}
+        <form method="post" action="/login" class="stack">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <input type="hidden" name="next" value="${escapeHtml(next)}">
+          <label><span data-i18n="admin-users-name">Username</span>
+            <input name="username" required maxlength="64" autocomplete="username" value="${escapeHtml(username)}" autofocus>
+          </label>
+          <label><span data-i18n="admin-login-password">Password</span>
+            <input name="password" type="password" required maxlength="256" autocomplete="current-password">
+          </label>
+          <div><button type="submit" data-i18n="admin-login-submit">Sign in</button></div>
+        </form>
+        <a class="button secondary" href="/" data-i18n="admin-login-back">Back to self-service</a>
+      </div>
+    </section>
+  `, { activeTab: null });
+}
+
+/**
+ * Step two of making an account private: the devices that would lose it, and
+ * where they go. The form re-submits the same choice plus the destination.
+ */
+export function accountRestrictionView({ account, machineIds, affected, targets, csrf, openMode = false }) {
+  const options = targets.map((target) => `<option value="${escapeHtml(target.id)}">${escapeHtml(target.alias)}</option>`).join('');
+  return layout('Make account private', `
+    <section class="login">
+      <div class="card stack">
+        <h1><span data-i18n="restriction-confirm-heading">Make private:</span> ${escapeHtml(account.alias)}</h1>
+        <p data-i18n="restriction-confirm-intro">These devices use this account but are not on a listed machine. They move to the account you choose now, keep their credentials, and do not need to be set up again.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th scope="col" data-i18n="restriction-confirm-device">Device</th><th scope="col" data-i18n="restriction-confirm-member">Member</th></tr></thead>
+          <tbody>${affected.map((device) => `<tr><td>${escapeHtml(device.name)}</td><td>${escapeHtml(device.member_label)}</td></tr>`).join('')}</tbody>
+        </table></div>
+        ${options ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/restriction" class="stack">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <input type="hidden" name="enabled" value="1">
+          ${machineIds.map((id) => `<input type="hidden" name="machine:${escapeHtml(id)}" value="1">`).join('')}
+          <label><span data-i18n="restriction-confirm-target">Move them to</span>
+            <select name="migrate_to" required>${options}</select>
+          </label>
+          <div><button type="submit" data-i18n="restriction-confirm-submit">Move devices and make private</button></div>
+        </form>` : '<div class="notice error" data-i18n="restriction-confirm-no-target">There is no other usable account of this provider to move them to. Add one first.</div>'}
+        <a class="button secondary" href="/#account-${escapeHtml(account.id)}" data-i18n="restriction-confirm-cancel">Cancel</a>
+      </div>
+    </section>
+  `, { openMode });
+}
+
+/**
+ * Password mode: members get only the tabs they can open, and every page says
+ * who is looking — with a way in for an administrator and a way out after.
+ */
+export function withViewerChrome(html, viewer) {
+  if (!viewer || typeof html !== 'string') return html;
+  let out = html;
+  if (!viewer.admin) {
+    out = out.replace(/\n\s*<a href="\/(?:conversations|admin|relay)"[^\n]*data-tab="(?:conversations|admin|relay)">[^<]*<\/a>/g, '');
+  }
+  const control = viewer.admin
+    ? `<span class="muted tiny viewer-chip"><span data-i18n="viewer-admin">Administrator</span> · <strong>${escapeHtml(viewer.username ?? '')}</strong></span><a class="button secondary" href="/logout" data-i18n="viewer-sign-out">Sign out</a>`
+    : '<a class="button secondary" href="/login" data-i18n="viewer-sign-in">Administrator sign-in</a>';
+  return out.replace('<div class="topbar-actions">', `<div class="topbar-actions">${control}`);
 }
 
 export function docsView({

@@ -1,3 +1,4 @@
+import { ACCOUNT_RESTRICTED_MESSAGE } from './account-restriction.js';
 import zlib from 'node:zlib';
 import { Buffer } from 'node:buffer';
 import http from 'node:http';
@@ -287,6 +288,11 @@ export async function handleCodexProxy(req, res, {
       account_id: accountId,
       code: accountResolutionError.code ?? accountResolutionError.name ?? 'unknown',
     });
+    if (accountResolutionError.code === 'ACCOUNT_RESTRICTED') {
+      recordRejected(403);
+      sendJson(res, 403, errorBody('permission_error', ACCOUNT_RESTRICTED_MESSAGE));
+      return;
+    }
     recordRejected(503);
     sendJson(res, 503, errorBody('api_error', 'device account configuration unavailable'));
     return;

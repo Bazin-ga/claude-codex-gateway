@@ -20,6 +20,7 @@ import {
   readBody,
 } from './lib/http.js';
 import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
+import { isRestrictedAccount } from './lib/account-restriction.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
@@ -72,6 +73,8 @@ import {
 import {
   claudeAuthorizationView,
   adminView,
+  adminLoginView,
+  accountRestrictionView,
   dashboardView,
   docsView,
   bedrockDeviceConfiguredView,
@@ -83,6 +86,7 @@ import {
   accountDeleteView,
   relayView,
   withRelayTab,
+  withViewerChrome,
   codexAuthorizationView,
   codexCredentialView,
   metricsView,
@@ -152,6 +156,10 @@ const SESSION_TTL_MS = 12 * 60 * 60_000;
 // not depend on someone authenticating first. The main isolate is capped at 96
 // MB of old-space; an unbounded map is an OOM plus a restart loop.
 const MAX_SESSIONS = 4_096;
+// Administrator sign-in attempts (password mode), per tailnet identity: a few
+// typos are fine, a guessing loop is not.
+const ADMIN_LOGIN_FAILURE_LIMIT = 5;
+const ADMIN_LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
 const HOUR_MS = 60 * 60_000;
 // Matches the hourly bucket ceiling in metrics-chart-data.js. A wider window does
 // not draw more of the range, it draws the same chart with holes in it.
@@ -589,7 +597,7 @@ export async function createCredentialConsole(options = {}) {
   const sendHtml = (res, status, html, headers) => sendHtmlBase(
     res,
     status,
-    relayEnabled ? withRelayTab(html) : html,
+    withViewerChrome(relayEnabled ? withRelayTab(html) : html, responseViewers.get(res) ?? null),
     headers,
   );
   // Overridable only so a test can drive the eviction path without minting the real
@@ -648,8 +656,13 @@ export async function createCredentialConsole(options = {}) {
       log('metrics_asset_unavailable', { code: error?.code ?? error?.name ?? 'invalid' });
     }
   }
-  if (!['tailscale', 'open'].includes(adminAuth)) {
-    throw new Error('CREDENTIAL_CONSOLE_ADMIN_AUTH must be tailscale or open');
+  if (!['tailscale', 'open', 'password'].includes(adminAuth)) {
+    throw new Error('CREDENTIAL_CONSOLE_ADMIN_AUTH must be tailscale, open, or password');
+  }
+  if (adminAuth === 'password' && store.adminUsers().length === 0) {
+    log('admin_password_mode_without_administrator', {
+      hint: 'create one with: node cli.js admin add <username>',
+    });
   }
   const enableMetricsQueryWorker = options.enableMetricsQueryWorker
     ?? !Object.hasOwn(options, 'store');
@@ -672,6 +685,31 @@ export async function createCredentialConsole(options = {}) {
   refreshApiSpend();
   // Open mode has no login, so every rendered page has to say so.
   const openMode = adminAuth === 'open';
+  // Password mode: the tailnet identity still gates the console, but a visitor
+  // is a member until they sign in as an administrator. The other two modes
+  // make every visitor an administrator, as before.
+  const passwordMode = adminAuth === 'password';
+  const adminLoginFailures = new Map();
+  // One session per request, so a page that asks twice does not mint two; and
+  // the viewer each response is rendered for.
+  const requestSessions = new WeakMap();
+  const responseViewers = new WeakMap();
+  const isAdmin = (session) => Boolean(session) && (!passwordMode || (
+    session.role === 'admin'
+    // A deleted administrator's session ends with the account, not at expiry.
+    && store.adminUsers().some((user) => user.username === session.admin_user)
+  ));
+  const actorFor = (session) => (session?.admin_user
+    ? `admin:${session.admin_user}`
+    : session?.admin_identity ?? 'anonymous');
+  const viewerFor = (session) => (passwordMode
+    ? { admin: isAdmin(session), username: isAdmin(session) ? session.admin_user : null }
+    : null);
+  // Accounts a member may not see. Nothing for an administrator, or outside
+  // password mode, where every visitor is one.
+  const hiddenAccountIds = (session) => (isAdmin(session)
+    ? []
+    : store.state.accounts.filter(isRestrictedAccount).map((account) => account.id));
   // Both providers issue the same kind of device token but need different client
   // instructions; handing a Codex enrollee the Claude launcher would be
   // confidently wrong.
@@ -727,12 +765,20 @@ export async function createCredentialConsole(options = {}) {
   }
 
   function sessionFor(req, res) {
-    const identity = adminAuth === 'tailscale' ? tailnetIdentity(req) : null;
-    if (adminAuth === 'tailscale' && !identity) return null;
+    if (requestSessions.has(req)) return requestSessions.get(req);
+    const session = findOrMintSession(req, res);
+    requestSessions.set(req, session);
+    if (session) responseViewers.set(res, viewerFor(session));
+    return session;
+  }
+
+  function findOrMintSession(req, res) {
+    const identity = adminAuth !== 'open' ? tailnetIdentity(req) : null;
+    if (adminAuth !== 'open' && !identity) return null;
     const token = parseCookies(req.headers.cookie).credential_console_session;
     const session = token ? sessions.get(token) : null;
     if (session && session.expires_at > Date.now()
-      && (adminAuth !== 'tailscale' || session.admin_identity === identity)) {
+      && (adminAuth === 'open' || session.admin_identity === identity)) {
       // Re-insert so the map reads least-recently-used first: a session a browser is
       // still presenting moves behind the ones nobody has come back for. The expiry is
       // deliberately not extended; this only reorders eviction.
@@ -747,17 +793,80 @@ export async function createCredentialConsole(options = {}) {
     // therefore already refused, so minting it a 12-hour session would only let an
     // anonymous caller grow this map one entry per request.
     if (adminAuth === 'open' && req.method !== 'GET') return null;
+    const newSession = mintSession(res, {
+      identity,
+      role: passwordMode ? 'member' : 'admin',
+    });
+    if (adminAuth === 'tailscale') log('tailnet_admin_authenticated', { identity });
+    return newSession;
+  }
+
+  function mintSession(res, { identity, role, adminUser = null }) {
     const newToken = randomToken(32);
     const newSession = {
       csrf: randomToken(24),
       expires_at: Date.now() + SESSION_TTL_MS,
       admin_identity: identity,
+      role,
+      admin_user: adminUser,
     };
     evictUntilBelowCap();
     sessions.set(newToken, newSession);
     res.setHeader('Set-Cookie', setSessionCookie(newToken));
-    if (adminAuth === 'tailscale') log('tailnet_admin_authenticated', { identity });
     return newSession;
+  }
+
+  /**
+   * Swap the request's session for a new one carrying `role`: on sign-in, so a
+   * session token seen before it cannot ride the elevation, and on sign-out.
+   */
+  function replaceSession(req, res, session, { role, adminUser = null }) {
+    const token = parseCookies(req.headers.cookie).credential_console_session;
+    if (token) sessions.delete(token);
+    const next = mintSession(res, { identity: session.admin_identity, role, adminUser });
+    requestSessions.set(req, next);
+    responseViewers.set(res, viewerFor(next));
+    return next;
+  }
+
+  function adminLoginLimited(identity) {
+    const entry = adminLoginFailures.get(identity);
+    return Boolean(entry) && Date.now() - entry.sinceMs < ADMIN_LOGIN_FAILURE_WINDOW_MS
+      && entry.count >= ADMIN_LOGIN_FAILURE_LIMIT;
+  }
+
+  function recordAdminLoginFailure(identity) {
+    const now = Date.now();
+    const entry = adminLoginFailures.get(identity);
+    const next = !entry || now - entry.sinceMs >= ADMIN_LOGIN_FAILURE_WINDOW_MS
+      ? { sinceMs: now, count: 1 }
+      : { sinceMs: entry.sinceMs, count: entry.count + 1 };
+    adminLoginFailures.delete(identity);
+    adminLoginFailures.set(identity, next);
+    while (adminLoginFailures.size > MAX_SESSIONS) {
+      adminLoginFailures.delete(adminLoginFailures.keys().next().value);
+    }
+  }
+
+  /** A same-origin path to return to after signing in, or `/`. */
+  function safeNext(value) {
+    const next = String(value ?? '');
+    return /^\/(?![\/\\])[^\s]*$/.test(next) && next.length <= 512 ? next : '/';
+  }
+
+  // Password mode: what a member may reach. Everything else that is not a
+  // device-token route or a static asset needs an administrator.
+  function memberRoute(method, path) {
+    if (method === 'GET') {
+      return ['/', '/docs', '/onboarding.md', '/metrics', '/metrics/chart-data', '/login', '/logout'].includes(path);
+    }
+    if (method === 'POST') return ['/self-service', '/codex/self-service', '/login'].includes(path);
+    return false;
+  }
+
+  function publicRoute(path) {
+    return path.startsWith('/assets/') || path.startsWith('/codex-agent/')
+      || path === '/favicon.ico' || path === '/health' || path.startsWith('/enroll/');
   }
 
   function requireSession(req, res) {
@@ -783,7 +892,7 @@ export async function createCredentialConsole(options = {}) {
 
   function metricsReadRateLimited(session) {
     const now = Date.now();
-    const key = adminAuth === 'tailscale'
+    const key = adminAuth !== 'open'
       ? `identity:${createHash('sha256').update(String(session.admin_identity ?? 'unknown')).digest('hex')}`
       : 'open-console-global';
     const previous = metricsChartRate.get(key);
@@ -820,8 +929,8 @@ export async function createCredentialConsole(options = {}) {
     return `credential_console_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${cookieSecure ? '; Secure' : ''}`;
   }
 
-  async function accountsWithExternalStatus() {
-    return Promise.all(store.publicAccounts().map(async (account) => {
+  async function accountsWithExternalStatus({ hidden = [] } = {}) {
+    return Promise.all(store.publicAccounts().filter((account) => !hidden.includes(account.id)).map(async (account) => {
       const internal = store.accountById(account.id);
       // publicAccounts intentionally contains a legacy last_failure string for
       // API compatibility. Do not pass it to a page or to the alert classifier:
@@ -856,6 +965,7 @@ export async function createCredentialConsole(options = {}) {
         failover: account.failover
           ? { ...account.failover, backup_account_ids: [...(account.failover.backup_account_ids ?? [])] }
           : null,
+        restriction: account.restriction ? { ...account.restriction } : null,
         active_devices: account.active_devices,
       };
       return {
@@ -908,7 +1018,7 @@ export async function createCredentialConsole(options = {}) {
     return known;
   }
 
-  async function queryMetricsPage(url) {
+  async function queryMetricsPage(url, { excludeAccountIds = [] } = {}) {
     const allowedHours = new Set([24, 168, 720]);
     const requestedHours = Number(url.searchParams.get('hours'));
     const presetHours = allowedHours.has(requestedHours) ? requestedHours : 24;
@@ -959,6 +1069,7 @@ export async function createCredentialConsole(options = {}) {
       ...(memberLabel ? { memberLabel } : {}),
       ...(accountId ? { accountId } : {}),
       ...(model ? { model } : {}),
+      ...(excludeAccountIds.length ? { excludeAccountIds } : {}),
     };
     const viewFilters = {
       hours: presetHours,
@@ -1119,7 +1230,7 @@ export async function createCredentialConsole(options = {}) {
     }
   }
 
-  async function metricsPage(url) {
+  async function metricsPage(url, { excludeAccountIds = [] } = {}) {
     const requestedHours = Number(url.searchParams.get('hours'));
     const hours = new Set([24, 168, 720]).has(requestedHours) ? requestedHours : 24;
     const cacheKey = JSON.stringify([
@@ -1131,6 +1242,9 @@ export async function createCredentialConsole(options = {}) {
       String(url.searchParams.get('member_label') ?? '').slice(0, 160),
       String(url.searchParams.get('account_id') ?? '').slice(0, 128),
       String(url.searchParams.get('model') ?? '').slice(0, 256),
+      // A member's page leaves private accounts out; it must not be served an
+      // administrator's cached one, or the reverse.
+      excludeAccountIds,
     ]);
     const now = metricsPageClock();
     const cached = metricsPageCache.get(cacheKey);
@@ -1143,7 +1257,7 @@ export async function createCredentialConsole(options = {}) {
     const inFlight = metricsPageInFlight.get(cacheKey);
     if (inFlight) return inFlight;
     const pending = (async () => {
-      const page = await queryMetricsPage(url);
+      const page = await queryMetricsPage(url, { excludeAccountIds });
       let bytes = MAX_METRICS_PAGE_CACHE_BYTES + 1;
       try {
         bytes = Buffer.byteLength(JSON.stringify(page), 'utf8');
@@ -1535,6 +1649,26 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    // Password mode: a member reaches the member routes; anything else needs an
+    // administrator, so a route added later is closed to members until it is
+    // listed above, not open until somebody remembers to check.
+    if (passwordMode && !publicRoute(path) && !memberRoute(req.method, path)) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      if (!isAdmin(session)) {
+        if (req.method === 'GET') {
+          redirect(res, `/login?next=${encodeURIComponent(`${path}${url.search}`)}`);
+        } else {
+          sendHtml(res, 403, messageView(
+            'Administrator sign-in required',
+            'Only an administrator can do this. Sign in as an administrator and try again.',
+            { error: true },
+          ));
+        }
+        return;
+      }
+    }
+
     if (path === '/onboarding.md') {
       if (req.method !== 'GET') {
         sendText(
@@ -1556,7 +1690,7 @@ export async function createCredentialConsole(options = {}) {
         // handing them the address of a retired path is how new machines end
         // up on it. Codex setup goes through the web page, which issues a
         // gateway device.
-        accounts: await accountsWithExternalStatus(),
+        accounts: await accountsWithExternalStatus({ hidden: hiddenAccountIds(session) }),
         adminAuth,
       });
       sendText(res, 200, markdown, 'text/markdown; charset=utf-8');
@@ -1570,7 +1704,7 @@ export async function createCredentialConsole(options = {}) {
         sendJson(res, 429, { error: 'metrics_chart_rate_limited' }, { 'Retry-After': '60' });
         return;
       }
-      const page = await metricsPage(url);
+      const page = await metricsPage(url, { excludeAccountIds: hiddenAccountIds(session) });
       sendJson(res, page.error || !page.metricsAvailable ? 503 : 200, buildMetricsChartPayload(page));
       return;
     }
@@ -1620,7 +1754,7 @@ export async function createCredentialConsole(options = {}) {
         return;
       }
       try {
-        const actor = session.admin_identity ?? 'anonymous';
+        const actor = actorFor(session);
         if (action === 'settings') {
           await store.setRelayPlatform({ name: form.name, baseUrl: form.base_url, apiKey: form.api_key, actor });
           relayCatalog.refresh().catch(() => {});
@@ -1647,7 +1781,102 @@ export async function createCredentialConsole(options = {}) {
         csrf: session.csrf,
         error: url.searchParams.get('error'),
         openMode,
+        adminUsers: passwordMode ? store.adminUsers() : null,
+        currentAdmin: passwordMode ? session.admin_user : null,
       }));
+      return;
+    }
+
+    // Administrators (password mode only; the gate above already required one).
+    const adminUserDeleteParams = routeMatch(path, '/admin/users/:username/delete');
+    if (passwordMode && req.method === 'POST'
+      && (path === '/admin/users' || path === '/admin/password' || adminUserDeleteParams)) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        return;
+      }
+      const actor = actorFor(session);
+      try {
+        if (path === '/admin/users') {
+          await store.addAdminUser({
+            username: String(form.username ?? '').trim(),
+            password: String(form.password ?? ''),
+            actor,
+          });
+        } else if (path === '/admin/password') {
+          if (!await store.verifyAdminLogin(session.admin_user, String(form.current_password ?? ''))) {
+            throw new Error('the current password is wrong');
+          }
+          await store.setAdminPassword(session.admin_user, String(form.password ?? ''), { actor });
+        } else {
+          if (adminUserDeleteParams.username === session.admin_user) {
+            throw new Error('you cannot delete the administrator you are signed in as');
+          }
+          await store.deleteAdminUser(adminUserDeleteParams.username, { actor });
+        }
+        log('admin_users_changed', { actor, action: path.split('/').pop() });
+        redirect(res, '/admin#administrators');
+      } catch (error) {
+        redirect(res, `/admin?error=${encodeURIComponent(error.message)}#administrators`);
+      }
+      return;
+    }
+
+    // Make an account private to some machines, or public again. When devices
+    // would lose it, the first submit shows them and asks where they go.
+    const restrictionParams = routeMatch(path, '/accounts/:id/restriction');
+    if (req.method === 'POST' && restrictionParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const accountId = restrictionParams.id;
+      const enabled = form.enabled === '1';
+      const machineIds = Object.keys(form)
+        .filter((key) => key.startsWith('machine:') && form[key] === '1')
+        .map((key) => key.slice('machine:'.length));
+      try {
+        const plan = store.accountRestrictionPlan(accountId, { enabled, machineIds });
+        if (plan.affected.length > 0 && !form.migrate_to) {
+          const devicesById = new Map(store.publicDevices().map((device) => [device.id, device]));
+          sendHtml(res, 200, accountRestrictionView({
+            account: plan.account,
+            machineIds: plan.next.machine_ids,
+            affected: plan.affected.map((device) => devicesById.get(device.id)).filter(Boolean),
+            targets: store.publicAccounts().filter((account) => (
+              account.id !== accountId
+              && account.provider === plan.account.provider
+              && !store.failoverCandidateProblem(store.accountById(account.id))
+              && plan.affected.every((device) => !store.failoverCandidateProblem(store.accountById(account.id), device))
+            )),
+            csrf: session.csrf,
+            openMode,
+          }));
+          return;
+        }
+        const result = await store.setAccountRestriction(accountId, {
+          enabled,
+          machineIds,
+          migrateToAccountId: form.migrate_to || null,
+          actor: actorFor(session),
+        });
+        log('account_restriction_updated', {
+          account_id: accountId,
+          enabled,
+          machines: machineIds.length,
+          moved: result.moved.length,
+          actor: actorFor(session),
+        });
+        redirect(res, `/#account-${encodeURIComponent(accountId)}`);
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
       return;
     }
 
@@ -1664,7 +1893,7 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
-      const actor = session.admin_identity ?? 'anonymous';
+      const actor = actorFor(session);
       if (failoverFailbackParams) {
         try {
           const result = await store.failbackDeviceAccount({
@@ -1729,7 +1958,7 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
-      const actor = session.admin_identity ?? 'anonymous';
+      const actor = actorFor(session);
       // An unchecked checkbox is simply absent from a form submission, so
       // "off" arrives as a missing field rather than a false one.
       const fields = {
@@ -1768,7 +1997,7 @@ export async function createCredentialConsole(options = {}) {
         ), { 'Retry-After': '60' });
         return;
       }
-      const page = await metricsPage(url);
+      const page = await metricsPage(url, { excludeAccountIds: hiddenAccountIds(session) });
       sendHtml(res, 200, metricsView({
         ...page,
         openMode,
@@ -2026,7 +2255,8 @@ export async function createCredentialConsole(options = {}) {
         // Whether an administrator is identified at all. `tailscale` authenticates
         // one; `open` deliberately authenticates nobody, and reporting that as
         // configured would hide the only fact worth alerting on here.
-        admin_configured: adminAuth === 'tailscale',
+        admin_configured: adminAuth === 'tailscale'
+          || (passwordMode && store.adminUsers().length > 0),
       });
       return;
     }
@@ -2034,6 +2264,63 @@ export async function createCredentialConsole(options = {}) {
     // Neither surviving mode has a sign-in. Answering these two paths explicitly
     // tells an operator following an old bookmark or runbook why, instead of
     // leaving them with a bare "page does not exist".
+    if (passwordMode && path === '/login') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const next = safeNext(url.searchParams.get('next'));
+      if (req.method === 'GET') {
+        if (isAdmin(session)) {
+          redirect(res, next);
+          return;
+        }
+        sendHtml(res, 200, adminLoginView({ csrf: session.csrf, next }));
+        return;
+      }
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true }));
+        return;
+      }
+      const formNext = safeNext(form.next);
+      const identity = session.admin_identity;
+      if (adminLoginLimited(identity)) {
+        log('admin_login_rate_limited', { identity });
+        sendHtml(res, 429, adminLoginView({
+          csrf: session.csrf,
+          next: formNext,
+          error: 'Too many failed sign-ins. Wait 15 minutes and try again.',
+        }), { 'Retry-After': String(ADMIN_LOGIN_FAILURE_WINDOW_MS / 1000) });
+        return;
+      }
+      const username = await store.verifyAdminLogin(String(form.username ?? ''), String(form.password ?? ''));
+      if (!username) {
+        recordAdminLoginFailure(identity);
+        log('admin_login_failed', { identity, username: String(form.username ?? '').slice(0, 64) });
+        sendHtml(res, 401, adminLoginView({
+          csrf: session.csrf,
+          next: formNext,
+          username: String(form.username ?? '').slice(0, 64),
+          error: 'Wrong username or password.',
+        }));
+        return;
+      }
+      adminLoginFailures.delete(identity);
+      replaceSession(req, res, session, { role: 'admin', adminUser: username });
+      log('admin_login', { identity, username });
+      await store.recordExternalAudit('admin_login', { username, identity }).catch(() => {});
+      redirect(res, formNext);
+      return;
+    }
+
+    if (passwordMode && path === '/logout') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      if (session.admin_user) log('admin_logout', { identity: session.admin_identity, username: session.admin_user });
+      replaceSession(req, res, session, { role: 'member' });
+      redirect(res, '/');
+      return;
+    }
+
     if (path === '/login' || path === '/logout') {
       sendHtml(res, 404, messageView(
         'Not found',
@@ -2046,17 +2333,21 @@ export async function createCredentialConsole(options = {}) {
     if (req.method === 'GET' && path === '/') {
       const session = requireSession(req, res);
       if (!session) return;
-      const codex = await codexMachineReport();
+      const admin = isAdmin(session);
+      const codex = admin ? await codexMachineReport() : { clients: [], unavailable: [] };
       const completedDraft = url.searchParams.get('draft_completed');
       sendHtml(res, 200, dashboardView({
-        accounts: await accountsWithExternalStatus(),
-        devices: store.publicDevices(),
+        accounts: await accountsWithExternalStatus({ hidden: hiddenAccountIds(session) }),
+        // A member's page has no administrator area, so it is given nothing
+        // that only that area would show.
+        adminArea: admin,
+        devices: admin ? store.publicDevices() : [],
         // Revoked rows are carried into the page and collapsed there, rather than
         // filtered out here: they are the majority of rows over time, they are
         // why the flat list stopped being readable, and they are still the record
         // of what a machine used to hold.
-        machines: store.publicMachines({ includeRevoked: true }),
-        deviceGroups: store.deviceGroups(),
+        machines: admin ? store.publicMachines({ includeRevoked: true }) : [],
+        deviceGroups: admin ? store.deviceGroups() : [],
         codexClients: codex.clients,
         codexUnavailable: codex.unavailable,
         csrf: session.csrf,
@@ -2129,6 +2420,9 @@ export async function createCredentialConsole(options = {}) {
           memberLabel,
           deviceName: String(form.device_name ?? '').trim(),
           machineId,
+          // An administrator issuing on a private account adds the machine to
+          // it; a member can only issue where their machine is already listed.
+          admitMachine: isAdmin(session),
         });
         sendHtml(res, 200, configuredDeviceView(result));
       } catch (error) {
@@ -2538,7 +2832,7 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
-      const actor = session.admin_identity ?? 'anonymous';
+      const actor = actorFor(session);
       try {
         const action = String(form.action ?? 'create');
         if (action === 'rename') {
@@ -2580,7 +2874,7 @@ export async function createCredentialConsole(options = {}) {
         log('device_groups_set', {
           device_id: deviceGroupsParams.id,
           groups,
-          actor: session.admin_identity ?? 'anonymous',
+          actor: actorFor(session),
         });
         redirect(res, '/');
       } catch (error) {
@@ -2605,7 +2899,7 @@ export async function createCredentialConsole(options = {}) {
           // "off" arrives as a missing field rather than a false one.
           enabled: form.enabled === '1',
           thresholdPercent: form.threshold_percent,
-          actor: session.admin_identity ?? 'anonymous',
+          actor: actorFor(session),
         });
         redirect(res, '/');
       } catch (error) {
@@ -2627,7 +2921,7 @@ export async function createCredentialConsole(options = {}) {
         await store.setCodexCreditGuard(codexCreditGuardParams.id, {
           // An unchecked checkbox is absent from the form, not false.
           enabled: form.enabled === '1',
-          actor: session.admin_identity ?? 'anonymous',
+          actor: actorFor(session),
         });
         redirect(res, '/');
       } catch (error) {
@@ -2653,7 +2947,7 @@ export async function createCredentialConsole(options = {}) {
           // An unchecked checkbox is absent from the form, not false.
           enabled: form.enabled === '1',
           backupAccountIds,
-          actor: session.admin_identity ?? 'anonymous',
+          actor: actorFor(session),
         });
         redirect(res, '/');
       } catch (error) {
@@ -2670,7 +2964,7 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
-      const actor = session.admin_identity ?? 'anonymous';
+      const actor = actorFor(session);
       const accountId = codexResetParams.id;
       const account = store.accountById(accountId);
       const refuse = (code, message) => {
@@ -2930,7 +3224,7 @@ export async function createCredentialConsole(options = {}) {
       try {
         await store.deleteAccount(deleteAccountParams.id, {
           confirmAlias: form.confirm_alias,
-          actor: session.admin_identity ?? 'anonymous',
+          actor: actorFor(session),
         });
         redirect(res, '/');
       } catch (error) {
@@ -2973,7 +3267,7 @@ export async function createCredentialConsole(options = {}) {
         log('device_machine_merged', {
           device_id: mergeMachineParams.id,
           machine_id: machineId,
-          identity: session.admin_identity ?? 'anonymous',
+          identity: actorFor(session),
           // A repeat submission is success with nothing written; say which it was.
           changed,
         });
@@ -2992,7 +3286,7 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
-      const actor = session.admin_identity ?? 'anonymous';
+      const actor = actorFor(session);
       const fromAccountId = String(form.from_account_id ?? '');
       try {
         // The count the operator was looking at. The store refuses if the set
@@ -3047,7 +3341,7 @@ export async function createCredentialConsole(options = {}) {
         else sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
-      const actor = session.admin_identity ?? 'anonymous';
+      const actor = actorFor(session);
       try {
         const summary = await store.configureDeviceAccount({
           deviceId: switchAccountParams.id,

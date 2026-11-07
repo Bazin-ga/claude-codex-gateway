@@ -1,3 +1,4 @@
+import { ACCOUNT_RESTRICTED_MESSAGE } from './account-restriction.js';
 import http from 'node:http';
 import https from 'node:https';
 import { performance } from 'node:perf_hooks';
@@ -442,6 +443,11 @@ export async function handleClaudeProxy(req, res, {
       account_id: accountId,
       code: accountResolutionError.code ?? accountResolutionError.name ?? 'unknown',
     });
+    if (accountResolutionError.code === 'ACCOUNT_RESTRICTED') {
+      recordRejected(403);
+      sendJson(res, 403, { type: 'error', error: { type: 'permission_error', message: ACCOUNT_RESTRICTED_MESSAGE } });
+      return;
+    }
     recordRejected(503);
     sendJson(res, 503, {
       type: 'error',

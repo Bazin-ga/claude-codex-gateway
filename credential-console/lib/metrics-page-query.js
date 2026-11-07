@@ -14,12 +14,12 @@ const EMPTY_DEVICE_COMPARISON = Object.freeze({
  * thread boundary.
  */
 export function queryMetricsDataset(requestMetrics, filters) {
-  const { fromMs, toMs, memberLabel, accountId, model } = filters;
+  const { fromMs, toMs, memberLabel, accountId, model, excludeAccountIds } = filters;
   const allTotals = requestMetrics.queryTotals({ ...filters, scope: 'all' });
   const consumptionTotals = requestMetrics.queryTotals({ ...filters, scope: 'consumption' });
   const hourly = requestMetrics.queryHourly({ ...filters, scope: 'all' });
   const tokenHourly = requestMetrics.queryHourly({ ...filters, scope: 'consumption' });
-  const dimensions = { fromMs, toMs, scope: 'all' };
+  const dimensions = { fromMs, toMs, scope: 'all', ...(excludeAccountIds ? { excludeAccountIds } : {}) };
   const machineRows = requestMetrics.queryBreakdown({ by: 'machine', ...dimensions });
   const deviceRows = requestMetrics.queryBreakdown({ by: 'device', ...dimensions });
   const memberRows = requestMetrics.queryBreakdown({ by: 'member', ...dimensions });
@@ -48,6 +48,7 @@ export function queryMetricsDataset(requestMetrics, filters) {
         ...(memberLabel ? { memberLabel } : {}),
         ...(accountId ? { accountId } : {}),
         ...(model ? { model } : {}),
+        ...(excludeAccountIds ? { excludeAccountIds } : {}),
       });
     } catch (error) {
       deviceComparisonError = error?.code ?? error?.name ?? 'unknown';

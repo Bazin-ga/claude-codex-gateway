@@ -622,10 +622,27 @@ the synchronous command hook may nevertheless add bounded delay while that failu
 
 - `master.key`, `state.json`, and the data directory are mode 600/700.
 - Provider credentials use AES-256-GCM with account-specific authenticated data.
-- There are exactly two administrator-auth modes, `tailscale` and `open`, and the console has
-  no login of its own in either: no password, no sign-in page, and no `/login` or `/logout`
-  route. `CREDENTIAL_CONSOLE_ADMIN_AUTH` defaults to `tailscale`, so an unconfigured
-  deployment refuses a request that carries no tailnet identity rather than serving it.
+- There are three administrator-auth modes. In `tailscale` and `open` every visitor is an
+  administrator and the console has no login of its own: no password, no sign-in page, and no
+  `/login` or `/logout` route. `CREDENTIAL_CONSOLE_ADMIN_AUTH` defaults to `tailscale`, so an
+  unconfigured deployment refuses a request that carries no tailnet identity rather than serving it.
+- `password` mode keeps the tailnet identity requirement and adds roles. A visitor is a member:
+  the self-service setup forms (shared accounts only), usage metrics without private accounts,
+  the docs and the live guide. Everything else redirects to `/login`, where an administrator signs
+  in with a username and password; the session token is replaced on sign-in and on `/logout`.
+  Passwords are stored only as salted scrypt digests in `state.json`, five wrong passwords from
+  one tailnet identity lock it out for 15 minutes, and deleting an administrator ends their
+  sessions. Create the first one with the service stopped:
+  `node cli.js admin add <username>` (the password is prompted, or read from stdin with
+  `--password-stdin`); after that, administrators are managed on the Administration tab.
+- Any mode can make an account **private** to a list of machines (the account card's access
+  control). A device on another machine cannot be issued on it, switched or bulk-moved to it,
+  failed over or back onto it, and the gateway refuses to forward for it (`403`). A private account
+  may back up a shared one's devices only in the other direction: it can list shared backups, a
+  shared account cannot list it. Making an account private moves the devices that lose it to an
+  account the administrator picks, and takes it out of every shared account's failover chain. In
+  `password` mode members do not see private accounts anywhere, including metrics and the guide;
+  conversations are visible to administrators only.
 - `open` administrator-auth mode has no authentication at all: no identity of any kind. Every
   client that can open the console is an administrator and can add accounts, issue device
   credentials, switch any active Claude device, and revoke them. Reaching the console is then the entire authorization boundary,

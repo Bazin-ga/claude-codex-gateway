@@ -23,6 +23,7 @@ const MAX_MODEL = 256;
 const MAX_METHOD = 32;
 const MAX_PATH = 256;
 const MAX_IDENTIFIER = 128;
+const MAX_EXCLUDED_ACCOUNTS = 256;
 const MAX_MACHINE_ID = 128;
 const MAX_OUTCOME = 64;
 const MAX_UPSTREAM_REQUEST_ID = 256;
@@ -944,6 +945,14 @@ function normalizeFilters(filters = {}) {
   });
   const model = boundedString(filters.model, 'model', MAX_MODEL, { emptyAsNull: true });
   const unattributedMachine = filters.unattributedMachine === true ? 1 : 0;
+  // Accounts a viewer may not see (private accounts, for a member). Their rows
+  // are left out of every total, series and breakdown, not just their own line.
+  const excludeAccountIds = filters.excludeAccountIds === undefined || filters.excludeAccountIds === null
+    ? []
+    : filters.excludeAccountIds;
+  if (!Array.isArray(excludeAccountIds) || excludeAccountIds.length > MAX_EXCLUDED_ACCOUNTS) {
+    throw new TypeError('excludeAccountIds must be a short array');
+  }
   return {
     fromMs,
     toMs,
@@ -953,6 +962,7 @@ function normalizeFilters(filters = {}) {
     memberLabel,
     accountId,
     model,
+    excludeAccountIds: excludeAccountIds.map((id) => boundedRequiredString(id, 'excludeAccountIds', MAX_IDENTIFIER)),
     scope,
   };
 }
@@ -985,6 +995,10 @@ function buildFilter(filters) {
   if (filters.unattributedMachine === 1) clauses.push('machine_id IS NULL');
   if (filters.memberLabel !== null) add('member_label = ?', filters.memberLabel);
   if (filters.accountId !== null) add('account_id = ?', filters.accountId);
+  if (filters.excludeAccountIds?.length) {
+    clauses.push(`(account_id IS NULL OR account_id NOT IN (${filters.excludeAccountIds.map(() => '?').join(', ')}))`);
+    params.push(...filters.excludeAccountIds);
+  }
   if (filters.model !== null) add('model = ?', filters.model);
   // The consumption scope means requests that actually spend model quota.
   // Both providers' inference paths belong here; catalog and token-count

@@ -1,3 +1,4 @@
+import { ACCOUNT_RESTRICTED_MESSAGE } from './account-restriction.js';
 import { Buffer } from 'node:buffer';
 import { sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
@@ -234,6 +235,11 @@ export async function handleBedrockProxy(req, res, {
       account_id: accountId,
       code: accountResolutionError.code ?? accountResolutionError.name ?? 'unknown',
     });
+    if (accountResolutionError.code === 'ACCOUNT_RESTRICTED') {
+      record({ statusCode: 403, outcome: 'rejected' });
+      sendJson(res, 403, errorBody(ACCOUNT_RESTRICTED_MESSAGE));
+      return;
+    }
     record({ statusCode: 503, outcome: 'rejected' });
     sendJson(res, 503, errorBody('device account configuration unavailable'));
     return;

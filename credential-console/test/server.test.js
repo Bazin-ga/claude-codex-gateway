@@ -626,16 +626,16 @@ test('neither surviving administrator mode serves a sign-in or sign-out route', 
   }
 });
 
-test('an administrator mode outside the surviving two is refused at startup', async () => {
+test('an administrator mode outside the three known ones is refused at startup', async () => {
   const home = await mkdtemp(join(tmpdir(), 'credential-console-bad-mode-'));
   const store = await new CredentialStore(home, { allowKeyInit: true }).init();
   await assert.rejects(
     createCredentialConsole({
       store,
       usageMonitor: { snapshotForAccount: () => null, refreshAccount: async () => null, stop() {} },
-      adminAuth: 'password',
+      adminAuth: 'passwd',
     }),
-    /must be tailscale or open/,
+    /must be tailscale, open, or password/,
   );
 });
 

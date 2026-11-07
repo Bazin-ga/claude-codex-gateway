@@ -527,6 +527,9 @@ export function usageShowsModelExhausted(snapshot, family, now = Date.now()) {
 export function chooseFailoverAccount({
   store,
   homeAccount,
+  // The device being moved, when known: a private backup it is not listed on
+  // is skipped like an unusable one.
+  device = null,
   exclude = [],
   exhaustion = quotaExhaustion,
   usageSnapshotFor = () => null,
@@ -552,7 +555,7 @@ export function chooseFailoverAccount({
     if (!candidate || candidate.provider !== homeAccount.provider) continue;
     if (!['healthy', 'stored'].includes(candidate.status)) continue;
     if (typeof store.failoverCandidateProblem === 'function'
-      && store.failoverCandidateProblem(candidate)) continue;
+      && store.failoverCandidateProblem(candidate, device)) continue;
     if (!acceptCandidate(candidate)) continue;
     let snapshot = null;
     try {
@@ -680,7 +683,7 @@ export function beginFailover({
   if (markerHome && homeAccount === markerHome
     && ['healthy', 'stored'].includes(markerHome.status)
     && !isExhausted(markerHome.id)
-    && !store.failoverCandidateProblem?.(markerHome)) {
+    && !store.failoverCandidateProblem?.(markerHome, device)) {
     log(`${logPrefix}_quota_failback`, {
       device_id: device.id,
       from_account_id: account.id,
@@ -712,6 +715,7 @@ export function beginFailover({
         family: requestFamily,
         store,
         homeAccount,
+        device,
         exclude: tried,
         exhaustion,
         usageSnapshotFor: snapshot,
