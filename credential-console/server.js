@@ -3509,13 +3509,28 @@ export async function createCredentialConsole(options = {}) {
     sendHtml(res, 404, messageView('Not found', 'The requested page does not exist.', { error: true, openMode }));
   }
 
+  // One request's exception must not end the process: unhandled, the rejection
+  // takes every proxied session down with it (a malformed /codex-agent/%E0 did).
+  async function safeHandler(req, res) {
+    try {
+      await handler(req, res);
+    } catch (error) {
+      log('request_handler_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+      if (!res.headersSent) {
+        sendText(res, 500, 'internal error\n', 'text/plain; charset=utf-8');
+      } else {
+        res.destroy();
+      }
+    }
+  }
+
   let server;
   if (options.server) {
-    server = options.server(handler);
+    server = options.server(safeHandler);
   } else if (options.tls) {
-    server = https.createServer(options.tls, handler);
+    server = https.createServer(options.tls, safeHandler);
   } else {
-    server = http.createServer(handler);
+    server = http.createServer(safeHandler);
   }
   const closeServer = server.close.bind(server);
   const drainBackgroundRefreshes = () => stopBackgroundRefreshes().catch((error) => {

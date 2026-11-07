@@ -502,3 +502,17 @@ test('an administrator gives a legacy credential a new machine, which a private 
     await console.close();
   }
 });
+
+test('a request that throws is answered 500 and the console keeps serving', async () => {
+  const console = await app({ adminAuth: 'tailscale' });
+  try {
+    const broken = await fetch(`${console.baseUrl}/codex-agent/%E0`);
+    assert.equal(broken.status, 500);
+    await broken.text();
+    const next = await fetch(`${console.baseUrl}/health`);
+    assert.equal(next.status, 200);
+    await next.text();
+  } finally {
+    await console.close();
+  }
+});
