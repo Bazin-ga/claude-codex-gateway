@@ -3,6 +3,7 @@ import http from 'node:http';
 import test from 'node:test';
 import { handleClaudeProxy } from '../lib/proxy.js';
 import { normalizeModelBlockRules } from '../lib/model-block-rules.js';
+import { uploadThenRead } from './upload-then-read-client.js';
 
 const DEVICE_TOKEN = 'device-block-token';
 const DEVICE = {
@@ -260,4 +261,47 @@ test('an overload retry still replays the whole body when rules are on', { timeo
   assert.equal(upstream.completeBodies.length, 2);
   assert.equal(upstream.completeBodies[0].toString('utf8'), parts.join(''));
   assert.ok(upstream.completeBodies[1].equals(upstream.completeBodies[0]), 'the retry replays the identical body');
+});
+
+test('a refused turn lets the client finish its upload, so the refusal is read instead of a reset', async (t) => {
+  // Claude Code sends a megabyte or more per turn and reads nothing until it
+  // has sent it all. Closing after the head was read reset the connection
+  // under it: the 403 was lost and the client retried "ECONNRESET" for minutes.
+  const { proxyUrl, upstream, metrics } = await startHarness(t);
+  const body = JSON.stringify({
+    model: 'claude-opus-5',
+    max_tokens: 16,
+    system: 's'.repeat(1024 * 1024),
+    messages: [{ role: 'user', content: 'hello' }],
+  });
+
+  const result = await uploadThenRead(proxyUrl, '/claude/v1/messages', {
+    'X-Api-Key': DEVICE_TOKEN,
+    'Content-Type': 'application/json',
+  }, body);
+
+  assert.equal(result.closedEarly, false, `the gateway waited for the whole body (error: ${result.error})`);
+  assert.equal(result.error, null);
+  assert.equal(result.status, 403);
+  assert.match(JSON.parse(result.body).error.message, /建议使用 Opus 5\.5/);
+  assert.equal(upstream.calls, 0, 'nothing reached Anthropic');
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_blocked');
+});
+
+test('a model refused past the head also waits for the rest of the body', async (t) => {
+  const { proxyUrl, upstream } = await startHarness(t);
+  // The allowed model leads; the blocked second `model` key only arrives after
+  // the head, so the refusal comes from the body stage.
+  const body = `{"model":"claude-opus-5-5","max_tokens":16,"system":"${'s'.repeat(256 * 1024)}",`
+    + `"model":"claude-opus-5","messages":[{"role":"user","content":"${'m'.repeat(512 * 1024)}"}]}`;
+
+  const result = await uploadThenRead(proxyUrl, '/claude/v1/messages', {
+    'X-Api-Key': DEVICE_TOKEN,
+    'Content-Type': 'application/json',
+  }, body);
+
+  assert.equal(result.closedEarly, false, `the gateway waited for the whole body (error: ${result.error})`);
+  assert.equal(result.status, 403);
+  assert.equal(upstream.completeBodies.length, 0, 'the upstream never held a complete body');
 });

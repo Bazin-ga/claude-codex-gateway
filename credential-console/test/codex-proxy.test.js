@@ -22,6 +22,7 @@ import {
 } from '../lib/proxy.js';
 import { CodexQuotaSignal } from '../lib/codex-quota-signal.js';
 import { normalizeModelBlockRules } from '../lib/model-block-rules.js';
+import { uploadThenRead } from './upload-then-read-client.js';
 
 const DEVICE_TOKEN = 'codex-device-test-token';
 const ACCESS_TOKEN = 'codex-upstream-access-token';
@@ -1085,6 +1086,27 @@ test('a second model key in the head is refused, not decided by the first', asyn
   const row = await waitFor(() => metrics.rows[0]);
   assert.equal(row.outcome, 'model_restricted');
   assert.equal(row.model, 'gpt-5.6-sol', 'recorded as the model that would have run');
+});
+
+test('a guard refusal lets the CLI finish its upload, so the 403 is read instead of a reset', async (t) => {
+  const metrics = sink();
+  const { proxyUrl, upstream } = await guardedHarness(t, { metrics });
+  const body = JSON.stringify({
+    model: 'gpt-5.6-sol',
+    input: [{ role: 'user', content: 'c'.repeat(1024 * 1024) }],
+  });
+
+  const result = await uploadThenRead(proxyUrl, '/codex-api/responses', {
+    'x-api-key': DEVICE_TOKEN,
+    'content-type': 'application/json',
+  }, body);
+
+  assert.equal(result.closedEarly, false, `the gateway waited for the whole body (error: ${result.error})`);
+  assert.equal(result.status, 403);
+  assert.match(JSON.parse(result.body).error.message, /luna/);
+  assert.equal(upstream.calls, 0, 'nothing reached chatgpt.com');
+  const row = await waitFor(() => metrics.rows[0]);
+  assert.equal(row.outcome, 'model_restricted');
 });
 
 test('syntax only a laxer parser accepts is refused rather than trusted', async (t) => {

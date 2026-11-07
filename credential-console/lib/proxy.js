@@ -2,7 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { performance } from 'node:perf_hooks';
 import { Transform } from 'node:stream';
-import { sendJson } from './http.js';
+import { refuseAfterDraining, sendJson } from './http.js';
 import { deviceToken } from './device-auth.js';
 import { createRequestMetadataTee, REQUEST_METADATA_PREFIX_BYTES } from './request-metadata.js';
 import { createCaptureBudget, CAPTURE_MEMORY_AMPLIFICATION } from './capture-budget.js';
@@ -520,12 +520,12 @@ export async function handleClaudeProxy(req, res, {
         model: recordedModel,
         requestBytes: gatePrefix.bytes,
       });
-      // The rest of an upload nobody will forward is still arriving; closing
-      // the connection is what stops it.
-      res.once('finish', () => {
-        if (!req.destroyed) req.destroy();
-      });
-      sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+      // The rest of an upload nobody will forward is still arriving. It is
+      // read and dropped before the refusal goes out: closing on it would
+      // reset the connection and lose the refusal with it.
+      refuseAfterDraining(req, res, () => {
+        sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+      }, { limitBytes: MAX_REQUEST_BYTES });
       return;
     }
   }
@@ -557,11 +557,11 @@ export async function handleClaudeProxy(req, res, {
       resets_at: new Date(failover.refusal.until).toISOString(),
     });
     recordRejected(429, 'quota_exhausted_cached');
-    // Nothing of the body is read; closing is what stops the rest of the upload.
-    res.once('finish', () => {
-      if (!req.destroyed) req.destroy();
-    });
-    sendCachedRefusal(res, failover.refusal);
+    // Nothing of the body is read. It is drained before the refusal goes out,
+    // so the client reads the 429 instead of a reset.
+    refuseAfterDraining(req, res, () => {
+      sendCachedRefusal(res, failover.refusal);
+    }, { limitBytes: MAX_REQUEST_BYTES });
     return;
   }
   // A backup whose credential cannot be read is skipped like an exhausted one.
@@ -1243,10 +1243,9 @@ export async function handleClaudeProxy(req, res, {
       if (currentUpstreamReq && !currentUpstreamReq.destroyed) currentUpstreamReq.destroy();
       requestMetadata.stream.destroy();
       if (!res.headersSent) {
-        res.once('finish', () => {
-          if (!req.destroyed) req.destroy();
-        });
-        sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+        refuseAfterDraining(req, res, () => {
+          sendJson(res, 403, refusalBody(refusal), { Connection: 'close' });
+        }, { limitBytes: MAX_REQUEST_BYTES });
       } else if (!res.destroyed) {
         res.destroy();
       }

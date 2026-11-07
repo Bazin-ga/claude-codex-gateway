@@ -809,7 +809,8 @@ export function sendCachedRefusal(res, refusal, now = Date.now()) {
     ...headers,
     'content-length': String(body.length),
     'cache-control': 'no-store',
-    // The request body was never read; closing stops the rest of the upload.
+    // The caller drains the unread request body first (see refuseAfterDraining);
+    // closing then ends the connection without resetting it.
     connection: 'close',
     'x-gateway-cached-refusal': '1',
   });
