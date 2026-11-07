@@ -3253,8 +3253,9 @@ test('the device list renders as a machine inventory, Codex machines included', 
       assert.equal(page.includes('[object Object]'), false);
       assert.equal(page.includes('machine:short'), false);
     }
-    // And the only handle the merge control offers is the one real one.
-    assert.equal((legacy.match(/<option value="/g) ?? []).length, 1);
+    // And the only handle the merge control offers is the one real one (the
+    // empty option is "name a new machine").
+    assert.equal((legacy.match(/<option value="[^"]/g) ?? []).length, 1);
 
     // Nothing that authenticates anything reaches the page: not the provider
     // credential, not a device token, not even the digest of a dispenser bearer.

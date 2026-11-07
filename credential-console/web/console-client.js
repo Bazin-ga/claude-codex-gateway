@@ -121,6 +121,8 @@ const translations = {
   'restriction-confirm-no-target': '没有同类型的其他可用账号可以迁过去，请先添加一个。',
   'restriction-confirm-cancel': '取消',
   'restriction-confirm-device': '设备',
+  'merge-new-machine': '新机器（在下面起名）',
+  'merge-machine-name': '新机器名',
   'restriction-no-enrollment': '专属账号：请在上方开通表单里填写机器名后签发。',
   'restriction-confirm-member': '成员',
   'admin-users-heading': '管理员',

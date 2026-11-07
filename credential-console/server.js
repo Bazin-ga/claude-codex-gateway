@@ -2443,7 +2443,7 @@ export async function createCredentialConsole(options = {}) {
           machineId,
           // An administrator issuing on a private account adds the machine to
           // it. A member never sees one in the form, and the store refuses a
-          // crafted request unless the machine is already listed.
+          // crafted request even from a listed machine.
           admitMachine: isAdmin(session),
         });
         sendHtml(res, 200, configuredDeviceView(result));
@@ -3274,9 +3274,20 @@ export async function createCredentialConsole(options = {}) {
         return;
       }
       try {
-        const machineId = String(form.machine_id ?? '').trim();
-        const codex = await codexMachineReport();
-        if (!knownMachineIds(codex.clients).has(machineId)) {
+        // Either a new machine, named here and hashed the way /self-service
+        // hashes one, or an existing handle the dashboard listed.
+        const machineName = String(form.machine_name ?? '').trim();
+        const device = machineName
+          ? store.publicDevices().find((entry) => entry.id === mergeMachineParams.id)
+          : null;
+        if (machineName && !DEVICE_NAME_PATTERN.test(machineName)) {
+          throw new Error('machine name must use letters, numbers, dots, underscores, or hyphens');
+        }
+        const machineId = machineName
+          ? createHash('sha256').update(`${device?.member_label ?? ''} ${machineName}`).digest('hex').slice(0, 40)
+          : String(form.machine_id ?? '').trim();
+        const codex = machineName ? null : await codexMachineReport();
+        if (!machineName && !knownMachineIds(codex.clients).has(machineId)) {
           // Including the case where the handle is real but lives only in a
           // dispenser home that has become unreadable since the page rendered.
           // Refusing is recoverable; writing an unverifiable handle is not.

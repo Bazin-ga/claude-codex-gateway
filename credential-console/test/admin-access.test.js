@@ -192,7 +192,8 @@ test('no path puts an unlisted device on a private account', async () => {
   // An administrator issuing on it admits the machine; a listed one needs nothing.
   await issue(store, mine, 'new-mac', MACHINE_B, true);
   assert.deepEqual(store.accountById(mine.id).restriction.machine_ids, [MACHINE_A, MACHINE_B]);
-  await issue(store, mine, 'my-mac-2', MACHINE_A);
+  // Even a listed machine: its handle is derived from a name anyone can type.
+  await assert.rejects(issue(store, mine, 'my-mac-2', MACHINE_A), (error) => error.code === 'ACCOUNT_RESTRICTED');
   await assert.rejects(issue(store, mine, 'no-machine', null, true), /needs a machine name/);
   assert.equal(store.resolveDeviceAccount(listed.device.id).account.id, mine.id);
 
@@ -469,6 +470,34 @@ test('a Codex account with a live unlisted dispenser machine cannot be made priv
     });
     assert.match(listed.response.headers.get('location'), /^\/#account-/);
     assert.equal(console.store.accountById(accountId).restriction.enabled, true);
+  } finally {
+    await console.close();
+  }
+});
+
+test('an administrator gives a legacy credential a new machine, which a private account can then list', async () => {
+  let deviceId;
+  let accountId;
+  const console = await app({
+    adminAuth: 'tailscale',
+    seed: async (store) => {
+      const mine = await claude(store, 'claude-mine');
+      accountId = mine.id;
+      deviceId = (await issue(store, mine, 'zefan-mac-studio')).device.id;
+    },
+  });
+  try {
+    const home = await console.request('/');
+    assert.match(home.body, new RegExp(`action="/devices/${deviceId}/machine"`));
+    const csrf = home.body.match(/name="csrf" value="([^"]+)"/)[1];
+    const named = await console.request(`/devices/${deviceId}/machine`, {
+      method: 'POST', form: { csrf, machine_name: 'zefan-mac-studio' },
+    });
+    assert.equal(named.response.headers.get('location'), '/');
+    const machineId = console.store.state.devices[0].machine_id;
+    assert.match(machineId, /^[0-9a-f]{40}$/);
+    await console.store.setAccountRestriction(accountId, { enabled: true, machineIds: [machineId] });
+    assert.equal(console.store.resolveDeviceAccount(deviceId).account.id, accountId);
   } finally {
     await console.close();
   }

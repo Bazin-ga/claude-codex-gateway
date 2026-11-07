@@ -2365,15 +2365,18 @@ export class CredentialStore {
   }
 
   /**
-   * A new credential on a private account. Issued by an administrator
-   * (`admitMachine`), the machine is added to the account's list, since
-   * choosing to issue it there is the decision. Otherwise the machine has to be
-   * on the list already. Mutates before the caller persists, like the device
-   * push beside it.
+   * A new credential on a private account, which only an administrator
+   * (`admitMachine`) may issue; the machine is added to the account's list,
+   * since choosing to issue it there is the decision. Mutates before the
+   * caller persists, like the device push beside it.
    */
   #admitIssuedDevice(account, device, admitMachine) {
-    if (accountUsableByDevice(account, device)) return;
+    if (!isRestrictedAccount(account)) return;
+    // Only an administrator issues on a private account, listed machine or
+    // not: a machine handle is derived from a name anyone can type, and where
+    // members share one tailnet identity it is not proof of the machine.
     if (!admitMachine) throw storeError('account is reserved for other machines', 'ACCOUNT_RESTRICTED');
+    if (accountUsableByDevice(account, device)) return;
     if (!device.machine_id) {
       throw storeError('a private account needs a machine name to issue on', 'ACCOUNT_RESTRICTED');
     }

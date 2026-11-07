@@ -1766,16 +1766,19 @@ function machineEntryView(entry, {
     <th data-i18n="last-seen">Last seen</th>
     <th data-i18n="action">Action</th>
   </tr></thead>`;
+  // A new machine name gives the credential a handle of its own, which is what
+  // a private account's machine list needs.
   const mergeControl = entry.mergeable
-    ? (machineOptions
-      ? `<form method="post" action="/devices/${encodeURIComponent(entry.devices[0].id)}/machine" class="merge-form">
+    ? `<form method="post" action="/devices/${encodeURIComponent(entry.devices[0].id)}/machine" class="merge-form">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-          <label><span data-i18n="merge-into-machine">File this credential under a machine</span>
-            <select name="machine_id" required>${machineOptions}</select>
+          ${machineOptions ? `<label><span data-i18n="merge-into-machine">File this credential under a machine</span>
+            <select name="machine_id"><option value="" data-i18n="merge-new-machine">New machine (name it below)</option>${machineOptions}</select>
+          </label>` : ''}
+          <label><span data-i18n="merge-machine-name">New machine name</span>
+            <input name="machine_name" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" maxlength="64" placeholder="my-macbook">
           </label>
           <div><button type="submit" class="secondary" data-i18n="merge-credential">Merge</button></div>
         </form>`
-      : '<p class="muted tiny" data-i18n="no-merge-targets">No machine has reported a handle yet, so there is nothing to file this under.</p>')
     : '';
   // Two different histories produce a handle-less Codex row and the registry does
   // not record which one this is, so the note names both rather than asserting
