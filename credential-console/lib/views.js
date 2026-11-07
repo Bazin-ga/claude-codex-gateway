@@ -274,8 +274,6 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .pill.low { background: #faecd7; color: var(--amber); }
 .pill.out { background: #f8e4e1; color: var(--red); }
 .pill.moved { background: #e5edf4; color: var(--blue); }
-label.check{display:flex;gap:6px;font-weight:400;margin:0 0 4px}
-label.check input{width:auto;min-height:0;margin:0}
 .switch { display: inline-flex; align-items: center; gap: 8px; margin: 0; padding: 4px 2px; background: none; color: var(--muted); font-size: 12px; font-weight: 800; border-radius: 999px; min-width: 88px; }
 .switch:hover { background: none; color: var(--ink); }
 .switch:disabled, .switch[aria-disabled="true"] { opacity: .5; }
@@ -554,16 +552,6 @@ label.check input{width:auto;min-height:0;margin:0}
 .account-switch-status.success { color: var(--green); }
 .account-switch-status.error { color: var(--red); }
 .account-selection-details { display: grid; gap: 3px; margin-top: 5px; }
-.accounts-table { width: 100%; min-width: 1000px; table-layout: fixed; }
-.accounts-table th:nth-child(1) { width: 16%; }
-.accounts-table th:nth-child(2) { width: 13%; }
-.accounts-table th:nth-child(3) { width: 13%; }
-.accounts-table th:nth-child(4) { width: 18%; }
-.accounts-table th:nth-child(5) { width: 20%; }
-.accounts-table th:nth-child(6) { width: 20%; }
-.accounts-table th:last-child, .accounts-table td:last-child { min-width: 240px; }
-.accounts-table td:last-child input { min-width: 140px; }
-.accounts-table td:last-child .button { white-space: normal; }
 .page-tabs { position: sticky; top: 10px; z-index: 3; display: flex; gap: var(--space-2); flex-wrap: wrap; margin: -8px 0 24px; padding: 6px; border: 1px solid var(--line); border-radius: var(--radius-md); background: rgba(255,255,255,.94); box-shadow: 0 6px 18px rgba(22,33,29,.06); backdrop-filter: blur(8px); }
 .page-tabs[hidden] { display: none; }
 .page-tabs a { padding: 8px 12px; border-radius: 8px; color: var(--muted); font-size: 13px; font-weight: 750; text-decoration: none; }
@@ -692,7 +680,7 @@ label.check input{width:auto;min-height:0;margin:0}
 .conversation-session-state-note { margin: 8px 0 0; }
 /* Wide data tables become cards on a phone.
 
-   These tables are 6-9 columns and .accounts-table carries min-width: 1000px,
+   These tables are 6-9 columns wide,
    so on a 390px screen the only previous option was dragging a 1000px table
    sideways. Each cell instead becomes a labelled row; the label text is stamped
    from the (already translated) header by app.js, so it follows the language
@@ -743,7 +731,6 @@ label.check input{width:auto;min-height:0;margin:0}
     color: var(--muted);
     font-size: 12px;
   }
-  .accounts-table td[data-label] { grid-template-columns: minmax(0, 40%) minmax(0, 1fr); }
   .table-wrap table:has(td[data-label]) td:not([data-label]), .metrics-table:has(td[data-label]) td:not([data-label]) {
     display: block;
   }
@@ -1216,26 +1203,77 @@ function accountRestrictionControl(account, machines, csrf) {
   const known = new Map();
   for (const machine of machines) {
     if (!machine.machine_id || (machine.active_devices === 0 && !restriction.machine_ids.includes(machine.machine_id))) continue;
-    known.set(machine.machine_id, [
-      (machine.names ?? []).join(', ') || machine.machine_id,
-      (machine.member_labels ?? []).join(', '),
-    ].filter(Boolean).join(' · '));
+    known.set(machine.machine_id, {
+      name: (machine.names ?? []).join(', ') || machine.machine_id,
+      member: (machine.member_labels ?? []).join(', '),
+    });
   }
-  for (const id of restriction.machine_ids) if (!known.has(id)) known.set(id, id);
-  const boxes = [...known].map(([id, label]) => `<label class="check"><input type="checkbox" name="machine:${escapeHtml(id)}" value="1"${restriction.machine_ids.includes(id) ? ' checked' : ''}> <span>${escapeHtml(label)}</span></label>`).join('');
-  return `<details class="restriction-control" data-account-restriction="${escapeHtml(account.id)}">
-    <summary>${restriction.enabled
-    ? `<span class="pill low" data-i18n="restriction-summary-private">Private</span> <span class="tiny">${restriction.machine_ids.length} <span data-i18n="restriction-summary-machines">machines</span></span>`
-    : '<span class="pill" data-i18n="restriction-summary-shared">Shared with everyone</span>'}</summary>
-    <form method="post" action="/accounts/${encodeURIComponent(account.id)}/restriction" class="stack">
+  for (const id of restriction.machine_ids) if (!known.has(id)) known.set(id, { name: id, member: '' });
+  const chips = [...known].map(([id, { name, member }]) => `<label class="machine-chip" title="${escapeHtml([name, member, id].filter(Boolean).join('\n'))}">
+      <input type="checkbox" name="machine:${escapeHtml(id)}" value="1"${restriction.machine_ids.includes(id) ? ' checked' : ''}>
+      <span class="machine-chip-text"><strong>${escapeHtml(name)}</strong>${member ? `<small>${escapeHtml(member)}</small>` : ''}</span>
+    </label>`).join('');
+  return `<section class="acct-panel" data-account-restriction="${escapeHtml(account.id)}">
+    <h3 data-i18n="restriction-panel-heading">Who may use this account</h3>
+    <form method="post" action="/accounts/${encodeURIComponent(account.id)}/restriction" class="acct-panel-form">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-      <label class="check"><input type="checkbox" name="enabled" value="1"${restriction.enabled ? ' checked' : ''}> <span data-i18n="restriction-enabled">Private: only the machines ticked below may use this account</span></label>
-      <div class="restriction-machines">${boxes || '<span class="muted tiny" data-i18n="restriction-no-machines">No machine has reported a name yet.</span>'}</div>
+      <label class="switch-row"><input type="checkbox" name="enabled" value="1"${restriction.enabled ? ' checked' : ''}> <span data-i18n="restriction-enabled">Private: only the machines ticked below may use this account</span></label>
+      <div class="machine-chips">${chips || '<span class="muted tiny" data-i18n="restriction-no-machines">No machine has reported a name yet.</span>'}</div>
       <p class="muted tiny" data-i18n="restriction-note">A private account is hidden from members, cannot be chosen or failed over to by any other machine, and the gateway refuses it for them. A credential issued without a machine name cannot be listed: merge it into a machine first.</p>
       <div><button type="submit" class="secondary" data-i18n="restriction-save">Save access</button></div>
     </form>
-  </details>`;
+  </section>`;
 }
+
+/** Private or shared, as a pill for the card's summary line. */
+function accountAccessPill(account) {
+  const restriction = normalizeAccountRestriction(account.restriction);
+  return restriction.enabled
+    ? `<span class="pill low"><span data-i18n="restriction-summary-private">Private</span> · ${restriction.machine_ids.length} <span data-i18n="restriction-summary-machines">machines</span></span>`
+    : '<span class="pill" data-i18n="restriction-summary-shared">Shared with everyone</span>';
+}
+
+/**
+ * The account list's own styles. Rendered with the dashboard only: every page
+ * inlines the shared stylesheet, and the long metrics page has a size budget.
+ */
+const ACCOUNT_CARD_STYLES = `<style>
+.acct-list{display:grid;gap:14px;margin-top:14px}
+.acct{border:1px solid var(--line);border-radius:16px;background:#fff;padding:16px 18px;min-width:0}
+.acct.is-private{border-color:#ecd3a8;box-shadow:inset 4px 0 0 #e2a54b}
+.acct-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px 16px;align-items:flex-start}
+.acct-name{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;font-size:16px}
+.acct-sub{margin-top:2px}
+.acct-tags{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end}
+.acct-body{display:grid;grid-template-columns:minmax(180px,1fr) minmax(240px,1.4fr) minmax(200px,1fr);gap:16px;margin-top:14px;align-items:start}
+.acct-col h4{margin:0 0 6px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.acct-col .account-history{min-width:0}
+.acct-actions{display:flex;flex-direction:column;gap:8px;align-items:stretch}
+.acct-actions .button,.acct-panel .button,.acct-panel button{font-size:13px;min-height:0;padding:8px 14px;text-align:center}
+.acct-actions .failover-summary{margin-top:0}
+.acct-settings{margin-top:14px;border-top:1px dashed var(--line);padding-top:10px}
+.acct-settings>summary{cursor:pointer;font-weight:700;font-size:13px;list-style:none;display:flex;gap:8px;align-items:center;color:var(--ink)}
+.acct-settings>summary::before{content:"\\25B8";transition:transform .15s}
+.acct-settings[open]>summary::before{transform:rotate(90deg)}
+.acct-panels{display:grid;grid-template-columns:minmax(0,2fr) minmax(260px,1fr);gap:12px;margin-top:12px;align-items:start}
+.acct-panels-side{display:grid;gap:12px;min-width:0}
+.acct-panel{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfa;min-width:0}
+.acct-panel h3{margin:0 0 10px;font-size:14px}
+.acct-panel.danger-zone{border-color:#f0d0cb;background:#fdf7f6;display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;justify-content:space-between}
+.acct-panel.danger-zone h3{margin:0}
+.acct-panel.danger-zone p{flex-basis:100%;margin:0}
+.acct-panel-form{display:grid;gap:10px}
+.acct-panel .inline{flex-wrap:wrap}
+.switch-row{display:flex;gap:8px;align-items:flex-start;font-weight:600;margin:0}
+.switch-row input,.machine-chip input{width:16px;height:16px;min-height:0;margin:2px 0 0;flex:none;accent-color:var(--green)}
+.machine-chips{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px;max-height:260px;overflow-y:auto}
+.machine-chip{display:flex;gap:8px;align-items:flex-start;margin:0;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:#fff;font-weight:400;cursor:pointer;min-width:0}
+.machine-chip:has(input:checked){border-color:var(--green);background:#eef7f1}
+.machine-chip-text{display:grid;min-width:0}
+.machine-chip-text strong,.machine-chip-text small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.machine-chip-text small{color:var(--muted);font-size:11px}
+@media (max-width:900px){.acct-body,.acct-panels{grid-template-columns:1fr}.acct-tags{justify-content:flex-start}}
+</style>`;
 
 /**
  * Where a failed-over device came from and when it goes back, on the device.
@@ -4149,39 +4187,70 @@ export function dashboardView({
     const alert = alertsById.get(account.id)
       ?? alerts.accounts.find((entry) => entry.alias === account.alias)
       ?? null;
-    return `
-    <tr data-account-row="${escapeHtml(account.id)}" id="account-${escapeHtml(account.id)}">
-      <td><strong>${escapeHtml(account.alias)}</strong>${isRestrictedAccount(account) ? ' <span class="pill low" data-i18n="restriction-summary-private">Private</span>' : ''}<div class="muted tiny">${escapeHtml(providerLabel(account.provider))} · ${escapeHtml(account.email_label || 'No email label')}</div></td>
-      <td><div class="account-status-stack">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}</div>
-        ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}
-        <div class="muted tiny"><span data-i18n="devices">Devices</span>: <span data-account-device-count>${escapeHtml(account.active_devices ?? '—')}</span></div></td>
-      <td>${expiryView(alert)}</td>
-      <td class="account-history">${credentialCheckText(alert?.lastSuccessAt, 'last-successful-check')}${credentialCheckText(alert?.lastRotationAt, 'last-rotation')}</td>
-      <td>${accountUsageView(account)}</td>
-      <td>
-        ${account.provider === 'claude' ? `<div class="stack">
-          <a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/claude-authorization" data-i18n="owner-authorization">Owner authorization</a>
-          ${available && isRestrictedAccount(account) ? '<span class="muted tiny" data-i18n="restriction-no-enrollment">Private: issue from the setup form above with a machine name.</span>' : available ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/enrollments" class="inline">
+    const id = encodeURIComponent(account.id);
+    const isPrivate = isRestrictedAccount(account);
+    const authorization = account.provider === 'claude'
+      ? `<a class="button secondary" href="/accounts/${id}/claude-authorization" data-i18n="owner-authorization">Owner authorization</a>`
+      : account.provider === 'codex' && !isCodexApiKeyAccount(account)
+        ? `<a class="button secondary" href="/accounts/${id}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>`
+        : '';
+    const enrollment = account.provider !== 'claude' ? ''
+      : `<section class="acct-panel">
+        <h3 data-i18n="enroll-panel-heading">One-time enrollment code</h3>
+        ${available && isPrivate ? '<p class="muted tiny" data-i18n="restriction-no-enrollment">Private: issue from the setup form above with a machine name.</p>' : available ? `<form method="post" action="/accounts/${id}/enrollments" class="inline">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
           <input name="member_label" aria-label="Member label for ${escapeHtml(account.alias)}" placeholder="member email/name" required maxlength="160">
           <button type="submit" data-i18n="enroll-device">Enroll device</button>
-        </form>` : '<span class="muted tiny" data-i18n="owner-login-required">Account owner must authorize before member enrollment.</span>'}
-          ${accountFailoverSummary(account, accounts)}
-          ${accountRestrictionControl(account, machines, csrf)}
-        </div>` : `<div class="stack">
-          ${isCodexApiKeyAccount(account)
-            ? '<span class="muted tiny" data-i18n="codex-api-key-account">OpenAI API key · billed per token</span>'
-            : `<a class="button secondary" href="/accounts/${encodeURIComponent(account.id)}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>`}
+        </form>` : '<p class="muted tiny" data-i18n="owner-login-required">Account owner must authorize before member enrollment.</p>'}
+      </section>`;
+    const codexControls = account.provider === 'codex'
+      ? [codexResetControl(account, csrf), codexModelGuardControl(account, csrf), codexCreditGuardControl(account, csrf)].join('')
+      : '';
+    return `
+    <article class="acct${isPrivate ? ' is-private' : ''}" data-account-row="${escapeHtml(account.id)}" id="account-${escapeHtml(account.id)}">
+      <header class="acct-head">
+        <div>
+          <div class="acct-name"><strong>${escapeHtml(account.alias)}</strong>${isPrivate ? ' <span class="pill low" data-i18n="restriction-summary-private">Private</span>' : ''}</div>
+          <div class="muted tiny acct-sub">${escapeHtml(providerLabel(account.provider))} · ${escapeHtml(account.email_label || 'No email label')}</div>
+        </div>
+        <div class="acct-tags">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}<span class="pill"><span data-i18n="devices">Devices</span>: <span data-account-device-count>${escapeHtml(account.active_devices ?? '—')}</span></span></div>
+      </header>
+      <div class="acct-body">
+        <div class="acct-col">
+          <h4 data-i18n="credential-history">Credential history</h4>
+          ${expiryView(alert)}
+          ${alert ? `<div class="muted tiny" data-i18n="${credentialAlertLabelKey(alert.code)}">Credential status needs attention.</div>` : ''}
+          <div class="account-history muted tiny">${credentialCheckText(alert?.lastSuccessAt, 'last-successful-check')}${credentialCheckText(alert?.lastRotationAt, 'last-rotation')}</div>
+        </div>
+        <div class="acct-col">
+          <h4 data-i18n="usage-quota">Usage quota</h4>
+          ${accountUsageView(account)}
+        </div>
+        <div class="acct-col acct-actions">
+          <h4 data-i18n="action">Action</h4>
+          ${authorization}
+          ${isCodexApiKeyAccount(account) ? '<span class="muted tiny" data-i18n="codex-api-key-account">OpenAI API key · billed per token</span>' : ''}
           ${account.external ? '<span class="muted tiny" data-i18n="existing-codex-agent">Existing Codex agent</span>' : ''}
-          ${codexResetControl(account, csrf)}
-          ${codexModelGuardControl(account, csrf)}
-          ${codexCreditGuardControl(account, csrf)}
           ${accountFailoverSummary(account, accounts)}
-          ${accountRestrictionControl(account, machines, csrf)}
-        </div>`}
-        <a class="button danger" href="/accounts/${encodeURIComponent(account.id)}/delete" data-i18n="delete-account">Delete account</a>
-      </td>
-    </tr>
+          <div>${GATEWAY_PROVIDERS.includes(account.provider) ? accountAccessPill(account) : ''}</div>
+        </div>
+      </div>
+      <details class="acct-settings" data-persist-details="account-settings-${escapeHtml(account.id)}">
+        <summary data-i18n="account-settings">Account settings</summary>
+        <div class="acct-panels">
+          <div class="acct-panels-main">${accountRestrictionControl(account, machines, csrf)}</div>
+          <div class="acct-panels-side">
+          ${codexControls ? `<section class="acct-panel"><h3 data-i18n="codex-panel-heading">Codex quota controls</h3><div class="stack">${codexControls}</div></section>` : ''}
+          ${enrollment}
+          <section class="acct-panel danger-zone">
+            <h3 data-i18n="danger-zone-heading">Delete</h3>
+            <p class="muted tiny" data-i18n="danger-zone-note">Deleting asks for confirmation and the account's name on the next page.</p>
+            <a class="button danger" href="/accounts/${id}/delete" data-i18n="delete-account">Delete account</a>
+          </section>
+          </div>
+        </div>
+      </details>
+    </article>
   `;
   }).join('');
   // Open mode has no verified identity, so the member types the label that keeps their
@@ -4455,13 +4524,8 @@ export function dashboardView({
           ${conversationHookUpgrade}
           <article class="card">
             <div class="topbar"><div><h2 data-i18n="accounts">Accounts</h2><div class="muted tiny" data-i18n="upstream-secret-note">Provider tokens are encrypted and never displayed after submission. Exceptional one-time enrollment remains available per account.</div></div></div>
-            <div class="table-wrap">
-              <table class="accounts-table">
-                <caption class="visually-hidden" data-i18n="accounts-table-caption">Credential accounts and safe health metadata</caption>
-                <thead><tr><th scope="col" data-i18n="account">Account</th><th scope="col" data-i18n="status">Status</th><th scope="col" data-i18n="expires">Expires</th><th scope="col" data-i18n="credential-history">Credential history</th><th scope="col" data-i18n="usage-quota">Usage quota</th><th scope="col" data-i18n="action">Action</th></tr></thead>
-                <tbody>${accountRows || '<tr><td colspan="6" class="empty" data-i18n="no-accounts">No accounts yet.</td></tr>'}</tbody>
-              </table>
-            </div>
+            ${ACCOUNT_CARD_STYLES}
+            <div class="acct-list" aria-label="Credential accounts and safe health metadata">${accountRows || '<p class="empty" data-i18n="no-accounts">No accounts yet.</p>'}</div>
           </article>
           <article class="card split">
             <h2 data-i18n="add-claude-heading">Add a Claude Code team account</h2>
@@ -5739,10 +5803,19 @@ function adminUsersSection({ adminUsers, currentAdmin, csrf }) {
     <td class="tiny">${escapeHtml(dateText(user.created_at))}${user.created_by ? ` · ${escapeHtml(user.created_by)}` : ''}</td>
     <td>${user.username === currentAdmin || adminUsers.length === 1 ? '' : `<form method="post" action="/admin/users/${encodeURIComponent(user.username)}/delete" class="inline">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-      <button type="submit" class="danger" data-i18n="admin-users-delete">Delete</button>
+      <button type="submit" class="danger admin-users-delete" data-i18n="admin-users-delete">Delete</button>
     </form>`}</td>
   </tr>`).join('');
   return `<article class="card stack" id="administrators">
+    <style>
+    #administrators td:last-child{text-align:right;width:1%;white-space:nowrap}
+    .admin-users-delete{width:auto;min-height:0;padding:6px 14px;font-size:12px}
+    .admin-users-forms{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+    .admin-users-forms section{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfa}
+    .admin-users-forms h3{margin:0 0 10px;font-size:14px}
+    .admin-users-forms .inline{flex-wrap:wrap}
+    .admin-users-forms button{flex:0 0 auto}
+    </style>
     <div>
       <h2 data-i18n="admin-users-heading">Administrators</h2>
       <p class="muted" data-i18n="admin-users-intro">Members see only the self-service area, usage and docs. These accounts sign in to see and change everything else.</p>
@@ -5751,18 +5824,21 @@ function adminUsersSection({ adminUsers, currentAdmin, csrf }) {
       <thead><tr><th scope="col" data-i18n="admin-users-name">Username</th><th scope="col" data-i18n="admin-users-created">Added</th><th scope="col"></th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
+    <div class="admin-users-forms">
+    <section><h3 data-i18n="admin-users-add">Add administrator</h3>
     <form method="post" action="/admin/users" class="inline">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
       <input name="username" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" maxlength="64" autocomplete="off" aria-label="Username" data-placeholder-en="username" data-placeholder-zh="用户名" placeholder="username">
       <input name="password" type="password" required minlength="10" maxlength="256" autocomplete="new-password" aria-label="Password" data-placeholder-en="password (10+ characters)" data-placeholder-zh="密码（至少 10 位）" placeholder="password (10+ characters)">
       <button type="submit" data-i18n="admin-users-add">Add administrator</button>
-    </form>
-    ${currentAdmin ? `<form method="post" action="/admin/password" class="inline">
+    </form></section>
+    ${currentAdmin ? `<section><h3 data-i18n="admin-users-change-password">Change my password</h3><form method="post" action="/admin/password" class="inline">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
       <input name="current_password" type="password" required autocomplete="current-password" aria-label="Current password" data-placeholder-en="current password" data-placeholder-zh="当前密码" placeholder="current password">
       <input name="password" type="password" required minlength="10" maxlength="256" autocomplete="new-password" aria-label="New password" data-placeholder-en="new password" data-placeholder-zh="新密码" placeholder="new password">
       <button type="submit" class="secondary" data-i18n="admin-users-change-password">Change my password</button>
-    </form>` : ''}
+    </form></section>` : ''}
+    </div>
   </article>`;
 }
 
@@ -5799,7 +5875,7 @@ export function accountRestrictionView({ account, machineIds, affected, targets,
   return layout('Make account private', `
     <section class="login">
       <div class="card stack">
-        <h1><span data-i18n="restriction-confirm-heading">Make private:</span> ${escapeHtml(account.alias)}</h1>
+        <h2><span data-i18n="restriction-confirm-heading">Make private:</span> ${escapeHtml(account.alias)}</h2>
         <p data-i18n="restriction-confirm-intro">These devices use this account but are not on a listed machine. They move to the account you choose now, keep their credentials, and do not need to be set up again.</p>
         <div class="table-wrap"><table>
           <thead><tr><th scope="col" data-i18n="restriction-confirm-device">Device</th><th scope="col" data-i18n="restriction-confirm-member">Member</th></tr></thead>
