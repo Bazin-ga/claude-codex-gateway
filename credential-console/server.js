@@ -696,8 +696,10 @@ export async function createCredentialConsole(options = {}) {
   const responseViewers = new WeakMap();
   const isAdmin = (session) => Boolean(session) && (!passwordMode || (
     session.role === 'admin'
-    // A deleted administrator's session ends with the account, not at expiry.
-    && store.adminUsers().some((user) => user.username === session.admin_user)
+    // A deleted administrator's session ends with the account, and a session
+    // signed in before a password change ends with the old password.
+    && store.adminUsers().some((user) => user.username === session.admin_user
+      && (user.password_changed_at ?? null) === (session.admin_password_changed_at ?? null))
   ));
   const actorFor = (session) => (session?.admin_user
     ? `admin:${session.admin_user}`
@@ -851,7 +853,8 @@ export async function createCredentialConsole(options = {}) {
   /** A same-origin path to return to after signing in, or `/`. */
   function safeNext(value) {
     const next = String(value ?? '');
-    return /^\/(?![\/\\])[^\s]*$/.test(next) && next.length <= 512 ? next : '/';
+    // Printable ASCII only: anything else cannot go into a Location header.
+    return /^\/(?![\/\\])[\x21-\x7e]*$/.test(next) && next.length <= 512 ? next : '/';
   }
 
   // Password mode: what a member may reach. Everything else that is not a
@@ -1811,6 +1814,9 @@ export async function createCredentialConsole(options = {}) {
             throw new Error('the current password is wrong');
           }
           await store.setAdminPassword(session.admin_user, String(form.password ?? ''), { actor });
+          // Every other session of this administrator ends; this one carries on.
+          session.admin_password_changed_at = store.adminUsers()
+            .find((user) => user.username === session.admin_user)?.password_changed_at ?? null;
         } else {
           if (adminUserDeleteParams.username === session.admin_user) {
             throw new Error('you cannot delete the administrator you are signed in as');
@@ -1843,6 +1849,17 @@ export async function createCredentialConsole(options = {}) {
         .map((key) => key.slice('machine:'.length));
       try {
         const plan = store.accountRestrictionPlan(accountId, { enabled, machineIds });
+        // Machines enrolled with the retired dispenser take the account's
+        // token straight to the provider, past every check here, so the
+        // account cannot be made private while an unlisted one is live.
+        if (plan.next.enabled && plan.account.external?.kind === 'codex-credential') {
+          const { clients, error } = await codexClientsFor(plan.account);
+          if (error) throw new Error('the Codex dispenser machine list could not be read, so the account cannot be made private');
+          const stray = clients.filter((client) => !client.revoked && !plan.next.machine_ids.includes(client.machine_id));
+          if (stray.length) {
+            throw new Error(`revoke this account's dispenser machines first: ${stray.map((client) => client.name || client.machine_id || 'unnamed').join(', ')}`);
+          }
+        }
         if (plan.affected.length > 0 && !form.migrate_to) {
           const devicesById = new Map(store.publicDevices().map((device) => [device.id, device]));
           sendHtml(res, 200, accountRestrictionView({
@@ -2292,9 +2309,11 @@ export async function createCredentialConsole(options = {}) {
         }), { 'Retry-After': String(ADMIN_LOGIN_FAILURE_WINDOW_MS / 1000) });
         return;
       }
+      // Counted before the slow check, not after it: otherwise a burst of
+      // parallel guesses all pass the limit before the first one is recorded.
+      recordAdminLoginFailure(identity);
       const username = await store.verifyAdminLogin(String(form.username ?? ''), String(form.password ?? ''));
       if (!username) {
-        recordAdminLoginFailure(identity);
         log('admin_login_failed', { identity, username: String(form.username ?? '').slice(0, 64) });
         sendHtml(res, 401, adminLoginView({
           csrf: session.csrf,
@@ -2306,6 +2325,8 @@ export async function createCredentialConsole(options = {}) {
       }
       adminLoginFailures.delete(identity);
       replaceSession(req, res, session, { role: 'admin', adminUser: username });
+      requestSessions.get(req).admin_password_changed_at = store.adminUsers()
+        .find((user) => user.username === username)?.password_changed_at ?? null;
       log('admin_login', { identity, username });
       await store.recordExternalAudit('admin_login', { username, identity }).catch(() => {});
       redirect(res, formNext);
@@ -2421,7 +2442,8 @@ export async function createCredentialConsole(options = {}) {
           deviceName: String(form.device_name ?? '').trim(),
           machineId,
           // An administrator issuing on a private account adds the machine to
-          // it; a member can only issue where their machine is already listed.
+          // it. A member never sees one in the form, and the store refuses a
+          // crafted request unless the machine is already listed.
           admitMachine: isAdmin(session),
         });
         sendHtml(res, 200, configuredDeviceView(result));

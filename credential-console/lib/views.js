@@ -274,12 +274,8 @@ pre { background: #111a17; color: #e9f2ed; border-radius: 12px; padding: 16px; o
 .pill.low { background: #faecd7; color: var(--amber); }
 .pill.out { background: #f8e4e1; color: var(--red); }
 .pill.moved { background: #e5edf4; color: var(--blue); }
-.restriction-control summary { cursor: pointer; }
-.viewer-chip { align-self: center; white-space: nowrap; }
-.restriction-control form { margin-top: 8px; }
-label.check { display: flex; align-items: center; gap: 6px; font-weight: 400; font-size: 12px; margin-bottom: 4px; }
-label.check input { width: auto; min-height: 0; margin: 0; }
-.restriction-machines { max-height: 180px; overflow-y: auto; }
+label.check{display:flex;gap:6px;font-weight:400;margin:0 0 4px}
+label.check input{width:auto;min-height:0;margin:0}
 .switch { display: inline-flex; align-items: center; gap: 8px; margin: 0; padding: 4px 2px; background: none; color: var(--muted); font-size: 12px; font-weight: 800; border-radius: 999px; min-width: 88px; }
 .switch:hover { background: none; color: var(--ink); }
 .switch:disabled, .switch[aria-disabled="true"] { opacity: .5; }
@@ -5832,7 +5828,7 @@ export function withViewerChrome(html, viewer) {
     out = out.replace(/\n\s*<a href="\/(?:conversations|admin|relay)"[^\n]*data-tab="(?:conversations|admin|relay)">[^<]*<\/a>/g, '');
   }
   const control = viewer.admin
-    ? `<span class="muted tiny viewer-chip"><span data-i18n="viewer-admin">Administrator</span> · <strong>${escapeHtml(viewer.username ?? '')}</strong></span><a class="button secondary" href="/logout" data-i18n="viewer-sign-out">Sign out</a>`
+    ? `<span class="muted tiny"><span data-i18n="viewer-admin">Administrator</span> · <strong>${escapeHtml(viewer.username ?? '')}</strong></span><a class="button secondary" href="/logout" data-i18n="viewer-sign-out">Sign out</a>`
     : '<a class="button secondary" href="/login" data-i18n="viewer-sign-in">Administrator sign-in</a>';
   return out.replace('<div class="topbar-actions">', `<div class="topbar-actions">${control}`);
 }

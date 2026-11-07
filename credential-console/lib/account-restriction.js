@@ -2,10 +2,10 @@
 // machines. Every other device can neither be issued on it, switched to it,
 // failed over to it, nor see it, and the gateway refuses to forward for it.
 //
-// The list is of machine handles, not devices, so a machine's next credential
-// on the same account needs no second visit to the console. A handle is
-// derived from the issuing member plus the machine name (see /self-service),
-// which is why it is not something another member can reproduce.
+// The list is of machine handles, not devices: every credential on a listed
+// machine is covered. A handle is derived from the issuing identity plus the
+// machine name (see /self-service), which is why another member cannot
+// reproduce one by typing the same name.
 
 const MACHINE_ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
 export const RESTRICTION_MAX_MACHINES = 64;

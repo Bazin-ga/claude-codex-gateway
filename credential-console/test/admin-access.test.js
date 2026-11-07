@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -385,6 +385,90 @@ test('tailscale mode is unchanged: every visitor is an administrator and there i
     assert.doesNotMatch(home.body, /href="\/login"/);
     assert.match(home.body, /href="\/conversations"/);
     assert.equal((await console.request('/login')).response.status, 404);
+  } finally {
+    await console.close();
+  }
+});
+
+test('password mode: parallel guesses still hit the limit, and a hostile next cannot break the redirect', async () => {
+  const console = await app({
+    seed: async (store) => store.addAdminUser({ username: 'root', password: PASSWORD }),
+  });
+  try {
+    const csrf = (await console.request('/login')).body.match(/name="csrf" value="([^"]+)"/)[1];
+    const statuses = await Promise.all(Array.from({ length: 12 }, () => console.request('/login', {
+      method: 'POST', form: { csrf, username: 'root', password: 'wrong password' },
+    }).then(({ response }) => response.status)));
+    assert.equal(statuses.filter((status) => status === 401).length, 5);
+    assert.equal(statuses.filter((status) => status === 429).length, 7);
+  } finally {
+    await console.close();
+  }
+  const other = await app({
+    seed: async (store) => store.addAdminUser({ username: 'root', password: PASSWORD }),
+  });
+  try {
+    const csrf = (await other.request('/login?next=/%C4%80')).body.match(/name="csrf" value="([^"]+)"/)[1];
+    const signedIn = await other.request('/login', {
+      method: 'POST', form: { csrf, username: 'root', password: PASSWORD, next: '/\u0100' },
+    });
+    assert.equal(signedIn.response.headers.get('location'), '/');
+    const again = await other.request('/login?next=/%C4%80');
+    assert.equal(again.response.headers.get('location'), '/');
+    assert.equal((await other.request('/login?next=//evil.example')).response.headers.get('location'), '/');
+  } finally {
+    await other.close();
+  }
+});
+
+test('password mode: changing a password ends the administrator\'s other sessions', async () => {
+  const first = await app({
+    seed: async (store) => store.addAdminUser({ username: 'root', password: PASSWORD }),
+  });
+  try {
+    await first.login();
+    assert.equal((await first.request('/admin')).response.status, 200);
+    await first.store.setAdminPassword('root', 'a brand new password');
+    assert.equal((await first.request('/admin')).response.status, 303);
+    await first.login('root', 'a brand new password');
+    const csrf = (await first.request('/admin')).body.match(/name="csrf" value="([^"]+)"/)[1];
+    await first.request('/admin/password', {
+      method: 'POST', form: { csrf, current_password: 'a brand new password', password: 'yet another password' },
+    });
+    // The session that made the change carries on.
+    assert.equal((await first.request('/admin')).response.status, 200);
+  } finally {
+    await first.close();
+  }
+});
+
+test('a Codex account with a live unlisted dispenser machine cannot be made private', async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), 'credential-console-dispenser-'));
+  await mkdir(join(codexHome, 'clients'));
+  await writeFile(join(codexHome, 'clients', 'clients.json'), JSON.stringify({
+    clients: [{ name: 'old-box', machine_id: MACHINE_B, revoked: false }],
+  }));
+  let accountId;
+  const console = await app({
+    adminAuth: 'tailscale',
+    seed: async (store) => {
+      accountId = (await store.addAccount({
+        provider: 'codex', alias: 'codex-mine', external: { kind: 'codex-credential', home: codexHome },
+      })).id;
+    },
+  });
+  try {
+    const csrf = await console.csrf();
+    const refused = await console.request(`/accounts/${accountId}/restriction`, {
+      method: 'POST', form: { csrf, enabled: '1', [`machine:${MACHINE_A}`]: '1' },
+    });
+    assert.match(decodeURIComponent(refused.response.headers.get('location')), /dispenser machines first: old-box/);
+    assert.equal(console.store.accountById(accountId).restriction, undefined);
+    const listed = await console.request(`/accounts/${accountId}/restriction`, {
+      method: 'POST', form: { csrf, enabled: '1', [`machine:${MACHINE_B}`]: '1' },
+    });
+    assert.match(listed.response.headers.get('location'), /^\/#account-/);
+    assert.equal(console.store.accountById(accountId).restriction.enabled, true);
   } finally {
     await console.close();
   }
