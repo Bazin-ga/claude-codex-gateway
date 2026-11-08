@@ -595,6 +595,7 @@ test('password mode: saves say what they did, and members move devices between s
       method: 'POST', form: { csrf: token, enabled: '1', [`machine:${MACHINE_A}`]: '1' },
     });
     assert.match(plan.body, /value="__disconnect__"/);
+    assert.match(plan.body, /data-i18n="restriction-confirm-unsaved"/);
     const cut = await console.request(`/accounts/${ids.spare}/restriction`, {
       method: 'POST',
       form: { csrf: token, enabled: '1', [`machine:${MACHINE_A}`]: '1', migrate_to: '__disconnect__' },

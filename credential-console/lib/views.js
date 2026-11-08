@@ -5945,6 +5945,7 @@ export function accountRestrictionView({ account, machineIds, affected, targets,
     <section class="login">
       <div class="card stack">
         <h2><span data-i18n="restriction-confirm-heading">Make private:</span> ${escapeHtml(account.alias)}</h2>
+        <div class="notice error" role="alert" data-i18n="restriction-confirm-unsaved">Not saved yet. Nothing changes until you press the button below; leaving or reloading this page keeps the account as it was.</div>
         <p data-i18n="restriction-confirm-intro">These devices use this account but are not on a listed machine. They move to the account you choose now, keep their credentials, and do not need to be set up again.</p>
         <div class="table-wrap"><table>
           <thead><tr><th scope="col" data-i18n="restriction-confirm-device">Device</th><th scope="col" data-i18n="restriction-confirm-member">Member</th></tr></thead>
