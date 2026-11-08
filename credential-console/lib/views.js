@@ -1237,6 +1237,7 @@ function memberDevicesView(devices, csrf) {
     <style>
     .member-devices{margin-top:18px;background:#fff;color:var(--ink);border-radius:16px;padding:16px 18px}
     .member-devices h2{margin:0 0 4px;font-size:17px}
+    .member-devices .muted{color:var(--muted)}
     .member-devices table{width:100%}
     .member-switch{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     .member-switch select{width:auto;min-width:160px;margin:0}
