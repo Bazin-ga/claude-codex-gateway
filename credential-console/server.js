@@ -20,7 +20,7 @@ import {
   readBody,
 } from './lib/http.js';
 import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
-import { isRestrictedAccount } from './lib/account-restriction.js';
+import { accountUsableByDevice, isRestrictedAccount } from './lib/account-restriction.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
@@ -712,6 +712,52 @@ export async function createCredentialConsole(options = {}) {
   const hiddenAccountIds = (session) => (isAdmin(session)
     ? []
     : store.state.accounts.filter(isRestrictedAccount).map((account) => account.id));
+  // Devices on a shared account, for the member page, each with the shared
+  // accounts of its kind it could move to.
+  const memberDeviceRows = () => {
+    const accounts = store.publicAccounts();
+    const usable = (account) => !isRestrictedAccount(account)
+      && ['stored', 'healthy'].includes(account.status)
+      && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
+      && (account.provider !== 'codex' || isCodexGatewayAccount(account));
+    return store.publicDevices().flatMap((device) => {
+      if (device.revoked_at) return [];
+      const current = accounts.find((account) => account.id === (device.selected_account_id ?? device.account_id));
+      if (!current || isRestrictedAccount(current) || !['claude', 'codex'].includes(current.provider)) return [];
+      return [{
+        id: device.id,
+        name: device.name,
+        lastSeenAt: device.last_seen_at ?? null,
+        account: { id: current.id, alias: current.alias, provider: current.provider },
+        targets: accounts.filter((account) => account.provider === current.provider && usable(account))
+          .map(({ id, alias }) => ({ id, alias })),
+      }];
+    }).sort((a, b) => a.name.localeCompare(b.name));
+  };
+  // What the last save did, from the redirect's query: a fixed key and a few
+  // numbers and names, each re-checked here before the page shows it.
+  const dashboardNotice = (params) => {
+    const key = params.get('notice');
+    if (!['restriction-private', 'restriction-shared', 'restriction-shared-ticked', 'member-switched'].includes(key)) return null;
+    const count = (name) => (/^\d{1,4}$/.test(params.get(name) ?? '') ? Number(params.get(name)) : 0);
+    const text = (name) => String(params.get(name) ?? '').slice(0, 64);
+    return {
+      key,
+      account: text('account'),
+      device: text('device'),
+      target: text('target'),
+      machines: count('machines'),
+      moved: count('moved'),
+      disconnected: count('disconnected'),
+    };
+  };
+  // The error for a switch onto a private account that does not list the
+  // device's machine, saying what to do instead of only that it failed.
+  const restrictedSwitchMessage = (error, accountId) => {
+    if (error?.code !== 'ACCOUNT_RESTRICTED') return error.message;
+    const alias = store.accountById(String(accountId ?? ''))?.alias ?? 'that account';
+    return `This machine is not on ${alias}'s list. Tick it under ${alias} → Account settings → Who may use this account, then switch again. A credential without a machine name has to be merged into a machine first.`;
+  };
   // Both providers issue the same kind of device token but need different client
   // instructions; handing a Codex enrollee the Claude launcher would be
   // confidently wrong.
@@ -863,7 +909,10 @@ export async function createCredentialConsole(options = {}) {
     if (method === 'GET') {
       return ['/', '/docs', '/onboarding.md', '/metrics', '/metrics/chart-data', '/login', '/logout'].includes(path);
     }
-    if (method === 'POST') return ['/self-service', '/codex/self-service', '/login'].includes(path);
+    if (method === 'POST') {
+      return ['/self-service', '/codex/self-service', '/login'].includes(path)
+        || Boolean(routeMatch(path, '/member/devices/:id/account'));
+    }
     return false;
   }
 
@@ -1860,6 +1909,7 @@ export async function createCredentialConsole(options = {}) {
             throw new Error(`revoke this account's dispenser machines first: ${stray.map((client) => client.name || client.machine_id || 'unnamed').join(', ')}`);
           }
         }
+        const disconnect = form.migrate_to === '__disconnect__';
         if (plan.affected.length > 0 && !form.migrate_to) {
           const devicesById = new Map(store.publicDevices().map((device) => [device.id, device]));
           sendHtml(res, 200, accountRestrictionView({
@@ -1880,7 +1930,8 @@ export async function createCredentialConsole(options = {}) {
         const result = await store.setAccountRestriction(accountId, {
           enabled,
           machineIds,
-          migrateToAccountId: form.migrate_to || null,
+          migrateToAccountId: disconnect ? null : (form.migrate_to || null),
+          disconnect,
           actor: actorFor(session),
         });
         log('account_restriction_updated', {
@@ -1888,9 +1939,20 @@ export async function createCredentialConsole(options = {}) {
           enabled,
           machines: machineIds.length,
           moved: result.moved.length,
+          disconnected: result.disconnected.length,
           actor: actorFor(session),
         });
-        redirect(res, `/#account-${encodeURIComponent(accountId)}`);
+        // Said back on the page: a save that changed nothing visible (machines
+        // ticked, account left shared) was being read as "it does not work".
+        const notice = new URLSearchParams({
+          notice: enabled ? 'restriction-private' : machineIds.length ? 'restriction-shared-ticked' : 'restriction-shared',
+          account: result.account.alias,
+          machines: String(machineIds.length),
+          moved: String(result.moved.length),
+          disconnected: String(result.disconnected.length),
+          ...(result.target ? { target: result.target.alias } : {}),
+        });
+        redirect(res, `/?${notice}#account-${encodeURIComponent(accountId)}`);
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }
@@ -2362,6 +2424,9 @@ export async function createCredentialConsole(options = {}) {
         // A member's page has no administrator area, so it is given nothing
         // that only that area would show.
         adminArea: admin,
+        notice: dashboardNotice(url.searchParams),
+        // A member's page lists the devices on shared accounts they may move.
+        memberDevices: admin ? [] : memberDeviceRows(),
         devices: admin ? store.publicDevices() : [],
         // Revoked rows are carried into the page and collapsed there, rather than
         // filtered out here: they are the majority of rows over time, they are
@@ -3363,6 +3428,46 @@ export async function createCredentialConsole(options = {}) {
       return;
     }
 
+    // A member moves a device between shared accounts, and nothing else: not
+    // onto or off a private account, not revoked. Members share one tailnet
+    // identity here, so "their own" device cannot be told apart; the limit is
+    // what keeps that harmless.
+    const memberSwitchParams = routeMatch(path, '/member/devices/:id/account');
+    if (req.method === 'POST' && memberSwitchParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        const device = store.publicDevices().find((entry) => entry.id === memberSwitchParams.id && !entry.revoked_at);
+        if (!device) throw new Error('device not found');
+        const current = store.accountById(device.selected_account_id ?? device.account_id);
+        const target = store.accountById(String(form.selected_account_id ?? ''));
+        if (!current || isRestrictedAccount(current) || !target || isRestrictedAccount(target)) {
+          throw new Error('only devices on shared accounts can be moved here, and only to a shared account');
+        }
+        if (target.provider !== current.provider) throw new Error('choose an account of the same kind');
+        const summary = await store.configureDeviceAccount({
+          deviceId: device.id,
+          selectedAccountId: target.id,
+          actor: `member:${session.admin_identity ?? 'anonymous'}`,
+          actorType: 'console',
+        });
+        log('device_account_configured', {
+          device_id: summary.device_id,
+          selected_account_id: summary.selected_account_id,
+          actor: `member:${session.admin_identity ?? 'anonymous'}`,
+        });
+        redirect(res, `/?${new URLSearchParams({ notice: 'member-switched', device: device.name, target: target.alias })}#member-devices`);
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}#member-devices`);
+      }
+      return;
+    }
+
     const switchAccountParams = routeMatch(path, '/devices/:id/account');
     if (req.method === 'POST' && switchAccountParams) {
       const asyncJson = expectsAsyncJson(req, 'account-switch');
@@ -3394,6 +3499,7 @@ export async function createCredentialConsole(options = {}) {
           const accountOptions = store.publicAccounts()
             .filter((account) => (
               account.provider === provider
+              && accountUsableByDevice(account, { machine_id: summary.machine_id })
               && account.status !== 'disabled'
               && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
               && (provider !== 'codex' || isCodexGatewayAccount(account))
@@ -3434,12 +3540,15 @@ export async function createCredentialConsole(options = {}) {
         });
         if (asyncJson) {
           const code = String(error.code ?? '');
-          const status = code === 'ACCOUNT_NOT_ALLOWED'
+          const status = code === 'ACCOUNT_NOT_ALLOWED' || code === 'ACCOUNT_RESTRICTED'
             ? 403
             : (code === 'ACCOUNT_UNAVAILABLE' || code.startsWith('DEVICE_') ? 409 : 500);
-          sendJson(res, status, { ok: false, error: 'account_switch_failed' });
+          sendJson(res, status, {
+            ok: false,
+            error: code === 'ACCOUNT_RESTRICTED' ? 'account_restricted' : 'account_switch_failed',
+          });
         } else {
-          redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+          redirect(res, `/?error=${encodeURIComponent(restrictedSwitchMessage(error, form.selected_account_id))}`);
         }
       }
       return;

@@ -468,7 +468,7 @@ test('a Codex account with a live unlisted dispenser machine cannot be made priv
     const listed = await console.request(`/accounts/${accountId}/restriction`, {
       method: 'POST', form: { csrf, enabled: '1', [`machine:${MACHINE_B}`]: '1' },
     });
-    assert.match(listed.response.headers.get('location'), /^\/#account-/);
+    assert.match(listed.response.headers.get('location'), /^\/\?notice=restriction-private[^#]*#account-/);
     assert.equal(console.store.accountById(accountId).restriction.enabled, true);
   } finally {
     await console.close();
@@ -512,6 +512,95 @@ test('a request that throws is answered 500 and the console keeps serving', asyn
     const next = await fetch(`${console.baseUrl}/health`);
     assert.equal(next.status, 200);
     await next.text();
+  } finally {
+    await console.close();
+  }
+});
+
+test('making an account private can disconnect the unlisted devices instead of moving them', async () => {
+  const store = await newStore();
+  const mine = await claude(store, 'claude-mine');
+  const kid = await issue(store, mine, 'kid-laptop', MACHINE_B);
+  await issue(store, mine, 'my-mac', MACHINE_A);
+  // The only account there is: nowhere to move the kid's device to.
+  const result = await store.setAccountRestriction(mine.id, {
+    enabled: true, machineIds: [MACHINE_A], disconnect: true,
+  });
+  assert.deepEqual(result.moved, []);
+  assert.deepEqual(result.disconnected, [kid.device.id]);
+  assert.throws(() => store.resolveDeviceAccount(kid.device.id), (error) => error.code === 'ACCOUNT_RESTRICTED');
+});
+
+test('password mode: saves say what they did, and members move devices between shared accounts only', async () => {
+  let ids;
+  const console = await app({
+    seed: async (store) => {
+      await store.addAdminUser({ username: 'root', password: PASSWORD });
+      const team = await claude(store, 'claude-team');
+      const spare = await claude(store, 'claude-spare');
+      const mine = await claude(store, 'claude-mine');
+      const kid = (await issue(store, team, 'kid-laptop', MACHINE_B)).device;
+      const mac = (await issue(store, mine, 'zefan-studio', MACHINE_A)).device;
+      await store.setAccountRestriction(mine.id, { enabled: true, machineIds: [MACHINE_A] });
+      ids = { team: team.id, spare: spare.id, mine: mine.id, kid: kid.id, mac: mac.id };
+    },
+  });
+  try {
+    const home = await console.request('/');
+    assert.match(home.body, /id="member-devices"/);
+    assert.match(home.body, /kid-laptop/);
+    assert.doesNotMatch(home.body, /zefan-studio/);
+    const csrf = home.body.match(/name="csrf" value="([^"]+)"/)[1];
+    const moved = await console.request(`/member/devices/${ids.kid}/account`, {
+      method: 'POST', form: { csrf, selected_account_id: ids.spare },
+    });
+    assert.match(moved.response.headers.get('location'), /notice=member-switched/);
+    assert.equal(console.store.resolveDeviceAccount(ids.kid).account.id, ids.spare);
+    for (const [device, target] of [[ids.kid, ids.mine], [ids.mac, ids.team]]) {
+      const refused = await console.request(`/member/devices/${device}/account`, {
+        method: 'POST', form: { csrf, selected_account_id: target },
+      });
+      assert.match(decodeURIComponent(refused.response.headers.get('location')), /only devices on shared accounts/);
+    }
+    assert.equal(console.store.resolveDeviceAccount(ids.mac).account.id, ids.mine);
+
+    await console.login();
+    const admin = await console.request('/');
+    const token = admin.body.match(/name="csrf" value="([^"]+)"/)[1];
+    // The kid's machine is not on the private account's list, so the switch
+    // control does not offer it, and a forced switch says why.
+    const kidRow = admin.body.slice(admin.body.indexOf(`/devices/${ids.kid}/account`));
+    assert.doesNotMatch(kidRow.slice(0, kidRow.indexOf('</form>')), new RegExp(`value="${ids.mine}"`));
+    const forced = await console.request(`/devices/${ids.kid}/account`, {
+      method: 'POST', form: { csrf: token, selected_account_id: ids.mine },
+    });
+    assert.match(decodeURIComponent(forced.response.headers.get('location')), /is not on claude-mine's list/);
+    const asyncForced = await console.request(`/devices/${ids.kid}/account`, {
+      method: 'POST',
+      form: { csrf: token, selected_account_id: ids.mine },
+      headers: { Accept: 'application/json', 'X-Credential-Console-Async': 'account-switch' },
+    });
+    assert.equal(asyncForced.response.status, 403);
+    assert.equal(JSON.parse(asyncForced.body).error, 'account_restricted');
+
+    // Machines ticked but the account left shared: saved, and the page says so.
+    const ticked = await console.request(`/accounts/${ids.team}/restriction`, {
+      method: 'POST', form: { csrf: token, enabled: '0', [`machine:${MACHINE_B}`]: '1' },
+    });
+    assert.match(ticked.response.headers.get('location'), /notice=restriction-shared-ticked/);
+    const after = await console.request(ticked.response.headers.get('location'));
+    assert.match(after.body, /data-i18n="notice-restriction-shared-ticked"/);
+    // Made private with the kid's device disconnected rather than moved.
+    const plan = await console.request(`/accounts/${ids.spare}/restriction`, {
+      method: 'POST', form: { csrf: token, enabled: '1', [`machine:${MACHINE_A}`]: '1' },
+    });
+    assert.match(plan.body, /value="__disconnect__"/);
+    const cut = await console.request(`/accounts/${ids.spare}/restriction`, {
+      method: 'POST',
+      form: { csrf: token, enabled: '1', [`machine:${MACHINE_A}`]: '1', migrate_to: '__disconnect__' },
+    });
+    assert.match(cut.response.headers.get('location'), /notice=restriction-private.*disconnected=1/);
+    assert.throws(() => console.store.resolveDeviceAccount(ids.kid), (error) => error.code === 'ACCOUNT_RESTRICTED');
   } finally {
     await console.close();
   }

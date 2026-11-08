@@ -2432,17 +2432,26 @@ export class CredentialStore {
    *
    *   - devices the plan says must move go to `migrateToAccountId`, a person's
    *     choice that also drops any failover marker that would bring them back;
+   *     or, with `disconnect`, they stay where they are and the gateway refuses
+   *     them from the next request on (a failover marker is still dropped, so a
+   *     device away on a backup is not sent back);
    *   - the account leaves the allowlist of every device not on the list,
    *     except where it is the device's original account (the policy keeps
    *     that one; the gateway refuses it all the same);
    *   - it leaves every shared account's backup chain, and a chain left empty
    *     is switched off. Made public, it drops private backups of its own.
    */
-  async setAccountRestriction(id, { enabled, machineIds = [], migrateToAccountId = null, actor = null }) {
+  async setAccountRestriction(id, {
+    enabled,
+    machineIds = [],
+    migrateToAccountId = null,
+    disconnect = false,
+    actor = null,
+  }) {
     return this.serialized(async () => {
       const { account, next, affected } = this.accountRestrictionPlan(id, { enabled, machineIds });
       let target = null;
-      if (affected.length > 0) {
+      if (affected.length > 0 && !disconnect) {
         target = this.accountById(migrateToAccountId);
         if (!target) throw new Error('choose an account to move the affected devices to');
         if (target.id === id) throw new Error('the devices cannot stay on the account being made private');
@@ -2466,7 +2475,18 @@ export class CredentialStore {
           updated_at: nowIso(),
           updated_by: auditActor(actor),
         };
-        for (const device of affected) {
+        for (const device of disconnect ? affected : []) {
+          if (device.account_failover?.home_account_id === id) delete device.account_failover;
+          this.audit('device_account_disconnected', this.#deviceAccountAudit({
+            device,
+            previousAccountId: device.selected_account_id ?? device.account_id,
+            nextAccountId: null,
+            outcome: 'success',
+            reason: 'account made private',
+            actor,
+          }));
+        }
+        for (const device of disconnect ? [] : affected) {
           const policy = this.#deviceAccountPolicy(device);
           const allowed = policy.allowedAccountIds.filter(
             (accountId) => accountId !== id || accountId === device.account_id,
@@ -2523,8 +2543,9 @@ export class CredentialStore {
           machine_ids: [...next.machine_ids],
           previous_enabled: previous.enabled,
           previous_machine_ids: previous.machine_ids,
-          moved_device_ids: affected.map((device) => device.id),
+          moved_device_ids: disconnect ? [] : affected.map((device) => device.id),
           moved_to_account_id: target?.id ?? null,
+          disconnected_device_ids: disconnect ? affected.map((device) => device.id) : [],
           actor: auditActor(actor),
         });
         await this.persist();
@@ -2534,7 +2555,12 @@ export class CredentialStore {
         this.state.audit = snapshot.audit;
         throw error;
       }
-      return { account: this.accountById(id), moved: affected.map((device) => device.id) };
+      return {
+        account: this.accountById(id),
+        moved: disconnect ? [] : affected.map((device) => device.id),
+        disconnected: disconnect ? affected.map((device) => device.id) : [],
+        target: target ? { id: target.id, alias: target.alias } : null,
+      };
     });
   }
 

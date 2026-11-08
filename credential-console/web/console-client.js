@@ -110,15 +110,29 @@ const translations = {
   'restriction-summary-private': '专属',
   'restriction-summary-machines': '台机器',
   'restriction-summary-shared': '所有人共用',
-  'restriction-enabled': '专属账号：只有下面勾选的机器可以使用',
   'restriction-no-machines': '还没有机器上报过机器名。',
   'restriction-note': '专属账号对普通成员不可见；其他机器既不能选它、也不会被自动切换到它，网关也会拒绝它们的请求。签发时没填机器名的凭证不能勾选，先在设备列表里把它「归入机器」。',
   'restriction-save': '保存使用范围',
   'restriction-confirm-heading': '设为专属：',
   'restriction-confirm-intro': '下面这些设备正在用这个账号，但不在勾选的机器上。它们会被迁到你现在选的账号，凭证不变，不需要重新配置。',
   'restriction-confirm-target': '迁到',
-  'restriction-confirm-submit': '迁移设备并设为专属',
-  'restriction-confirm-no-target': '没有同类型的其他可用账号可以迁过去，请先添加一个。',
+  'restriction-confirm-submit': '保存并设为专属',
+  'restriction-confirm-disconnect': '不迁移：直接断开（这些设备下一次请求就会被拒绝）',
+  'restriction-mode-shared': '所有人共用',
+  'restriction-mode-private': '仅限下面勾选的机器',
+  'notice-restriction-private': '现在只有勾选的机器能用。',
+  'notice-restriction-shared': '所有人共用。',
+  'notice-restriction-shared-ticked': '已保存为「所有人共用」。勾选的机器只有在选「仅限下面勾选的机器」时才生效。',
+  'notice-machines': '机器：',
+  'notice-moved': '迁走设备：',
+  'notice-disconnected': '断开设备：',
+  'member-switched': '现在使用',
+  'member-devices-heading': '设备与账号',
+  'member-devices-intro': '按设备名找到你的设备，可以把它换到另一个公共账号。下一次请求就生效，不需要重新安装。',
+  'member-devices-current': '当前账号',
+  'member-devices-move': '换到',
+  'member-no-other-account': '没有其他公共账号',
+  'account-switch-restricted': '这台机器不在该专属账号的白名单里。请先在该账号的「账号设置 → 谁可以使用这个账号」里勾选这台机器，再切换。',
   'restriction-confirm-cancel': '取消',
   'restriction-confirm-device': '设备',
   'machine-optional': '机器名（可选）',
@@ -1265,6 +1279,12 @@ function renderAccountSwitchStatus(node, state, alias = '') {
   if (state === 'saved') {
     node.classList.add('success');
     node.textContent = translatedText('account-switch-saved', 'Switched to') + ' ' + alias;
+  } else if (state === 'restricted') {
+    node.classList.add('error');
+    node.textContent = translatedText(
+      'account-switch-restricted',
+      'This machine is not on that private account\'s list. Tick it under that account → Account settings → Who may use this account, then switch again.',
+    );
   } else if (state === 'failed') {
     node.classList.add('error');
     node.textContent = translatedText(
@@ -1351,6 +1371,7 @@ document.addEventListener('submit', async (event) => {
     });
     const contentType = response.headers.get('content-type') ?? '';
     const result = contentType.includes('application/json') ? await response.json() : null;
+    if (result?.error === 'account_restricted') throw new Error('account_restricted');
     if (!response.ok || result?.ok !== true || !result.account) throw new Error('account switch failed');
     const accountId = String(result.selected_account_id ?? '');
     const alias = String(result.account.alias ?? '');
@@ -1379,9 +1400,9 @@ document.addEventListener('submit', async (event) => {
     updateAccountCounts(result.account_device_counts);
     applyLanguage(currentLanguage());
     renderAccountSwitchStatus(statusNode, 'saved', alias);
-  } catch {
+  } catch (error) {
     if (select && committedAccountId) select.value = committedAccountId;
-    renderAccountSwitchStatus(statusNode, 'failed');
+    renderAccountSwitchStatus(statusNode, error?.message === 'account_restricted' ? 'restricted' : 'failed');
   } finally {
     form.dataset.submitting = 'false';
     form.removeAttribute('aria-busy');

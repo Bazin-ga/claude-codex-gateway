@@ -350,12 +350,16 @@ test('tailnet identity mode has no sign-in and binds sessions to the user', asyn
     assert.match(selfServiceHtml, /claude-claude-self-service-api-key-helper/);
     assert.match(selfServiceHtml, /claude-gateway-api-key-helper/);
     assert.match(selfServiceHtml, /claude-gateway/);
-    assert.match(selfServiceHtml, /export ANTHROPIC_DEFAULT_OPUS_MODEL=&#39;claude-opus-5&#39;/);
+    // Opus 5.5 is the "opus" alias, and a refusal is not retried on an older
+    // Opus behind the user's back.
+    assert.match(selfServiceHtml, /export ANTHROPIC_DEFAULT_OPUS_MODEL=&#39;claude-opus-5-5&#39;/);
+    assert.match(selfServiceHtml, /export CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1/);
     assert.match(selfServiceHtml, /export CLAUDE_CODE_USE_GATEWAY=1/);
     assert.match(selfServiceHtml, /export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1/);
     assert.match(selfServiceHtml, /export ANTHROPIC_AUTH_TOKEN=&quot;\$\(cat/);
     assert.match(selfServiceHtml, /\$env:CLAUDE_CODE_USE_GATEWAY=&#39;1&#39;/);
-    assert.match(selfServiceHtml, /\$env:ANTHROPIC_DEFAULT_OPUS_MODEL=&#39;claude-opus-5&#39;/);
+    assert.match(selfServiceHtml, /\$env:ANTHROPIC_DEFAULT_OPUS_MODEL=&#39;claude-opus-5-5&#39;/);
+    assert.match(selfServiceHtml, /\$env:CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=&#39;1&#39;/);
     assert.match(selfServiceHtml, /\$env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=&#39;1&#39;/);
     assert.match(selfServiceHtml, /\$env:ANTHROPIC_AUTH_TOKEN = \[IO\.File\]::ReadAllText/);
     assert.equal(app.store.state.enrollments.length, 0);

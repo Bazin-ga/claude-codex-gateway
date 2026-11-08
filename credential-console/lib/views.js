@@ -9,7 +9,7 @@ import {
 } from './codex-model-guard.js';
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
-import { isRestrictedAccount, normalizeAccountRestriction } from './account-restriction.js';
+import { accountUsableByDevice, isRestrictedAccount, normalizeAccountRestriction } from './account-restriction.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
 import { MODEL_BLOCK_MAX_MESSAGE_CHARS } from './model-block-rules.js';
 import { bedrockExampleModel } from './bedrock-models.js';
@@ -1197,6 +1197,60 @@ function accountFailoverSummary(account, accounts) {
  * Make an account private to a list of machines. Only machines that reported a
  * handle can be listed; a legacy credential has to be merged into one first.
  */
+/** One line saying what the last save did. */
+function dashboardNoticeView(notice) {
+  if (!notice) return '';
+  const name = (value) => `<strong>${escapeHtml(value)}</strong>`;
+  const count = (i18n, label, value) => `<span data-i18n="${i18n}">${label}</span> ${value}`;
+  if (notice.key === 'member-switched') {
+    return `<div class="notice success" role="status">${name(notice.device)} <span data-i18n="member-switched">now uses</span> ${name(notice.target)}</div>`;
+  }
+  if (notice.key === 'restriction-private') {
+    return `<div class="notice success" role="status">${name(notice.account)}: <span data-i18n="notice-restriction-private">only the ticked machines may use it now.</span>
+      ${count('notice-machines', 'Machines:', notice.machines)} · ${count('notice-moved', 'devices moved:', notice.moved)}${notice.target ? ` → ${name(notice.target)}` : ''} · ${count('notice-disconnected', 'devices disconnected:', notice.disconnected)}</div>`;
+  }
+  if (notice.key === 'restriction-shared-ticked') {
+    return `<div class="notice error" role="status">${name(notice.account)}: <span data-i18n="notice-restriction-shared-ticked">saved as shared with everyone. The ticked machines only take effect once "Only the machines ticked below" is chosen.</span></div>`;
+  }
+  return `<div class="notice success" role="status">${name(notice.account)}: <span data-i18n="notice-restriction-shared">shared with everyone.</span></div>`;
+}
+
+/**
+ * Member self-service: the devices on shared accounts, each movable to another
+ * shared account. Private accounts and the devices on them never appear.
+ */
+function memberDevicesView(devices, csrf) {
+  if (!devices.length) return '';
+  const rows = devices.map((device) => {
+    const others = device.targets.filter((target) => target.id !== device.account.id);
+    return `<tr>
+      <td><strong>${escapeHtml(device.name)}</strong><div class="muted tiny">${escapeHtml(providerLabel(device.account.provider))} · <span data-i18n="last-seen">Last seen</span> ${escapeHtml(device.lastSeenAt ? dateText(device.lastSeenAt) : '—')}</div></td>
+      <td>${escapeHtml(device.account.alias)}</td>
+      <td>${others.length ? `<form method="post" action="/member/devices/${encodeURIComponent(device.id)}/account" class="member-switch">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <select name="selected_account_id" aria-label="Account for ${escapeHtml(device.name)}">${others.map((target) => `<option value="${escapeHtml(target.id)}">${escapeHtml(target.alias)}</option>`).join('')}</select>
+        <button type="submit" class="secondary" data-i18n="switch-account">Switch account</button>
+      </form>` : '<span class="muted tiny" data-i18n="member-no-other-account">No other shared account</span>'}</td>
+    </tr>`;
+  }).join('');
+  return `<article class="member-devices" id="member-devices">
+    <style>
+    .member-devices{margin-top:18px;background:#fff;color:var(--ink);border-radius:16px;padding:16px 18px}
+    .member-devices h2{margin:0 0 4px;font-size:17px}
+    .member-devices table{width:100%}
+    .member-switch{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .member-switch select{width:auto;min-width:160px;margin:0}
+    .member-switch button{min-height:0;padding:8px 14px;font-size:13px}
+    </style>
+    <h2 data-i18n="member-devices-heading">Devices and their accounts</h2>
+    <p class="muted tiny" data-i18n="member-devices-intro">Find your device by name and move it to another shared account. The change applies from its next request; nothing needs reinstalling.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th scope="col" data-i18n="device-name">Device name</th><th scope="col" data-i18n="member-devices-current">Current account</th><th scope="col" data-i18n="member-devices-move">Move to</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  </article>`;
+}
+
 function accountRestrictionControl(account, machines, csrf) {
   if (!GATEWAY_PROVIDERS.includes(account.provider)) return '';
   const restriction = normalizeAccountRestriction(account.restriction);
@@ -1217,7 +1271,10 @@ function accountRestrictionControl(account, machines, csrf) {
     <h3 data-i18n="restriction-panel-heading">Who may use this account</h3>
     <form method="post" action="/accounts/${encodeURIComponent(account.id)}/restriction" class="acct-panel-form">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
-      <label class="switch-row"><input type="checkbox" name="enabled" value="1"${restriction.enabled ? ' checked' : ''}> <span data-i18n="restriction-enabled">Private: only the machines ticked below may use this account</span></label>
+      <div class="access-mode">
+        <label class="switch-row"><input type="radio" name="enabled" value="0"${restriction.enabled ? '' : ' checked'}> <span data-i18n="restriction-mode-shared">Shared with everyone</span></label>
+        <label class="switch-row"><input type="radio" name="enabled" value="1"${restriction.enabled ? ' checked' : ''}> <span data-i18n="restriction-mode-private">Only the machines ticked below</span></label>
+      </div>
       <div class="machine-chips">${chips || '<span class="muted tiny" data-i18n="restriction-no-machines">No machine has reported a name yet.</span>'}</div>
       <p class="muted tiny" data-i18n="restriction-note">A private account is hidden from members, cannot be chosen or failed over to by any other machine, and the gateway refuses it for them. A credential issued without a machine name cannot be listed: merge it into a machine first.</p>
       <div><button type="submit" class="secondary" data-i18n="restriction-save">Save access</button></div>
@@ -1265,6 +1322,7 @@ const ACCOUNT_CARD_STYLES = `<style>
 .acct-panel-form{display:grid;gap:10px}
 .acct-panel .inline{flex-wrap:wrap}
 .switch-row{display:flex;gap:8px;align-items:flex-start;font-weight:600;margin:0}
+.access-mode{display:flex;flex-wrap:wrap;gap:8px 18px}
 .switch-row input,.machine-chip input{width:16px;height:16px;min-height:0;margin:2px 0 0;flex:none;accent-color:var(--green)}
 .machine-chips{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px;max-height:260px;overflow-y:auto}
 .machine-chip{display:flex;gap:8px;align-items:flex-start;margin:0;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:#fff;font-weight:400;cursor:pointer;min-width:0}
@@ -1565,6 +1623,8 @@ function accountSwitchControl(device, selection, accounts, csrf) {
   const destinations = providerAccounts.filter((account) => (
     account.provider === deviceProvider
     && accountCanReceiveDevice(account)
+    // A private account this machine is not on would only fail; not offered.
+    && accountUsableByDevice(account, device)
   ));
   if (providerAccounts.length === 0) {
     return `<div class="muted tiny">No ${escapeHtml(providerLabel(deviceProvider))} accounts are registered.</div>`;
@@ -4074,6 +4134,10 @@ export function dashboardView({
   devices,
   // False for a member in password mode: the page is the self-service area only.
   adminArea = true,
+  // What the last save did (see dashboardNotice in server.js), or null.
+  notice = null,
+  // Member page only: devices on shared accounts, each with where it may move.
+  memberDevices = [],
   machines = [],
   codexClients = [],
   codexUnavailable = [],
@@ -4428,6 +4492,7 @@ export function dashboardView({
   return layout('Dashboard', `
     <div class="stack">
       ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+      ${dashboardNoticeView(notice)}
       ${credentialAlertSummaryView(accounts, alerts)}
       ${openMode || adminIdentity ? `<section class="member-zone">
         <div class="zone-heading">
@@ -4509,6 +4574,7 @@ export function dashboardView({
           </article>` : ''}
         </div>
         ${openMode ? '<p class="muted tiny" data-i18n="member-label-note">Nobody checks the label. It only keeps two members\' device names apart.</p>' : ''}
+        ${adminArea ? '' : memberDevicesView(memberDevices, csrf)}
       </section>` : ''}
 
       ${adminArea ? `<section class="admin-zone">
@@ -5125,7 +5191,8 @@ if [ ! -f "$SETTINGS_FILE" ]; then printf '{}\n' > "$SETTINGS_FILE"; fi
 cat > "$PROFILE_FILE" <<'PROFILE'
 export ANTHROPIC_BASE_URL=${shellSingleQuote(gateway)}
 export ${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${shellSingleQuote(CLIENT_CONFIG_VERSION)}
-export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5'
+export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5-5'
+export CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1
 export CLAUDE_CODE_API_KEY_HELPER_TTL_MS=300000
 ${unixGatewayMode}
 export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
@@ -5169,7 +5236,8 @@ if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) {
 $tokenFile = [IO.Path]::Combine($HOME, '.config', 'claude-codex-gateway', 'claude-${profile}.token')
 $env:ANTHROPIC_BASE_URL=${powerShellSingleQuote(gateway)}
 $env:${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${powerShellSingleQuote(CLIENT_CONFIG_VERSION)}
-$env:ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5'
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5-5'
+$env:CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK='1'
 ${windowsGatewayMode}
 $env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB='1'
 Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
@@ -5881,15 +5949,15 @@ export function accountRestrictionView({ account, machineIds, affected, targets,
           <thead><tr><th scope="col" data-i18n="restriction-confirm-device">Device</th><th scope="col" data-i18n="restriction-confirm-member">Member</th></tr></thead>
           <tbody>${affected.map((device) => `<tr><td>${escapeHtml(device.name)}</td><td>${escapeHtml(device.member_label)}</td></tr>`).join('')}</tbody>
         </table></div>
-        ${options ? `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/restriction" class="stack">
+        <form method="post" action="/accounts/${encodeURIComponent(account.id)}/restriction" class="stack">
           <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
           <input type="hidden" name="enabled" value="1">
           ${machineIds.map((id) => `<input type="hidden" name="machine:${escapeHtml(id)}" value="1">`).join('')}
           <label><span data-i18n="restriction-confirm-target">Move them to</span>
-            <select name="migrate_to" required>${options}</select>
+            <select name="migrate_to" required>${options}<option value="__disconnect__" data-i18n="restriction-confirm-disconnect">Do not move them: disconnect (their next request is refused)</option></select>
           </label>
-          <div><button type="submit" data-i18n="restriction-confirm-submit">Move devices and make private</button></div>
-        </form>` : '<div class="notice error" data-i18n="restriction-confirm-no-target">There is no other usable account of this provider to move them to. Add one first.</div>'}
+          <div><button type="submit" data-i18n="restriction-confirm-submit">Save and make private</button></div>
+        </form>
         <a class="button secondary" href="/#account-${escapeHtml(account.id)}" data-i18n="restriction-confirm-cancel">Cancel</a>
       </div>
     </section>
