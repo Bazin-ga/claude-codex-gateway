@@ -1,12 +1,17 @@
 import { randomBytes } from 'node:crypto';
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import {
+  CLAUDE_CLI_USER_AGENT,
+  CLAUDE_FABLE_RESET_STATUS_URL,
+  summarizeFableResets,
+} from './claude-fable-reset.js';
 import { codexCreditBalance } from './codex-credit-guard.js';
 
 const CACHE_VERSION = 1;
 const DEFAULT_REFRESH_MS = 60 * 60_000;
 const MIN_REFRESH_MS = 60_000;
-const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const CLAUDE_USAGE_URL = CLAUDE_FABLE_RESET_STATUS_URL;
 const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 
 class UsageFetchError extends Error {
@@ -89,11 +94,16 @@ async function responseJson(response, provider) {
 }
 
 export async function fetchClaudeUsage({ oauthToken, fetchImpl = fetch }) {
+  // The same read Claude Code makes, under its identity: with `cedar_ember=1`
+  // and a CLI User-Agent the response also carries the account's limit resets
+  // (see claude-fable-reset.js). Any other User-Agent gets the windows but an
+  // empty, ineligible reset block. `skip_spend=1` drops a billing section this
+  // console never reads.
   const response = await fetchImpl(CLAUDE_USAGE_URL, {
     headers: {
       Authorization: `Bearer ${oauthToken}`,
       'Anthropic-Beta': 'oauth-2025-04-20',
-      'User-Agent': 'claude-code',
+      'User-Agent': CLAUDE_CLI_USER_AGENT,
     },
     signal: AbortSignal.timeout(15_000),
   });
@@ -113,6 +123,7 @@ export async function fetchClaudeUsage({ oauthToken, fetchImpl = fetch }) {
     status: 'available',
     fetched_at: new Date().toISOString(),
     plan_type: null,
+    fable_resets: summarizeFableResets(body.cedar_ember),
     windows,
   };
 }

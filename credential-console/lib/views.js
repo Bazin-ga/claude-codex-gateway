@@ -1,6 +1,7 @@
 import { APP_ASSET_URL } from './app-asset.js';
 import { GATEWAY_PROVIDERS } from './store.js';
 import { CODEX_RESET_QUOTA_CEILING, codexResetEligibility } from './codex-reset.js';
+import { fableResetEligibility } from './claude-fable-reset.js';
 import {
   CODEX_GUARD_MAX_THRESHOLD_PERCENT,
   CODEX_GUARD_MIN_THRESHOLD_PERCENT,
@@ -1104,6 +1105,60 @@ function codexResetControl(account, csrf) {
   return `<div class="muted tiny"><span data-i18n="codex-reset-available">Reset credits</span>: ${escapeHtml(String(resetCredits))} · ${explanation}</div>`;
 }
 
+/** "2026-11-17" style date for a grant expiry, in UTC like the rest of the panel. */
+function shortDate(iso) {
+  const parsed = Date.parse(String(iso ?? ''));
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : '';
+}
+
+const FABLE_RESET_WINDOW_LABELS = {
+  five_hour: '5-hour window',
+  seven_day_overage_included: 'Fable share of the weekly limit',
+};
+
+/**
+ * The control for using a Claude limit reset (the Fable launch resets), and
+ * only when one may be used.
+ *
+ * Rendered from the same `fableResetEligibility` the route enforces. The route
+ * re-reads the live status before it spends anything, so a stale snapshot can
+ * at worst offer a button that is then refused, never spend a reset the
+ * snapshot was wrong about. The confirmation names the account, what the reset
+ * gives back, and when the remaining resets expire, because "are you sure?" on
+ * its own is a dialog people learn to dismiss.
+ */
+function fableResetControl(account, csrf) {
+  const resets = account.usage?.fable_resets ?? null;
+  if (!resets || !resets.available) return '';
+  const { eligible, reason, grant, givesBack } = fableResetEligibility(account, resets);
+  const expiry = resets.earliest_expiry
+    ? ` · <span data-i18n="fable-reset-expires">expires</span> ${escapeHtml(shortDate(resets.earliest_expiry))}`
+    : '';
+  const summary = `<div class="muted tiny"><span data-i18n="fable-reset-available">Fable resets left</span>: ${escapeHtml(String(resets.available))}${expiry}</div>`;
+  if (eligible) {
+    const cleared = grant.clears
+      .map((key) => `${FABLE_RESET_WINDOW_LABELS[key] ?? key}: ${grant.percent_used?.[key] ?? '?'}% used -> 0%`)
+      .join('\n');
+    const confirm = `Use one Claude limit reset on ${account.alias}?\n\n`
+      + `${cleared}\n`
+      + `(${grant.label || grant.id})\n\n`
+      + `Resets left after this: ${resets.available - 1} of ${resets.available}\n\n`
+      + 'This cannot be undone. Usage on other models is not given back.';
+    return `<form method="post" action="/accounts/${encodeURIComponent(account.id)}/claude-fable-reset" class="inline" data-confirm="${escapeHtml(confirm)}">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <button class="danger" type="submit" data-i18n="fable-reset-use">Use a Fable reset</button>
+    </form>
+    ${summary}
+    <div class="muted tiny"><span data-i18n="fable-reset-gives-back">Gives back up to</span> ${escapeHtml(String(givesBack ?? '?'))}%</div>`;
+  }
+  const explanation = {
+    nothing_to_restore: '<span data-i18n="fable-reset-nothing">No Fable usage this week for a reset to give back.</span>',
+    cooldown: '<span data-i18n="fable-reset-cooldown">Resets are cooling down.</span>',
+    not_usable_now: '<span data-i18n="fable-reset-not-usable">No reset can be used right now.</span>',
+  }[reason] ?? '';
+  return `${summary}${explanation ? `<div class="muted tiny">${explanation}</div>` : ''}`;
+}
+
 /**
  * The low-quota guard switch, on the account it governs.
  *
@@ -1378,6 +1433,11 @@ function accountUsageView(account, { showAccount = false } = {}) {
   const resetCredits = Number.isInteger(usage?.reset_credits) && usage.reset_credits > 0
     ? usage.reset_credits
     : null;
+  // Claude's counterpart: limit resets granted with the Fable launch. Like the
+  // credits line, only shown when there is something to use.
+  const fableResets = Number.isInteger(usage?.fable_resets?.available) && usage.fable_resets.available > 0
+    ? usage.fable_resets
+    : null;
   const creditBalance = Number.isFinite(usage?.credits?.balance) && usage.credits.balance >= 1
     ? usage.credits.balance
     : null;
@@ -1390,6 +1450,9 @@ function accountUsageView(account, { showAccount = false } = {}) {
       : '',
     resetCredits
       ? `<span class="quota-reset-credits"><span data-i18n="usage-reset-credits">Reset credits left</span> ${escapeHtml(String(resetCredits))}</span>`
+      : '',
+    fableResets
+      ? `<span class="quota-reset-credits"><span data-i18n="usage-fable-resets">Fable resets left</span> ${escapeHtml(String(fableResets.available))}${fableResets.earliest_expiry ? ` <span class="muted">(${escapeHtml(shortDate(fableResets.earliest_expiry))})</span>` : ''}</span>`
       : '',
     // Like reset credits, only a balance worth acting on earns a line.
     creditBalance
@@ -4274,6 +4337,7 @@ export function dashboardView({
           <button type="submit" data-i18n="enroll-device">Enroll device</button>
         </form>` : '<p class="muted tiny" data-i18n="owner-login-required">Account owner must authorize before member enrollment.</p>'}
       </section>`;
+    const claudeControls = account.provider === 'claude' ? fableResetControl(account, csrf) : '';
     const codexControls = account.provider === 'codex'
       ? [codexResetControl(account, csrf), codexModelGuardControl(account, csrf), codexCreditGuardControl(account, csrf)].join('')
       : '';
@@ -4312,6 +4376,7 @@ export function dashboardView({
           <div class="acct-panels-main">${accountRestrictionControl(account, machines, csrf)}</div>
           <div class="acct-panels-side">
           ${codexControls ? `<section class="acct-panel"><h3 data-i18n="codex-panel-heading">Codex quota controls</h3><div class="stack">${codexControls}</div></section>` : ''}
+          ${claudeControls ? `<section class="acct-panel"><h3 data-i18n="claude-panel-heading">Claude limit reset</h3><div class="stack">${claudeControls}</div></section>` : ''}
           ${enrollment}
           <section class="acct-panel danger-zone">
             <h3 data-i18n="danger-zone-heading">Delete</h3>

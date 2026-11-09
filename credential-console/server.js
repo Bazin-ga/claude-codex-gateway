@@ -48,6 +48,13 @@ import {
   listCodexResetCredits,
   usableResetCredit,
 } from './lib/codex-reset.js';
+import {
+  ClaudeFableResetError,
+  claimFableReset,
+  fableResetEligibility,
+  fetchClaudeOrganizationUuid,
+  fetchFableResetStatus,
+} from './lib/claude-fable-reset.js';
 import { safeTimestamp } from './lib/credential-alerts.js';
 import { externalAccountStatus } from './lib/external-account-status.js';
 import { buildMetricsChartPayload } from './lib/metrics-chart-data.js';
@@ -3182,6 +3189,119 @@ export async function createCredentialConsole(options = {}) {
       });
       // The panel reads the snapshot, so refresh it before the redirect or the
       // page the operator lands on still shows the account at its limit.
+      await usageMonitor.refreshAccount?.(account.id).catch?.(() => {});
+      redirect(res, '/?reset=ok');
+      return;
+    }
+
+    const fableResetParams = routeMatch(path, '/accounts/:id/claude-fable-reset');
+    if (req.method === 'POST' && fableResetParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const actor = actorFor(session);
+      const accountId = fableResetParams.id;
+      const account = store.accountById(accountId);
+      const refuse = (code, message) => {
+        log('claude_fable_reset_refused', { account_id: accountId, actor, code });
+        redirect(res, `/?error=${encodeURIComponent(message)}`);
+      };
+      if (!account || account.provider !== 'claude') {
+        refuse('not_claude', 'that account is not a Claude account');
+        return;
+      }
+      let oauthToken;
+      try {
+        oauthToken = store.accountCredential(account.id)?.oauth_token;
+      } catch {
+        oauthToken = null;
+      }
+      if (!oauthToken) {
+        refuse('credential_unavailable', 'the account credential could not be read');
+        return;
+      }
+
+      // Re-read from upstream rather than trusting the hourly snapshot the
+      // button was rendered from: the grant list, the usage it would give back,
+      // and any cooldown can all have changed since, including by someone using
+      // a reset on claude.ai directly.
+      let live;
+      let organizationUuid;
+      try {
+        live = await fetchFableResetStatus({ oauthToken });
+        organizationUuid = await fetchClaudeOrganizationUuid({ oauthToken });
+      } catch (error) {
+        refuse(error?.code ?? 'status_unavailable', 'the account\'s reset status could not be read, so nothing was used');
+        return;
+      }
+      const eligibility = fableResetEligibility(account, live.resets);
+      if (!eligibility.eligible) {
+        refuse(eligibility.reason, {
+          no_resets: 'that account has no limit reset left',
+          cooldown: 'that account\'s limit resets are cooling down; try again later',
+          not_usable_now: 'none of that account\'s limit resets can be used right now',
+          nothing_to_restore: 'that account has no Fable usage this week for a reset to give back, so nothing was used',
+        }[eligibility.reason] ?? 'that account is not eligible for a limit reset right now');
+        return;
+      }
+      const { grant } = eligibility;
+
+      // Recorded before the call: if the response never arrives, this is the
+      // only record of which grant was staked under which request id.
+      const requestId = randomUUID().replace(/-/g, '');
+      const staked = {
+        account_id: account.id,
+        grant_id: grant.id,
+        request_id: requestId,
+        fable_used_percent: live.fable_used,
+        weekly_used_percent: live.weekly_used,
+        five_hour_used_percent: live.five_hour_used,
+        resets_available: eligibility.available,
+        actor,
+      };
+      await store.recordExternalAudit('claude_fable_reset_started', staked).catch(() => {});
+      log('claude_fable_reset_started', staked);
+
+      let claim;
+      try {
+        claim = await claimFableReset({ oauthToken, organizationUuid, grantId: grant.id, requestId });
+      } catch (error) {
+        const code = error instanceof ClaudeFableResetError ? error.code : 'claim_failed';
+        // Never retried, automatically or otherwise: a timeout or a dropped
+        // connection cannot be told apart from a reset that was used.
+        const ambiguous = ['upstream_timeout', 'upstream_unreachable'].includes(code);
+        const failure = { account_id: account.id, grant_id: grant.id, request_id: requestId, code, ambiguous, actor };
+        await store.recordExternalAudit('claude_fable_reset_failed', failure).catch(() => {});
+        log('claude_fable_reset_failed', failure);
+        redirect(res, `/?error=${encodeURIComponent(ambiguous
+          ? `the reset request did not complete cleanly (${code}); it was NOT retried, and whether the reset was used must be checked before trying again`
+          : `the limit reset could not be used (${code})`)}`);
+        return;
+      }
+
+      const outcome = {
+        account_id: account.id,
+        grant_id: grant.id,
+        request_id: requestId,
+        result: claim.result,
+        reason: claim.reason,
+        resets_left: claim.resets_left,
+        cleared: claim.cleared,
+        actor,
+      };
+      if (claim.result !== 'reset') {
+        await store.recordExternalAudit('claude_fable_reset_declined', outcome).catch(() => {});
+        log('claude_fable_reset_declined', outcome);
+        await usageMonitor.refreshAccount?.(account.id).catch?.(() => {});
+        redirect(res, `/?error=${encodeURIComponent(`Anthropic did not apply the reset (${claim.result}${claim.reason ? `: ${claim.reason}` : ''})`)}`);
+        return;
+      }
+      await store.recordExternalAudit('claude_fable_reset_used', outcome).catch(() => {});
+      log('claude_fable_reset_completed', outcome);
       await usageMonitor.refreshAccount?.(account.id).catch?.(() => {});
       redirect(res, '/?reset=ok');
       return;
