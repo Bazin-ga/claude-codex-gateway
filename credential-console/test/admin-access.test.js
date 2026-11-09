@@ -541,8 +541,12 @@ test('password mode: saves say what they did, and members move devices between s
       const mine = await claude(store, 'claude-mine');
       const kid = (await issue(store, team, 'kid-laptop', MACHINE_B)).device;
       const mac = (await issue(store, mine, 'zefan-studio', MACHINE_A)).device;
+      // Shared too, but not shown to members: it stays off their list.
+      const hidden = (await issue(store, team, 'admin-box', MACHINE_A)).device;
+      await store.setDeviceMemberVisible(kid.id, true);
+      await store.setDeviceMemberVisible(mac.id, true);
       await store.setAccountRestriction(mine.id, { enabled: true, machineIds: [MACHINE_A] });
-      ids = { team: team.id, spare: spare.id, mine: mine.id, kid: kid.id, mac: mac.id };
+      ids = { team: team.id, spare: spare.id, mine: mine.id, kid: kid.id, mac: mac.id, hidden: hidden.id };
     },
   });
   try {
@@ -550,6 +554,10 @@ test('password mode: saves say what they did, and members move devices between s
     assert.match(home.body, /id="member-devices"/);
     assert.match(home.body, /kid-laptop/);
     assert.doesNotMatch(home.body, /zefan-studio/);
+    assert.doesNotMatch(home.body, /admin-box/);
+    // The way in is a faint link at the foot of the page, not a topbar button.
+    assert.doesNotMatch(home.body, /<div class="topbar-actions"><a class="button secondary" href="\/login"/);
+    assert.match(home.body, /<footer[^>]*><a href="\/login"/);
     const csrf = home.body.match(/name="csrf" value="([^"]+)"/)[1];
     const moved = await console.request(`/member/devices/${ids.kid}/account`, {
       method: 'POST', form: { csrf, selected_account_id: ids.spare },
@@ -563,10 +571,24 @@ test('password mode: saves say what they did, and members move devices between s
       assert.match(decodeURIComponent(refused.response.headers.get('location')), /only devices on shared accounts/);
     }
     assert.equal(console.store.resolveDeviceAccount(ids.mac).account.id, ids.mine);
+    const notShown = await console.request(`/member/devices/${ids.hidden}/account`, {
+      method: 'POST', form: { csrf, selected_account_id: ids.spare },
+    });
+    assert.match(decodeURIComponent(notShown.response.headers.get('location')), /device not found/);
+    assert.equal(console.store.resolveDeviceAccount(ids.hidden).account.id, ids.team);
+    // A member's own issuance shows up on their list straight away.
+    await console.request('/self-service', {
+      method: 'POST', form: { csrf, account_id: ids.team, device_name: 'kid-new', machine: 'kid-new' },
+    });
+    assert.equal(console.store.state.devices.find((device) => device.name === 'kid-new').member_visible, true);
 
     await console.login();
     const admin = await console.request('/');
     const token = admin.body.match(/name="csrf" value="([^"]+)"/)[1];
+    // An administrator shows the hidden device to members.
+    assert.match(admin.body, new RegExp(`action="/devices/${ids.hidden}/member-visible"`));
+    await console.request(`/devices/${ids.hidden}/member-visible`, { method: 'POST', form: { csrf: token, visible: '1' } });
+    assert.equal(console.store.state.devices.find((device) => device.id === ids.hidden).member_visible, true);
     // The kid's machine is not on the private account's list, so the switch
     // control does not offer it, and a forced switch says why.
     const kidRow = admin.body.slice(admin.body.indexOf(`/devices/${ids.kid}/account`));

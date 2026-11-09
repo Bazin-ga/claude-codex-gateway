@@ -1713,6 +1713,12 @@ function consoleCredentialRow(device, accounts, csrf, groupNames = []) {
       ${deviceFailoverNote(device, accounts)}
       ${deviceGroupControl(device, groupNames, csrf)}
       ${accountSwitchControl(device, selection, accounts, csrf)}
+      ${device.revoked_at ? '' : `<form method="post" action="/devices/${encodeURIComponent(device.id)}/member-visible" class="member-visible-form" id="device-${escapeHtml(device.id)}" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <input type="hidden" name="visible" value="${device.member_visible === true ? '0' : '1'}">
+        <span class="tiny ${device.member_visible === true ? '' : 'muted'}" data-i18n="${device.member_visible === true ? 'member-visible-on' : 'member-visible-off'}">${device.member_visible === true ? 'Shown on the member page' : 'Hidden from the member page'}</span>
+        <button type="submit" class="secondary" style="width:auto;min-height:0;padding:6px 12px;font-size:12px" data-i18n="${device.member_visible === true ? 'member-visible-hide' : 'member-visible-show'}">${device.member_visible === true ? 'Hide' : 'Show to members'}</button>
+      </form>`}
       ${device.revoked_at
       ? `<span class="muted tiny">${escapeHtml(dateText(device.revoked_at))}</span>`
       : `<form method="post" action="/devices/${encodeURIComponent(device.id)}/revoke">
@@ -5976,10 +5982,12 @@ export function withViewerChrome(html, viewer) {
   if (!viewer.admin) {
     out = out.replace(/\n\s*<a href="\/(?:conversations|admin|relay)"[^\n]*data-tab="(?:conversations|admin|relay)">[^<]*<\/a>/g, '');
   }
-  const control = viewer.admin
-    ? `<span class="muted tiny"><span data-i18n="viewer-admin">Administrator</span> · <strong>${escapeHtml(viewer.username ?? '')}</strong></span><a class="button secondary" href="/logout" data-i18n="viewer-sign-out">Sign out</a>`
-    : '<a class="button secondary" href="/login" data-i18n="viewer-sign-in">Administrator sign-in</a>';
-  return out.replace('<div class="topbar-actions">', `<div class="topbar-actions">${control}`);
+  if (viewer.admin) {
+    return out.replace('<div class="topbar-actions">', `<div class="topbar-actions"><span class="muted tiny"><span data-i18n="viewer-admin">Administrator</span> · <strong>${escapeHtml(viewer.username ?? '')}</strong></span><a class="button secondary" href="/logout" data-i18n="viewer-sign-out">Sign out</a>`);
+  }
+  // Members get no button: a faint link at the foot of the page is enough for
+  // the few who need it, and does not invite everyone else to try.
+  return out.replace('</main>', '<footer style="text-align:center;margin:36px 0 12px;font-size:11px;opacity:.4"><a href="/login" style="color:inherit" data-i18n="viewer-sign-in">Administrator sign-in</a></footer>\n  </main>');
 }
 
 export function docsView({

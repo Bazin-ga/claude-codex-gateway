@@ -2314,6 +2314,7 @@ export class CredentialStore {
     deviceName,
     machineId = null,
     admitMachine = false,
+    memberVisible = false,
   }) {
     return this.serialized(async () => {
       const account = this.accountById(accountId);
@@ -2351,6 +2352,9 @@ export class CredentialStore {
         machineId,
       });
       this.#admitIssuedDevice(account, device, admitMachine);
+      // Shown on the member page's device list. A member's own issuance is
+      // theirs to manage; anything else waits for an administrator to show it.
+      if (memberVisible) device.member_visible = true;
       this.state.devices.push(device);
       this.audit('device_self_enrolled', {
         device_id: device.id,
@@ -2797,6 +2801,32 @@ export class CredentialStore {
       });
       await this.persist();
       return { device, changed: true };
+    });
+  }
+
+  /** Show or hide a device on the member page's "Devices and their accounts". */
+  async setDeviceMemberVisible(deviceId, visible, { actor = null } = {}) {
+    return this.serialized(async () => {
+      const device = this.state.devices.find((entry) => entry.id === deviceId);
+      if (!device) throw new Error('device not found');
+      const before = device.member_visible === true;
+      if (visible) device.member_visible = true;
+      else delete device.member_visible;
+      if (before === (visible === true)) return device;
+      this.audit('device_member_visibility_changed', {
+        device_id: device.id,
+        name: device.name,
+        member_visible: visible === true,
+        actor: auditActor(actor),
+      });
+      try {
+        await this.persist();
+      } catch (error) {
+        if (before) device.member_visible = true;
+        else delete device.member_visible;
+        throw error;
+      }
+      return device;
     });
   }
 

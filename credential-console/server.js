@@ -721,7 +721,7 @@ export async function createCredentialConsole(options = {}) {
       && (!account.expires_at || Date.parse(account.expires_at) > Date.now())
       && (account.provider !== 'codex' || isCodexGatewayAccount(account));
     return store.publicDevices().flatMap((device) => {
-      if (device.revoked_at) return [];
+      if (device.revoked_at || device.member_visible !== true) return [];
       const current = accounts.find((account) => account.id === (device.selected_account_id ?? device.account_id));
       if (!current || isRestrictedAccount(current) || !['claude', 'codex'].includes(current.provider)) return [];
       return [{
@@ -2510,6 +2510,7 @@ export async function createCredentialConsole(options = {}) {
           // it. A member never sees one in the form, and the store refuses a
           // crafted request even from a listed machine.
           admitMachine: isAdmin(session),
+          memberVisible: passwordMode && !isAdmin(session),
         });
         sendHtml(res, 200, configuredDeviceView(result));
       } catch (error) {
@@ -3442,7 +3443,9 @@ export async function createCredentialConsole(options = {}) {
         return;
       }
       try {
-        const device = store.publicDevices().find((entry) => entry.id === memberSwitchParams.id && !entry.revoked_at);
+        const device = store.publicDevices().find((entry) => (
+          entry.id === memberSwitchParams.id && !entry.revoked_at && entry.member_visible === true
+        ));
         if (!device) throw new Error('device not found');
         const current = store.accountById(device.selected_account_id ?? device.account_id);
         const target = store.accountById(String(form.selected_account_id ?? ''));
@@ -3464,6 +3467,25 @@ export async function createCredentialConsole(options = {}) {
         redirect(res, `/?${new URLSearchParams({ notice: 'member-switched', device: device.name, target: target.alias })}#member-devices`);
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}#member-devices`);
+      }
+      return;
+    }
+
+    // Administrator only (the gate above): whether the member page lists it.
+    const memberVisibleParams = routeMatch(path, '/devices/:id/member-visible');
+    if (req.method === 'POST' && memberVisibleParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      try {
+        await store.setDeviceMemberVisible(memberVisibleParams.id, form.visible === '1', { actor: actorFor(session) });
+        redirect(res, `/#device-${encodeURIComponent(memberVisibleParams.id)}`);
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }
       return;
     }
