@@ -133,7 +133,8 @@ const CODEX_API_KEY_MODELS = parseApiKeyModels(process.env.CREDENTIAL_CONSOLE_CO
 // exist only where this is exactly "1".
 const RELAY_ENABLED = process.env.CREDENTIAL_CONSOLE_RELAY_ENABLED === '1';
 // Fixed `model=url` routes beside the platform (e.g. a self-hosted model only this host
-// can reach). Only read where the relay is on; unset means none.
+// can reach), or `model=other-model` to send that model's turns on as another one
+// (e.g. onto the platform). Only read where the relay is on; unset means none.
 const RELAY_ROUTES = parseRelayRoutes(process.env.CREDENTIAL_CONSOLE_RELAY_ROUTES);
 // And for Claude Code's own WebSearch: the Claude installer leaves Claude Code
 // out of its gateway mode, where WebSearch is switched off, only here.

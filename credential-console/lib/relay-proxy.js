@@ -49,6 +49,8 @@ const KINDS = {
   chat: { upstreamPath: '/v1/chat/completions' },
 };
 
+const MODEL_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
 const DIRECT_ROUTES = new Map([
   ['/v1/messages', 'messages'],
   ['/v1/responses', 'responses'],
@@ -156,8 +158,10 @@ async function readRest(stream, already, limit) {
  * newline-separated) from `CREDENTIAL_CONSOLE_RELAY_ROUTES`. A routed model goes
  * to its own OpenAI/Anthropic-compatible endpoint — typically a self-hosted
  * server reachable only from this host — with no platform key, and is allowed
- * because the deployment named it. Malformed entries are skipped, never
- * widened into something else; an unset value means no routes.
+ * because the deployment named it. `model=other-model` instead sends the turn
+ * on as that other model, wherever it goes; it is allowed only while that
+ * model is. Malformed entries are skipped, never widened into something else;
+ * an unset value means no routes.
  */
 export function parseRelayRoutes(value) {
   const routes = new Map();
@@ -165,8 +169,15 @@ export function parseRelayRoutes(value) {
     const at = entry.indexOf('=');
     if (at < 1) continue;
     const model = entry.slice(0, at).trim();
-    const baseUrl = relayBaseUrl(entry.slice(at + 1).trim());
-    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(model) || !baseUrl) continue;
+    const target = entry.slice(at + 1).trim();
+    if (!MODEL_NAME.test(model)) continue;
+    // A mistyped address (`http:host:port`) stays an address, never a model name.
+    if (MODEL_NAME.test(target) && !/^https?:/i.test(target)) {
+      routes.set(model, { model: target });
+      continue;
+    }
+    const baseUrl = relayBaseUrl(target);
+    if (!baseUrl) continue;
     routes.set(model, { base_url: baseUrl, alias: 'direct' });
   }
   return routes;
@@ -187,9 +198,26 @@ export function createRelay({
     return Boolean(current.base_url && current.has_key && current.allowed_models.length);
   };
   const active = () => enabled && (routes.size > 0 || platformActive());
-  const allows = (model) => typeof model === 'string'
-    && (routes.has(model) || (platformActive() && settings().allowed_models.includes(model)));
-  const allowedModels = () => [...(platformActive() ? settings().allowed_models : []), ...routes.keys()];
+  /**
+   * Where a turn naming `model` goes, and under which name: a route's own
+   * endpoint, else the platform. A renaming route is followed one hop, so the
+   * model it names must itself be routed to an endpoint or allowed on the
+   * platform. Null when the turn is not the relay's.
+   */
+  const destination = (model) => {
+    if (typeof model !== 'string') return null;
+    const upstreamModel = routes.get(model)?.model ?? model;
+    const route = routes.get(upstreamModel) ?? null;
+    if (route) return route.base_url ? { model: upstreamModel, route } : null;
+    return platformActive() && settings().allowed_models.includes(upstreamModel)
+      ? { model: upstreamModel, route: null }
+      : null;
+  };
+  const allows = (model) => destination(model) !== null;
+  const allowedModels = () => [
+    ...(platformActive() ? settings().allowed_models : []),
+    ...[...routes.keys()].filter(allows),
+  ];
   const platformAlias = () => `relay:${settings().name ?? 'platform'}`;
 
   /**
@@ -276,26 +304,33 @@ export function createRelay({
     } catch {
       // Judged below.
     }
-    const model = typeof parsed?.model === 'string' ? parsed.model : null;
+    const requestedModel = typeof parsed?.model === 'string' ? parsed.model : null;
     const streaming = parsed?.stream === true;
-    if (!allows(model)) {
-      log('relay_proxy_model_refused', { device_id: device.id, model });
-      record({ statusCode: 403, outcome: 'model_blocked', model, stream: streaming, requestBytes: body.length });
+    const target = destination(requestedModel);
+    if (!target) {
+      log('relay_proxy_model_refused', { device_id: device.id, model: requestedModel });
+      record({ statusCode: 403, outcome: 'model_blocked', model: requestedModel, stream: streaming, requestBytes: body.length });
       sendJson(res, 403, errorBody(
         kind,
         'permission_error',
-        `model "${model ?? ''}" is not allowed on the third-party platform; allowed: ${allowedModels().join(', ') || 'none'} `
+        `model "${requestedModel ?? ''}" is not allowed on the third-party platform; allowed: ${allowedModels().join(', ') || 'none'} `
           + `(第三方模型平台只允许：${allowedModels().join('、') || '无'})`,
       ));
       return;
     }
 
-    const route = routes.get(model) ?? null;
+    // Recorded as the model that ran, which is the one the upstream bills.
+    const { model, route } = target;
+    const requestBytes = body.length;
+    if (model !== requestedModel) {
+      parsed.model = model;
+      body = Buffer.from(JSON.stringify(parsed), 'utf8');
+    }
     if (route) accountAlias = `relay:${route.alias}`;
     const current = route ?? settings();
     const apiKey = route ? null : store.relayApiKey();
     if (!current.base_url || (!route && !apiKey)) {
-      record({ statusCode: 503, outcome: 'rejected', model, stream: streaming, requestBytes: body.length });
+      record({ statusCode: 503, outcome: 'rejected', model, stream: streaming, requestBytes });
       sendJson(res, 503, errorBody(kind, 'api_error', 'third-party platform is not configured'));
       return;
     }
@@ -311,7 +346,7 @@ export function createRelay({
     }
 
     const startedAtMonotonic = performance.now();
-    const metricBase = { model, stream: streaming, requestBytes: body.length, startedAtMonotonic };
+    const metricBase = { model, stream: streaming, requestBytes, startedAtMonotonic };
     const clientGone = new AbortController();
     const abort = () => clientGone.abort();
     res.once('close', () => {
@@ -418,7 +453,7 @@ export function createRelay({
       const created = Math.floor(now() / 1000);
       sendJson(res, 200, {
         object: 'list',
-        data: (active() ? allowedModels() : []).map((id) => ({ id, object: 'model', created, owned_by: routes.has(id) ? 'direct' : (settings().name ?? 'relay') })),
+        data: (active() ? allowedModels() : []).map((id) => ({ id, object: 'model', created, owned_by: destination(id)?.route ? 'direct' : (settings().name ?? 'relay') })),
       });
       return;
     }

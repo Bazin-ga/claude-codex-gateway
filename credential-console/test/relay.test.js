@@ -87,7 +87,7 @@ test('the tab is added once, and marked current only on the relay page', () => {
   assert.match(withRelayTab(`${page}<section data-relay-page>`), /href="\/relay"[^>]*aria-current="page"/);
 });
 
-async function relayConsole(t, { relayEnabled = true, routeModel = null } = {}) {
+async function relayConsole(t, { relayEnabled = true, routeModel = null, routes = null } = {}) {
   const { store } = await newStore(t);
   const seen = { platform: [], claude: [], codex: [], route: [] };
   const platform = http.createServer(async (req, res) => {
@@ -128,6 +128,8 @@ async function relayConsole(t, { relayEnabled = true, routeModel = null } = {}) 
     publicBaseUrl: 'http://console.test',
     relayEnabled,
     ...(routeModel ? { relayRoutes: new Map([[routeModel, { base_url: routeUrl, alias: 'direct' }]]) } : {}),
+    // Or the deployment's own `CREDENTIAL_CONSOLE_RELAY_ROUTES` value, given the route server's address.
+    ...(routes ? { relayRoutes: parseRelayRoutes(routes(routeUrl)) } : {}),
     relayCatalog: { snapshot: () => ({ rows: [], balance: null, fetched_at: null, error: null }), row: () => null, refresh: async () => {}, stop() {} },
     claudeUpstreamBaseUrl: anthropicUrl,
     requestMetrics: { enqueueRequest: (row) => { metrics.push(row); } },
@@ -252,6 +254,63 @@ test('relay routes parse model=url entries and skip malformed ones', () => {
   assert.equal(routes.get('DeepSeek-V4.1-Flash').base_url, 'http://127.0.0.1:18540');
   assert.equal(routes.get('qwen').base_url, 'https://h.example');
   assert.equal(parseRelayRoutes(undefined).size, 0);
+  const renamed = parseRelayRoutes('DeepSeek-V4.1-Flash=deepseek-v4-flash\nlocal=http://127.0.0.1:1/');
+  assert.deepEqual(renamed.get('DeepSeek-V4.1-Flash'), { model: 'deepseek-v4-flash' });
+  assert.equal(renamed.get('local').base_url, 'http://127.0.0.1:1');
+  assert.equal(parseRelayRoutes('a=http:127.0.0.1:1').get('a').base_url, 'http://127.0.0.1:1', 'still an address, as before');
+});
+
+test('a route naming another model sends the turn on as that model, and only while that model is allowed', { timeout: 20_000 }, async (t) => {
+  const { baseUrl, token, seen, metrics, store } = await relayConsole(t, {
+    routes: (routeUrl) => `DeepSeek-V4.1-Flash=deepseek-v4-flash; qwen-local=qwen-selfhosted; qwen-selfhosted=${routeUrl}; loop=loop; chain=DeepSeek-V4.1-Flash; off=kimi-k3`,
+  });
+
+  const turn = { model: 'DeepSeek-V4.1-Flash', max_tokens: 10, stream: true, thinking: { type: 'enabled', budget_tokens: 1024 }, messages: [{ role: 'user', content: '中文 ✓ "quoted"' }] };
+  const renamed = await postJson(`${baseUrl}/claude/v1/messages`, token, turn, { 'anthropic-version': '2023-06-01' });
+  assert.equal(renamed.status, 200);
+  assert.equal(await renamed.text(), SSE_MESSAGES);
+  assert.equal(seen.platform.length, 1);
+  assert.equal(seen.platform[0].url, '/v1/messages');
+  assert.deepEqual(seen.platform[0].body, { ...turn, model: 'deepseek-v4-flash' }, 'only the model changes');
+  assert.equal(seen.platform[0].headers.authorization, `Bearer ${PLATFORM_KEY}`);
+  assert.equal(seen.claude.length, 0);
+  assert.equal(seen.route.length, 0);
+  const row = metrics.at(-1);
+  assert.equal(row.model, 'deepseek-v4-flash', 'recorded as the model the platform ran and bills');
+  assert.equal(row.accountAlias, 'relay:boyue');
+  assert.equal(row.inputTokens, 11);
+
+  // To a self-hosted route: renamed too, and still without the platform key.
+  const local = await postJson(`${baseUrl}/relay/v1/messages`, token, { model: 'qwen-local', max_tokens: 10, stream: true, messages: [] });
+  assert.equal(local.status, 200);
+  await local.text();
+  assert.equal(seen.route.length, 1);
+  assert.equal(seen.route[0].body.model, 'qwen-selfhosted');
+  assert.equal(seen.route[0].headers.authorization, undefined);
+  assert.equal(metrics.at(-1).accountAlias, 'relay:direct');
+
+  // One hop only, and never onto a model the platform does not allow.
+  for (const model of ['loop', 'chain', 'off']) {
+    const refused = await postJson(`${baseUrl}/relay/v1/chat/completions`, token, { model, messages: [] });
+    assert.equal(refused.status, 403, model);
+  }
+  assert.equal(seen.platform.length, 1);
+  const models = await fetch(`${baseUrl}/relay/v1/models`, { headers: { authorization: `Bearer ${token}` } });
+  assert.deepEqual((await models.json()).data.map((entry) => [entry.id, entry.owned_by]), [
+    ['deepseek-v4-flash', 'boyue'],
+    ['DeepSeek-V4.1-Flash', 'boyue'],
+    ['qwen-local', 'direct'],
+    ['qwen-selfhosted', 'direct'],
+  ]);
+
+  // Taken off the platform's allow-list, the model is no longer the relay's
+  // under its other name either: the turn carries on to the account.
+  await store.setRelayModelAllowed({ model: 'deepseek-v4-flash', allowed: false });
+  const after = await postJson(`${baseUrl}/claude/v1/messages`, token, { model: 'DeepSeek-V4.1-Flash', max_tokens: 10, messages: [] });
+  assert.equal(after.status, 200);
+  await after.text();
+  assert.equal(seen.platform.length, 1);
+  assert.equal(seen.claude.length, 1);
 });
 
 test('a routed model goes to its own endpoint without the platform key; the platform and accounts are untouched', { timeout: 20_000 }, async (t) => {
