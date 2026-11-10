@@ -21,7 +21,9 @@ function usage() {
   node cli.js admin list
   node cli.js admin add <username> [--password-stdin]
   node cli.js admin passwd <username> [--password-stdin]
-  node cli.js admin delete <username>`);
+  node cli.js admin delete <username>
+  node cli.js relay-chain show
+  node cli.js relay-chain import <chains.json>`);
   process.exitCode = 2;
 }
 
@@ -84,6 +86,37 @@ async function main() {
       else if (action === 'passwd') await store.setAdminPassword(username, password, { actor: 'cli' });
       else await store.deleteAdminUser(username, { actor: 'cli' });
       console.log(`administrator ${username}: ${action} done`);
+    } finally {
+      await lock.release();
+    }
+    return;
+  }
+
+  if (command === 'relay-chain') {
+    const action = process.argv[3];
+    if (action === 'show') {
+      const store = await new CredentialStore(HOME).init();
+      console.log(JSON.stringify(store.relayChains(), null, 2));
+      return;
+    }
+    const file = process.argv[4];
+    if (action !== 'import' || !file) return usage();
+    // The whole set of chains, as `show` prints it. A source's key is never in
+    // what `show` prints: give it as `api_key`, or as `api_key_file` naming a
+    // file that holds nothing else, or leave both out to keep the stored one.
+    const described = JSON.parse(await readFile(resolve(file), 'utf8'));
+    const chains = Array.isArray(described) ? described : described?.chains;
+    if (!Array.isArray(chains)) throw new Error('the file must hold a list of chains');
+    for (const chain of chains) {
+      for (const source of Array.isArray(chain?.sources) ? chain.sources : []) {
+        if (typeof source?.api_key_file !== 'string') continue;
+        source.api_key = (await readFile(resolve(source.api_key_file), 'utf8')).trim();
+      }
+    }
+    const lock = await acquireHomeLock(HOME, { role: 'cli:relay-chain-import' });
+    try {
+      const store = await new CredentialStore(HOME).init();
+      console.log(JSON.stringify(await store.importRelayChains({ chains, actor: 'cli' }), null, 2));
     } finally {
       await lock.release();
     }

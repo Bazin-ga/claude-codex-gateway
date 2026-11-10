@@ -20,6 +20,15 @@ import { relayStream } from './bedrock-proxy.js';
 import { createCodexUsageParser, parseCodexUsage } from './codex-usage.js';
 import { createResponseUsageParser, parseResponseUsage } from './response-usage.js';
 import { RELAY_ACCOUNT_ID, RELAY_PROXY_PREFIX, relayBaseUrl } from './relay.js';
+import {
+  createRelaySourceHealth,
+  planRelaySources,
+  relayBalanceRefusal,
+  relayChainFor,
+  relayFailoverStatus,
+  relayRequestWithoutThinking,
+  RELAY_THINKING_REFUSAL,
+} from './relay-chain.js';
 
 /**
  * Carries a device's turn to the third-party platform.
@@ -67,7 +76,8 @@ function errorBody(kind, type, message) {
 /**
  * Usage from an OpenAI chat-completions body or stream: the final chunk of a
  * stream carries `usage` when the client asked for it, a JSON body always
- * does. Prompt tokens include the cached ones, as in the other two formats.
+ * does. Its prompt tokens include the cached ones; they are taken out here,
+ * so input means the same as in the other two formats — what was not cached.
  */
 export class ChatUsageParser {
   constructor() {
@@ -112,12 +122,14 @@ export class ChatUsageParser {
     const token = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
     const usage = this.usage;
     if (!usage) return unavailableUsage();
-    const inputTokens = token(usage.prompt_tokens);
+    const promptTokens = token(usage.prompt_tokens);
+    const cachedTokens = token(usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens);
+    const inputTokens = promptTokens === null ? null : Math.max(0, promptTokens - (cachedTokens ?? 0));
     const outputTokens = token(usage.completion_tokens);
     return {
       inputTokens,
       cacheCreationInputTokens: null,
-      cacheReadInputTokens: token(usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens),
+      cacheReadInputTokens: cachedTokens,
       outputTokens,
       usageState: !truncated && inputTokens !== null && outputTokens !== null ? 'complete' : 'partial',
     };
@@ -136,6 +148,16 @@ function bufferedUsage(kind, body) {
   const parser = new ChatUsageParser();
   parser.push(body);
   return safeUsageSnapshot({ snapshot: () => parser.finish() });
+}
+
+/**
+ * What ties a request to its conversation: the session id Claude Code and
+ * Codex each send. A client that sends neither has no conversation to keep
+ * on one source.
+ */
+function conversationKey(req, device) {
+  const id = req.headers['x-claude-code-session-id'] ?? req.headers['session-id'];
+  return typeof id === 'string' && /^[A-Za-z0-9._:-]{8,128}$/.test(id) ? `${device.id}:${id}` : null;
 }
 
 async function readRest(stream, already, limit) {
@@ -193,32 +215,82 @@ export function createRelay({
   routes = new Map(),
 }) {
   const settings = () => store.relaySettings();
+  const health = createRelaySourceHealth({ now });
   const platformActive = () => {
     const current = settings();
     return Boolean(current.base_url && current.has_key && current.allowed_models.length);
   };
-  const active = () => enabled && (routes.size > 0 || platformActive());
+  /** Chains that can serve: one whose sources are all switched off is as good as absent. */
+  const liveChains = () => store.relayChains().filter((chain) => chain.sources.some((source) => source.enabled));
+  const active = () => enabled && (routes.size > 0 || platformActive() || liveChains().length > 0);
   /**
-   * Where a turn naming `model` goes, and under which name: a route's own
-   * endpoint, else the platform. A renaming route is followed one hop, so the
-   * model it names must itself be routed to an endpoint or allowed on the
-   * platform. Null when the turn is not the relay's.
+   * Where a turn naming `model` goes, and under which name: a chain of
+   * sources, a route's own endpoint, else the platform. A renaming route is
+   * followed one hop, so the model it names must itself be a chain's, routed
+   * to an endpoint or allowed on the platform. Null when the turn is not the
+   * relay's.
    */
   const destination = (model) => {
     if (typeof model !== 'string') return null;
     const upstreamModel = routes.get(model)?.model ?? model;
+    const chains = liveChains();
+    const chain = relayChainFor(chains, model) ?? relayChainFor(chains, upstreamModel);
+    if (chain) return { model: chain.model, route: null, chain };
     const route = routes.get(upstreamModel) ?? null;
-    if (route) return route.base_url ? { model: upstreamModel, route } : null;
+    if (route) return route.base_url ? { model: upstreamModel, route, chain: null } : null;
     return platformActive() && settings().allowed_models.includes(upstreamModel)
-      ? { model: upstreamModel, route: null }
+      ? { model: upstreamModel, route: null, chain: null }
       : null;
   };
   const allows = (model) => destination(model) !== null;
-  const allowedModels = () => [
+  const allowedModels = () => [...new Set([
     ...(platformActive() ? settings().allowed_models : []),
+    ...liveChains().flatMap((chain) => [chain.model, ...chain.aliases]),
     ...[...routes.keys()].filter(allows),
-  ];
+  ])];
   const platformAlias = () => `relay:${settings().name ?? 'platform'}`;
+
+  /** A platform source below its balance line. An unread balance is not a low one. */
+  const balanceLow = (source) => {
+    if (source.kind !== 'platform' || source.min_balance_usd === null) return false;
+    const remaining = catalog?.remainingUsd?.() ?? null;
+    return remaining !== null && remaining < source.min_balance_usd;
+  };
+  /** Where a source's requests go, or null while it has nowhere to send them. */
+  const sourceEndpoint = (chain, source) => {
+    if (source.kind === 'platform') {
+      const current = settings();
+      const apiKey = store.relayApiKey();
+      return current.base_url && apiKey ? { baseUrl: current.base_url, apiKey } : null;
+    }
+    return {
+      baseUrl: source.base_url,
+      apiKey: source.has_key ? store.relaySourceApiKey(chain.model, source.id) : null,
+    };
+  };
+  /**
+   * The sources a turn may try, in the order it tries them. `fallback` marks
+   * the ones that are not the chain's first choice: a conversation served by
+   * one of those is held on it.
+   */
+  const chainCandidates = (chain, conversation) => {
+    const usable = [];
+    for (const source of chain.sources) {
+      if (!source.enabled || balanceLow(source)) continue;
+      const endpoint = sourceEndpoint(chain, source);
+      if (!endpoint) continue;
+      usable.push({
+        id: source.id,
+        alias: `relay:${source.name}`,
+        ...endpoint,
+        upstreamModel: source.upstream_model,
+        firstByteTimeoutMs: source.first_byte_timeout_s * 1000,
+        platform: source.kind === 'platform',
+        fallback: usable.length > 0,
+      });
+    }
+    return planRelaySources(usable, { health, pinnedId: health.pinned(conversation) });
+  };
 
   /**
    * Forward one turn whose first bytes may already have been read. Owns the
@@ -226,8 +298,8 @@ export function createRelay({
    */
   async function forward(req, res, { device, kind, head = null, ended = false, path, authenticatedAtMs = now() }) {
     const authenticatedAtMonotonic = performance.now();
-    let accountAlias = platformAlias();
     const record = ({
+      alias = platformAlias(),
       statusCode,
       outcome,
       model = null,
@@ -235,18 +307,19 @@ export function createRelay({
       requestBytes = 0,
       responseBytes = 0,
       ttfbMs = null,
+      startedAtMs = authenticatedAtMs,
       startedAtMonotonic = authenticatedAtMonotonic,
       usage = unavailableUsage(),
     }) => {
       enqueueMetricSafely(requestMetrics, {
-        startedAtMs: authenticatedAtMs,
+        startedAtMs,
         method: req.method ?? 'UNKNOWN',
         path,
         deviceId: device.id,
         machineId: device.machine_id ?? null,
         memberLabel: device.member_label,
         accountId: RELAY_ACCOUNT_ID,
-        accountAlias,
+        accountAlias: alias,
         model,
         stream,
         statusCode,
@@ -319,99 +392,260 @@ export function createRelay({
       return;
     }
 
-    // Recorded as the model that ran, which is the one the upstream bills.
-    const { model, route } = target;
+    // Recorded as the model that ran — for a chain, the one name its sources
+    // share — which is what the spend is priced by.
+    const { model, route, chain } = target;
     const requestBytes = body.length;
-    if (model !== requestedModel) {
-      parsed.model = model;
-      body = Buffer.from(JSON.stringify(parsed), 'utf8');
+    const conversation = chain ? conversationKey(req, device) : null;
+    let candidates;
+    if (chain) {
+      candidates = chainCandidates(chain, conversation);
+    } else {
+      const current = route ?? settings();
+      const apiKey = route ? null : store.relayApiKey();
+      candidates = current.base_url && (route || apiKey)
+        ? [{
+          id: null,
+          alias: route ? `relay:${route.alias}` : platformAlias(),
+          baseUrl: current.base_url,
+          apiKey,
+          upstreamModel: model,
+        }]
+        : [];
     }
-    if (route) accountAlias = `relay:${route.alias}`;
-    const current = route ?? settings();
-    const apiKey = route ? null : store.relayApiKey();
-    if (!current.base_url || (!route && !apiKey)) {
-      record({ statusCode: 503, outcome: 'rejected', model, stream: streaming, requestBytes });
-      sendJson(res, 503, errorBody(kind, 'api_error', 'third-party platform is not configured'));
+    if (candidates.length === 0) {
+      record({
+        ...(chain ? {} : { alias: route ? `relay:${route.alias}` : platformAlias() }),
+        statusCode: 503,
+        outcome: 'rejected',
+        model,
+        stream: streaming,
+        requestBytes,
+      });
+      sendJson(res, 503, errorBody(kind, 'api_error', chain
+        ? `no source of model "${model}" can take requests right now (该模型的所有来源当前均不可用)`
+        : 'third-party platform is not configured'));
       return;
     }
-    const headers = {};
+
+    const baseHeaders = {};
     for (const name of FORWARDED_REQUEST_HEADERS) {
-      if (typeof req.headers[name] === 'string') headers[name] = req.headers[name];
+      if (typeof req.headers[name] === 'string') baseHeaders[name] = req.headers[name];
     }
-    headers['content-type'] ??= 'application/json';
-    if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-    if (kind === 'messages') {
-      if (apiKey) headers['x-api-key'] = apiKey;
-      headers['anthropic-version'] ??= '2023-06-01';
-    }
+    baseHeaders['content-type'] ??= 'application/json';
+    if (kind === 'messages') baseHeaders['anthropic-version'] ??= '2023-06-01';
+    const payload = (upstreamModel, request = parsed) => (request === parsed && upstreamModel === requestedModel
+      ? body
+      : Buffer.from(JSON.stringify({ ...request, model: upstreamModel }), 'utf8'));
 
-    const startedAtMonotonic = performance.now();
-    const metricBase = { model, stream: streaming, requestBytes, startedAtMonotonic };
     const clientGone = new AbortController();
-    const abort = () => clientGone.abort();
     res.once('close', () => {
-      if (!res.writableFinished) abort();
+      if (!res.writableFinished) clientGone.abort();
     });
-    let upstreamResponse;
-    try {
-      upstreamResponse = await fetchImpl(`${current.base_url}${KINDS[kind].upstreamPath}`, {
-        method: 'POST',
-        headers,
-        body,
-        signal: AbortSignal.any([
-          clientGone.signal,
-          AbortSignal.timeout(streaming ? STREAM_TIMEOUT_MS : UPSTREAM_TIMEOUT_MS),
-        ]),
-      });
-    } catch (error) {
-      if (clientGone.signal.aborted) {
-        record({ ...metricBase, statusCode: null, outcome: 'client_disconnected' });
-        return;
+
+    /**
+     * One source's turn at the request. True when the response is settled —
+     * answered, or the client gone; false when the source failed before
+     * anything reached the client and another one is left to try.
+     */
+    async function attempt(candidate, more) {
+      const startedAtMs = now();
+      const startedAtMonotonic = performance.now();
+      const metricBase = {
+        alias: candidate.alias,
+        model,
+        stream: streaming,
+        requestBytes,
+        // The first attempt carries the time spent reading the request, as a
+        // turn always has; a later one only its own.
+        ...(candidate === candidates[0] ? {} : { startedAtMs }),
+        startedAtMonotonic,
+      };
+      const headers = { ...baseHeaders };
+      if (candidate.apiKey) {
+        headers.authorization = `Bearer ${candidate.apiKey}`;
+        if (kind === 'messages') headers['x-api-key'] = candidate.apiKey;
       }
-      const code = error?.name === 'TimeoutError' ? 'timeout' : (error?.cause?.code ?? error?.code ?? error?.name ?? 'unknown');
-      log('relay_proxy_upstream_failed', { device_id: device.id, model, code });
-      record({ ...metricBase, statusCode: 502, outcome: 'upstream_error' });
-      if (!res.headersSent) sendJson(res, 502, errorBody(kind, 'api_error', 'third-party platform request failed'));
-      return;
+      // A source that has not begun to answer a streaming turn in time is
+      // given up on while another can still take it. Once its headers are in,
+      // only the whole-stream limit applies.
+      const slow = more && streaming && candidate.firstByteTimeoutMs ? new AbortController() : null;
+      const send = async (requestBody) => {
+        const timer = slow ? setTimeout(() => slow.abort(), candidate.firstByteTimeoutMs) : null;
+        try {
+          return await fetchImpl(`${candidate.baseUrl}${KINDS[kind].upstreamPath}`, {
+            method: 'POST',
+            headers,
+            body: requestBody,
+            signal: AbortSignal.any([
+              clientGone.signal,
+              AbortSignal.timeout(streaming ? STREAM_TIMEOUT_MS : UPSTREAM_TIMEOUT_MS),
+              ...(slow ? [slow.signal] : []),
+            ]),
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      const failed = ({ status, reason, balance = false }) => {
+        log('relay_proxy_source_failed', { device_id: device.id, model, source: candidate.alias, status, reason, failover: more });
+        if (candidate.id === null) return;
+        health.failure(candidate.id, { status, reason, balance });
+        if (balance && candidate.platform) catalog?.refreshBalance?.().catch(() => {});
+      };
+
+      let upstreamResponse;
+      try {
+        upstreamResponse = await send(payload(candidate.upstreamModel));
+      } catch (error) {
+        if (clientGone.signal.aborted) {
+          record({ ...metricBase, statusCode: null, outcome: 'client_disconnected' });
+          return true;
+        }
+        const code = slow?.signal.aborted
+          ? 'first_byte_timeout'
+          : (error?.name === 'TimeoutError' ? 'timeout' : (error?.cause?.code ?? error?.code ?? error?.name ?? 'unknown'));
+        log('relay_proxy_upstream_failed', { device_id: device.id, model, code });
+        failed({ status: null, reason: code });
+        record({ ...metricBase, statusCode: 502, outcome: 'upstream_error' });
+        if (more) return false;
+        if (!res.headersSent) sendJson(res, 502, errorBody(kind, 'api_error', 'third-party platform request failed'));
+        return true;
+      }
+
+      // A refusal is read whole before anything is decided: what it says
+      // settles whether the next source is tried, and the client gets it
+      // unchanged if none is.
+      let refusal = null;
+      if (!upstreamResponse.ok) {
+        try {
+          refusal = await readRest(upstreamResponse.body ?? [], null, MAX_RESPONSE_BYTES);
+        } catch (error) {
+          if (clientGone.signal.aborted) {
+            record({ ...metricBase, statusCode: null, outcome: 'client_disconnected' });
+            return true;
+          }
+          log('relay_proxy_upstream_body_failed', { device_id: device.id, model, code: error?.code ?? error?.name ?? 'unknown' });
+          failed({ status: upstreamResponse.status, reason: 'unreadable' });
+          record({ ...metricBase, statusCode: 502, outcome: 'upstream_error' });
+          if (more) return false;
+          if (!res.headersSent) sendJson(res, 502, errorBody(kind, 'api_error', 'third-party platform response unreadable'));
+          return true;
+        }
+        // A conversation whose history lacks the reasoning this source wants
+        // passed back runs without reasoning rather than not at all.
+        if (upstreamResponse.status === 400 && RELAY_THINKING_REFUSAL.test(refusal.subarray(0, 4096).toString('utf8'))) {
+          const plain = relayRequestWithoutThinking(kind, parsed);
+          if (plain) {
+            try {
+              const second = await send(payload(candidate.upstreamModel, plain));
+              if (second.ok) {
+                log('relay_proxy_thinking_dropped', { device_id: device.id, model, source: candidate.alias });
+                upstreamResponse = second;
+                refusal = null;
+              } else {
+                await second.body?.cancel().catch(() => {});
+              }
+            } catch {
+              if (clientGone.signal.aborted) {
+                record({ ...metricBase, statusCode: null, outcome: 'client_disconnected' });
+                return true;
+              }
+              // The first answer stands.
+            }
+          }
+        }
+      }
+
+      const ttfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
+      const contentType = upstreamResponse.headers.get('content-type') ?? 'application/json';
+      const responseHeaders = { 'Content-Type': contentType, 'Cache-Control': 'no-store' };
+      if (refusal) {
+        const status = upstreamResponse.status;
+        const elsewhere = relayFailoverStatus(status);
+        if (elsewhere) {
+          const balance = relayBalanceRefusal(status, refusal.subarray(0, 4096).toString('utf8'));
+          failed({ status, reason: balance ? 'balance' : 'status', balance });
+        }
+        record({ ...metricBase, statusCode: status, outcome: 'upstream_error', ttfbMs, responseBytes: refusal.length });
+        if (elsewhere && more) return false;
+        if (res.destroyed) return true;
+        res.writeHead(status, { ...responseHeaders, 'Content-Length': String(refusal.length) });
+        res.end(refusal);
+        return true;
+      }
+
+      if (candidate.id !== null) {
+        health.success(candidate.id);
+        if (candidate.fallback) health.pin(conversation, candidate.id);
+      }
+      const mediaType = contentType.split(';', 1)[0].trim().toLowerCase();
+      if (mediaType === 'text/event-stream') {
+        await relayStream(res, upstreamResponse, {
+          parser: usageParser(kind, 'sse'),
+          clientGone,
+          onDone: ({ outcome, statusCode, responseBytes, usage }) => {
+            if (outcome === 'upstream_error') {
+              log('relay_proxy_upstream_stream_failed', { device_id: device.id, model });
+              failed({ status: statusCode, reason: 'stream_broken' });
+            }
+            record({ ...metricBase, stream: true, statusCode, outcome, ttfbMs, responseBytes, usage });
+          },
+          headers: responseHeaders,
+          status: upstreamResponse.status,
+        });
+        return true;
+      }
+      let responseBody;
+      try {
+        responseBody = await readRest(upstreamResponse.body ?? [], null, MAX_RESPONSE_BYTES);
+      } catch (error) {
+        if (clientGone.signal.aborted) {
+          record({ ...metricBase, statusCode: null, outcome: 'client_disconnected', ttfbMs });
+          return true;
+        }
+        log('relay_proxy_upstream_body_failed', { device_id: device.id, model, code: error?.code ?? error?.name ?? 'unknown' });
+        failed({ status: upstreamResponse.status, reason: 'unreadable' });
+        record({ ...metricBase, statusCode: 502, outcome: 'upstream_error', ttfbMs });
+        if (more) return false;
+        if (!res.headersSent) sendJson(res, 502, errorBody(kind, 'api_error', 'third-party platform response unreadable'));
+        return true;
+      }
+      record({
+        ...metricBase,
+        statusCode: upstreamResponse.status,
+        outcome: 'completed',
+        ttfbMs,
+        responseBytes: responseBody.length,
+        usage: bufferedUsage(kind, responseBody),
+      });
+      if (res.destroyed) return true;
+      res.writeHead(upstreamResponse.status, { ...responseHeaders, 'Content-Length': String(responseBody.length) });
+      res.end(responseBody);
+      return true;
     }
 
-    const ttfbMs = Math.max(0, Math.round(performance.now() - startedAtMonotonic));
-    const contentType = upstreamResponse.headers.get('content-type') ?? 'application/json';
-    const responseHeaders = { 'Content-Type': contentType, 'Cache-Control': 'no-store' };
-    const mediaType = contentType.split(';', 1)[0].trim().toLowerCase();
-    if (upstreamResponse.ok && mediaType === 'text/event-stream') {
-      await relayStream(res, upstreamResponse, {
-        parser: usageParser(kind, 'sse'),
-        clientGone,
-        onDone: ({ outcome, statusCode, responseBytes, usage }) => {
-          if (outcome === 'upstream_error') log('relay_proxy_upstream_stream_failed', { device_id: device.id, model });
-          record({ ...metricBase, stream: true, statusCode, outcome, ttfbMs, responseBytes, usage });
-        },
-        headers: responseHeaders,
-        status: upstreamResponse.status,
-      });
-      return;
+    for (let index = 0; index < candidates.length; index += 1) {
+      if (await attempt(candidates[index], index < candidates.length - 1)) return;
     }
-    let responseBody;
-    try {
-      responseBody = await readRest(upstreamResponse.body ?? [], null, MAX_RESPONSE_BYTES);
-    } catch (error) {
-      log('relay_proxy_upstream_body_failed', { device_id: device.id, model, code: error?.code ?? error?.name ?? 'unknown' });
-      record({ ...metricBase, statusCode: 502, outcome: 'upstream_error', ttfbMs });
-      if (!res.headersSent) sendJson(res, 502, errorBody(kind, 'api_error', 'third-party platform response unreadable'));
-      return;
+  }
+
+  /**
+   * For the console: each chain source's standing right now — resting after
+   * a failure, below its balance line, or without an endpoint to send to.
+   */
+  function sourceStates() {
+    const states = new Map();
+    for (const chain of store.relayChains()) {
+      for (const source of chain.sources) {
+        states.set(source.id, {
+          ...health.describe(source.id),
+          balance_low: balanceLow(source),
+          configured: sourceEndpoint(chain, source) !== null,
+        });
+      }
     }
-    record({
-      ...metricBase,
-      statusCode: upstreamResponse.status,
-      outcome: upstreamResponse.ok ? 'completed' : 'upstream_error',
-      ttfbMs,
-      responseBytes: responseBody.length,
-      usage: upstreamResponse.ok ? bufferedUsage(kind, responseBody) : unavailableUsage(),
-    });
-    if (res.destroyed) return;
-    res.writeHead(upstreamResponse.status, { ...responseHeaders, 'Content-Length': String(responseBody.length) });
-    res.end(responseBody);
+    return states;
   }
 
   /**
@@ -453,7 +687,10 @@ export function createRelay({
       const created = Math.floor(now() / 1000);
       sendJson(res, 200, {
         object: 'list',
-        data: (active() ? allowedModels() : []).map((id) => ({ id, object: 'model', created, owned_by: destination(id)?.route ? 'direct' : (settings().name ?? 'relay') })),
+        data: (active() ? allowedModels() : []).map((id) => {
+          const target = destination(id);
+          return { id, object: 'model', created, owned_by: target?.route ? 'direct' : (target?.chain ? 'relay' : (settings().name ?? 'relay')) };
+        }),
       });
       return;
     }
@@ -473,5 +710,5 @@ export function createRelay({
     await forward(req, res, { device, kind, path });
   }
 
-  return { active, allows, intercept, handle, settings };
+  return { active, allows, intercept, handle, settings, sourceStates };
 }

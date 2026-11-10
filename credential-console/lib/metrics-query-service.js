@@ -99,6 +99,11 @@ export class MetricsQueryService {
     return this.#send({ type: 'api-spend', params });
   }
 
+  /** `MetricsStore.queryRelayStats`, off the gateway's event loop. */
+  relayStats(params) {
+    return this.#send({ type: 'relay-stats', params });
+  }
+
   #send(message) {
     if (!this.ready || !this.worker || this.closed) {
       return Promise.reject(new Error('metrics query service is unavailable'));

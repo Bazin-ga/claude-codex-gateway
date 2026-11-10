@@ -24,6 +24,7 @@ import { sanitizeUrl } from './onboarding.js';
 import { derivePromptDisplay } from './prompt-display.js';
 import { isCodexApiKeyAccount, isCodexGatewayAccount } from './codex-api-key.js';
 import { OPENAI_PRICES_AS_OF } from './openai-api-pricing.js';
+import { relayPriceMultiplier } from './relay.js';
 import {
   buildClaudeConversationHookEndpoint,
   CLAUDE_CONVERSATION_HOOK_UPDATER_FILENAME,
@@ -6324,19 +6325,235 @@ function tokenCount(value) {
   return String(value);
 }
 
+function usdWhole(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  return `$${Math.round(value).toLocaleString('en-US')}`;
+}
+
+function relayLatency(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  if (value < 1000) return `${Math.round(value)} ms`;
+  if (value < 60_000) return `${(value / 1000).toFixed(1)} s`;
+  return `${(value / 60_000).toFixed(1)} min`;
+}
+
+function relayShare(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  const percent = value * 100;
+  return `${percent === 0 ? '0' : (percent < 10 ? percent.toFixed(1) : percent.toFixed(0))}%`;
+}
+
+/**
+ * The styles of the source table and the chain settings. Rendered with this
+ * page only, like the account list's: the shared stylesheet is in every page.
+ */
+const RELAY_SOURCE_STYLES = `<style>
+.relay-sources-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.relay-sources-head h2 { margin: 0; }
+.relay-windows { display: flex; gap: 6px; margin-left: auto; }
+.relay-window { padding: 3px 12px; border: 1px solid var(--line); border-radius: 999px; text-decoration: none; color: inherit; font-size: .85rem; }
+.relay-window.active { background: var(--ink); border-color: var(--ink); color: #fff; }
+.relay-order { display: inline-block; min-width: 1.5em; padding: 0 5px; border-radius: 999px; background: var(--line); text-align: center; font-size: .8rem; }
+table.relay-sources td { vertical-align: top; white-space: nowrap; }
+table.relay-sources td:first-child, table.relay-sources .relay-statuses { white-space: normal; }
+tr.relay-source-off td, li.relay-source-off .relay-chain-source-head > strong { color: var(--muted); }
+.relay-chain { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 4px; }
+.relay-chain-sources { list-style: none; margin: 0 0 10px; padding: 0; display: grid; gap: 8px; }
+.relay-chain-source { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.relay-chain-source-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.relay-chain-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+[data-relay-page] summary { cursor: pointer; }
+.relay-inline-form { display: inline; margin: 0; }
+.relay-inline-form button { width: auto; }
+.relay-source-form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); align-items: end; margin: 10px 0; }
+.relay-source-form p, .relay-source-form button { grid-column: 1 / -1; }
+.relay-source-form button { justify-self: start; width: auto; }
+</style>`;
+
+const RELAY_WINDOW_LABELS = { '15m': ['relay-window-15m', '15 min'], '1h': ['relay-window-1h', '1 hour'], '24h': ['relay-window-24h', '24 hours'] };
+
+/** A source's prices on one line, or what stands in for them. */
+function relaySourcePrice(source, catalogRow) {
+  const row = source.price ?? (source.kind === 'platform' ? catalogRow : null);
+  if (!row || row.input_usd_per_m === null || row.input_usd_per_m === undefined) {
+    return '<span data-i18n="relay-src-unpriced">no price set</span>';
+  }
+  if (!row.input_usd_per_m && !row.output_usd_per_m && !row.cached_input_usd_per_m) {
+    return '<span data-i18n="relay-src-free">no charge</span>';
+  }
+  return `<span data-i18n="relay-input">Input</span> ${perMillion(row.input_usd_per_m)} · <span data-i18n="relay-output">Output</span> ${perMillion(row.output_usd_per_m)} · <span data-i18n="relay-cached">Cached input</span> ${perMillion(row.cached_input_usd_per_m)}${source.price ? '' : ' <span data-i18n="relay-src-list-price">(platform list price)</span>'}`;
+}
+
+/** The speed, failure and spend table of one group of sources. */
+function relaySourceTable(rows, { nowMs, catalogRow, windowTotal }) {
+  const body = rows.map((row) => {
+    const { source, state } = row;
+    const badges = [];
+    if (state) {
+      if (!state.enabled) badges.push('<span class="badge unavailable" data-i18n="relay-src-disabled">switched off</span>');
+      else if (!state.configured) badges.push('<span class="badge unhealthy" data-i18n="relay-src-unconfigured">not configured</span>');
+      else if (state.balance_low) badges.push('<span class="badge login_required" data-i18n="relay-src-balance-low">below its balance line</span>');
+      else if (state.cooling_until_ms) {
+        const failure = state.last_failure;
+        const why = failure ? escapeHtml(String(failure.status ?? failure.reason ?? '')) : '';
+        badges.push(`<span class="badge pending"><span data-i18n="relay-src-cooling" style="margin-left:0">resting after a failure</span><span>${why ? `${why} · ` : ''}${compactDuration(state.cooling_until_ms - nowMs)}</span></span>`);
+      } else if (row.first) badges.push('<span class="badge healthy" data-i18n="relay-src-first">first choice now</span>');
+      else badges.push('<span class="badge stored" data-i18n="relay-src-standby">standby</span>');
+    } else {
+      badges.push('<span class="badge" data-i18n="relay-src-unchained">not in a chain</span>');
+    }
+    const where = source
+      ? `<div class="muted tiny">${source.kind === 'platform' ? '<span data-i18n="relay-src-kind-platform">platform</span>' : escapeHtml(source.base_url ?? '')} · <code>${escapeHtml(source.upstream_model)}</code></div>
+         <div class="muted tiny">${relaySourcePrice(source, catalogRow(source.upstream_model))}</div>`
+      : '';
+    const statuses = Object.entries(row.failure_statuses ?? {})
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 4)
+      .map(([status, count]) => `${Number(status) >= 300 ? escapeHtml(status) : '<span data-i18n="relay-src-stream-broken">cut off</span>'}×${count}`)
+      .join(' ');
+    const balance = row.balance
+      ? `<strong>${usdWhole(row.balance.remaining_usd)}</strong>
+         ${row.balance.hours_left === null ? '' : `<div class="muted tiny"><span data-i18n="relay-src-runs-out">runs out in about</span> ${compactDuration(row.balance.hours_left * 3_600_000)} <span class="muted">(${usd(row.balance.burn_usd_per_hour)}/h${row.balance.burn_estimated ? ' <span data-i18n="relay-src-estimated">est.</span>' : ''})</span></div>`}
+         ${row.balance.line_usd === null ? '' : `<div class="muted tiny"><span data-i18n="relay-src-line">stops at</span> ${usdWhole(row.balance.line_usd)}${row.balance.hours_to_line === null ? '' : ` · ${compactDuration(row.balance.hours_to_line * 3_600_000)}`}</div>`}`
+      : '—';
+    // One element per cell: on a narrow screen a cell is a label beside its content.
+    return `<tr${state && !state.enabled ? ' class="relay-source-off"' : ''}>
+      <td><div>${row.order ? `<span class="relay-order">${row.order}</span> ` : ''}<strong>${escapeHtml(row.name)}</strong> ${badges.join(' ')}${where}</div></td>
+      <td><div>${row.requests.toLocaleString('en-US')}</div></td>
+      <td><div>${row.requests ? `${relayShare(row.error_rate)}${row.failures ? ` <span class="muted tiny">(${row.failures})</span><div class="muted tiny relay-statuses">${statuses}</div>` : ''}` : '—'}</div></td>
+      <td><div>${relayLatency(row.ttfb_p50_ms)} <span class="muted">/ ${relayLatency(row.ttfb_p90_ms)}</span></div></td>
+      <td><div>${relayLatency(row.duration_p50_ms)} <span class="muted">/ ${relayLatency(row.duration_p90_ms)}</span></div></td>
+      <td><div>${row.output_tokens_per_s === null ? '—' : `${row.output_tokens_per_s < 10 ? row.output_tokens_per_s.toFixed(1) : Math.round(row.output_tokens_per_s)}`}</div></td>
+      <td><div>${row.usd_per_hour === null ? (row.requests ? '<span class="muted tiny" data-i18n="relay-src-unpriced">no price set</span>' : '—') : `${usd(row.usd_per_hour)}/h${windowTotal ? `<div class="muted tiny"><span data-i18n="relay-src-window-total">in all</span> ${usd(row.cost_usd)}</div>` : ''}`}</div></td>
+      <td><div>${balance}</div></td>
+    </tr>`;
+  }).join('');
+  return `<div class="table-wrap"><table class="relay-sources">
+    <thead><tr><th data-i18n="relay-src-source">Source</th><th data-i18n="relay-requests">Requests</th><th data-i18n="relay-src-errors">Failed</th><th data-i18n="relay-src-ttfb">First byte p50 / p90</th><th data-i18n="relay-src-duration">Whole turn p50 / p90</th><th data-i18n="relay-src-speed">Output tok/s</th><th data-i18n="relay-src-rate">Est. spend</th><th data-i18n="relay-src-balance">Balance</th></tr></thead>
+    <tbody>${body}</tbody>
+  </table></div>`;
+}
+
+/** The form that adds a source to a chain or changes one. */
+function relaySourceForm({ csrf, chain, source = null }) {
+  const value = (text) => escapeHtml(text === null || text === undefined ? '' : String(text));
+  return `<form method="post" action="/relay/chain/source" class="relay-source-form" autocomplete="off">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <input type="hidden" name="op" value="save">
+      <input type="hidden" name="model" value="${escapeHtml(chain.model)}">
+      ${source ? `<input type="hidden" name="source_id" value="${escapeHtml(source.id)}">` : ''}
+      <label><span data-i18n="relay-src-name">Source name</span>
+        <input name="name" required maxlength="32" pattern="[a-z0-9][a-z0-9._\\-]{0,31}" value="${value(source?.name)}" placeholder="tensoris"></label>
+      <label><span data-i18n="relay-src-kind">Where it goes</span>
+        <select name="kind">
+          <option value="endpoint"${source?.kind === 'platform' ? '' : ' selected'} data-i18n="relay-src-kind-endpoint">Its own address and key</option>
+          <option value="platform"${source?.kind === 'platform' ? ' selected' : ''} data-i18n="relay-src-kind-platform-long">The platform configured on this page</option>
+        </select></label>
+      <label><span data-i18n="relay-src-upstream">Model name at the source</span>
+        <input name="upstream_model" required maxlength="128" value="${value(source?.upstream_model)}" placeholder="deepseek-v4-flash"></label>
+      <label><span data-i18n="relay-src-url">Address (own address only)</span>
+        <input name="base_url" maxlength="300" value="${value(source?.base_url)}" placeholder="https://example.com/v1"></label>
+      <label><span data-i18n="${source?.has_key ? 'relay-src-key-keep' : 'relay-src-key'}">${source?.has_key ? 'API key (leave empty to keep the stored one)' : 'API key (own address only; empty if it needs none)'}</span>
+        <input name="api_key" type="password" autocomplete="off" maxlength="512"></label>
+      <label><span data-i18n="relay-src-price-in">Input price, $ per million tokens</span>
+        <input name="input_usd_per_m" inputmode="decimal" maxlength="14" value="${value(source?.price?.input_usd_per_m)}"></label>
+      <label><span data-i18n="relay-src-price-out">Output price, $ per million tokens</span>
+        <input name="output_usd_per_m" inputmode="decimal" maxlength="14" value="${value(source?.price?.output_usd_per_m)}"></label>
+      <label><span data-i18n="relay-src-price-cached">Cached-input price, $ per million tokens</span>
+        <input name="cached_input_usd_per_m" inputmode="decimal" maxlength="14" value="${value(source?.price?.cached_input_usd_per_m)}"></label>
+      <label><span data-i18n="relay-src-wait">Seconds to wait for a first byte before trying the next source</span>
+        <input name="first_byte_timeout_s" inputmode="numeric" maxlength="3" value="${value(source?.first_byte_timeout_s ?? 60)}"></label>
+      <label><span data-i18n="relay-src-min-balance">Stop using it when the platform key has less than this many dollars left (platform only)</span>
+        <input name="min_balance_usd" inputmode="decimal" maxlength="14" value="${value(source?.min_balance_usd)}"></label>
+      <p class="muted tiny" data-i18n="relay-src-price-hint">Prices are only for the estimates on this page. Leave all three empty to use the platform's list price (platform) or to leave the source unpriced; enter 0 for a source that costs nothing.</p>
+      <button type="submit" data-i18n="relay-save">Save</button>
+    </form>`;
+}
+
+/** Where the chains are set up: names, sources, their order. */
+function relayChainSettings({ chains, csrf, open, error }) {
+  const post = (action, fields, button, confirm = null) => `<form method="post" action="${action}" class="relay-inline-form"${confirm ? ` data-confirm="${escapeHtml(confirm)}"` : ''}>
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      ${Object.entries(fields).map(([name, value]) => `<input type="hidden" name="${name}" value="${escapeHtml(value)}">`).join('')}
+      ${button}
+    </form>`;
+  const chainBlocks = chains.map((chain) => {
+    const sources = chain.sources.map((source, index) => {
+      const target = { model: chain.model, source_id: source.id };
+      return `<li class="relay-chain-source${source.enabled ? '' : ' relay-source-off'}">
+        <div class="relay-chain-source-head">
+          <span class="relay-order">${index + 1}</span>
+          <strong>${escapeHtml(source.name)}</strong>
+          ${source.enabled ? '' : '<span class="badge unavailable" data-i18n="relay-src-disabled">switched off</span>'}
+          <span class="muted tiny">${source.kind === 'platform' ? '<span data-i18n="relay-src-kind-platform">platform</span>' : escapeHtml(source.base_url ?? '')} · <code>${escapeHtml(source.upstream_model)}</code>${source.kind === 'endpoint' ? ` · <span data-i18n="${source.has_key ? 'relay-src-has-key' : 'relay-src-no-key'}">${source.has_key ? 'key stored' : 'no key'}</span>` : ''}${source.min_balance_usd === null ? '' : ` · <span data-i18n="relay-src-line">stops at</span> ${usdWhole(source.min_balance_usd)}`}</span>
+          <span class="relay-chain-actions">
+            ${post('/relay/chain/source', { ...target, op: 'up' }, `<button type="submit" class="secondary tiny"${index === 0 ? ' disabled' : ''} data-i18n="relay-src-up">Earlier</button>`)}
+            ${post('/relay/chain/source', { ...target, op: 'down' }, `<button type="submit" class="secondary tiny"${index === chain.sources.length - 1 ? ' disabled' : ''} data-i18n="relay-src-down">Later</button>`)}
+            ${post('/relay/chain/source', { ...target, op: source.enabled ? 'disable' : 'enable' }, `<button type="submit" class="secondary tiny" data-i18n="${source.enabled ? 'relay-src-switch-off' : 'relay-src-switch-on'}">${source.enabled ? 'Switch off' : 'Switch on'}</button>`)}
+            ${post('/relay/chain/source', { ...target, op: 'delete' }, '<button type="submit" class="danger tiny" data-i18n="relay-src-remove">Remove</button>', `Remove source ${source.name} from ${chain.model}?\n\nIts address and stored key are deleted with it.`)}
+          </span>
+        </div>
+        <details><summary data-i18n="relay-src-edit">Change</summary>${relaySourceForm({ csrf, chain, source })}</details>
+      </li>`;
+    }).join('');
+    return `<section class="relay-chain">
+      <h3><code>${escapeHtml(chain.model)}</code>${chain.aliases.length ? ` <span class="muted tiny"><span data-i18n="relay-chain-also">also answers to</span> ${chain.aliases.map((alias) => `<code>${escapeHtml(alias)}</code>`).join(' ')}</span>` : ''}</h3>
+      ${chain.sources.length ? `<ol class="relay-chain-sources">${sources}</ol>` : '<p class="muted" data-i18n="relay-chain-empty">No source yet: the chain does nothing until it has one.</p>'}
+      <details><summary data-i18n="relay-src-add">Add a source</summary>${relaySourceForm({ csrf, chain })}</details>
+      <details><summary data-i18n="relay-chain-rename">Names</summary>
+        <form method="post" action="/relay/chain" class="stack" autocomplete="off">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <input type="hidden" name="op" value="save">
+          <input type="hidden" name="previous_model" value="${escapeHtml(chain.model)}">
+          <label><span data-i18n="relay-chain-model">Model name clients use</span>
+            <input name="model" required maxlength="128" value="${escapeHtml(chain.model)}"></label>
+          <label><span data-i18n="relay-chain-aliases">Other names for the same model (space separated)</span>
+            <input name="aliases" maxlength="1200" value="${escapeHtml(chain.aliases.join(' '))}"></label>
+          <button type="submit" data-i18n="relay-save">Save</button>
+        </form>
+        ${post('/relay/chain', { op: 'delete', model: chain.model }, '<button type="submit" class="danger" data-i18n="relay-chain-delete">Delete this chain</button>', `Delete the chain ${chain.model} and its ${chain.sources.length} source(s)?\n\nThe name goes back to the allowed list and the platform.`)}
+      </details>
+    </section>`;
+  }).join('');
+  return `<article class="card" id="relay-chains">
+      <details${open ? ' open' : ''}>
+        <summary data-i18n="relay-chains-heading">Source chains: one model from several sources</summary>
+        <p class="muted tiny" data-i18n="relay-chains-hint">A chain gives a model one name and an ordered list of sources. Every turn goes to the first source that is switched on, configured and above its balance line; if that source fails before answering, it is rested for a while and the turn is retried on the next. A conversation moved to a later source stays there for 30 minutes. A chain's name takes precedence over the allowed list above.</p>
+        ${open && error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+        ${chainBlocks}
+        <details${chains.length ? '' : ' open'}><summary data-i18n="relay-chain-new">New chain</summary>
+          <form method="post" action="/relay/chain" class="stack" autocomplete="off">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+            <input type="hidden" name="op" value="save">
+            <label><span data-i18n="relay-chain-model">Model name clients use</span>
+              <input name="model" required maxlength="128" placeholder="deepseek-v4-flash"></label>
+            <label><span data-i18n="relay-chain-aliases">Other names for the same model (space separated)</span>
+              <input name="aliases" maxlength="1200" placeholder="DeepSeek-V4.1-Flash"></label>
+            <button type="submit" data-i18n="relay-chain-create">Create</button>
+          </form>
+        </details>
+      </details>
+    </article>`;
+}
+
 /**
  * The third-party models page: what the platform offers and at what price,
- * which models members may use and how, and what they have spent.
+ * which models members may use and how, how each source is doing, and what
+ * has been spent.
  */
 export function relayView({
   settings,
   catalog,
+  chains = [],
+  sources = null,
   spend = null,
   csrf,
   gatewayBaseUrl,
   query = '',
   vendor = '',
   error = null,
+  chainsOpen = false,
+  nowMs = Date.now(),
   openMode = false,
 }) {
   const rows = catalog?.rows ?? [];
@@ -6359,24 +6576,29 @@ export function relayView({
       python: openai || types.includes('openai-response'),
     };
   };
+  /** A model the platform charges more for at some hours: by how much, and whether now. */
+  const peakBadge = (row) => {
+    if (!row || !(row.peak_multiplier > 1)) return '';
+    const times = `×${Number(row.peak_multiplier.toFixed(2))}`;
+    return relayPriceMultiplier(row, nowMs) > 1.001
+      ? ` <span class="badge unhealthy"><span data-i18n="relay-peak-now" style="margin-left:0">peak price in effect</span><span>${times}</span></span>`
+      : ` <span class="badge pending"><span data-i18n="relay-peak" style="margin-left:0">peak hours</span><span>${times}</span></span>`;
+  };
   const allowForm = (model, allow) => `<form method="post" action="/relay/models" class="inline">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
       <input type="hidden" name="model" value="${escapeHtml(model)}">
       <input type="hidden" name="op" value="${allow ? 'allow' : 'disallow'}">
       <button type="submit" class="${allow ? 'secondary' : 'danger'}" data-i18n="${allow ? 'relay-allow' : 'relay-disallow'}">${allow ? 'Allow' : 'Stop'}</button>
     </form>`;
-
-  const allowedCards = allowed.length ? allowed.map((model) => {
-    const row = byModel.get(model);
+  const usageCard = (model, { row, head, price }) => {
     const can = supports(row);
     const python = `from openai import OpenAI\n\nclient = OpenAI(\n    api_key=open(TOKEN_FILE).read().strip(),  # your device token\n    base_url="${relayBase}",\n)\nreply = client.chat.completions.create(\n    model="${model}",\n    messages=[{"role": "user", "content": "你好"}],\n)\nprint(reply.choices[0].message.content)`;
     return `<article class="card relay-model">
       <div class="relay-model-head">
         <h3><code>${escapeHtml(model)}</code></h3>
-        <div class="muted tiny">${escapeHtml(row?.vendor ?? '')}</div>
-        ${allowForm(model, false)}
+        ${head}
       </div>
-      <div class="relay-price"><span data-i18n="relay-input">Input</span> ${perMillion(row?.input_usd_per_m)} · <span data-i18n="relay-output">Output</span> ${perMillion(row?.output_usd_per_m)} · <span data-i18n="relay-cached">Cached input</span> ${perMillion(row?.cached_input_usd_per_m)} <span class="muted tiny" data-i18n="relay-per-million">per million tokens</span>${row?.placeholder ? ' <span class="badge unhealthy" data-i18n="relay-placeholder">placeholder price</span>' : ''}</div>
+      <div class="relay-price">${price}</div>
       <div class="relay-usage">
         <div><strong>Claude Code</strong> ${can.claude ? '' : '<span class="muted tiny" data-i18n="relay-unsupported">not supported</span>'}
           ${can.claude ? `<pre>claude --model ${escapeHtml(model)}</pre><div class="muted tiny" data-i18n="relay-claude-hint">Any device already on the gateway. Inside a session: /model ${escapeHtml(model)}</div>` : ''}</div>
@@ -6386,16 +6608,57 @@ export function relayView({
           <pre>${escapeHtml(python)}</pre><div class="muted tiny" data-i18n="relay-python-hint">Any device token works (the .token file the installer wrote). Base URL ends in /relay/v1; /chat/completions, /responses and /messages are all available.</div></div>
       </div>
     </article>`;
-  }).join('') : '<p class="muted" data-i18n="relay-none-allowed">No model is allowed yet. Pick one in the catalog below.</p>';
+  };
+
+  // A chain's name is usable whether or not it is on the allowed list, so it
+  // is shown once, as a chain.
+  const liveChains = chains.filter((chain) => chain.sources.some((source) => source.enabled));
+  const chained = new Set(liveChains.flatMap((chain) => [chain.model, ...chain.aliases]));
+  const chainCards = liveChains.map((chain) => usageCard(chain.model, {
+    row: null,
+    head: `<div class="muted tiny">${chain.aliases.length ? `<span data-i18n="relay-chain-also">also answers to</span> ${chain.aliases.map((alias) => `<code>${escapeHtml(alias)}</code>`).join(' ')} · ` : ''}<span data-i18n="relay-chain-served">served by</span> ${chain.sources.filter((source) => source.enabled).map((source) => escapeHtml(source.name)).join(' → ')}</div>`,
+    price: '<span class="muted tiny" data-i18n="relay-chain-price">Priced by whichever source serves the turn; see the sources table above.</span>',
+  }));
+  const allowedCards = allowed.filter((model) => !chained.has(model)).map((model) => {
+    const row = byModel.get(model);
+    return usageCard(model, {
+      row,
+      head: `<div class="muted tiny">${escapeHtml(row?.vendor ?? '')}</div>${allowForm(model, false)}`,
+      price: `<span data-i18n="relay-input">Input</span> ${perMillion(row?.input_usd_per_m)} · <span data-i18n="relay-output">Output</span> ${perMillion(row?.output_usd_per_m)} · <span data-i18n="relay-cached">Cached input</span> ${perMillion(row?.cached_input_usd_per_m)} <span class="muted tiny" data-i18n="relay-per-million">per million tokens</span>${row?.placeholder ? ' <span class="badge unhealthy" data-i18n="relay-placeholder">placeholder price</span>' : ''}${peakBadge(row)}`,
+    });
+  });
+  const modelCards = [...chainCards, ...allowedCards].join('')
+    || '<p class="muted" data-i18n="relay-none-allowed">No model is allowed yet. Pick one in the catalog below.</p>';
+
+  const sourcesSection = sources && (sources.chains.length || sources.others.length) ? (() => {
+    // Over an hour the total is the hourly rate; only the other windows need both.
+    const context = { nowMs, catalogRow: (model) => byModel.get(model) ?? null, windowTotal: sources.window !== '1h' };
+    const windows = Object.entries(RELAY_WINDOW_LABELS).map(([key, [i18n, label]]) => `<a href="/relay?window=${key}#relay-sources" class="relay-window${key === sources.window ? ' active' : ''}"${key === sources.window ? ' aria-current="true"' : ''} data-i18n="${i18n}">${label}</a>`).join('');
+    const chainTables = sources.chains.map((chain) => `<h3><code>${escapeHtml(chain.model)}</code>${chain.aliases.length ? ` <span class="muted tiny"><span data-i18n="relay-chain-also">also answers to</span> ${chain.aliases.map((alias) => `<code>${escapeHtml(alias)}</code>`).join(' ')}</span>` : ''}</h3>
+      ${chain.sources.length ? relaySourceTable(chain.sources, context) : '<p class="muted" data-i18n="relay-chain-empty">No source yet: the chain does nothing until it has one.</p>'}`).join('');
+    return `<article class="card" id="relay-sources">
+      <div class="relay-sources-head">
+        <h2 data-i18n="relay-sources-heading">Sources: speed and spend</h2>
+        <nav class="relay-windows" aria-label="Window">${windows}</nav>
+      </div>
+      <p class="muted tiny" data-i18n="relay-sources-hint">Measured from the turns that actually went through this gateway; nothing probes a source, so a source nobody used shows no figures. First byte is the wait for the response to begin, whole turn is until it ends, output speed is the median of streamed turns. Spend is estimated from recorded tokens at each source's price; balance is the platform key's own reading.</p>
+      ${chainTables}
+      ${sources.others.length ? `${sources.chains.length ? '<h3 data-i18n="relay-sources-other">Sources outside any chain</h3>' : ''}${relaySourceTable(sources.others, context)}` : ''}
+      <p class="muted tiny">${sources.at_ms ? `<span data-i18n="relay-sources-read">Figures read</span> ${escapeHtml(dateText(new Date(sources.at_ms).toISOString()))}` : '<span data-i18n="relay-sources-unread">No figures could be read yet.</span>'}</p>
+    </article>`;
+  })() : '';
 
   const spendSection = spend ? (() => {
-    const modelRows = spend.models.map((entry) => `<tr><td><code>${escapeHtml(entry.model ?? '—')}</code></td><td>${entry.requestCount}</td><td>${tokenCount(entry.inputTokens)}</td><td>${tokenCount(entry.outputTokens)}</td><td>${usd(entry.costUsd)}</td></tr>`).join('');
-    const deviceRows = spend.devices.map((entry) => `<tr><td>${escapeHtml(entry.label)}</td><td><code>${escapeHtml(entry.model ?? '—')}</code></td><td>${entry.requestCount}</td><td>${tokenCount(entry.inputTokens)}</td><td>${tokenCount(entry.outputTokens)}</td><td>${usd(entry.costUsd)}</td></tr>`).join('');
+    const cells = (entry) => `<td>${entry.requestCount.toLocaleString('en-US')}</td><td>${tokenCount(entry.inputTokens)}</td><td>${tokenCount(entry.cachedTokens)}</td><td>${tokenCount(entry.outputTokens)}</td><td>${usd(entry.costUsd)}</td>`;
+    const modelRows = spend.models.map((entry) => `<tr><td><code>${escapeHtml(entry.model ?? '—')}</code></td>${cells(entry)}</tr>`).join('');
+    const deviceRows = spend.devices.map((entry) => `<tr><td>${escapeHtml(entry.label)}</td><td><code>${escapeHtml(entry.model ?? '—')}</code></td>${cells(entry)}</tr>`).join('');
+    const heads = '<th data-i18n="relay-requests">Requests</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-cached">Cached input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cost">Est. cost</th>';
     return `<article class="card">
       <h2 data-i18n="relay-spend-heading">Spend through the gateway</h2>
-      <p class="muted tiny"><span data-i18n="relay-spend-window">Last 30 days, estimated from recorded tokens × the catalog price.</span> <span data-i18n="relay-spend-total">Total</span>: <strong>${usd(spend.totalUsd)}</strong></p>
-      ${spend.models.length ? `<div class="table-wrap"><table><thead><tr><th data-i18n="relay-model">Model</th><th data-i18n="relay-requests">Requests</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cost">Est. cost</th></tr></thead><tbody>${modelRows}</tbody></table></div>
-      <div class="table-wrap"><table><thead><tr><th data-i18n="relay-device">Device</th><th data-i18n="relay-model">Model</th><th data-i18n="relay-requests">Requests</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cost">Est. cost</th></tr></thead><tbody>${deviceRows}</tbody></table></div>`
+      <p class="muted tiny"><span data-i18n="relay-spend-window">Last 30 days, estimated from recorded tokens at the price of the source that served each turn: cached input at its own price, peak hours at theirs.</span> <span data-i18n="relay-spend-total">Total</span>: <strong>${usd(spend.totalUsd)}</strong></p>
+      ${spend.models.length ? `<div class="table-wrap"><table><thead><tr><th data-i18n="relay-model">Model</th>${heads}</tr></thead><tbody>${modelRows}</tbody></table></div>
+      <details class="relay-spend-devices"><summary><span data-i18n="relay-spend-by-device">By device</span> <span class="muted tiny">(${spend.devices.length})</span></summary>
+      <div class="table-wrap"><table><thead><tr><th data-i18n="relay-device">Device</th><th data-i18n="relay-model">Model</th>${heads}</tr></thead><tbody>${deviceRows}</tbody></table></div></details>`
         : '<p class="muted" data-i18n="relay-spend-none">No third-party turns yet.</p>'}
     </article>`;
   })() : '';
@@ -6410,7 +6673,7 @@ export function relayView({
       ? `<td colspan="3">${usd(row.per_call_usd, 4)} <span class="muted tiny" data-i18n="relay-per-call">per call</span></td>`
       : `<td>${perMillion(row.input_usd_per_m)}</td><td>${perMillion(row.output_usd_per_m)}</td><td>${perMillion(row.cached_input_usd_per_m)}</td>`;
     return `<tr class="${isAllowed ? 'relay-allowed' : ''}${row.placeholder ? ' relay-placeholder' : ''}">
-      <td><code>${escapeHtml(row.model)}</code>${isAllowed ? ' <span class="badge healthy" data-i18n="relay-allowed-badge">allowed</span>' : ''}${row.placeholder ? ' <span class="badge unhealthy" data-i18n="relay-placeholder">placeholder price</span>' : ''}</td>
+      <td><code>${escapeHtml(row.model)}</code>${isAllowed ? ' <span class="badge healthy" data-i18n="relay-allowed-badge">allowed</span>' : ''}${row.placeholder ? ' <span class="badge unhealthy" data-i18n="relay-placeholder">placeholder price</span>' : ''}${peakBadge(row)}</td>
       <td>${escapeHtml(row.vendor || '—')}</td>
       ${price}
       <td class="muted tiny">${escapeHtml(row.endpoints.join(' / '))}</td>
@@ -6430,24 +6693,27 @@ export function relayView({
     </form>`;
 
   return layout('Third-party models', `
+    ${RELAY_SOURCE_STYLES}
     <section class="stack" data-relay-page>
       <article class="card">
         <h1 data-i18n="relay-heading">Third-party models</h1>
         <p class="muted" data-i18n="relay-intro">Models from another provider, run through this gateway with the device you already have. Only the models allowed here can be used; every turn is billed to the shared platform key and recorded below.</p>
-        ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+        ${error && !chainsOpen ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
         ${settings.base_url ? `<p><span data-i18n="relay-platform">Platform</span>: <strong>${escapeHtml(settings.name ?? '')}</strong> <span class="muted tiny">${escapeHtml(settings.base_url)}</span></p>` : '<div class="notice" data-i18n="relay-not-configured">No platform is configured yet. Fill in the settings at the bottom of this page.</div>'}
         ${plaintext ? '<div class="notice error" data-i18n="relay-plaintext">This platform is reached over plain HTTP: the platform key and every prompt cross the internet unencrypted between this server and the platform. Do not send anything sensitive.</div>' : ''}
-        ${balance ? `<p><span data-i18n="relay-balance">Platform key spend</span>: <strong>${usd(balance.used_usd)}</strong> / ${usd(balance.limit_usd, 0)} <span class="muted tiny">(${escapeHtml(dateText(balance.fetched_at))})</span></p>` : ''}
+        ${balance ? `<p><span data-i18n="relay-balance">Platform key spend</span>: <strong>${usd(balance.used_usd)}</strong> / ${usd(balance.limit_usd, 0)}${Number.isFinite(balance.remaining_usd) ? ` · <span data-i18n="relay-balance-left">left</span> <strong>${usdWhole(balance.remaining_usd)}</strong>` : ''} <span class="muted tiny">(${escapeHtml(dateText(balance.fetched_at))})</span></p>` : ''}
         ${catalog?.error && catalog.error !== 'not_configured' ? `<div class="notice error"><span data-i18n="relay-catalog-error">The price list could not be refreshed</span>: ${escapeHtml(catalog.error)}</div>` : ''}
       </article>
+      ${sourcesSection}
       <article class="card">
         <h2 data-i18n="relay-allowed-heading">Allowed models</h2>
-        <div class="relay-models">${allowedCards}</div>
+        <div class="relay-models">${modelCards}</div>
       </article>
       ${spendSection}
+      ${relayChainSettings({ chains, csrf, open: chainsOpen, error })}
       <article class="card">
         <h2><span data-i18n="relay-catalog-heading">All models on the platform</span> <span class="muted tiny">(${shown.length}/${rows.length})</span></h2>
-        <p class="muted tiny" data-i18n="relay-catalog-hint">Dollars per million tokens, from the platform's own price list at the cheapest group it offers the model in. A placeholder price is the platform's default for a model it has not priced; what it actually bills may differ.</p>
+        <p class="muted tiny" data-i18n="relay-catalog-hint">Dollars per million tokens, from the platform's own price list at the cheapest group it offers the model in. A placeholder price is the platform's default for a model it has not priced; what it actually bills may differ. A model marked with peak hours is billed that many times more during them; the table shows the off-peak price.</p>
         <form method="get" action="/relay" class="relay-filter">
           <input name="q" value="${escapeHtml(query)}" placeholder="deepseek, kimi, glm…" aria-label="Search models">
           <select name="vendor" aria-label="Vendor"><option value="" data-i18n="relay-all-vendors">All vendors</option>${vendors.map((name) => `<option value="${escapeHtml(name)}"${name === vendor ? ' selected' : ''}>${escapeHtml(name)}</option>`).join('')}</select>

@@ -20,6 +20,12 @@ try {
   parentPort.close();
 }
 
+const QUERIES = new Map([
+  ['query', (message) => queryMetricsDataset(store, message.filters ?? {})],
+  ['api-spend', (message) => store.queryApiSpendGroups(message.params ?? {})],
+  ['relay-stats', (message) => store.queryRelayStats(message.params ?? {})],
+]);
+
 if (store) {
   parentPort.on('message', (message) => {
     if (message?.type === 'close') {
@@ -27,15 +33,10 @@ if (store) {
       parentPort.close();
       return;
     }
-    if (!['query', 'api-spend'].includes(message?.type) || !Number.isSafeInteger(message.id)) return;
+    const run = QUERIES.get(message?.type);
+    if (!run || !Number.isSafeInteger(message.id)) return;
     try {
-      parentPort.postMessage({
-        type: 'result',
-        id: message.id,
-        dataset: message.type === 'api-spend'
-          ? store.queryApiSpendGroups(message.params ?? {})
-          : queryMetricsDataset(store, message.filters ?? {}),
-      });
+      parentPort.postMessage({ type: 'result', id: message.id, dataset: run(message) });
     } catch (error) {
       parentPort.postMessage({
         type: 'error',
