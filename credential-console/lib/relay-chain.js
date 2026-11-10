@@ -349,6 +349,34 @@ export function planRelaySources(usable, { health, pinnedId = null }) {
 export const RELAY_THINKING_REFUSAL = /thinking|reasoning/i;
 
 /**
+ * The same request with an empty block of reasoning at the head of every
+ * assistant turn that has none, or null when no turn lacks one.
+ *
+ * A source may leave reasoning out of what it streams. Its turns then reach
+ * the next source of the chain with nothing to pass back, and a source that
+ * insists on it is content with an empty block. The turn runs with reasoning
+ * still on, where dropping it switches reasoning off for the rest of the
+ * tool loop: each answer given without reasoning is one more turn that lacks
+ * it. Only the Messages protocol has such a block.
+ */
+export function relayRequestWithThinkingRestored(kind, parsed) {
+  if (kind !== 'messages' || !parsed || typeof parsed !== 'object' || !Array.isArray(parsed.messages)) return null;
+  if (parsed.thinking?.type === 'disabled') return null;
+  let restored = false;
+  const messages = parsed.messages.map((message) => {
+    if (message?.role !== 'assistant') return message;
+    const content = typeof message.content === 'string' && message.content
+      ? [{ type: 'text', text: message.content }]
+      : message.content;
+    if (!Array.isArray(content) || content.length === 0) return message;
+    if (content.some((block) => ['thinking', 'redacted_thinking'].includes(block?.type))) return message;
+    restored = true;
+    return { ...message, content: [{ type: 'thinking', thinking: '', signature: '' }, ...content] };
+  });
+  return restored ? { ...parsed, messages } : null;
+}
+
+/**
  * The same request with reasoning switched off and no reasoning left in its
  * history, or null when there was nothing to change.
  *
