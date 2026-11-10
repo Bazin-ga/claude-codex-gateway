@@ -46,6 +46,7 @@ import {
 } from './account-failover.js';
 import { createCodexResponseContentAssembler } from './codex-response-content.js';
 import { codexTurnMetadata, extractCodexPromptCandidate } from './codex-prompt-capture.js';
+import { chargeGuestRequest, guestBudgetMessage, isGuestDevice } from './guest-keys.js';
 import {
   AUTH_FAILURE_LIMIT,
   CONVERSATION_PREFIX_BYTES,
@@ -223,7 +224,7 @@ export async function handleCodexProxy(req, res, {
   const upstreamPath = requestUrl.pathname.slice(CODEX_PROXY_PREFIX.length);
 
   const token = deviceToken(req);
-  const device = token ? store.deviceByToken(token) : null;
+  const device = token ? store.deviceByToken(token, 'codex') : null;
   if (!device) {
     const ip = sourceIp(req);
     if (rateLimited(authFailures, ip, AUTH_FAILURE_LIMIT)) {
@@ -320,8 +321,35 @@ export async function handleCodexProxy(req, res, {
   // A turn naming an allowed third-party model goes to that platform instead
   // of to this account; any other turn carries on, with the bytes read to find
   // out put back in front of the body by the gate code below.
+  // A guest key is an allowance on the subscription accounts only: its turns
+  // are never handed to a third-party platform, and once the allowance is
+  // spent inference is refused here, before the body is read or anything is
+  // sent. 403 with a message, since the CLI replaces a 429's with its own.
+  const guestDevice = isGuestDevice(device);
+  if (guestDevice && inferenceRequest) {
+    const budget = typeof store.guestKeyBudget === 'function' ? store.guestKeyBudget(device) : null;
+    if (!budget || budget.exhausted) {
+      log('codex_proxy_guest_budget_exhausted', {
+        account_id: account.id,
+        device_id: device.id,
+        guest_key_id: device.guest_key_id,
+        spent_micro_usd: budget?.spentMicroUsd ?? null,
+        budget_micro_usd: budget?.budgetMicroUsd ?? null,
+      });
+      recordRejected(403, 'guest_budget_exhausted');
+      refuseAfterDraining(req, res, () => {
+        sendJson(res, 403, errorBody('permission_error', guestBudgetMessage({
+          name: budget?.name ?? device.name,
+          budgetMicroUsd: budget?.budgetMicroUsd ?? 0,
+          revoked: !budget || budget.revoked,
+        })), { 'x-gateway-guest-budget': 'exhausted', Connection: 'close' });
+      }, { limitBytes: MAX_REQUEST_BYTES });
+      return;
+    }
+  }
+
   let relayPrefix = null;
-  if (relay && inferenceRequest) {
+  if (relay && inferenceRequest && !guestDevice) {
     const relayed = await relay.intercept(req, res, { device, kind: 'responses', path: upstreamPath });
     if (relayed.handled) return;
     relayPrefix = relayed.prefix;
@@ -702,6 +730,8 @@ export async function handleCodexProxy(req, res, {
   // the head and would record the first model named. The one worth recording
   // is the one that got the body stopped.
   let gateRecordedModel = null;
+  // The usage parser of the answer being relayed, kept only for a guest key.
+  let guestUsageParser = null;
 
   const finalizeMetric = (outcome, statusCode = upstreamStatus) => {
     if (metricFinalized) return;
@@ -748,6 +778,18 @@ export async function handleCodexProxy(req, res, {
           code: error?.code ?? error?.name ?? 'unknown',
         });
       }
+    }
+    // A guest key pays for what was answered, at list price. A turn cut off
+    // before its terminal event reports no usage and is not charged.
+    if (guestUsageParser) {
+      chargeGuestRequest({
+        store,
+        device,
+        provider: 'codex',
+        model: gateRecordedModel ?? metadata.model ?? null,
+        parser: guestUsageParser,
+        log,
+      });
     }
     enqueueMetricSafely(requestMetrics, {
       startedAtMs,
@@ -836,9 +878,13 @@ export async function handleCodexProxy(req, res, {
       ? (responseUsageFormat(upstreamRes.headers['content-type']) ?? 'auto')
       : null;
     const observers = [];
-    if (responseFormat && requestMetrics?.enqueueRequest) {
+    guestUsageParser = null;
+    // Metering a guest key needs the usage whether or not metrics are recorded.
+    if (responseFormat && (requestMetrics?.enqueueRequest || guestDevice)) {
       try {
-        observers.push(usageObserver(codexUsageParserFactory({ format: responseFormat })));
+        const parser = codexUsageParserFactory({ format: responseFormat });
+        observers.push(usageObserver(parser));
+        if (guestDevice) guestUsageParser = parser;
       } catch (error) {
         log('codex_usage_parser_init_failed', {
           account_id: account.id,

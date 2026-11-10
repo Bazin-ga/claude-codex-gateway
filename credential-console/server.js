@@ -29,6 +29,7 @@ import { claudeQuotaSignal } from './lib/claude-quota-signal.js';
 import { normalizeClaudeReserve, reserveRestricts } from './lib/claude-reserve.js';
 import { applyFailoverEdit, quotaExhaustion, recheckExhaustedAccounts } from './lib/account-failover.js';
 import { isCodexApiKeyAccount, parseApiKeyModels } from './lib/codex-api-key.js';
+import { GUEST_PROVIDERS, parseUsdAmount } from './lib/guest-keys.js';
 import { OPENAI_LONG_CONTEXT_ABOVE, summarizeApiSpend } from './lib/openai-api-pricing.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
@@ -101,6 +102,8 @@ import {
   messageView,
   accountDeleteView,
   relayView,
+  guestsView,
+  guestKeyCreatedView,
   withRelayTab,
   withViewerChrome,
   codexAuthorizationView,
@@ -534,7 +537,11 @@ export async function createCredentialConsole(options = {}) {
   const stopBackgroundRefreshes = () => {
     clearInterval(apiSpendTimer);
     clearInterval(relayStatsTimer);
-    const recheckDrain = Promise.all([stopExhaustionRechecks(), apiSpendPromise, relayStats?.pending()]);
+    // Guest spend waits up to a second for its write; do not lose it to a restart.
+    const guestSpend = Promise.resolve(store.flushGuestSpend?.()).catch((error) => {
+      log('guest_spend_flush_failed', { code: error?.code ?? error?.name ?? 'unknown' });
+    });
+    const recheckDrain = Promise.all([stopExhaustionRechecks(), apiSpendPromise, relayStats?.pending(), guestSpend]);
     let usageDrain;
     try {
       usageDrain = Promise.resolve(usageMonitor.stop?.());
@@ -2195,6 +2202,86 @@ export async function createCredentialConsole(options = {}) {
         redirect(res, '/admin');
       } catch (error) {
         redirect(res, `/admin?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+
+    // Guest keys. Administrators only: none of these is a member route, so in
+    // password mode the gate above has already required an administrator.
+    if (req.method === 'GET' && path === '/guests') {
+      const session = requireSession(req, res);
+      if (!session) return;
+      sendHtml(res, 200, guestsView({
+        accounts: store.publicAccounts().filter((account) => (
+          GUEST_PROVIDERS.includes(account.provider) && !isCodexApiKeyAccount(account)
+        )),
+        keys: store.publicGuestKeys(),
+        csrf: session.csrf,
+        error: url.searchParams.get('error'),
+        openMode,
+      }));
+      return;
+    }
+    const guestTopUpParams = routeMatch(path, '/guests/:id/top-up');
+    const guestRevokeParams = routeMatch(path, '/guests/:id/revoke');
+    if (req.method === 'POST'
+      && (path === '/guests' || path === '/guests/pool' || guestTopUpParams || guestRevokeParams)) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const actor = actorFor(session);
+      try {
+        if (path === '/guests/pool') {
+          const account = await store.setAccountGuestPool(String(form.account_id ?? ''), {
+            enabled: form.enabled === '1',
+            actor,
+          });
+          log('account_guest_pool_updated', { account_id: account.id, enabled: form.enabled === '1', actor });
+          redirect(res, '/guests#guest-pool');
+        } else if (guestTopUpParams) {
+          const microUsd = parseUsdAmount(form.amount);
+          const key = await store.topUpGuestKey(guestTopUpParams.id, { microUsd, actor });
+          log('guest_key_topped_up', { guest_key_id: key.id, micro_usd: microUsd, actor });
+          redirect(res, '/guests#guest-keys');
+        } else if (guestRevokeParams) {
+          const key = await store.revokeGuestKey(guestRevokeParams.id, { actor });
+          log('guest_key_revoked', { guest_key_id: key.id, actor });
+          redirect(res, '/guests#guest-keys');
+        } else {
+          const accountIds = {};
+          for (const provider of GUEST_PROVIDERS) {
+            const id = String(form[`${provider}_account_id`] ?? '').trim();
+            if (id) accountIds[provider] = id;
+          }
+          const { key, token } = await store.createGuestKey({
+            name: String(form.name ?? '').trim(),
+            budgetMicroUsd: parseUsdAmount(form.budget),
+            accountIds,
+            note: String(form.note ?? '').trim(),
+            actor,
+          });
+          log('guest_key_created', {
+            guest_key_id: key.id,
+            budget_micro_usd: key.budget_micro_usd,
+            providers: Object.keys(key.devices),
+            actor,
+          });
+          // Rendered here rather than after a redirect: the secret exists only
+          // in this response.
+          sendHtml(res, 200, guestKeyCreatedView({
+            key,
+            token,
+            claudeGatewayUrl,
+            codexGatewayUrl,
+            openMode,
+          }), { 'Cache-Control': 'no-store' });
+        }
+      } catch (error) {
+        redirect(res, `/guests?error=${encodeURIComponent(error.message)}`);
       }
       return;
     }
