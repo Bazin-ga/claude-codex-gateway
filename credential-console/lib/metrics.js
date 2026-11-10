@@ -139,6 +139,15 @@ const CREATE_REQUEST_METRICS = `
   )
 `;
 
+/** The windows the relay page reports on, shortest first; the last bounds the scan. */
+export const RELAY_STAT_WINDOWS = Object.freeze([
+  Object.freeze(['15m', 15 * 60_000]),
+  Object.freeze(['1h', 60 * 60_000]),
+  Object.freeze(['24h', 24 * 60 * 60_000]),
+]);
+const RELAY_SPEED_MIN_OUTPUT_TOKENS = 20;
+const RELAY_SPEED_MIN_GENERATION_MS = 500;
+
 const V2_COLUMN_DEFINITIONS = Object.freeze({
   input_tokens: 'INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0)',
   cache_creation_input_tokens:
@@ -3650,6 +3659,144 @@ export class MetricsStore {
        GROUP BY 1, 2, 3, 4`,
       [longContextAbove, nowMs - day, nowMs - 7 * day, accountId, nowMs - 30 * day],
     ).map((row) => ({ ...row }));
+  }
+
+  /**
+   * How each source under one account id has been doing, for the relay page:
+   * per account alias and per window (the last 15 minutes, hour and day),
+   * the request count, failures, time to first byte, whole-request time and
+   * output speed, with the tokens used by model and hour so the caller can
+   * price them. Beside it, token sums since `spendFromMs` by hour, alias,
+   * model and device, for the spend tables.
+   *
+   * Requests the gateway itself turned away (rate limit, model not allowed,
+   * body too large) never reached a source and are left out. The day is read
+   * row by row: percentiles need the values, and a busy day is a hundred
+   * thousand rows — too many to hold as objects in the reader's small heap.
+   */
+  queryRelayStats({ accountId, nowMs = Date.now(), spendFromMs = nowMs - 30 * 86_400_000 } = {}) {
+    if (typeof accountId !== 'string' || !accountId) throw new TypeError('accountId is required');
+    if (!Number.isSafeInteger(nowMs) || !Number.isSafeInteger(spendFromMs)) {
+      throw new TypeError('nowMs and spendFromMs must be integers');
+    }
+    this.#assertOpen();
+    const windows = RELAY_STAT_WINDOWS.map(([key, spanMs]) => ({ key, fromMs: nowMs - spanMs }));
+    const sources = new Map();
+    const emptyWindow = () => ({
+      requests: 0,
+      failures: 0,
+      disconnects: 0,
+      failureStatuses: new Map(),
+      ttfb: [],
+      duration: [],
+      speed: [],
+      usage: new Map(),
+    });
+    const rows = this.db.prepare(
+      `SELECT started_at_ms, hour_bucket_ms, account_alias, model, stream, status_code, outcome,
+         ttfb_ms, duration_ms, input_tokens, cache_read_input_tokens, output_tokens
+       FROM request_metrics
+       WHERE account_id = ? AND started_at_ms >= ? AND model IS NOT NULL
+         AND outcome NOT IN ('rejected', 'model_blocked', 'request_too_large')`,
+    ).iterate(accountId, nowMs - RELAY_STAT_WINDOWS.at(-1)[1]);
+    for (const row of rows) {
+      const startedAtMs = Number(row.started_at_ms);
+      let source = sources.get(row.account_alias);
+      if (!source) {
+        source = {
+          alias: row.account_alias,
+          lastRequestAtMs: 0,
+          lastSuccessAtMs: null,
+          windows: new Map(windows.map(({ key }) => [key, emptyWindow()])),
+        };
+        sources.set(row.account_alias, source);
+      }
+      const completed = row.outcome === 'completed';
+      const failed = row.outcome === 'upstream_error';
+      const answered = Number.isInteger(row.status_code) && row.status_code >= 200 && row.status_code < 300;
+      source.lastRequestAtMs = Math.max(source.lastRequestAtMs, startedAtMs);
+      if (completed) source.lastSuccessAtMs = Math.max(source.lastSuccessAtMs ?? 0, startedAtMs);
+      const generationMs = (row.duration_ms ?? 0) - (row.ttfb_ms ?? 0);
+      for (const { key, fromMs } of windows) {
+        if (startedAtMs < fromMs) continue;
+        const window = source.windows.get(key);
+        window.requests += 1;
+        if (failed) {
+          window.failures += 1;
+          const status = row.status_code ?? 0;
+          window.failureStatuses.set(status, (window.failureStatuses.get(status) ?? 0) + 1);
+        } else if (!completed) {
+          window.disconnects += 1;
+        }
+        if (answered && row.ttfb_ms !== null) window.ttfb.push(row.ttfb_ms);
+        if (completed && row.duration_ms !== null) window.duration.push(row.duration_ms);
+        // Output speed is only meaningful for a stream that ran long enough
+        // to have one; the wait for its first token is part of it.
+        if (completed && row.stream === 1 && row.output_tokens >= RELAY_SPEED_MIN_OUTPUT_TOKENS
+          && generationMs >= RELAY_SPEED_MIN_GENERATION_MS) {
+          window.speed.push((row.output_tokens * 1000) / generationMs);
+        }
+        const usageKey = `${row.hour_bucket_ms}\n${row.model}`;
+        let usage = window.usage.get(usageKey);
+        if (!usage) {
+          usage = {
+            model: row.model,
+            hour_bucket_ms: Number(row.hour_bucket_ms),
+            requests: 0,
+            input_tokens: 0,
+            cache_read_tokens: 0,
+            output_tokens: 0,
+          };
+          window.usage.set(usageKey, usage);
+        }
+        usage.requests += 1;
+        usage.input_tokens += row.input_tokens ?? 0;
+        usage.cache_read_tokens += row.cache_read_input_tokens ?? 0;
+        usage.output_tokens += row.output_tokens ?? 0;
+      }
+    }
+    const percentile = (sorted, share) => (sorted.length
+      ? sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(share * sorted.length) - 1))]
+      : null);
+    const ascending = (values) => values.sort((left, right) => left - right);
+    const spend = this.#queryRows(
+      `SELECT hour_bucket_ms, account_alias, model, device_id,
+         COUNT(*) AS requests,
+         SUM(COALESCE(input_tokens, 0)) AS input_tokens,
+         SUM(COALESCE(cache_read_input_tokens, 0)) AS cache_read_tokens,
+         SUM(COALESCE(output_tokens, 0)) AS output_tokens
+       FROM request_metrics
+       WHERE account_id = ? AND started_at_ms >= ? AND model IS NOT NULL
+         AND outcome NOT IN ('rejected', 'model_blocked', 'request_too_large')
+       GROUP BY 1, 2, 3, 4`,
+      [accountId, spendFromMs],
+    ).map((row) => ({ ...row }));
+    return {
+      now_ms: nowMs,
+      sources: [...sources.values()].map((source) => ({
+        alias: source.alias,
+        last_request_at_ms: source.lastRequestAtMs,
+        last_success_at_ms: source.lastSuccessAtMs,
+        windows: Object.fromEntries([...source.windows].map(([key, window]) => {
+          const ttfb = ascending(window.ttfb);
+          const duration = ascending(window.duration);
+          const speed = ascending(window.speed);
+          return [key, {
+            requests: window.requests,
+            failures: window.failures,
+            disconnects: window.disconnects,
+            failure_statuses: Object.fromEntries(window.failureStatuses),
+            ttfb_p50_ms: percentile(ttfb, 0.5),
+            ttfb_p90_ms: percentile(ttfb, 0.9),
+            duration_p50_ms: percentile(duration, 0.5),
+            duration_p90_ms: percentile(duration, 0.9),
+            output_tokens_per_s: percentile(speed, 0.5),
+            usage: [...window.usage.values()],
+          }];
+        })),
+      })),
+      spend,
+    };
   }
 
   queryConversationFacets(filters = {}) {

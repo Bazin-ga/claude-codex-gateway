@@ -33,7 +33,14 @@ import { OPENAI_LONG_CONTEXT_ABOVE, summarizeApiSpend } from './lib/openai-api-p
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { isCodexGatewayAccount } from './lib/codex-api-key.js';
-import { RELAY_ACCOUNT_ID, RELAY_PROXY_PREFIX, RelayCatalog, relayCostUsd } from './lib/relay.js';
+import { RELAY_PROXY_PREFIX, RelayCatalog } from './lib/relay.js';
+import {
+  RELAY_STAT_DEFAULT_WINDOW,
+  createRelayStatsCache,
+  relayPricer,
+  summarizeRelaySources,
+  summarizeRelaySpend,
+} from './lib/relay-stats.js';
 import { createRelay, parseRelayRoutes } from './lib/relay-proxy.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
@@ -526,7 +533,8 @@ export async function createCredentialConsole(options = {}) {
   apiSpendTimer.unref();
   const stopBackgroundRefreshes = () => {
     clearInterval(apiSpendTimer);
-    const recheckDrain = Promise.all([stopExhaustionRechecks(), apiSpendPromise]);
+    clearInterval(relayStatsTimer);
+    const recheckDrain = Promise.all([stopExhaustionRechecks(), apiSpendPromise, relayStats?.pending()]);
     let usageDrain;
     try {
       usageDrain = Promise.resolve(usageMonitor.stop?.());
@@ -568,55 +576,36 @@ export async function createCredentialConsole(options = {}) {
     ? (options.relayCatalog ?? new RelayCatalog({ store, fetchImpl: options.relayFetch ?? fetch }).start())
     : null;
   const relay = relayEnabled
-    ? createRelay({ store, requestMetrics, enabled: true, fetchImpl: options.relayFetch ?? fetch, routes: options.relayRoutes ?? RELAY_ROUTES })
+    ? createRelay({
+      store,
+      catalog: relayCatalog,
+      requestMetrics,
+      enabled: true,
+      fetchImpl: options.relayFetch ?? fetch,
+      routes: options.relayRoutes ?? RELAY_ROUTES,
+    })
     : null;
   /**
-   * Last 30 days of relay turns, by model and by device, priced at the
-   * catalog's rates. An estimate: the platform bills its own way, and the
-   * key's actual spend is shown beside it.
+   * How each source is doing and what the month cost, read from the recorded
+   * turns. The reading scans a day of turns, seconds of work on a busy
+   * console, so where the console has a query worker it runs there and never
+   * on the event loop; with neither, the page goes without figures.
    */
-  const relaySpend = () => {
-    if (!requestMetrics?.queryTokenBreakdown) return null;
-    try {
-      requestMetrics.flush?.();
-      const fromMs = Date.now() - 30 * 86_400_000;
-      const filters = { accountId: RELAY_ACCOUNT_ID, fromMs };
-      const devices = new Map(store.publicDevices().map((device) => [device.id, device]));
-      const cost = (model, row) => relayCostUsd(relayCatalog?.row(model), {
-        inputTokens: row.totalInputTokens ?? 0,
-        outputTokens: row.totalOutputTokens ?? 0,
-        cacheReadInputTokens: row.totalCacheReadInputTokens ?? 0,
-      });
-      const models = requestMetrics.queryTokenBreakdown({ by: 'model', ...filters }).map((row) => ({
-        model: row.groupValue,
-        requestCount: row.requestCount,
-        inputTokens: row.totalInputTokens,
-        outputTokens: row.totalOutputTokens,
-        costUsd: cost(row.groupValue, row),
-      }));
-      const deviceRows = models.flatMap((entry) => (entry.model
-        ? requestMetrics.queryTokenBreakdown({ by: 'device', ...filters, model: entry.model }).map((row) => {
-          const device = devices.get(row.groupValue);
-          return {
-            label: device ? `${device.name} · ${device.member_label}` : (row.groupValue ?? '—'),
-            model: entry.model,
-            requestCount: row.requestCount,
-            inputTokens: row.totalInputTokens,
-            outputTokens: row.totalOutputTokens,
-            costUsd: cost(entry.model, row),
-          };
-        })
-        : []));
-      return {
-        models,
-        devices: deviceRows.sort((a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0)),
-        totalUsd: models.reduce((sum, entry) => sum + (entry.costUsd ?? 0), 0),
-      };
-    } catch (error) {
-      log('relay_spend_query_failed', { code: error?.code ?? error?.name ?? 'unknown' });
-      return null;
-    }
-  };
+  const relayStats = relayEnabled && requestMetrics?.queryRelayStats
+    ? createRelayStatsCache({
+      query: async (params) => {
+        if (closing || (enableMetricsQueryWorker && !metricsQueryService)) return null;
+        requestMetrics.flush?.();
+        return metricsQueryService?.relayStats
+          ? metricsQueryService.relayStats(params)
+          : requestMetrics.queryRelayStats(params);
+      },
+      now: typeof options.relayStatsClock === 'function' ? options.relayStatsClock : Date.now,
+      log,
+    })
+    : null;
+  const relayStatsTimer = setInterval(() => relayStats?.tick(), options.relayStatsRefreshMs ?? 5 * 60_000);
+  relayStatsTimer.unref();
 
   // Every page gets the third-party tab when the platform is switched on; no
   // page has to know about it.
@@ -709,6 +698,8 @@ export async function createCredentialConsole(options = {}) {
     }
   }
   refreshApiSpend();
+  // Warm the sources reading where it costs the event loop nothing.
+  if (metricsQueryService) relayStats?.refresh();
   // Open mode has no login, so every rendered page has to say so.
   const openMode = adminAuth === 'open';
   // Password mode: the tailnet identity still gates the console, but a visitor
@@ -1856,20 +1847,50 @@ export async function createCredentialConsole(options = {}) {
       const session = requireSession(req, res);
       if (!session) return;
       if (req.method === 'GET' && path === RELAY_PROXY_PREFIX) {
+        const settings = store.relaySettings();
+        const chains = store.relayChains();
+        const snapshot = relayCatalog.snapshot();
+        const stats = await relayStats?.read() ?? null;
+        const devices = new Map(store.publicDevices().map((device) => [device.id, device]));
         sendHtml(res, 200, relayView({
-          settings: store.relaySettings(),
-          catalog: relayCatalog.snapshot(),
-          spend: relaySpend(),
+          settings,
+          catalog: snapshot,
+          chains,
+          sources: summarizeRelaySources({
+            stats,
+            window: url.searchParams.get('window') ?? RELAY_STAT_DEFAULT_WINDOW,
+            chains,
+            settings,
+            catalog: relayCatalog,
+            balance: snapshot.balance,
+            sourceStates: relay.sourceStates(),
+          }),
+          spend: stats
+            ? summarizeRelaySpend({
+              spend: stats.spend,
+              price: relayPricer({ chains, settings, catalog: relayCatalog }),
+              describeDevice: (id) => {
+                const device = devices.get(id);
+                return device ? `${device.name} · ${device.member_label}` : (id ?? '—');
+              },
+            })
+            : null,
           csrf: session.csrf,
           gatewayBaseUrl: publicBaseUrl,
           query: url.searchParams.get('q') ?? '',
           vendor: url.searchParams.get('vendor') ?? '',
           error: url.searchParams.get('error'),
+          chainsOpen: url.searchParams.has('chains'),
           openMode,
         }));
         return;
       }
-      const action = { [`${RELAY_PROXY_PREFIX}/settings`]: 'settings', [`${RELAY_PROXY_PREFIX}/models`]: 'models' }[path];
+      const action = {
+        [`${RELAY_PROXY_PREFIX}/settings`]: 'settings',
+        [`${RELAY_PROXY_PREFIX}/models`]: 'models',
+        [`${RELAY_PROXY_PREFIX}/chain`]: 'chain',
+        [`${RELAY_PROXY_PREFIX}/chain/source`]: 'source',
+      }[path];
       if (req.method !== 'POST' || !action) {
         sendHtml(res, 404, messageView('Not found', 'The requested page does not exist.', { error: true, openMode }));
         return;
@@ -1879,18 +1900,57 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
+      const chainAction = action === 'chain' || action === 'source';
       try {
         const actor = actorFor(session);
         if (action === 'settings') {
           await store.setRelayPlatform({ name: form.name, baseUrl: form.base_url, apiKey: form.api_key, actor });
           relayCatalog.refresh().catch(() => {});
-        } else {
+        } else if (action === 'models') {
           if (!['allow', 'disallow'].includes(form.op)) throw new Error('unknown action');
           await store.setRelayModelAllowed({ model: form.model, allowed: form.op === 'allow', actor });
+        } else if (action === 'chain') {
+          if (form.op === 'save') {
+            await store.saveRelayChain({
+              model: form.model,
+              aliases: form.aliases,
+              previousModel: form.previous_model || null,
+              actor,
+            });
+          } else if (form.op === 'delete') {
+            await store.deleteRelayChain({ model: form.model, actor });
+          } else {
+            throw new Error('unknown action');
+          }
+        } else {
+          const target = { model: form.model, sourceId: form.source_id || null, actor };
+          if (form.op === 'save') {
+            await store.saveRelaySource({
+              ...target,
+              name: form.name,
+              kind: form.kind,
+              upstream_model: form.upstream_model,
+              base_url: form.base_url,
+              api_key: form.api_key,
+              input_usd_per_m: form.input_usd_per_m,
+              output_usd_per_m: form.output_usd_per_m,
+              cached_input_usd_per_m: form.cached_input_usd_per_m,
+              first_byte_timeout_s: form.first_byte_timeout_s,
+              min_balance_usd: form.min_balance_usd,
+            });
+          } else if (form.op === 'enable' || form.op === 'disable') {
+            await store.setRelaySourceEnabled({ ...target, enabled: form.op === 'enable' });
+          } else if (form.op === 'up' || form.op === 'down') {
+            await store.moveRelaySource({ ...target, direction: form.op });
+          } else if (form.op === 'delete') {
+            await store.deleteRelaySource(target);
+          } else {
+            throw new Error('unknown action');
+          }
         }
-        redirect(res, RELAY_PROXY_PREFIX);
+        redirect(res, chainAction ? `${RELAY_PROXY_PREFIX}?chains=1#relay-chains` : RELAY_PROXY_PREFIX);
       } catch (error) {
-        redirect(res, `${RELAY_PROXY_PREFIX}?error=${encodeURIComponent(error.message)}`);
+        redirect(res, `${RELAY_PROXY_PREFIX}?${chainAction ? 'chains=1&' : ''}error=${encodeURIComponent(error.message)}${chainAction ? '#relay-chains' : ''}`);
       }
       return;
     }
@@ -3936,6 +3996,7 @@ export async function createCredentialConsole(options = {}) {
     clearInterval(cleanupTimer);
     clearInterval(exhaustionRecheckTimer);
     clearInterval(apiSpendTimer);
+    clearInterval(relayStatsTimer);
     usageMonitor.stop?.();
     relayCatalog?.stop();
     codexManagedRefresher?.stop?.();

@@ -23,6 +23,14 @@ import { normalizeClaudeReserve, parseClaudeReserveInput } from './claude-reserv
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
 import { CODEX_API_KEY_AUTH, isCodexApiKeyAccount } from './codex-api-key.js';
 import { normalizeRelay, RELAY_MAX_ALLOWED_MODELS, relayBaseUrl, relayModelName } from './relay.js';
+import {
+  normalizeRelayChains,
+  parseRelayChainInput,
+  parseRelaySourceInput,
+  publicRelayChain,
+  RELAY_MAX_CHAINS,
+  RELAY_MAX_SOURCES,
+} from './relay-chain.js';
 import { normalizeBedrockModelPin } from './bedrock-models.js';
 import {
   accountUsableByDevice,
@@ -232,6 +240,7 @@ export class CredentialStore {
     this.masterKey = null;
     this.queue = Promise.resolve();
     this.pendingDeviceAccountFields = new Map();
+    this.relayChainCache = null;
   }
 
   async init() {
@@ -1656,6 +1665,255 @@ export class CredentialStore {
       });
       await this.persist();
       return this.relaySettings();
+    });
+  }
+
+  #storedRelayChains() {
+    // Asked on every inference request, to see whether the model named is a
+    // chain's; the stored array is replaced, never edited, on a change.
+    const stored = this.state.relay_chains;
+    if (!this.relayChainCache || this.relayChainCache.stored !== stored) {
+      const chains = normalizeRelayChains(stored);
+      this.relayChainCache = { stored, chains, shown: chains.map(publicRelayChain) };
+    }
+    return this.relayChainCache;
+  }
+
+  /** The source chains, without any source's key. */
+  relayChains() {
+    return this.#storedRelayChains().shown;
+  }
+
+  relaySourceApiKey(model, sourceId) {
+    const source = this.#storedRelayChains().chains
+      .find((chain) => chain.model === model)?.sources
+      .find((entry) => entry.id === sourceId);
+    if (!source?.credential) return null;
+    try {
+      return decryptJson(this.masterKey, source.credential, `relay:source:${sourceId}:v1`)?.api_key ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  #writeRelayChains(chains) {
+    this.state.relay_chains = chains;
+  }
+
+  /**
+   * Create a chain, or change the names of one. `model` is the name clients
+   * use; `previousModel` names the chain being renamed.
+   */
+  async saveRelayChain({ model, aliases = '', previousModel = null, actor = null }) {
+    return this.serialized(async () => {
+      const chains = this.#storedRelayChains().chains;
+      const existing = previousModel ? chains.find((chain) => chain.model === previousModel) : null;
+      if (previousModel && !existing) throw new Error('unknown chain');
+      const names = parseRelayChainInput({ model, aliases }, { others: chains.filter((chain) => chain !== existing) });
+      if (!existing && chains.length >= RELAY_MAX_CHAINS) throw new Error(`at most ${RELAY_MAX_CHAINS} chains`);
+      const next = {
+        ...(existing ?? { sources: [] }),
+        ...names,
+        updated_at: nowIso(),
+        updated_by: auditActor(actor),
+      };
+      this.#writeRelayChains(existing
+        ? chains.map((chain) => (chain === existing ? next : chain))
+        : [...chains, next]);
+      this.audit(existing ? 'relay_chain_updated' : 'relay_chain_created', {
+        model: names.model,
+        aliases: names.aliases,
+        previous_model: existing?.model ?? null,
+        previous_aliases: existing?.aliases ?? null,
+        actor: auditActor(actor),
+      });
+      await this.persist();
+      return this.relayChains();
+    });
+  }
+
+  async deleteRelayChain({ model, actor = null }) {
+    return this.serialized(async () => {
+      const chains = this.#storedRelayChains().chains;
+      const existing = chains.find((chain) => chain.model === model);
+      if (!existing) throw new Error('unknown chain');
+      this.#writeRelayChains(chains.filter((chain) => chain !== existing));
+      this.audit('relay_chain_deleted', {
+        model: existing.model,
+        aliases: existing.aliases,
+        sources: existing.sources.map((source) => source.name),
+        actor: auditActor(actor),
+      });
+      await this.persist();
+      return this.relayChains();
+    });
+  }
+
+  #changeRelaySources(model, change) {
+    const chains = this.#storedRelayChains().chains;
+    const chain = chains.find((entry) => entry.model === model);
+    if (!chain) throw new Error('unknown chain');
+    const sources = change(chain.sources);
+    this.#writeRelayChains(chains.map((entry) => (entry === chain
+      ? { ...chain, sources, updated_at: nowIso() }
+      : entry)));
+    return chain;
+  }
+
+  /**
+   * Add a source to a chain (at the end), or change one. Its key is encrypted
+   * like an account credential and never rendered back; leaving it empty keeps
+   * the one already stored.
+   */
+  async saveRelaySource({ model, sourceId = null, actor = null, ...input }) {
+    return this.serialized(async () => {
+      const { source, apiKey } = parseRelaySourceInput(input);
+      let saved;
+      let previous = null;
+      this.#changeRelaySources(model, (sources) => {
+        previous = sourceId ? sources.find((entry) => entry.id === sourceId) : null;
+        if (sourceId && !previous) throw new Error('unknown source');
+        if (sources.some((entry) => entry !== previous && entry.name === source.name)) {
+          throw new Error(`this chain already has a source named "${source.name}"`);
+        }
+        if (!previous && sources.length >= RELAY_MAX_SOURCES) throw new Error(`at most ${RELAY_MAX_SOURCES} sources in a chain`);
+        const id = previous?.id ?? randomBytes(6).toString('hex');
+        saved = {
+          ...source,
+          // The form that changes a source does not say whether it is switched
+          // on; saving it must not switch a rested source back on.
+          enabled: input.enabled === undefined && previous ? previous.enabled : source.enabled,
+          id,
+          credential: source.kind !== 'endpoint'
+            ? null
+            : (apiKey
+              ? encryptJson(this.masterKey, { api_key: apiKey }, `relay:source:${id}:v1`)
+              : (previous?.credential ?? null)),
+        };
+        return previous
+          ? sources.map((entry) => (entry === previous ? saved : entry))
+          : [...sources, saved];
+      });
+      const { credential, ...shown } = saved;
+      const { credential: previousCredential, ...previousShown } = previous ?? {};
+      this.audit(previous ? 'relay_source_updated' : 'relay_source_added', {
+        model,
+        source: shown,
+        previous: previous ? previousShown : null,
+        key_replaced: Boolean(apiKey),
+        actor: auditActor(actor),
+      });
+      await this.persist();
+      return this.relayChains();
+    });
+  }
+
+  /** Enable or rest a source without losing its place or its key. */
+  async setRelaySourceEnabled({ model, sourceId, enabled, actor = null }) {
+    return this.serialized(async () => {
+      let name = null;
+      this.#changeRelaySources(model, (sources) => {
+        const source = sources.find((entry) => entry.id === sourceId);
+        if (!source) throw new Error('unknown source');
+        name = source.name;
+        return sources.map((entry) => (entry === source ? { ...source, enabled: enabled === true } : entry));
+      });
+      this.audit(enabled === true ? 'relay_source_enabled' : 'relay_source_disabled', {
+        model,
+        source: name,
+        actor: auditActor(actor),
+      });
+      await this.persist();
+      return this.relayChains();
+    });
+  }
+
+  /** Move a source one place up or down its chain: order is preference. */
+  async moveRelaySource({ model, sourceId, direction, actor = null }) {
+    return this.serialized(async () => {
+      if (!['up', 'down'].includes(direction)) throw new Error('unknown direction');
+      let order = null;
+      this.#changeRelaySources(model, (sources) => {
+        const at = sources.findIndex((entry) => entry.id === sourceId);
+        if (at === -1) throw new Error('unknown source');
+        const to = direction === 'up' ? at - 1 : at + 1;
+        const next = [...sources];
+        if (to >= 0 && to < next.length) [next[at], next[to]] = [next[to], next[at]];
+        order = next.map((entry) => entry.name);
+        return next;
+      });
+      this.audit('relay_source_moved', { model, order, actor: auditActor(actor) });
+      await this.persist();
+      return this.relayChains();
+    });
+  }
+
+  async deleteRelaySource({ model, sourceId, actor = null }) {
+    return this.serialized(async () => {
+      let name = null;
+      this.#changeRelaySources(model, (sources) => {
+        const source = sources.find((entry) => entry.id === sourceId);
+        if (!source) throw new Error('unknown source');
+        name = source.name;
+        return sources.filter((entry) => entry !== source);
+      });
+      this.audit('relay_source_deleted', { model, source: name, actor: auditActor(actor) });
+      await this.persist();
+      return this.relayChains();
+    });
+  }
+
+  /**
+   * Replace every chain from a description, as `cli.js relay-chain import`
+   * reads it. A source that keeps its name within its chain keeps its id and,
+   * unless a new key is given, its key.
+   */
+  async importRelayChains({ chains, actor = null }) {
+    return this.serialized(async () => {
+      if (!Array.isArray(chains)) throw new Error('chains must be a list');
+      if (chains.length > RELAY_MAX_CHAINS) throw new Error(`at most ${RELAY_MAX_CHAINS} chains`);
+      const before = this.#storedRelayChains().chains;
+      const next = [];
+      for (const entry of chains) {
+        const names = parseRelayChainInput({ model: entry?.model, aliases: entry?.aliases ?? [] }, { others: next });
+        const previous = before.find((chain) => chain.model === names.model);
+        const sources = [];
+        for (const item of Array.isArray(entry?.sources) ? entry.sources : []) {
+          const { source, apiKey } = parseRelaySourceInput({
+            ...item,
+            input_usd_per_m: item?.price?.input_usd_per_m ?? item?.input_usd_per_m,
+            output_usd_per_m: item?.price?.output_usd_per_m ?? item?.output_usd_per_m,
+            cached_input_usd_per_m: item?.price?.cached_input_usd_per_m ?? item?.cached_input_usd_per_m,
+          });
+          if (sources.some((other) => other.name === source.name)) {
+            throw new Error(`chain "${names.model}" names source "${source.name}" twice`);
+          }
+          const kept = previous?.sources.find((other) => other.name === source.name) ?? null;
+          const id = kept?.id ?? randomBytes(6).toString('hex');
+          sources.push({
+            ...source,
+            id,
+            credential: source.kind !== 'endpoint'
+              ? null
+              : (apiKey
+                ? encryptJson(this.masterKey, { api_key: apiKey }, `relay:source:${id}:v1`)
+                : (kept?.kind === 'endpoint' ? kept.credential : null)),
+          });
+        }
+        if (sources.length > RELAY_MAX_SOURCES) throw new Error(`at most ${RELAY_MAX_SOURCES} sources in a chain`);
+        next.push({ ...names, sources, updated_at: nowIso(), updated_by: auditActor(actor) });
+      }
+      this.#writeRelayChains(next);
+      this.audit('relay_chains_imported', {
+        chains: next.map((chain) => ({
+          model: chain.model,
+          aliases: chain.aliases,
+          sources: chain.sources.map((source) => source.name),
+        })),
+        actor: auditActor(actor),
+      });
+      await this.persist();
+      return this.relayChains();
     });
   }
 
