@@ -255,8 +255,14 @@ test('password mode: a member sees self-service only, private accounts are absen
       assert.match(page.response.headers.get('location'), /^\/login\?next=/);
     }
     const csrf = await console.csrf();
-    const add = await console.request('/accounts', { method: 'POST', form: { csrf, provider: 'claude', alias: 'x-y' } });
-    assert.equal(add.response.status, 403);
+    // Members may add Claude and Codex accounts now (see the member-accounts
+    // tests), but never a Bedrock key.
+    const add = await console.request('/accounts', {
+      method: 'POST',
+      form: { csrf, provider: 'bedrock', alias: 'x-y', region: 'us-west-2', model_id: 'm', api_key: 'k' },
+    });
+    assert.equal(add.response.status, 303);
+    assert.match(decodeURIComponent(add.response.headers.get('location')), /only an administrator can add a Bedrock account/);
     assert.equal(console.store.state.accounts.length, 2);
     const metrics = await console.request('/metrics');
     assert.equal(metrics.response.status, 200);
@@ -624,6 +630,144 @@ test('password mode: saves say what they did, and members move devices between s
     });
     assert.match(cut.response.headers.get('location'), /notice=restriction-private.*disconnected=1/);
     assert.throws(() => console.store.resolveDeviceAccount(ids.kid), (error) => error.code === 'ACCOUNT_RESTRICTED');
+  } finally {
+    await console.close();
+  }
+});
+
+test('password mode: a member adds a Claude and a Codex account and lands on its authorization page', async () => {
+  const console = await app({
+    seed: async (store) => { await store.addAdminUser({ username: 'root', password: PASSWORD }); },
+  });
+  try {
+    const home = await console.request('/');
+    assert.match(home.body, /id="member-accounts"/);
+    assert.match(home.body, /data-persist-draft="member-register-claude-account"/);
+    assert.doesNotMatch(home.body, /name="openai_api_key"/, 'no platform-key field on the member form');
+
+    const csrf = await console.csrf();
+    const claudeAdd = await console.request('/accounts', {
+      method: 'POST', form: { csrf, provider: 'claude', alias: 'claude-alex', email_label: 'alex@example.com' },
+    });
+    assert.equal(claudeAdd.response.status, 303);
+    const claudeRow = console.store.state.accounts.find((entry) => entry.alias === 'claude-alex');
+    assert.ok(claudeRow);
+    assert.equal(claudeAdd.response.headers.get('location'), `/accounts/${claudeRow.id}/claude-authorization`);
+    assert.deepEqual(claudeRow.created_by, { role: 'member', identity: 'member@example.com' });
+    assert.equal(claudeRow.status, 'login_required');
+
+    const codexAdd = await console.request('/accounts', {
+      method: 'POST', form: { csrf, provider: 'codex', alias: 'codex-alex' },
+    });
+    const codexRow = console.store.state.accounts.find((entry) => entry.alias === 'codex-alex');
+    assert.equal(codexAdd.response.headers.get('location'), `/accounts/${codexRow.id}/codex-authorization`);
+
+    // The member reaches the authorization pages of the rows they added.
+    assert.equal((await console.request(`/accounts/${claudeRow.id}/claude-authorization`)).response.status, 200);
+    assert.equal((await console.request(`/accounts/${codexRow.id}/codex-authorization`)).response.status, 200);
+
+    // And sees them on their page with the next step.
+    const after = await console.request('/');
+    assert.match(after.body, /Accounts you added/);
+    assert.match(after.body, new RegExp(`href="/accounts/${claudeRow.id}/claude-authorization"`));
+    assert.match(after.body, new RegExp(`href="/accounts/${codexRow.id}/codex-authorization"`));
+
+    const audit = console.store.state.audit.filter((entry) => entry.event === 'account_added');
+    assert.ok(audit.every((entry) => entry.created_by_role === 'member' && entry.created_by === 'member@example.com'));
+  } finally {
+    await console.close();
+  }
+});
+
+test('password mode: a member cannot authorize an account someone else added', async () => {
+  let teamClaude;
+  let teamCodex;
+  const console = await app({
+    seed: async (store) => {
+      await store.addAdminUser({ username: 'root', password: PASSWORD });
+      // A row from before creators were recorded, and one another member added.
+      teamClaude = await store.addAccount({ provider: 'claude', alias: 'claude-team', emailLabel: 'team@example.com' });
+      teamCodex = await store.addAccount({
+        provider: 'codex', alias: 'codex-other', createdBy: { role: 'member', identity: 'someone-else@example.com' },
+      });
+    },
+  });
+  try {
+    const csrf = await console.csrf();
+    for (const path of [
+      `/accounts/${teamClaude.id}/claude-authorization`,
+      `/accounts/${teamCodex.id}/codex-authorization`,
+    ]) {
+      const page = await console.request(path);
+      assert.equal(page.response.status, 403, path);
+      assert.match(page.body, /only the accounts they added themselves/);
+    }
+    for (const path of [
+      `/accounts/${teamClaude.id}/claude-authorization/start`,
+      `/accounts/${teamClaude.id}/claude-authorization/complete`,
+      `/accounts/${teamCodex.id}/codex-authorization/start`,
+      `/accounts/${teamCodex.id}/codex-authorization/complete`,
+      `/accounts/${teamCodex.id}/codex-authorization/paste`,
+    ]) {
+      const post = await console.request(path, { method: 'POST', form: { csrf, authorization_code: 'x', credential_json: '{}' } });
+      assert.equal(post.response.status, 403, path);
+    }
+    // No authorization flow was opened on either row.
+    assert.equal(console.store.state.oauth_flows.length, 0);
+
+    // Everything else about accounts stays administrator-only.
+    for (const path of [`/accounts/${teamClaude.id}/delete`, `/accounts/${teamClaude.id}/failover`, `/accounts/${teamClaude.id}/enrollments`]) {
+      const post = await console.request(path, { method: 'POST', form: { csrf } });
+      assert.equal(post.response.status, 403, path);
+      assert.match(post.body, /Only an administrator can do this/, path);
+    }
+
+    // An administrator may authorize any row.
+    await console.login();
+    assert.equal((await console.request(`/accounts/${teamClaude.id}/claude-authorization`)).response.status, 200);
+    assert.equal((await console.request(`/accounts/${teamCodex.id}/codex-authorization`)).response.status, 200);
+  } finally {
+    await console.close();
+  }
+});
+
+test('password mode: a member may not add a platform key and may not pile up unauthorized rows', async () => {
+  const console = await app({
+    seed: async (store) => { await store.addAdminUser({ username: 'root', password: PASSWORD }); },
+  });
+  try {
+    const csrf = await console.csrf();
+    const keyed = await console.request('/accounts', {
+      method: 'POST', form: { csrf, provider: 'codex', alias: 'codex-key', openai_api_key: 'sk-abcdefghijklmnopqrstuvwxyz' },
+    });
+    assert.match(decodeURIComponent(keyed.response.headers.get('location')), /only an administrator can add an OpenAI API key account/);
+    assert.equal(console.store.state.accounts.length, 0);
+
+    for (let index = 1; index <= 3; index += 1) {
+      await console.request('/accounts', { method: 'POST', form: { csrf, provider: 'codex', alias: `codex-pending-${index}` } });
+    }
+    assert.equal(console.store.state.accounts.length, 3);
+    const fourth = await console.request('/accounts', { method: 'POST', form: { csrf, provider: 'codex', alias: 'codex-pending-4' } });
+    assert.match(decodeURIComponent(fourth.response.headers.get('location')), /already have 3 accounts waiting for authorization/);
+    assert.equal(console.store.state.accounts.length, 3);
+
+    // An administrator is not held to the member limit.
+    await console.login();
+    const adminCsrf = await console.csrf();
+    const adminAdd = await console.request('/accounts', { method: 'POST', form: { csrf: adminCsrf, provider: 'codex', alias: 'codex-admin' } });
+    assert.match(adminAdd.response.headers.get('location'), /draft_completed=register-codex-account/);
+    assert.equal(console.store.state.accounts.find((entry) => entry.alias === 'codex-admin').created_by.role, 'admin');
+  } finally {
+    await console.close();
+  }
+});
+
+test('tailscale mode shows no member add-account section: everyone already has the administrator forms', async () => {
+  const console = await app({ adminAuth: 'tailscale' });
+  try {
+    const home = await console.request('/');
+    assert.doesNotMatch(home.body, /id="member-accounts"/);
+    assert.match(home.body, /data-persist-draft="register-claude-account"/);
   } finally {
     await console.close();
   }
