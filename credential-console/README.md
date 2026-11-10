@@ -618,6 +618,58 @@ bearer values are never persisted. The installed sender always exits zero on tim
 or validation failure, so a failed hook cannot deny or terminate Claude or invalidate a credential;
 the synchronous command hook may nevertheless add bounded delay while that failure is handled.
 
+## Guest keys
+
+A guest key lets someone outside the team use Claude Code and Codex through the gateway up to a
+dollar allowance, without being handed an ordinary device credential. The **Guest keys** tab
+(administrators only in `password` mode) does three things:
+
+1. **Opens accounts to guests.** Only Claude and Codex subscription accounts can be opened; an
+   OpenAI API-key account, a Bedrock account and a third-party platform cannot. An account in the
+   guest pool is otherwise unchanged: members keep using it unless it is also made private on the
+   Overview tab. A private account in the pool admits guest keys in addition to its listed
+   machines, so a private account with no machines listed serves guests only.
+2. **Issues a key.** A key has a name, an allowance in US dollars, and one pool account per
+   provider (leave a provider out and the key cannot use it). The secret is shown once, together
+   with the Claude Code and Codex settings to paste; only its digest is stored. The same secret
+   works on `/claude` and on `/codex-api`.
+3. **Tops a key up or revokes it.** The allowance is a one-time total, not a monthly one: a top-up
+   adds to it, nothing resets it. Revoking is permanent and takes effect on the next request.
+
+Every answer is charged at the provider's public API list price for the tokens the gateway
+counted — uncached input, cache writes (five-minute and one-hour apart), cache reads and output —
+from `lib/claude-api-pricing.js` and `lib/openai-api-pricing.js`. The subscription behind the key
+is not billed that way; the price list only turns usage into a number an allowance can be set in.
+Once a key has spent its allowance, the next inference request is refused with `403
+permission_error` before anything is sent upstream, and the message names the key and says to ask
+for a top-up. Requests that are not inference (token counting, model listing) are neither charged
+nor refused.
+
+A guest key is a device like any other past that point: the console-wide model block rules, a
+Claude account's owner reserve, the Codex credit guard and quota failover all apply, and failover
+follows the home account's own backup chain — list only pool accounts there if guests must never
+land on a team account. Two things differ. A guest token is accepted by the two subscription
+gateways only; the third-party relay, Bedrock and the machine-control API answer `401`. And a
+guest turn is never rerouted to a third-party platform.
+
+Limits of this version:
+
+- The check runs before a request and the charge after it, so requests already in flight when the
+  allowance runs out still complete. A key can overshoot by what its concurrent requests cost.
+- A Claude answer cut off before its final usage is charged for the input it reported plus an
+  estimate of the output from the bytes that streamed. A Codex turn that ends without a
+  `response.completed` event reports no usage and is not charged.
+- Not priced: the Claude fast-mode premium, the `inference_geo` multiplier and per-search web-search
+  fees. A model missing from a price table is charged at the dearest row in it and logged
+  (`guest_key_charge_approximate`); the OpenAI table lists the GPT-6 models only.
+- Spend is counted in memory at once and written to `state.json` within a second; a clean shutdown
+  writes it first. A crash can lose up to that second of spend.
+- A key has no model list of its own.
+- Guest conversations are captured and shown under Conversations like anyone else's.
+- The allowance binds the key, not the person. Anyone who can open the console in a browser can
+  issue themselves an ordinary, unbudgeted device from the self-service page, so a guest who can
+  reach the console itself — rather than only the two gateway paths — is not held to the allowance.
+
 ## Security boundaries
 
 - `master.key`, `state.json`, and the data directory are mode 600/700.

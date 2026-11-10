@@ -25,6 +25,7 @@ import { derivePromptDisplay } from './prompt-display.js';
 import { isCodexApiKeyAccount, isCodexGatewayAccount } from './codex-api-key.js';
 import { OPENAI_PRICES_AS_OF } from './openai-api-pricing.js';
 import { relayPriceMultiplier } from './relay.js';
+import { GUEST_KEY_MAX_NOTE, GUEST_PROVIDERS, formatMicroUsd } from './guest-keys.js';
 import {
   buildClaudeConversationHookEndpoint,
   CLAUDE_CONVERSATION_HOOK_UPDATER_FILENAME,
@@ -874,6 +875,7 @@ function layout(title, content, {
       <a href="/conversations" data-i18n="tab-conversations"${activeTab === 'conversations' ? ' aria-current="page"' : ''} data-tab="conversations">Conversations</a>
       <a href="/docs" data-i18n="tab-docs"${activeTab === 'docs' ? ' aria-current="page"' : ''} data-tab="docs">Docs &amp; API</a>
       <a href="/admin" data-i18n="tab-admin"${activeTab === 'admin' ? ' aria-current="page"' : ''} data-tab="admin">Administration</a>
+      <a href="/guests" data-i18n="tab-guests"${activeTab === 'guests' ? ' aria-current="page"' : ''} data-tab="guests">Guest keys</a>
     </nav>` : ''}
     <div data-page-content data-active-tab="${escapeHtml(activeTab ?? '')}">${PAGE_CONTENT_START}${openMode ? openBanner : ''}
     ${content}${PAGE_CONTENT_END}</div>
@@ -6183,7 +6185,7 @@ export function withViewerChrome(html, viewer) {
   if (!viewer || typeof html !== 'string') return html;
   let out = html;
   if (!viewer.admin) {
-    out = out.replace(/\n\s*<a href="\/(?:conversations|admin|relay)"[^\n]*data-tab="(?:conversations|admin|relay)">[^<]*<\/a>/g, '');
+    out = out.replace(/\n\s*<a href="\/(?:conversations|admin|relay|guests)"[^\n]*data-tab="(?:conversations|admin|relay|guests)">[^<]*<\/a>/g, '');
   }
   if (viewer.admin) {
     return out.replace('<div class="topbar-actions">', `<div class="topbar-actions"><span class="muted tiny"><span data-i18n="viewer-admin">Administrator</span> · <strong>${escapeHtml(viewer.username ?? '')}</strong></span><a class="button secondary" href="/logout" data-i18n="viewer-sign-out">Sign out</a>`);
@@ -6733,4 +6735,218 @@ export function relayView({
       </article>
     </section>
   `, { openMode, activeTab: 'relay' });
+}
+
+const GUEST_PROVIDER_LABELS = Object.freeze({ claude: 'Claude', codex: 'Codex' });
+
+/**
+ * Guest keys: which accounts guests may use, issuing a key with a dollar
+ * allowance, and what each key has spent. Administrators only.
+ */
+export function guestsView({
+  accounts = [],
+  keys = [],
+  csrf,
+  error = null,
+  openMode = false,
+} = {}) {
+  const byId = new Map(accounts.map((account) => [account.id, account]));
+  const alias = (id) => byId.get(id)?.alias ?? '—';
+  const pool = accounts.filter((account) => account.guest_pool);
+  const activeKeys = keys.filter((key) => !key.revoked_at);
+  const keysOn = (accountId) => activeKeys.filter((key) => Object.values(key.devices)
+    .some((device) => !device.revoked && (device.home_account_id === accountId || device.account_id === accountId))).length;
+
+  const poolRows = accounts.map((account) => {
+    const chain = account.failover?.enabled && account.failover.backup_account_ids.length
+      ? account.failover.backup_account_ids.map((id) => escapeHtml(alias(id))).join(' → ')
+      : '<span class="muted" data-i18n="guest-pool-no-chain">no backups</span>';
+    const visibility = !account.guest_pool
+      ? '<span class="muted">—</span>'
+      : account.restriction?.enabled
+        ? '<span class="pill ok" data-i18n="guest-pool-private">Guests only</span>'
+        : '<span class="pill low" data-i18n="guest-pool-shared">Shared with members</span>';
+    return `<tr>
+      <td><strong>${escapeHtml(account.alias)}</strong><div class="muted tiny">${escapeHtml(GUEST_PROVIDER_LABELS[account.provider] ?? account.provider)} · ${statusBadge(account.status)}</div></td>
+      <td>${account.guest_pool ? '<span class="pill ok" data-i18n="guest-pool-open">Open to guests</span>' : '<span class="pill" data-i18n="guest-pool-closed">Closed</span>'}</td>
+      <td>${visibility}</td>
+      <td class="tiny">${chain}</td>
+      <td>${keysOn(account.id)}</td>
+      <td><form method="post" action="/guests/pool" class="inline">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <input type="hidden" name="account_id" value="${escapeHtml(account.id)}">
+        <input type="hidden" name="enabled" value="${account.guest_pool ? '0' : '1'}">
+        <button type="submit" class="${account.guest_pool ? 'danger' : 'secondary'} guest-small" data-i18n="${account.guest_pool ? 'guest-pool-close' : 'guest-pool-add'}">${account.guest_pool ? 'Close to guests' : 'Open to guests'}</button>
+      </form></td>
+    </tr>`;
+  }).join('');
+
+  const accountSelect = (provider) => {
+    const options = pool.filter((account) => account.provider === provider);
+    return `<label><span>${GUEST_PROVIDER_LABELS[provider]} <span data-i18n="guest-create-account">account</span></span>
+      <select name="${provider}_account_id"${options.length ? '' : ' disabled'}>
+        <option value="" data-i18n="guest-create-no-provider">Not available on this key</option>
+        ${options.map((account, index) => `<option value="${escapeHtml(account.id)}"${index === 0 ? ' selected' : ''}>${escapeHtml(account.alias)}</option>`).join('')}
+      </select>
+    </label>`;
+  };
+
+  const keyRows = keys.map((key) => {
+    const revoked = Boolean(key.revoked_at);
+    const remaining = key.budget_micro_usd - key.spent_micro_usd;
+    const exhausted = !revoked && remaining <= 0;
+    const status = revoked
+      ? '<span class="pill out" data-i18n="guest-status-revoked">Revoked</span>'
+      : exhausted
+        ? '<span class="pill out" data-i18n="guest-status-exhausted">Allowance used up</span>'
+        : '<span class="pill ok" data-i18n="guest-status-active">Active</span>';
+    const routes = GUEST_PROVIDERS.filter((provider) => key.devices[provider]).map((provider) => {
+      const device = key.devices[provider];
+      const moved = device.account_id && device.account_id !== device.home_account_id
+        ? ` → ${escapeHtml(alias(device.account_id))} <span class="pill moved" data-i18n="guest-on-backup">on a backup</span>`
+        : '';
+      return `<div class="tiny">${GUEST_PROVIDER_LABELS[provider]}: ${escapeHtml(alias(device.home_account_id))}${moved}${device.revoked && !revoked ? ' <span class="pill out" data-i18n="guest-device-revoked">device revoked</span>' : ''}</div>`;
+    }).join('');
+    const lastSeen = Object.values(key.devices)
+      .map((device) => device.last_seen_at)
+      .filter(Boolean)
+      .sort()
+      .at(-1) ?? null;
+    const confirm = `Revoke guest key ${key.name}? It stops working at once and cannot be restored.`;
+    return `<tr${revoked ? ' class="guest-revoked"' : ''}>
+      <td><strong>${escapeHtml(key.name)}</strong>${key.note ? `<div class="muted tiny">${escapeHtml(key.note)}</div>` : ''}<div class="muted tiny">${escapeHtml(dateText(key.created_at))}${key.created_by ? ` · ${escapeHtml(key.created_by)}` : ''}</div></td>
+      <td>${routes || '—'}</td>
+      <td>${escapeHtml(formatMicroUsd(key.budget_micro_usd))}${key.topups.length ? `<div class="muted tiny">${key.topups.length} <span data-i18n="guest-topups">top-ups</span></div>` : ''}</td>
+      <td>${escapeHtml(formatMicroUsd(key.spent_micro_usd))}<div class="muted tiny">Claude ${escapeHtml(formatMicroUsd(key.spent_by_provider.claude))} · Codex ${escapeHtml(formatMicroUsd(key.spent_by_provider.codex))}</div></td>
+      <td><strong>${escapeHtml(formatMicroUsd(Math.max(0, remaining)))}</strong></td>
+      <td>${Number(key.requests).toLocaleString('en-US')}<div class="muted tiny">${escapeHtml(dateText(key.last_charged_at ?? lastSeen))}</div></td>
+      <td>${status}</td>
+      <td>${revoked ? `<span class="muted tiny">${escapeHtml(dateText(key.revoked_at))}${key.revoked_by ? ` · ${escapeHtml(key.revoked_by)}` : ''}</span>` : `<form method="post" action="/guests/${encodeURIComponent(key.id)}/top-up" class="inline guest-topup">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <input name="amount" required inputmode="decimal" pattern="\\$?[0-9]{1,7}(\\.[0-9]{1,6})?" maxlength="16" autocomplete="off" aria-label="Top-up amount in US dollars" data-placeholder-en="USD" data-placeholder-zh="美元" placeholder="USD">
+        <button type="submit" class="secondary guest-small" data-i18n="guest-top-up">Top up</button>
+      </form>
+      <form method="post" action="/guests/${encodeURIComponent(key.id)}/revoke" class="inline" data-confirm="${escapeHtml(confirm)}">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <button type="submit" class="danger guest-small" data-i18n="guest-revoke">Revoke</button>
+      </form>`}</td>
+    </tr>`;
+  }).join('');
+
+  return layout('Guest keys', `
+    <section class="stack" data-guests-page>
+      <style>
+      .guest-small{width:auto;min-height:0;padding:6px 14px;font-size:12px;flex:0 0 auto}
+      .guest-topup{margin-bottom:6px}
+      .guest-topup input{width:96px;flex:0 0 auto;min-height:0;padding:6px 10px}
+      .guest-revoked td{opacity:.55}
+      .guest-create{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px}
+      .guest-create .wide{grid-column:1 / -1}
+      .guest-create input,.guest-create select{width:100%}
+      @media (max-width:720px){.guest-create{grid-template-columns:minmax(0,1fr)}}
+      </style>
+      <header class="metrics-page-hero">
+        <div>
+        <h1 data-i18n="guest-heading">Guest keys</h1>
+        <p class="muted" data-i18n="guest-intro">A gateway key for somebody outside the team. Instead of a seat it carries an allowance in US dollars: every answered request is priced at the public API list price, and once the allowance is spent the key is refused until you top it up. One key works for both Claude Code and Codex.</p>
+        </div>
+      </header>
+      ${error ? `<div class="notice error" role="alert">${escapeHtml(error)}</div>` : ''}
+      <article class="card stack" id="guest-pool">
+        <div>
+          <h2 data-i18n="guest-pool-heading">Guest account pool</h2>
+          <p class="muted" data-i18n="guest-pool-intro">Guest keys can only be issued on the accounts opened here. When an account runs out of quota a guest follows that account's own backup chain, exactly as a member's device does.</p>
+          <p class="muted tiny" data-i18n="guest-pool-private-hint">To keep an account for guests alone, also make it private on the Overview tab: a private account in the pool admits guest keys and the machines you ticked, nobody else. An account left open is shared between guests and members.</p>
+        </div>
+        ${accounts.length ? `<div class="table-wrap"><table>
+          <thead><tr>
+            <th scope="col" data-i18n="guest-col-account">Account</th>
+            <th scope="col" data-i18n="guest-col-pool">Guest pool</th>
+            <th scope="col" data-i18n="guest-col-visibility">Who else uses it</th>
+            <th scope="col" data-i18n="guest-col-chain">Backup chain</th>
+            <th scope="col" data-i18n="guest-col-keys">Active keys</th>
+            <th scope="col"></th>
+          </tr></thead>
+          <tbody>${poolRows}</tbody>
+        </table></div>` : '<p class="empty muted" data-i18n="guest-pool-none">No Claude or Codex subscription accounts are registered.</p>'}
+      </article>
+      <article class="card stack" id="guest-create">
+        <div>
+          <h2 data-i18n="guest-create-heading">Issue a guest key</h2>
+          <p class="muted tiny" data-i18n="guest-create-intro">The key is shown once, on the next page, with the two settings the guest needs. The allowance is a one-off total; it does not renew.</p>
+        </div>
+        ${pool.length ? `<form method="post" action="/guests" class="guest-create">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <label><span data-i18n="guest-create-name">Name</span>
+            <input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" maxlength="64" autocomplete="off" data-placeholder-en="who it is for, e.g. alice-acme" data-placeholder-zh="给谁用，例如 alice-acme" placeholder="who it is for, e.g. alice-acme">
+          </label>
+          <label><span data-i18n="guest-create-budget">Allowance (US dollars)</span>
+            <input name="budget" required inputmode="decimal" pattern="\\$?[0-9]{1,7}(\\.[0-9]{1,6})?" maxlength="16" autocomplete="off" placeholder="20">
+          </label>
+          ${accountSelect('claude')}
+          ${accountSelect('codex')}
+          <label class="wide"><span data-i18n="guest-create-note">Note (optional)</span>
+            <input name="note" maxlength="${GUEST_KEY_MAX_NOTE}" autocomplete="off">
+          </label>
+          <div class="wide"><button type="submit" data-i18n="guest-create-submit">Issue guest key</button></div>
+        </form>` : '<p class="empty muted" data-i18n="guest-create-no-pool">Open at least one account to guests above first.</p>'}
+      </article>
+      <article class="card stack" id="guest-keys">
+        <div>
+          <h2 data-i18n="guest-keys-heading">Issued keys</h2>
+          <p class="muted tiny" data-i18n="guest-keys-intro">Spend is an estimate at list price: requests already under way when the allowance runs out still finish, and a Codex turn cut off before it reports usage is not counted.</p>
+        </div>
+        ${keys.length ? `<div class="table-wrap"><table>
+          <thead><tr>
+            <th scope="col" data-i18n="guest-col-key">Key</th>
+            <th scope="col" data-i18n="guest-col-accounts">Accounts</th>
+            <th scope="col" data-i18n="guest-col-budget">Allowance</th>
+            <th scope="col" data-i18n="guest-col-spent">Spent</th>
+            <th scope="col" data-i18n="guest-col-remaining">Remaining</th>
+            <th scope="col" data-i18n="guest-col-requests">Requests · last used</th>
+            <th scope="col" data-i18n="guest-col-status">Status</th>
+            <th scope="col"></th>
+          </tr></thead>
+          <tbody>${keyRows}</tbody>
+        </table></div>` : '<p class="empty muted" data-i18n="guest-keys-none">No guest keys have been issued.</p>'}
+      </article>
+    </section>
+  `, { openMode, activeTab: 'guests' });
+}
+
+/** The one page that ever shows a guest key's secret, with how to use it. */
+export function guestKeyCreatedView({
+  key,
+  token,
+  claudeGatewayUrl = null,
+  codexGatewayUrl = null,
+  openMode = false,
+}) {
+  const claude = key.devices.claude && claudeGatewayUrl
+    ? `export ANTHROPIC_BASE_URL=${shellSingleQuote(claudeGatewayUrl)}\nexport ANTHROPIC_AUTH_TOKEN=${shellSingleQuote(token)}\nclaude`
+    : null;
+  const codexConfig = key.devices.codex && codexGatewayUrl
+    ? `model_provider = "gateway"\n\n[model_providers.gateway]\nname = "gateway"\nbase_url = "${codexGatewayUrl}"\nwire_api = "responses"\nenv_key = "CODEX_GATEWAY_TOKEN"`
+    : null;
+  const codexEnv = codexConfig ? `export CODEX_GATEWAY_TOKEN=${shellSingleQuote(token)}\ncodex` : null;
+  const block = (id, text) => `<pre id="${id}">${escapeHtml(text)}</pre>
+      <div class="setup-actions"><button type="button" class="secondary" data-copy-target="${id}" data-i18n="guest-copy">Copy</button></div>`;
+  return layout('Guest key issued', `
+    <section class="card stack">
+      <div class="notice success"><span data-i18n="guest-created-notice">Guest key issued</span>: <strong>${escapeHtml(key.name)}</strong> · ${escapeHtml(formatMicroUsd(key.budget_micro_usd))}</div>
+      <h1 data-i18n="guest-created-heading">Copy this key now</h1>
+      <p class="muted" data-i18n="guest-created-intro">It is displayed once; the console keeps only a digest and this page cannot be reproduced. Send it to the guest over a private channel. The gateway address is only reachable from inside the tailnet.</p>
+      ${block('guest-key-token', token)}
+      ${claude ? `<h3 data-i18n="guest-created-claude">Claude Code</h3>
+      <p class="muted tiny" data-i18n="guest-created-claude-hint">Run in the shell that starts Claude Code, or put the two exports in the shell profile.</p>
+      ${block('guest-key-claude', claude)}` : ''}
+      ${codexConfig ? `<h3 data-i18n="guest-created-codex">Codex</h3>
+      <p class="muted tiny" data-i18n="guest-created-codex-config">Add to ~/.codex/config.toml (the first line goes above any [section]):</p>
+      ${block('guest-key-codex-config', codexConfig)}
+      <p class="muted tiny" data-i18n="guest-created-codex-env">Then start Codex with the key in the environment:</p>
+      ${block('guest-key-codex-env', codexEnv)}` : ''}
+      <div class="notice" data-i18n="guest-created-closing">Closing or refreshing this page permanently hides the key. If it is lost, revoke it and issue another.</div>
+      <a class="button secondary" href="/guests" data-i18n="guest-created-back">Back to guest keys</a>
+    </section>
+  `, { openMode, activeTab: 'guests' });
 }

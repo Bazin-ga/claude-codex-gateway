@@ -49,9 +49,26 @@ import {
   normalizeModelBlockRules,
   parseModelBlockRuleInput,
 } from './model-block-rules.js';
+import {
+  GUEST_BUDGET_MAX_MICRO_USD,
+  GUEST_KEY_MAX_ACTIVE,
+  GUEST_KEY_MAX_NOTE,
+  GUEST_KEY_MAX_TOPUPS,
+  GUEST_KEY_NAME_PATTERN,
+  GUEST_PROVIDERS,
+  guestMachineId,
+  isGuestDevice,
+  isGuestPoolAccount,
+} from './guest-keys.js';
 
 const STATE_VERSION = 1;
 const MAX_AUDIT_EVENTS = 2_000;
+/**
+ * How long a guest key's spend may sit in memory before it is written. Every
+ * charged request would otherwise rewrite the whole state file.
+ */
+const GUEST_SPEND_PERSIST_MS = 1_000;
+const GUEST_SPEND_RETRY_MS = 30_000;
 
 /**
  * The opaque handle a client reports for the machine it runs on.
@@ -241,6 +258,7 @@ export class CredentialStore {
     this.queue = Promise.resolve();
     this.pendingDeviceAccountFields = new Map();
     this.relayChainCache = null;
+    this.guestSpendTimer = null;
   }
 
   async init() {
@@ -318,6 +336,7 @@ export class CredentialStore {
       restriction: account.restriction
         ? { ...account.restriction, ...normalizeAccountRestriction(account.restriction) }
         : null,
+      guest_pool: isGuestPoolAccount(account),
       active_devices: this.state.devices.filter((device) => {
         if (device.revoked_at) return false;
         try {
@@ -2904,6 +2923,347 @@ export class CredentialStore {
     });
   }
 
+  #guestKeys() {
+    return Array.isArray(this.state.guest_keys) ? this.state.guest_keys : [];
+  }
+
+  #guestKey(id) {
+    return this.#guestKeys().find((entry) => entry.id === id) ?? null;
+  }
+
+  /** The account a device answers to now, or null when its policy is broken. */
+  #selectedAccountId(device) {
+    try {
+      return this.#deviceAccountPolicy(device).selectedAccountId;
+    } catch {
+      return null;
+    }
+  }
+
+  #publicGuestKey(key) {
+    const devices = {};
+    for (const provider of GUEST_PROVIDERS) {
+      const device = this.state.devices.find((entry) => entry.id === key.devices?.[provider]);
+      if (!device) continue;
+      devices[provider] = {
+        device_id: device.id,
+        home_account_id: device.account_failover?.home_account_id ?? device.account_id,
+        account_id: this.#selectedAccountId(device),
+        revoked: Boolean(device.revoked_at),
+        last_seen_at: device.last_seen_at ?? null,
+      };
+    }
+    return {
+      id: key.id,
+      name: key.name,
+      note: key.note ?? '',
+      budget_micro_usd: key.budget_micro_usd,
+      spent_micro_usd: key.spent_micro_usd,
+      spent_by_provider: { claude: 0, codex: 0, ...key.spent_by_provider },
+      requests: key.requests ?? 0,
+      created_at: key.created_at,
+      created_by: key.created_by ?? null,
+      last_charged_at: key.last_charged_at ?? null,
+      topups: (key.topups ?? []).map((entry) => ({ ...entry })),
+      revoked_at: key.revoked_at ?? null,
+      revoked_by: key.revoked_by ?? null,
+      devices,
+    };
+  }
+
+  /** Every guest key, newest first, without its secret. */
+  publicGuestKeys() {
+    return this.#guestKeys().map((key) => this.#publicGuestKey(key)).reverse();
+  }
+
+  /**
+   * Open an account to guest keys, or close it. Subscription accounts only: a
+   * guest allowance is counted at API list price, which is not what an
+   * API-key or Bedrock account is actually billed. An account with guest keys
+   * on it cannot be closed to them — revoke the keys first.
+   */
+  async setAccountGuestPool(id, { enabled, actor = null }) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account) throw new Error('account not found');
+      if (!GUEST_PROVIDERS.includes(account.provider) || isCodexApiKeyAccount(account)) {
+        throw new Error('only Claude and Codex subscription accounts can take guest keys');
+      }
+      const next = enabled === true;
+      const previous = isGuestPoolAccount(account);
+      if (next === previous) return account;
+      if (!next) {
+        const inUse = this.state.devices.some((device) => (
+          !device.revoked_at && isGuestDevice(device) && (
+            device.account_id === id
+            || this.#selectedAccountId(device) === id
+            || device.account_failover?.home_account_id === id
+          )
+        ));
+        if (inUse) throw new Error('guest keys are still using this account; revoke them first');
+      }
+      const before = account.guest_pool;
+      account.guest_pool = { enabled: next, updated_at: nowIso(), updated_by: auditActor(actor) };
+      const auditLength = this.state.audit.length;
+      this.audit('account_guest_pool_updated', {
+        account_id: id,
+        enabled: next,
+        actor: auditActor(actor),
+      });
+      try {
+        await this.persist();
+      } catch (error) {
+        if (before === undefined) delete account.guest_pool;
+        else account.guest_pool = before;
+        this.state.audit.length = auditLength;
+        throw error;
+      }
+      return account;
+    });
+  }
+
+  /**
+   * Issue a guest key: one secret, one device per provider it may use, and a
+   * dollar allowance. `accountIds` names the guest-pool account each provider
+   * starts on; a provider left out is one the key cannot use. The token is
+   * returned once and only its digest is kept.
+   */
+  async createGuestKey({ name, budgetMicroUsd, accountIds = {}, note = '', actor = null }) {
+    return this.serialized(async () => {
+      const keyName = String(name ?? '').trim();
+      if (!GUEST_KEY_NAME_PATTERN.test(keyName)) {
+        throw new Error('a guest key name is 1-64 letters, digits, dots, underscores or hyphens');
+      }
+      const active = this.#guestKeys().filter((entry) => !entry.revoked_at);
+      if (active.some((entry) => entry.name === keyName)) {
+        throw new Error('an active guest key already has this name');
+      }
+      if (active.length >= GUEST_KEY_MAX_ACTIVE) {
+        throw new Error(`at most ${GUEST_KEY_MAX_ACTIVE} active guest keys`);
+      }
+      if (!Number.isSafeInteger(budgetMicroUsd) || budgetMicroUsd <= 0
+        || budgetMicroUsd > GUEST_BUDGET_MAX_MICRO_USD) {
+        throw new Error('the allowance must be more than zero');
+      }
+      const id = randomToken(12);
+      const devices = [];
+      const deviceIds = {};
+      const accountAudit = {};
+      for (const provider of GUEST_PROVIDERS) {
+        const accountId = accountIds?.[provider];
+        if (typeof accountId !== 'string' || !accountId) continue;
+        const account = this.accountById(accountId);
+        if (!account || account.provider !== provider) throw new Error(`${provider} account not found`);
+        if (!isGuestPoolAccount(account)) throw new Error(`${account.alias} is not open to guest keys`);
+        this.#assertSwitchableAccount(account);
+        const { device } = buildDevice({
+          account,
+          memberLabel: `guest:${keyName}`,
+          deviceName: keyName,
+          machineId: guestMachineId(id),
+        });
+        // The device's own secret is dropped unseen: a guest device answers
+        // to its key's token only (see deviceByToken).
+        device.guest_key_id = id;
+        devices.push(device);
+        deviceIds[provider] = device.id;
+        accountAudit[provider] = account.id;
+      }
+      if (devices.length === 0) throw new Error('choose at least one account for the guest key');
+
+      const token = `sk-ant-api03-${randomToken(32)}`;
+      const key = {
+        id,
+        name: keyName,
+        note: String(note ?? '').trim().slice(0, GUEST_KEY_MAX_NOTE),
+        token_sha256: sha256(token),
+        devices: deviceIds,
+        budget_micro_usd: budgetMicroUsd,
+        spent_micro_usd: 0,
+        spent_by_provider: { claude: 0, codex: 0 },
+        requests: 0,
+        created_at: nowIso(),
+        created_by: auditActor(actor),
+        last_charged_at: null,
+        topups: [],
+        revoked_at: null,
+        revoked_by: null,
+      };
+      const hadKeys = Array.isArray(this.state.guest_keys);
+      const deviceCount = this.state.devices.length;
+      const auditLength = this.state.audit.length;
+      if (!hadKeys) this.state.guest_keys = [];
+      this.state.guest_keys.push(key);
+      this.state.devices.push(...devices);
+      this.audit('guest_key_created', {
+        guest_key_id: id,
+        name: keyName,
+        budget_micro_usd: budgetMicroUsd,
+        account_ids: accountAudit,
+        device_ids: { ...deviceIds },
+        actor: auditActor(actor),
+      });
+      try {
+        await this.persist();
+      } catch (error) {
+        this.state.guest_keys.pop();
+        if (!hadKeys) delete this.state.guest_keys;
+        this.state.devices.length = deviceCount;
+        this.state.audit.length = auditLength;
+        throw error;
+      }
+      return { key: this.#publicGuestKey(key), token };
+    });
+  }
+
+  /** Add to a guest key's allowance. The spend so far is untouched. */
+  async topUpGuestKey(id, { microUsd, actor = null }) {
+    return this.serialized(async () => {
+      const key = this.#guestKey(id);
+      if (!key) throw new Error('guest key not found');
+      if (key.revoked_at) throw new Error('this guest key is revoked');
+      if (!Number.isSafeInteger(microUsd) || microUsd <= 0) {
+        throw new Error('the amount must be more than zero');
+      }
+      if (key.budget_micro_usd + microUsd > GUEST_BUDGET_MAX_MICRO_USD) {
+        throw new Error('the allowance would be too large');
+      }
+      const before = { budget: key.budget_micro_usd, topups: key.topups };
+      const auditLength = this.state.audit.length;
+      key.budget_micro_usd += microUsd;
+      key.topups = [
+        ...(Array.isArray(key.topups) ? key.topups : []),
+        { at: nowIso(), micro_usd: microUsd, by: auditActor(actor) },
+      ].slice(-GUEST_KEY_MAX_TOPUPS);
+      this.audit('guest_key_topped_up', {
+        guest_key_id: key.id,
+        name: key.name,
+        micro_usd: microUsd,
+        budget_micro_usd: key.budget_micro_usd,
+        spent_micro_usd: key.spent_micro_usd,
+        actor: auditActor(actor),
+      });
+      try {
+        await this.persist();
+      } catch (error) {
+        key.budget_micro_usd = before.budget;
+        key.topups = before.topups;
+        this.state.audit.length = auditLength;
+        throw error;
+      }
+      return this.#publicGuestKey(key);
+    });
+  }
+
+  /** Revoke a guest key and the devices behind it. Its record and spend stay. */
+  async revokeGuestKey(id, { actor = null } = {}) {
+    return this.serialized(async () => {
+      const key = this.#guestKey(id);
+      if (!key) throw new Error('guest key not found');
+      if (key.revoked_at) return this.#publicGuestKey(key);
+      const at = nowIso();
+      const revoked = [];
+      const auditLength = this.state.audit.length;
+      key.revoked_at = at;
+      key.revoked_by = auditActor(actor);
+      for (const device of this.state.devices) {
+        if (device.guest_key_id !== key.id || device.revoked_at) continue;
+        device.revoked_at = at;
+        revoked.push(device);
+      }
+      this.audit('guest_key_revoked', {
+        guest_key_id: key.id,
+        name: key.name,
+        device_ids: revoked.map((device) => device.id),
+        spent_micro_usd: key.spent_micro_usd,
+        budget_micro_usd: key.budget_micro_usd,
+        actor: auditActor(actor),
+      });
+      try {
+        await this.persist();
+      } catch (error) {
+        key.revoked_at = null;
+        key.revoked_by = null;
+        for (const device of revoked) device.revoked_at = null;
+        this.state.audit.length = auditLength;
+        throw error;
+      }
+      return this.#publicGuestKey(key);
+    });
+  }
+
+  /**
+   * Where a guest device's key stands, or null for an ordinary device. Read by
+   * the proxies before every inference request; `exhausted` means the spend
+   * has reached the allowance (or the key is gone) and nothing may be sent.
+   */
+  guestKeyBudget(device) {
+    if (!isGuestDevice(device)) return null;
+    const key = this.#guestKey(device.guest_key_id);
+    if (!key || key.revoked_at) {
+      return {
+        id: device.guest_key_id,
+        name: key?.name ?? device.name,
+        budgetMicroUsd: key?.budget_micro_usd ?? 0,
+        spentMicroUsd: key?.spent_micro_usd ?? 0,
+        revoked: true,
+        exhausted: true,
+      };
+    }
+    return {
+      id: key.id,
+      name: key.name,
+      budgetMicroUsd: key.budget_micro_usd,
+      spentMicroUsd: key.spent_micro_usd,
+      revoked: false,
+      exhausted: key.spent_micro_usd >= key.budget_micro_usd,
+    };
+  }
+
+  /**
+   * Add one request's cost to a guest key. Synchronous on purpose: the next
+   * request's check must see it at once, so the count is updated in memory
+   * here and written shortly afterwards (see GUEST_SPEND_PERSIST_MS). A
+   * revoked key is still charged for what was in flight when it was revoked.
+   */
+  chargeGuestKey(id, { provider, microUsd }) {
+    const key = this.#guestKey(id);
+    if (!key || !GUEST_PROVIDERS.includes(provider)) return null;
+    const amount = Number.isSafeInteger(microUsd) && microUsd > 0 ? microUsd : 0;
+    key.spent_micro_usd = (key.spent_micro_usd ?? 0) + amount;
+    key.spent_by_provider = { claude: 0, codex: 0, ...key.spent_by_provider };
+    key.spent_by_provider[provider] += amount;
+    key.requests = (key.requests ?? 0) + 1;
+    key.last_charged_at = nowIso();
+    this.#scheduleGuestSpendPersist(GUEST_SPEND_PERSIST_MS);
+    return { spentMicroUsd: key.spent_micro_usd, budgetMicroUsd: key.budget_micro_usd };
+  }
+
+  #scheduleGuestSpendPersist(delayMs) {
+    if (this.guestSpendTimer) return;
+    this.guestSpendTimer = setTimeout(() => {
+      this.guestSpendTimer = null;
+      this.serialized(() => this.persist()).catch(() => {
+        // The spend is still in memory and goes out with the next write of
+        // any kind; this only makes sure one is attempted.
+        this.#scheduleGuestSpendPersist(GUEST_SPEND_RETRY_MS);
+      });
+    }, delayMs);
+    this.guestSpendTimer.unref?.();
+  }
+
+  /** Write any guest spend still waiting for its timer. For shutdown. */
+  async flushGuestSpend() {
+    if (!this.guestSpendTimer) {
+      // A write the timer has already started is in the queue: wait it out.
+      await this.serialized(async () => {});
+      return;
+    }
+    clearTimeout(this.guestSpendTimer);
+    this.guestSpendTimer = null;
+    await this.serialized(() => this.persist());
+  }
+
   adminUsers() {
     return (Array.isArray(this.state.admin_users) ? this.state.admin_users : []).map((user) => ({
       username: user.username,
@@ -2987,9 +3347,24 @@ export class CredentialStore {
     return ok && user ? user.username : null;
   }
 
-  deviceByToken(token) {
+  /**
+   * The device a token belongs to. With `provider`, a guest key is accepted
+   * as well and answers as its device for that provider; only the Claude and
+   * the Codex route ask that way, which is what keeps a guest key off every
+   * other route.
+   */
+  deviceByToken(token, provider = null) {
+    const device = this.state.devices.find(
+      (entry) => !entry.revoked_at && secretMatches(token, entry.token_sha256),
+    );
+    if (device || !GUEST_PROVIDERS.includes(provider)) return device ?? null;
+    const key = this.#guestKeys().find(
+      (entry) => !entry.revoked_at && secretMatches(token, entry.token_sha256),
+    );
+    const deviceId = key?.devices?.[provider];
+    if (typeof deviceId !== 'string') return null;
     return this.state.devices.find(
-      (device) => !device.revoked_at && secretMatches(token, device.token_sha256),
+      (entry) => entry.id === deviceId && !entry.revoked_at && entry.guest_key_id === key.id,
     ) ?? null;
   }
 

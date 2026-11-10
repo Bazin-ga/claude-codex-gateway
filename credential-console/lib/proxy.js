@@ -39,6 +39,12 @@ import {
 } from './account-failover.js';
 import { claudeQuotaSignal } from './claude-quota-signal.js';
 import { claudeReserveHold, claudeReserveMessage } from './claude-reserve.js';
+import {
+  GUEST_CLAUDE_USAGE_LIMITS,
+  chargeGuestRequest,
+  guestBudgetMessage,
+  isGuestDevice,
+} from './guest-keys.js';
 
 /**
  * The body a replayed refusal carries: the shape the Messages API refuses
@@ -370,7 +376,7 @@ export async function handleClaudeProxy(req, res, {
   }
 
   const token = deviceToken(req);
-  const device = token ? store.deviceByToken(token) : null;
+  const device = token ? store.deviceByToken(token, 'claude') : null;
   if (!device) {
     const ip = sourceIp(req);
     if (rateLimited(authFailures, ip, AUTH_FAILURE_LIMIT)) {
@@ -391,8 +397,11 @@ export async function handleClaudeProxy(req, res, {
   // A turn naming an allowed third-party model goes to that platform instead
   // of to an account. Any other turn carries on below, with the bytes read to
   // find out put back in front of the body by the gate code.
+  // A guest key is an allowance on the subscription accounts only: its turns
+  // are never handed to a third-party platform.
+  const guestDevice = isGuestDevice(device);
   let relayPrefix = null;
-  if (relay && upstreamPath === '/v1/messages') {
+  if (relay && upstreamPath === '/v1/messages' && !guestDevice) {
     const relayed = await relay.intercept(req, res, { device, kind: 'messages', path: upstreamPath });
     if (relayed.handled) return;
     relayPrefix = relayed.prefix;
@@ -473,6 +482,38 @@ export async function handleClaudeProxy(req, res, {
     recordRejected(404);
     sendJson(res, 404, { type: 'error', error: { type: 'not_found_error', message: 'unsupported gateway path' } });
     return;
+  }
+
+  // A guest key whose allowance is spent is refused here, before the body is
+  // read or anything is sent. Only inference is refused, as it is all that is
+  // charged. 403, not 429: Claude Code prints a permission error at once,
+  // where it would retry a rate limit.
+  if (guestDevice && upstreamPath === '/v1/messages') {
+    const budget = typeof store.guestKeyBudget === 'function' ? store.guestKeyBudget(device) : null;
+    if (!budget || budget.exhausted) {
+      log('claude_proxy_guest_budget_exhausted', {
+        account_id: account.id,
+        device_id: device.id,
+        guest_key_id: device.guest_key_id,
+        spent_micro_usd: budget?.spentMicroUsd ?? null,
+        budget_micro_usd: budget?.budgetMicroUsd ?? null,
+      });
+      recordRejected(403, 'guest_budget_exhausted');
+      refuseAfterDraining(req, res, () => {
+        sendJson(res, 403, {
+          type: 'error',
+          error: {
+            type: 'permission_error',
+            message: guestBudgetMessage({
+              name: budget?.name ?? device.name,
+              budgetMicroUsd: budget?.budgetMicroUsd ?? 0,
+              revoked: !budget || budget.revoked,
+            }),
+          },
+        }, { 'x-should-retry': 'false', 'x-gateway-guest-budget': 'exhausted', Connection: 'close' });
+      }, { limitBytes: MAX_REQUEST_BYTES });
+      return;
+    }
   }
 
   // The console-wide model block rules, evaluated before anything is acquired.
@@ -756,6 +797,8 @@ export async function handleClaudeProxy(req, res, {
   const RETRY_BASE_DELAY_MS = 250;
   const RETRY_MAX_DELAY_MS = 5000;
   let responseObservation = null;
+  // The usage parser of the answer being relayed, kept only for a guest key.
+  let guestUsageParser = null;
   let responseUsageFinished = true;
   let upstreamTtfbMs = null;
   let upstreamStatus = null;
@@ -835,6 +878,19 @@ export async function handleClaudeProxy(req, res, {
       upstreamRequestId,
       ...safeUsageSnapshot(responseObservation),
     };
+    // A guest key pays for what was answered, at list price, from the same
+    // counts — read off the parser itself, which also knows the cache write's
+    // lifetime split and how much of a cut-off answer had streamed.
+    if (guestUsageParser) {
+      chargeGuestRequest({
+        store,
+        device,
+        provider: 'claude',
+        model: metricRow.model,
+        parser: guestUsageParser,
+        log,
+      });
+    }
     let conversation = null;
     if (upstreamPath === '/v1/messages'
       && typeof requestMetrics?.enqueueCompletion === 'function') {
@@ -1085,9 +1141,18 @@ export async function handleClaudeProxy(req, res, {
           ? responseUsageFormat(upstreamRes.headers['content-type'])
           : null;
         const observers = [];
-        if (responseFormat && requestMetrics?.enqueueRequest) {
+        guestUsageParser = null;
+        // Metering a guest key needs the usage whether or not this console
+        // records metrics, and needs the whole answer read: see
+        // GUEST_CLAUDE_USAGE_LIMITS.
+        if (responseFormat && (requestMetrics?.enqueueRequest || guestDevice)) {
           try {
-            observers.push(usageObserver(responseUsageParserFactory({ format: responseFormat })));
+            const parser = responseUsageParserFactory({
+              format: responseFormat,
+              ...(guestDevice ? GUEST_CLAUDE_USAGE_LIMITS : {}),
+            });
+            observers.push(usageObserver(parser));
+            if (guestDevice) guestUsageParser = parser;
           } catch (error) {
             log('response_usage_parser_init_failed', {
               account_id: account.id,

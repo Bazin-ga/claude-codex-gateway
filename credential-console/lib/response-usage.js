@@ -9,7 +9,9 @@ export const RESPONSE_USAGE_MAX_EVENTS = 8192;
 export const RESPONSE_USAGE_MAX_EVENT_BYTES = 64 * 1024;
 
 const MAX_CONFIG_BYTES = 16 * 1024 * 1024;
-const MAX_CONFIG_EVENTS = 32 * 1024;
+// A long answer is one event per few tokens; a caller that must read the final
+// usage of every response (a guest key is charged from it) asks for this many.
+const MAX_CONFIG_EVENTS = 1_000_000;
 const MAX_CONFIG_EVENT_BYTES = 1024 * 1024;
 const AUTO_DETECT_CHARS = 256;
 
@@ -18,6 +20,10 @@ const USAGE_KEYS = Object.freeze([
   ['cache_creation_input_tokens', 'cacheCreationInputTokens'],
   ['cache_read_input_tokens', 'cacheReadInputTokens'],
   ['output_tokens', 'outputTokens'],
+]);
+const CACHE_CREATION_KEYS = Object.freeze([
+  ['ephemeral_5m_input_tokens', 'ephemeral5mInputTokens'],
+  ['ephemeral_1h_input_tokens', 'ephemeral1hInputTokens'],
 ]);
 const EVENT_TYPES = new Set(['message_start', 'message_delta', 'message_stop', 'error']);
 
@@ -77,6 +83,9 @@ export class ResponseUsageParser {
 
     this.decoder = new TextDecoder('utf-8', { fatal: true });
     this.usage = emptyUsage();
+    // How much of the cache write asked for which lifetime. Kept beside the
+    // four counts rather than among them: only pricing reads it.
+    this.cacheCreation = { ephemeral5mInputTokens: null, ephemeral1hInputTokens: null };
     this.bytesSeen = 0;
     this.eventsSeen = 0;
     this.numericUsageSeen = false;
@@ -185,6 +194,14 @@ export class ResponseUsageParser {
       bytesSeen: this.bytesSeen,
       eventsSeen: this.eventsSeen,
     };
+  }
+
+  /**
+   * The cache write split by lifetime (`usage.cache_creation`), each null when
+   * the response did not say. The two prices differ, the total does not.
+   */
+  cacheCreationDetail() {
+    return { ...this.cacheCreation };
   }
 
   feedText(text) {
@@ -373,6 +390,13 @@ export class ResponseUsageParser {
     for (const [property, tokenValue] of updates) {
       this.usage[property] = tokenValue;
       if (tokenValue !== null) this.numericUsageSeen = true;
+    }
+    // Optional detail, never a reason to call the usage invalid.
+    if (isRecord(value.cache_creation)) {
+      for (const [key, property] of CACHE_CREATION_KEYS) {
+        const tokenValue = value.cache_creation[key];
+        if (Number.isSafeInteger(tokenValue) && tokenValue >= 0) this.cacheCreation[property] = tokenValue;
+      }
     }
     return true;
   }
