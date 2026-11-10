@@ -20,6 +20,7 @@ import {
   planRelaySources,
   relayBalanceRefusal,
   relayFailoverStatus,
+  relayRequestOnlyStatus,
   relayRequestWithoutThinking,
 } from '../lib/relay-chain.js';
 import {
@@ -535,6 +536,121 @@ test('a stream that has not begun in time is given up on while another source ca
   assert.deepEqual(attempts(metrics), ['relay:first 502 upstream_error', 'relay:second 200 completed']);
   assert.equal(metrics[1].outputTokens, 7);
   assert.equal(second.seen[0].url, '/v1/messages');
+});
+
+test('a source that accepts a stream and then says nothing, or stalls on the retry without reasoning, is given up on too', { timeout: 40_000 }, async (t) => {
+  const { first, platform, second, metrics, post, relay, sourceId } = await chainRelay(t, {
+    sources: [{ use: 'first', with: { first_byte_timeout_s: 5 } }, { use: 'platform', with: { first_byte_timeout_s: 5 } }, 'second'],
+  });
+  first.answer = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.flushHeaders(); // and not a byte more
+  };
+  platform.answer = (req, res, body) => {
+    if (body.thinking?.type !== 'disabled') answerJson(res, 400, { error: { message: 'reasoning_content must be passed back' } });
+  };
+  const chunk = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n';
+  second.answer = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(chunk);
+  };
+  const streamed = await post({
+    model: 'deepseek-v4-flash',
+    stream: true,
+    messages: [{ role: 'assistant', content: 'a', reasoning_content: 'r' }, { role: 'user', content: 'q' }],
+  });
+  assert.equal(streamed.status, 200);
+  assert.equal(await streamed.text(), chunk, 'nothing of the silent sources reached the client');
+  assert.deepEqual(attempts(metrics), ['relay:first 502 upstream_error', 'relay:boyue 502 upstream_error', 'relay:second 200 completed']);
+  assert.equal(platform.seen.length, 2, 'asked again without reasoning before it was given up on');
+  assert.equal(relay.sourceStates().get(sourceId('first')).last_failure.reason, 'first_byte_timeout');
+  assert.equal(relay.sourceStates().get(sourceId('boyue')).last_failure.reason, 'first_byte_timeout');
+});
+
+test('a source is cleared of its failures by finishing an answer, not by starting one', { timeout: 20_000 }, async (t) => {
+  const { first, state, post, relay, sourceId, metrics } = await chainRelay(t, { sources: ['first', 'second'] });
+  const cut = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"content":"h"}}]}\n\n', () => res.destroy());
+  };
+  const whole = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: [DONE]\n\n');
+  };
+  const stream = async () => {
+    const response = await post({ model: 'deepseek-v4-flash', stream: true, messages: [] });
+    await response.text().catch(() => {});
+  };
+  const resting = () => relay.sourceStates().get(sourceId('first')).cooling_until_ms - state.clock;
+
+  first.answer = cut;
+  await stream();
+  assert.equal(metrics.at(-1).outcome, 'upstream_error');
+  assert.equal(resting(), 30_000);
+  state.clock += 31_000;
+  await stream();
+  assert.equal(resting(), 60_000, 'the second break in a row, though each began well');
+
+  state.clock += 61_000;
+  first.answer = whole;
+  await stream();
+  assert.equal(relay.sourceStates().get(sourceId('first')).cooling_until_ms, null);
+  first.answer = cut;
+  await stream();
+  assert.equal(resting(), 30_000, 'a finished answer in between starts the count again');
+});
+
+test('a source that does not serve an endpoint passes the turn on without being rested', { timeout: 20_000 }, async (t) => {
+  const { first, second, metrics, post, turn, relay, sourceId } = await chainRelay(t, { sources: ['first', 'second'] });
+  first.answer = (req, res) => (req.url === '/v1/responses'
+    ? answerJson(res, 404, { error: { message: 'Not Found' } })
+    : completion(res));
+  const session = { headers: { 'session-id': 'conversation-0001' } };
+  const moved = await post({ model: 'deepseek-v4-flash', input: 'q' }, { path: '/relay/v1/responses', ...session });
+  assert.equal(moved.status, 200);
+  assert.deepEqual(attempts(metrics), ['relay:first 404 upstream_error', 'relay:second 200 completed']);
+  assert.equal(relay.sourceStates().get(sourceId('first')).cooling_until_ms, null);
+  assert.equal(relay.sourceStates().get(sourceId('first')).last_failure, null);
+
+  // Everybody else's turns still go to it; the conversation that needed the
+  // other source stays there.
+  await (await turn()).text();
+  assert.equal(first.seen.length, 2);
+  await (await post({ model: 'deepseek-v4-flash', input: 'q' }, { path: '/relay/v1/responses', ...session })).text();
+  assert.equal(first.seen.length, 2);
+  assert.equal(second.seen.length, 2);
+
+  assert.equal(relayRequestOnlyStatus(404), true);
+  assert.equal(relayRequestOnlyStatus(405), true);
+  assert.equal(relayFailoverStatus(405), true);
+  assert.equal(relayRequestOnlyStatus(429), false);
+});
+
+test('a rate limit that speaks of quota is not taken for an empty balance', () => {
+  assert.equal(relayBalanceRefusal(429, 'Rate limit reached: requests per minute quota'), false);
+  assert.equal(relayBalanceRefusal(429, '当前分组额度限流，请稍后再试'), false);
+  assert.equal(relayBalanceRefusal(429, 'You exceeded your current quota, please check your plan and billing details'), true);
+  assert.equal(relayBalanceRefusal(403, '用户额度不足'), true);
+  assert.equal(relayBalanceRefusal(403, 'token quota is not enough'), true);
+  assert.equal(relayBalanceRefusal(401, '该令牌额度已用尽'), true);
+  assert.equal(relayBalanceRefusal(402, ''), true);
+  assert.equal(relayBalanceRefusal(500, 'insufficient balance'), false);
+});
+
+test('a model with one source is forwarded as it always was: a refusal about reasoning is the client\'s to see', { timeout: 20_000 }, async (t) => {
+  const { platform, first, metrics, post, store } = await chainRelay(t, { sources: ['first'] });
+  await store.setRelayModelAllowed({ model: 'plain-model', allowed: true });
+  platform.answer = (req, res) => answerJson(res, 400, { error: { message: 'reasoning_content must be passed back' } });
+  const refused = await post({
+    model: 'plain-model',
+    messages: [{ role: 'assistant', content: 'a', reasoning_content: 'r' }, { role: 'user', content: 'q' }],
+  });
+  assert.equal(refused.status, 400);
+  assert.equal((await refused.json()).error.message, 'reasoning_content must be passed back');
+  assert.equal(platform.seen.length, 1, 'not asked a second time with the request changed');
+  assert.equal(platform.seen[0].body.messages[0].reasoning_content, 'r');
+  assert.equal(first.seen.length, 0);
+  assert.deepEqual(attempts(metrics), ['relay:boyue 400 upstream_error']);
 });
 
 test('a chain answers to its aliases and outranks a renaming route; with every source off it is as good as absent', { timeout: 20_000 }, async (t) => {

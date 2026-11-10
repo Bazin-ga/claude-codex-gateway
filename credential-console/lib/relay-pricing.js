@@ -39,6 +39,8 @@ function tokenize(text) {
 
 /** Wall-clock fields of an instant in an IANA zone, as the formulas ask for them. */
 const zoneFormats = new Map();
+const zoneMinutes = new Map();
+const ZONE_MINUTES_KEPT = 2048;
 function zoneParts(zone, atMs) {
   let format = zoneFormats.get(zone);
   if (!format) {
@@ -53,9 +55,15 @@ function zoneParts(zone, atMs) {
     });
     zoneFormats.set(zone, format);
   }
+  // Formatting is the slow part of pricing a turn, and a month of spend asks
+  // about the same few hundred hours over and over.
+  const minute = `${zone}\n${Math.floor(atMs / 60_000)}`;
+  const kept = zoneMinutes.get(minute);
+  if (kept) return kept;
   const parts = {};
   for (const part of format.formatToParts(new Date(atMs))) parts[part.type] = part.value;
-  return {
+  if (zoneMinutes.size >= ZONE_MINUTES_KEPT) zoneMinutes.clear();
+  const read = {
     hour: Number(parts.hour),
     minute: Number(parts.minute),
     day: Number(parts.day),
@@ -63,6 +71,8 @@ function zoneParts(zone, atMs) {
     // Sunday is 0, as in the Go runtime these formulas were written for.
     weekday: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(parts.weekday),
   };
+  zoneMinutes.set(minute, read);
+  return read;
 }
 
 const CLOCK_FUNCTIONS = new Set(['hour', 'minute', 'day', 'month', 'weekday']);
@@ -221,7 +231,13 @@ export function compileBillingExpression(text) {
     return null;
   }
   return ({ p = 0, c = 0, cr = 0, cc = 0 } = {}, atMs = Date.now()) => {
-    const value = Number(evaluate(tree, { p, c, cr, cc }, atMs));
+    let value;
+    try {
+      value = Number(evaluate(tree, { p, c, cr, cc }, atMs));
+    } catch {
+      // A formula that cannot be worked out prices nothing; it never fails the page or a turn.
+      return null;
+    }
     return Number.isFinite(value) && value >= 0 ? value : null;
   };
 }

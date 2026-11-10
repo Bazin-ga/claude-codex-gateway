@@ -26,6 +26,7 @@ import {
   relayBalanceRefusal,
   relayChainFor,
   relayFailoverStatus,
+  relayRequestOnlyStatus,
   relayRequestWithoutThinking,
   RELAY_THINKING_REFUSAL,
 } from './relay-chain.js';
@@ -467,11 +468,19 @@ export function createRelay({
         if (kind === 'messages') headers['x-api-key'] = candidate.apiKey;
       }
       // A source that has not begun to answer a streaming turn in time is
-      // given up on while another can still take it. Once its headers are in,
-      // only the whole-stream limit applies.
+      // given up on while another can still take it. The wait runs to the
+      // first bytes of the answer, not to its headers: a source may accept a
+      // turn and then say nothing. Once it has begun, only the whole-stream
+      // limit applies.
       const slow = more && streaming && candidate.firstByteTimeoutMs ? new AbortController() : null;
+      let slowTimer = null;
+      const begun = () => {
+        clearTimeout(slowTimer);
+        slowTimer = null;
+      };
       const send = async (requestBody) => {
-        const timer = slow ? setTimeout(() => slow.abort(), candidate.firstByteTimeoutMs) : null;
+        begun();
+        if (slow) slowTimer = setTimeout(() => slow.abort(), candidate.firstByteTimeoutMs);
         try {
           return await fetchImpl(`${candidate.baseUrl}${KINDS[kind].upstreamPath}`, {
             method: 'POST',
@@ -483,13 +492,14 @@ export function createRelay({
               ...(slow ? [slow.signal] : []),
             ]),
           });
-        } finally {
-          clearTimeout(timer);
+        } catch (error) {
+          begun();
+          throw error;
         }
       };
       const failed = ({ status, reason, balance = false }) => {
-        log('relay_proxy_source_failed', { device_id: device.id, model, source: candidate.alias, status, reason, failover: more });
         if (candidate.id === null) return;
+        log('relay_proxy_source_failed', { device_id: device.id, model, source: candidate.alias, status, reason, failover: more });
         health.failure(candidate.id, { status, reason, balance });
         if (balance && candidate.platform) catalog?.refreshBalance?.().catch(() => {});
       };
@@ -526,15 +536,18 @@ export function createRelay({
             return true;
           }
           log('relay_proxy_upstream_body_failed', { device_id: device.id, model, code: error?.code ?? error?.name ?? 'unknown' });
-          failed({ status: upstreamResponse.status, reason: 'unreadable' });
+          failed({ status: upstreamResponse.status, reason: slow?.signal.aborted ? 'first_byte_timeout' : 'unreadable' });
           record({ ...metricBase, statusCode: 502, outcome: 'upstream_error' });
           if (more) return false;
           if (!res.headersSent) sendJson(res, 502, errorBody(kind, 'api_error', 'third-party platform response unreadable'));
           return true;
+        } finally {
+          begun();
         }
-        // A conversation whose history lacks the reasoning this source wants
-        // passed back runs without reasoning rather than not at all.
-        if (upstreamResponse.status === 400 && RELAY_THINKING_REFUSAL.test(refusal.subarray(0, 4096).toString('utf8'))) {
+        // A conversation moved between a chain's sources may lack the
+        // reasoning this one wants passed back; it runs without reasoning
+        // rather than not at all. A model with one source is not rewritten.
+        if (chain && upstreamResponse.status === 400 && RELAY_THINKING_REFUSAL.test(refusal.subarray(0, 4096).toString('utf8'))) {
           const plain = relayRequestWithoutThinking(kind, parsed);
           if (plain) {
             try {
@@ -544,12 +557,18 @@ export function createRelay({
                 upstreamResponse = second;
                 refusal = null;
               } else {
+                begun();
                 await second.body?.cancel().catch(() => {});
               }
             } catch {
               if (clientGone.signal.aborted) {
                 record({ ...metricBase, statusCode: null, outcome: 'client_disconnected' });
                 return true;
+              }
+              if (slow?.signal.aborted) {
+                failed({ status: null, reason: 'first_byte_timeout' });
+                record({ ...metricBase, statusCode: 502, outcome: 'upstream_error' });
+                return false;
               }
               // The first answer stands.
             }
@@ -563,7 +582,10 @@ export function createRelay({
       if (refusal) {
         const status = upstreamResponse.status;
         const elsewhere = relayFailoverStatus(status);
-        if (elsewhere) {
+        if (elsewhere && relayRequestOnlyStatus(status)) {
+          // Not served here, whatever else is: the source is not rested for it.
+          if (chain) log('relay_proxy_source_skipped', { device_id: device.id, model, source: candidate.alias, status, failover: more });
+        } else if (elsewhere) {
           const balance = relayBalanceRefusal(status, refusal.subarray(0, 4096).toString('utf8'));
           failed({ status, reason: balance ? 'balance' : 'status', balance });
         }
@@ -575,16 +597,57 @@ export function createRelay({
         return true;
       }
 
-      if (candidate.id !== null) {
-        health.success(candidate.id);
-        if (candidate.fallback) health.pin(conversation, candidate.id);
-      }
       const mediaType = contentType.split(';', 1)[0].trim().toLowerCase();
+      let stream = upstreamResponse.body;
+      if (slow && mediaType === 'text/event-stream' && stream) {
+        // Nothing has reached the client yet, so a stream that does not start
+        // is still another source's to answer.
+        const reader = stream.getReader();
+        let first;
+        let code = 'empty_stream';
+        try {
+          first = await reader.read();
+        } catch (error) {
+          code = slow.signal.aborted ? 'first_byte_timeout' : (error?.cause?.code ?? error?.code ?? error?.name ?? 'unknown');
+        } finally {
+          begun();
+        }
+        if (!first || first.done) {
+          if (clientGone.signal.aborted) {
+            record({ ...metricBase, statusCode: null, outcome: 'client_disconnected', ttfbMs });
+            return true;
+          }
+          log('relay_proxy_upstream_failed', { device_id: device.id, model, code });
+          failed({ status: upstreamResponse.status, reason: code });
+          record({ ...metricBase, statusCode: 502, outcome: 'upstream_error', ttfbMs });
+          return false;
+        }
+        stream = (async function* rest() {
+          try {
+            yield first.value;
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) return;
+              yield value;
+            }
+          } finally {
+            reader.cancel().catch(() => {});
+          }
+        }());
+      }
+      begun();
+      // The answer has begun, so the conversation stays where it was moved to;
+      // the source is only cleared of its earlier failures by finishing one.
+      if (candidate.fallback) health.pin(conversation, candidate.id);
+      const served = () => {
+        if (candidate.id !== null) health.success(candidate.id);
+      };
       if (mediaType === 'text/event-stream') {
-        await relayStream(res, upstreamResponse, {
+        await relayStream(res, { body: stream }, {
           parser: usageParser(kind, 'sse'),
           clientGone,
           onDone: ({ outcome, statusCode, responseBytes, usage }) => {
+            if (outcome === 'completed') served();
             if (outcome === 'upstream_error') {
               log('relay_proxy_upstream_stream_failed', { device_id: device.id, model });
               failed({ status: statusCode, reason: 'stream_broken' });
@@ -611,6 +674,7 @@ export function createRelay({
         if (!res.headersSent) sendJson(res, 502, errorBody(kind, 'api_error', 'third-party platform response unreadable'));
         return true;
       }
+      served();
       record({
         ...metricBase,
         statusCode: upstreamResponse.status,

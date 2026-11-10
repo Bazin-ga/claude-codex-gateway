@@ -224,10 +224,20 @@ export function parseRelaySourceInput(input) {
 
 /** Upstream answers that mean "this source cannot take the turn", not "this turn is wrong". */
 export function relayFailoverStatus(status) {
-  return status >= 500 || [401, 402, 403, 404, 408, 429].includes(status);
+  return status >= 500 || [401, 402, 403, 404, 405, 408, 429].includes(status);
 }
 
-const BALANCE_REFUSAL = /insufficient|quota|balance|billing|arrears|余额|额度|欠费/i;
+/**
+ * Of those, the ones that say nothing of the source's health: it does not
+ * serve this endpoint or this model, and is as fit for every other turn as it
+ * was. The turn goes on to the next source and this one is not rested.
+ */
+export function relayRequestOnlyStatus(status) {
+  return status === 404 || status === 405;
+}
+
+// "quota" and "额度" alone are also how a rate limit is worded.
+const BALANCE_REFUSAL = /insufficient|balance|billing|arrears|quota (?:is )?not enough|exceeded your current quota|余额|欠费|额度(?:不足|已用尽|已耗尽|已用完)/i;
 
 /** Whether a refusal is the source saying its account is out of money. */
 export function relayBalanceRefusal(status, text) {
