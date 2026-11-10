@@ -9,6 +9,11 @@ import {
   normalizeCodexGuard,
 } from './codex-model-guard.js';
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
+import {
+  CLAUDE_RESERVE_MAX_THRESHOLD_PERCENT,
+  CLAUDE_RESERVE_MIN_THRESHOLD_PERCENT,
+  normalizeClaudeReserve,
+} from './claude-reserve.js';
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
 import { accountUsableByDevice, isRestrictedAccount, normalizeAccountRestriction } from './account-restriction.js';
 import { PAGE_CONTENT_END, PAGE_CONTENT_START, escapeHtml } from './http.js';
@@ -1338,6 +1343,77 @@ function accountRestrictionControl(account, machines, csrf) {
   </section>`;
 }
 
+/**
+ * The reserve of a Claude account: the threshold below which the gateway stops
+ * using it, and the devices that may carry on regardless.
+ *
+ * The devices are ticked from chips, like the machines of a private account —
+ * a machine by its handle, and a credential issued before handles existed by
+ * itself, since there is nothing else to name it by. Only machines holding a
+ * Claude credential are offered: nothing else could ever reach this account.
+ */
+function claudeReserveControl(account, machines, accounts, csrf) {
+  if (account.provider !== 'claude') return '';
+  const reserve = normalizeClaudeReserve(account.claude_reserve);
+  const onClaude = (device) => !device.revoked_at
+    && accountForId(accounts, device.selected_account_id ?? device.account_id)?.provider === 'claude';
+  const known = new Map();
+  for (const machine of machines) {
+    if (machine.machine_id) {
+      if (!(machine.devices ?? []).some(onClaude) && !reserve.exempt_machine_ids.includes(machine.machine_id)) continue;
+      known.set(`machine:${machine.machine_id}`, {
+        name: (machine.names ?? []).join(', ') || machine.machine_id,
+        member: (machine.member_labels ?? []).join(', '),
+      });
+      continue;
+    }
+    for (const device of machine.devices ?? []) {
+      if (!onClaude(device) && !reserve.exempt_device_ids.includes(device.id)) continue;
+      known.set(`device:${device.id}`, { name: device.name || device.id, member: device.member_label ?? '' });
+    }
+  }
+  const ticked = new Set([
+    ...reserve.exempt_machine_ids.map((id) => `machine:${id}`),
+    ...reserve.exempt_device_ids.map((id) => `device:${id}`),
+  ]);
+  // One still exempted whose rows are gone: shown, so it can be unticked.
+  for (const key of ticked) if (!known.has(key)) known.set(key, { name: key.slice(key.indexOf(':') + 1), member: '' });
+  const chips = [...known].map(([key, { name, member }]) => `<label class="machine-chip" title="${escapeHtml([name, member, key.slice(key.indexOf(':') + 1)].filter(Boolean).join('\n'))}">
+      <input type="checkbox" name="${escapeHtml(key)}" value="1"${ticked.has(key) ? ' checked' : ''}>
+      <span class="machine-chip-text"><strong>${escapeHtml(name)}</strong>${member ? `<small>${escapeHtml(member)}</small>` : ''}</span>
+    </label>`).join('');
+  return `<section class="acct-panel" data-claude-reserve="${escapeHtml(account.id)}">
+    <h3 data-i18n="claude-reserve-heading">Reserve for the owner</h3>
+    <form method="post" action="/accounts/${encodeURIComponent(account.id)}/claude-reserve" class="acct-panel-form">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+      <div class="reserve-rule">
+        <label class="switch-row"><input type="checkbox" name="enabled" value="1"${reserve.enabled ? ' checked' : ''}> <span data-i18n="claude-reserve-enable">Stop using this account through the gateway once its weekly quota left is below</span></label>
+        <label class="reserve-threshold"><input type="number" name="threshold_percent" min="${CLAUDE_RESERVE_MIN_THRESHOLD_PERCENT}" max="${CLAUDE_RESERVE_MAX_THRESHOLD_PERCENT}" step="1" value="${escapeHtml(String(reserve.threshold_percent))}" aria-label="Reserve threshold for ${escapeHtml(account.alias)}"> %</label>
+      </div>
+      <p class="muted tiny" data-i18n="claude-reserve-help">Below the line, devices on this account move along its failover chain, no other account fails over to it, and a device with no backup is told the account is held in reserve. It serves again when the weekly window resets. Clients logged in to the account directly never pass the gateway and are not affected.</p>
+      <div class="reserve-exempt-heading" data-i18n="claude-reserve-exempt-heading">Devices that may keep using it below the line</div>
+      <div class="machine-chips">${chips || '<span class="muted tiny" data-i18n="claude-reserve-no-devices">No device holds a Claude credential yet.</span>'}</div>
+      <div><button type="submit" class="secondary" data-i18n="claude-reserve-save">Save reserve</button></div>
+    </form>
+  </section>`;
+}
+
+/**
+ * The same rule, stated where people read the quota. Without it an account
+ * the gateway has stopped using looks like one that broke.
+ */
+function claudeReserveNote(account) {
+  if (account.provider !== 'claude') return '';
+  const reserve = normalizeClaudeReserve(account.claude_reserve);
+  if (!reserve.enabled) return '';
+  const state = account.claude_reserve_state ?? null;
+  const exempt = reserve.exempt_machine_ids.length + reserve.exempt_device_ids.length;
+  const status = state?.in_force
+    ? `<strong class="reserve-in-force"><span data-i18n="claude-reserve-in-force">in force: the gateway is not using this account</span>${state.resets_at ? ` <span data-i18n="claude-reserve-until">until</span> ${escapeHtml(dateText(state.resets_at))}` : ''}</strong>`
+    : '<span data-i18n="claude-reserve-standby">not reached</span>';
+  return `<div class="quota-guard muted tiny" data-claude-reserve-note><span data-i18n="claude-reserve-active">Reserve</span> ${escapeHtml(String(reserve.threshold_percent))}% · ${status}${exempt ? ` · ${exempt} <span data-i18n="claude-reserve-exempt-count">exempt</span>` : ''}</div>`;
+}
+
 /** Private or shared, as a pill for the card's summary line. */
 function accountAccessPill(account) {
   const restriction = normalizeAccountRestriction(account.restriction);
@@ -1369,7 +1445,12 @@ const ACCOUNT_CARD_STYLES = `<style>
 .acct-settings>summary::before{content:"\\25B8";transition:transform .15s}
 .acct-settings[open]>summary::before{transform:rotate(90deg)}
 .acct-panels{display:grid;grid-template-columns:minmax(0,2fr) minmax(260px,1fr);gap:12px;margin-top:12px;align-items:start}
-.acct-panels-side{display:grid;gap:12px;min-width:0}
+.acct-panels-main,.acct-panels-side{display:grid;gap:12px;min-width:0;align-content:start}
+.reserve-rule{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}
+.reserve-threshold{display:inline-flex;align-items:center;gap:6px;margin:0;font-weight:600}
+.reserve-threshold input{width:72px;margin:0}
+.reserve-exempt-heading{font-weight:600;font-size:13px}
+.reserve-in-force{color:var(--amber)}
 .acct-panel{border:1px solid var(--line);border-radius:12px;padding:14px;background:#fbfcfa;min-width:0}
 .acct-panel h3{margin:0 0 10px;font-size:14px}
 .acct-panel.danger-zone{border-color:#f0d0cb;background:#fdf7f6;display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;justify-content:space-between}
@@ -1468,6 +1549,7 @@ function accountUsageView(account, { showAccount = false } = {}) {
     ${message}
     ${quotaMeta ? `<div class="quota-meta">${quotaMeta}</div>` : ''}
     ${codexModelGuardNote(account)}
+    ${claudeReserveNote(account)}
     ${normalizeCodexCreditGuard(account.codex_credit_guard).enabled ? '<div class="quota-guard muted tiny" data-i18n="codex-credit-guard-active">No credits are spent through the gateway once the included quota is used up</div>' : ''}
   </div>`;
 }
@@ -4399,7 +4481,7 @@ export function dashboardView({
     <article class="acct${isPrivate ? ' is-private' : ''}" data-account-row="${escapeHtml(account.id)}" id="account-${escapeHtml(account.id)}">
       <header class="acct-head">
         <div>
-          <div class="acct-name"><strong>${escapeHtml(account.alias)}</strong>${isPrivate ? ' <span class="pill low" data-i18n="restriction-summary-private">Private</span>' : ''}</div>
+          <div class="acct-name"><strong>${escapeHtml(account.alias)}</strong>${isPrivate ? ' <span class="pill low" data-i18n="restriction-summary-private">Private</span>' : ''}${account.claude_reserve_state?.in_force ? ' <span class="pill low" data-i18n="claude-reserve-pill">Held in reserve</span>' : ''}</div>
           <div class="muted tiny acct-sub">${escapeHtml(providerLabel(account.provider))} · ${escapeHtml(account.email_label || 'No email label')}</div>
         </div>
         <div class="acct-tags">${statusBadge(account.status)}${alert ? credentialAlertBadge(alert) : ''}<span class="pill"><span data-i18n="devices">Devices</span>: <span data-account-device-count>${escapeHtml(account.active_devices ?? '—')}</span></span></div>
@@ -4427,7 +4509,7 @@ export function dashboardView({
       <details class="acct-settings" data-persist-details="account-settings-${escapeHtml(account.id)}">
         <summary data-i18n="account-settings">Account settings</summary>
         <div class="acct-panels">
-          <div class="acct-panels-main">${accountRestrictionControl(account, machines, csrf)}</div>
+          <div class="acct-panels-main">${accountRestrictionControl(account, machines, csrf)}${claudeReserveControl(account, machines, accounts, csrf)}</div>
           <div class="acct-panels-side">
           ${codexControls ? `<section class="acct-panel"><h3 data-i18n="codex-panel-heading">Codex quota controls</h3><div class="stack">${codexControls}</div></section>` : ''}
           ${claudeControls ? `<section class="acct-panel"><h3 data-i18n="claude-panel-heading">Claude limit reset</h3><div class="stack">${claudeControls}</div></section>` : ''}

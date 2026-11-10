@@ -25,6 +25,8 @@ import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
 import { CODEX_PROXY_PREFIX, handleCodexProxy } from './lib/codex-proxy.js';
 import { codexQuotaSignal } from './lib/codex-quota-signal.js';
+import { claudeQuotaSignal } from './lib/claude-quota-signal.js';
+import { normalizeClaudeReserve, reserveRestricts } from './lib/claude-reserve.js';
 import { applyFailoverEdit, quotaExhaustion, recheckExhaustedAccounts } from './lib/account-failover.js';
 import { isCodexApiKeyAccount, parseApiKeyModels } from './lib/codex-api-key.js';
 import { OPENAI_LONG_CONTEXT_ABOVE, summarizeApiSpend } from './lib/openai-api-pricing.js';
@@ -1064,6 +1066,7 @@ export async function createCredentialConsole(options = {}) {
         // no matter what the account actually holds.
         codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
         codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
+        claude_reserve: account.claude_reserve ? { ...account.claude_reserve } : null,
         // The failover chain was missing here once, and every page showed it
         // off while the gateway was moving devices by it.
         failover: account.failover
@@ -1072,14 +1075,33 @@ export async function createCredentialConsole(options = {}) {
         restriction: account.restriction ? { ...account.restriction } : null,
         active_devices: account.active_devices,
       };
+      const polledUsage = usageMonitor.snapshotForAccount(account.id);
+      // What the reserve is judged on, and whether it is holding the account
+      // back right now: the page has to show the same reading the gateway acts
+      // on, or a held account looks like an outage.
+      const reserve = normalizeClaudeReserve(account.claude_reserve);
+      const reserveReading = account.provider === 'claude' && reserve.enabled
+        ? claudeQuotaSignal.weeklyReading(account.id, polledUsage)
+        : null;
       return {
         ...safeAccount,
+        claude_reserve_state: account.provider === 'claude' && reserve.enabled
+          ? {
+            in_force: reserveRestricts(reserve, reserveReading?.remaining_percent ?? null),
+            remaining_percent: reserveReading?.remaining_percent ?? null,
+            resets_at: Number.isFinite(reserveReading?.resets_at_ms)
+              ? new Date(reserveReading.resets_at_ms).toISOString()
+              : null,
+          }
+          : null,
         ...await externalAccountStatus(internal),
         // Folded in here rather than written back into the monitor: the
         // observation is evidence about two windows, not a usage poll, and
         // merging at read time keeps the cached snapshot honest about what was
         // actually fetched.
-        usage: codexQuotaSignal.merge(account.id, usageMonitor.snapshotForAccount(account.id)),
+        usage: account.provider === 'claude'
+          ? claudeQuotaSignal.merge(account.id, polledUsage)
+          : codexQuotaSignal.merge(account.id, polledUsage),
         // Estimated from recorded tokens; the key itself cannot read billing.
         api_spend: isCodexApiKeyAccount(account) ? apiSpend.get(account.id) ?? null : null,
       };
@@ -3080,6 +3102,36 @@ export async function createCredentialConsole(options = {}) {
           actor: actorFor(session),
         });
         redirect(res, '/');
+      } catch (error) {
+        redirect(res, `/?error=${encodeURIComponent(error.message)}`);
+      }
+      return;
+    }
+
+    // Administrators only: not among the routes memberRoute opens to members.
+    const claudeReserveParams = routeMatch(path, '/accounts/:id/claude-reserve');
+    if (req.method === 'POST' && claudeReserveParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      // Ticked chips: a machine by its handle, a credential issued before
+      // handles existed by its device id.
+      const ticked = (prefix) => Object.keys(form)
+        .filter((key) => key.startsWith(prefix) && form[key] === '1')
+        .map((key) => key.slice(prefix.length));
+      try {
+        await store.setClaudeReserve(claudeReserveParams.id, {
+          enabled: form.enabled === '1',
+          thresholdPercent: form.threshold_percent,
+          exemptMachineIds: ticked('machine:'),
+          exemptDeviceIds: ticked('device:'),
+          actor: actorFor(session),
+        });
+        redirect(res, `/#account-${encodeURIComponent(claudeReserveParams.id)}`);
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }

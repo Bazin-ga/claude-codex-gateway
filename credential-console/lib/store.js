@@ -19,6 +19,7 @@ import {
 import { credentialSwitchBlock, externalAccountStatus } from './external-account-status.js';
 import { normalizeCodexGuard, parseCodexGuardInput } from './codex-model-guard.js';
 import { normalizeCodexCreditGuard } from './codex-credit-guard.js';
+import { normalizeClaudeReserve, parseClaudeReserveInput } from './claude-reserve.js';
 import { FAILOVER_MAX_BACKUPS, normalizeAccountFailover } from './account-failover.js';
 import { CODEX_API_KEY_AUTH, isCodexApiKeyAccount } from './codex-api-key.js';
 import { normalizeRelay, RELAY_MAX_ALLOWED_MODELS, relayBaseUrl, relayModelName } from './relay.js';
@@ -299,6 +300,9 @@ export class CredentialStore {
       bedrock: account.bedrock ? { ...account.bedrock } : null,
       codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
       codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
+      claude_reserve: account.claude_reserve
+        ? { ...account.claude_reserve, ...normalizeClaudeReserve(account.claude_reserve) }
+        : null,
       failover: account.failover
         ? { ...account.failover, backup_account_ids: [...normalizeAccountFailover(account.failover).backup_account_ids] }
         : null,
@@ -1302,6 +1306,63 @@ export class CredentialStore {
         previous_enabled: previous.enabled,
         previous_threshold_percent: previous.threshold_percent,
         actor: account.codex_guard.updated_by,
+      });
+      await this.persist();
+      return account;
+    });
+  }
+
+  /**
+   * Set one Claude account's reserve: the share of its weekly allowance the
+   * gateway leaves alone, and the devices that may use the account regardless.
+   *
+   * An exemption names a machine handle or, for a credential issued before
+   * handles existed, a device id. Each has to exist: a list that can hold
+   * anything typed into a form would exempt nothing while looking like it did.
+   */
+  async setClaudeReserve(id, {
+    enabled,
+    thresholdPercent,
+    exemptMachineIds = [],
+    exemptDeviceIds = [],
+    actor = null,
+  }) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account) throw new Error('account not found');
+      if (account.provider !== 'claude') throw new Error('account is not a Claude account');
+      const reserve = parseClaudeReserveInput({ enabled, thresholdPercent, exemptMachineIds, exemptDeviceIds });
+      const previous = normalizeClaudeReserve(account.claude_reserve);
+      // One the account already exempts may be kept even if its device rows
+      // are gone; a new one has to be something the console issued.
+      const knownMachines = new Set([
+        ...previous.exempt_machine_ids,
+        ...this.state.devices.map((device) => device.machine_id).filter(Boolean),
+      ]);
+      const knownDevices = new Set([
+        ...previous.exempt_device_ids,
+        ...this.state.devices.filter((device) => !device.machine_id).map((device) => device.id),
+      ]);
+      if (reserve.exempt_machine_ids.some((machineId) => !knownMachines.has(machineId))
+        || reserve.exempt_device_ids.some((deviceId) => !knownDevices.has(deviceId))) {
+        throw new Error('unknown exempt device');
+      }
+      account.claude_reserve = {
+        ...reserve,
+        updated_at: nowIso(),
+        updated_by: auditActor(actor),
+      };
+      this.audit('claude_reserve_updated', {
+        account_id: id,
+        enabled: reserve.enabled,
+        threshold_percent: reserve.threshold_percent,
+        exempt_machines: reserve.exempt_machine_ids.length,
+        exempt_devices: reserve.exempt_device_ids.length,
+        previous_enabled: previous.enabled,
+        previous_threshold_percent: previous.threshold_percent,
+        previous_exempt_machines: previous.exempt_machine_ids.length,
+        previous_exempt_devices: previous.exempt_device_ids.length,
+        actor: auditActor(actor),
       });
       await this.persist();
       return account;

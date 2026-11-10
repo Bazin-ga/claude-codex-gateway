@@ -645,7 +645,14 @@ export function beginFailover({
   exhaustion = quotaExhaustion,
   usageSnapshotFor = () => null,
   exhaustedBy = usageShowsExhausted,
-  acceptCandidate = () => true,
+  acceptCandidate: acceptOtherwise = () => true,
+  // Whether an account is being held back from this device for a reason that
+  // is not exhaustion — a Claude account under its reserve threshold. Returns
+  // null, or what is known about the hold: `{ until }`, the epoch
+  // milliseconds it ends at when that is known. Such an account is neither
+  // gone back to nor failed over to, and unlike a doubted one it is not worth
+  // a try: the upstream would answer, which is exactly what is being avoided.
+  reservedFor = () => null,
   // The Claude model family the request is for, when the gateway has read it
   // already; see claudeModelFamily.
   family = null,
@@ -653,6 +660,14 @@ export function beginFailover({
   logPrefix,
   now = Date.now,
 }) {
+  const held = (candidate) => {
+    try {
+      return reservedFor(candidate) ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const acceptCandidate = (candidate) => !held(candidate) && acceptOtherwise(candidate);
   const marker = device.account_failover;
   const markerHome = marker && marker.account_id === account.id
     ? store.accountById(marker.home_account_id)
@@ -683,6 +698,7 @@ export function beginFailover({
   if (markerHome && homeAccount === markerHome
     && ['healthy', 'stored'].includes(markerHome.status)
     && !isExhausted(markerHome.id)
+    && !held(markerHome)
     && !store.failoverCandidateProblem?.(markerHome, device)) {
     log(`${logPrefix}_quota_failback`, {
       device_id: device.id,
@@ -745,8 +761,10 @@ export function beginFailover({
       // guessed quarter of an hour only when neither knows.
       const returnAfterMs = exhaustion.exhausted(homeAccount.id, now())?.until
         ?? usageExhaustedUntil(snapshot(homeAccount.id), now())
+        ?? held(homeAccount)?.until
         ?? exhaustion.exhausted(state.failedOverFrom.id, now())?.until
         ?? usageExhaustedUntil(snapshot(state.failedOverFrom.id), now())
+        ?? held(state.failedOverFrom)?.until
         ?? now() + FAILOVER_UNKNOWN_RESET_MS;
       store.failoverDeviceAccount?.({
         deviceId: device.id,
@@ -754,7 +772,9 @@ export function beginFailover({
         fromAccountId: deviceSelectedId,
         toAccountId: state.account.id,
         returnAfterMs,
-        reason: `quota exhausted on ${state.failedOverFrom.alias}`,
+        reason: state.reservedMove
+          ? `reserve threshold reached on ${state.failedOverFrom.alias}`
+          : `quota exhausted on ${state.failedOverFrom.alias}`,
       })?.catch?.((error) => log(`${logPrefix}_failover_persist_failed`, {
         device_id: device.id,
         to_account_id: state.account.id,
@@ -767,7 +787,33 @@ export function beginFailover({
     // upstream and has not reset: the refusal to answer with instead of
     // sending the request to collect it again.
     refusal: null,
+    // Set when the account this request would go to is held in reserve and no
+    // backup can take the request: what `reservedFor` said about the hold. The
+    // proxy answers for itself then; nothing is sent upstream.
+    reserved: null,
+    // Whether the move away was for a reserve rather than for exhaustion.
+    reservedMove: false,
   };
+  const reserved = held(current);
+  if (reserved) {
+    // A held account must not be asked at all, so even a backup the usage
+    // reading doubts is tried before giving up.
+    const backup = state.nextBackup({ allowLastResort: true });
+    if (!backup) {
+      state.reserved = reserved;
+      return state;
+    }
+    log(`${logPrefix}_reserve_failover`, {
+      stage: 'preflight',
+      device_id: device.id,
+      from_account_id: current.id,
+      to_account_id: backup.id,
+    });
+    state.moveTo(backup);
+    state.preflight = true;
+    state.reservedMove = true;
+    return state;
+  }
   const refused = exhaustion.exhausted(current.id, now());
   const refusedForModel = exhaustion.modelExhausted(current.id, family, now());
   const accountDoubted = Boolean(refused) || isExhausted(current.id);
