@@ -28,6 +28,7 @@ import {
   relayFailoverStatus,
   relayRequestOnlyStatus,
   relayRequestWithoutThinking,
+  relayRequestWithThinkingRestored,
   RELAY_THINKING_REFUSAL,
 } from './relay-chain.js';
 
@@ -545,21 +546,27 @@ export function createRelay({
           begun();
         }
         // A conversation moved between a chain's sources may lack the
-        // reasoning this one wants passed back; it runs without reasoning
-        // rather than not at all. A model with one source is not rewritten.
+        // reasoning this one wants passed back. It is asked again with an
+        // empty block of reasoning where a turn has none, and failing that
+        // without reasoning, rather than not run at all. A model with one
+        // source is not rewritten.
         if (chain && upstreamResponse.status === 400 && RELAY_THINKING_REFUSAL.test(refusal.subarray(0, 4096).toString('utf8'))) {
-          const plain = relayRequestWithoutThinking(kind, parsed);
-          if (plain) {
+          const rewrites = [
+            ['relay_proxy_thinking_restored', relayRequestWithThinkingRestored(kind, parsed)],
+            ['relay_proxy_thinking_dropped', relayRequestWithoutThinking(kind, parsed)],
+          ];
+          for (const [event, rewritten] of rewrites) {
+            if (!rewritten) continue;
             try {
-              const second = await send(payload(candidate.upstreamModel, plain));
+              const second = await send(payload(candidate.upstreamModel, rewritten));
               if (second.ok) {
-                log('relay_proxy_thinking_dropped', { device_id: device.id, model, source: candidate.alias });
+                log(event, { device_id: device.id, model, source: candidate.alias });
                 upstreamResponse = second;
                 refusal = null;
-              } else {
-                begun();
-                await second.body?.cancel().catch(() => {});
+                break;
               }
+              begun();
+              await second.body?.cancel().catch(() => {});
             } catch {
               if (clientGone.signal.aborted) {
                 record({ ...metricBase, statusCode: null, outcome: 'client_disconnected' });
@@ -571,6 +578,7 @@ export function createRelay({
                 return false;
               }
               // The first answer stands.
+              break;
             }
           }
         }

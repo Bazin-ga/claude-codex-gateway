@@ -22,6 +22,7 @@ import {
   relayFailoverStatus,
   relayRequestOnlyStatus,
   relayRequestWithoutThinking,
+  relayRequestWithThinkingRestored,
 } from '../lib/relay-chain.js';
 import {
   createRelayStatsCache,
@@ -311,6 +312,35 @@ test('a request is rewritten without reasoning for each of the three protocols',
   assert.equal(relayRequestWithoutThinking('chat', null), null);
 });
 
+test('reasoning a turn lacks is put back as an empty block, for the Messages protocol only', () => {
+  const placeholder = { type: 'thinking', thinking: '', signature: '' };
+  const request = {
+    model: 'm',
+    thinking: { type: 'enabled', budget_tokens: 1000 },
+    messages: [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'n', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'r' }] },
+      { role: 'assistant', content: [{ type: 'thinking', thinking: 'kept', signature: 's' }, { type: 'text', text: 'a' }] },
+      { role: 'assistant', content: 'said plainly' },
+      { role: 'assistant', content: '' },
+      { role: 'assistant', content: [] },
+    ],
+  };
+  const restored = relayRequestWithThinkingRestored('messages', request);
+  assert.deepEqual(restored.thinking, request.thinking, 'reasoning stays on');
+  assert.deepEqual(restored.messages[1].content, [placeholder, request.messages[1].content[0]]);
+  assert.deepEqual(restored.messages[4].content, [placeholder, { type: 'text', text: 'said plainly' }]);
+  for (const index of [0, 2, 3, 5, 6]) assert.equal(restored.messages[index], request.messages[index]);
+  assert.equal(request.messages[1].content.length, 1, 'the request it was made from is not touched');
+
+  assert.equal(relayRequestWithThinkingRestored('messages', { messages: [request.messages[0], request.messages[3]] }), null, 'no turn lacks it');
+  assert.equal(relayRequestWithThinkingRestored('messages', { ...request, thinking: { type: 'disabled' } }), null);
+  assert.equal(relayRequestWithThinkingRestored('chat', { messages: [{ role: 'assistant', content: 'a' }] }), null);
+  assert.equal(relayRequestWithThinkingRestored('responses', { input: [] }), null);
+  assert.equal(relayRequestWithThinkingRestored('messages', null), null);
+});
+
 test('chains are stored with their keys encrypted; changing a source keeps its key, its place and whether it is on', async (t) => {
   const { home, store } = await newStore(t);
   await store.setRelayPlatform({ name: 'boyue', baseUrl: 'http://1.2.3.4:3888/v1', apiKey: PLATFORM_KEY });
@@ -475,6 +505,51 @@ test('a conversation whose history lacks reasoning is retried on the same source
   const refused = await post({ model: 'deepseek-v4-flash', messages: [] });
   assert.equal(refused.status, 400);
   assert.equal((await refused.json()).error.message, 'thinking is not supported');
+});
+
+test('a Messages conversation whose turns lack reasoning keeps reasoning on: the source is asked again with empty blocks', { timeout: 20_000 }, async (t) => {
+  const { first, second, metrics, post } = await chainRelay(t, { sources: ['first', 'second'] });
+  const refusal = { error: { message: 'The `content[].thinking` in the thinking mode must be passed back to the API.' } };
+  const reasoned = (body) => body.messages
+    .filter((message) => message.role === 'assistant')
+    .every((message) => Array.isArray(message.content) && message.content[0]?.type === 'thinking');
+  const request = {
+    model: 'deepseek-v4-flash',
+    max_tokens: 10,
+    thinking: { type: 'enabled', budget_tokens: 1000 },
+    messages: [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'n', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'r' }] },
+    ],
+  };
+  const ask = () => post(request, { path: '/relay/v1/messages' });
+  first.answer = (req, res, body) => (reasoned(body) ? completion(res) : answerJson(res, 400, refusal));
+  assert.equal((await ask()).status, 200);
+  assert.equal(first.seen.length, 2);
+  assert.deepEqual(first.seen[1].body.thinking, request.thinking, 'reasoning is still on');
+  assert.deepEqual(first.seen[1].body.messages[1].content, [{ type: 'thinking', thinking: '', signature: '' }, request.messages[1].content[0]]);
+  assert.equal(first.seen[1].body.model, 'flash-at-first');
+  assert.equal(second.seen.length, 0, 'not a reason to change source');
+  assert.deepEqual(attempts(metrics), ['relay:first 200 completed']);
+
+  // A source an empty block does not satisfy is asked a third time, without reasoning.
+  first.seen.length = 0;
+  first.answer = (req, res, body) => (body.thinking?.type === 'disabled' ? completion(res) : answerJson(res, 400, refusal));
+  assert.equal((await ask()).status, 200);
+  assert.equal(first.seen.length, 3);
+  assert.equal(reasoned(first.seen[1].body), true);
+  assert.deepEqual(first.seen[2].body.thinking, { type: 'disabled' });
+  assert.deepEqual(first.seen[2].body.messages[1].content, request.messages[1].content);
+
+  // And when nothing helps, the first refusal is what the client sees.
+  first.seen.length = 0;
+  first.answer = (req, res) => answerJson(res, 400, refusal);
+  const refused = await ask();
+  assert.equal(refused.status, 400);
+  assert.deepEqual(await refused.json(), refusal);
+  assert.equal(first.seen.length, 3);
+  assert.equal(second.seen.length, 0);
 });
 
 test('the platform source is skipped below its balance line, and used while the balance is unknown', { timeout: 20_000 }, async (t) => {
