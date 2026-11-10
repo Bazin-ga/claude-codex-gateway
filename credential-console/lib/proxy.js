@@ -37,6 +37,8 @@ import {
   quotaExhaustion,
   sendCachedRefusal,
 } from './account-failover.js';
+import { claudeQuotaSignal } from './claude-quota-signal.js';
+import { claudeReserveHold, claudeReserveMessage } from './claude-reserve.js';
 
 /**
  * The body a replayed refusal carries: the shape the Messages API refuses
@@ -357,6 +359,7 @@ export async function handleClaudeProxy(req, res, {
   responseContentAssemblerFactory = createResponseContentAssembler,
   usageSnapshotFor = () => null,
   exhaustion = quotaExhaustion,
+  quotaSignal = claudeQuotaSignal,
   relay = null,
 }) {
   const requestUrl = new URL(req.url, 'https://credential-console.invalid');
@@ -547,11 +550,62 @@ export async function handleClaudeProxy(req, res, {
     account,
     exhaustion,
     usageSnapshotFor,
+    // An account under its reserve threshold is kept for its owner: this
+    // device is neither left on it nor moved to it. See claude-reserve.js.
+    reservedFor: (candidate) => {
+      let snapshot = null;
+      try {
+        snapshot = usageSnapshotFor(candidate.id);
+      } catch {
+        snapshot = null;
+      }
+      return claudeReserveHold({ account: candidate, device, quotaSignal, snapshot });
+    },
     family: claudeModelFamily(prefixModel),
     log,
     logPrefix: 'claude_proxy',
   });
   account = failover.account;
+  // The account is held in reserve and no backup can take the request: say so
+  // here. Nothing goes upstream — an answer from there is what the reserve
+  // exists to prevent. Only inference is refused; counting tokens or listing
+  // models spends nothing of the allowance being kept.
+  if (failover.reserved && upstreamPath === '/v1/messages') {
+    const hold = failover.reserved;
+    log('claude_proxy_account_reserved', {
+      account_id: account.id,
+      device_id: device.id,
+      remaining_percent: hold.remainingPercent,
+      threshold_percent: hold.thresholdPercent,
+      resets_at: Number.isFinite(hold.until) ? new Date(hold.until).toISOString() : null,
+    });
+    recordRejected(429, 'account_reserved');
+    refuseAfterDraining(req, res, () => {
+      sendJson(res, 429, {
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: claudeReserveMessage({
+            alias: account.alias,
+            thresholdPercent: hold.thresholdPercent,
+            remainingPercent: hold.remainingPercent,
+            resetsAtMs: hold.until,
+          }),
+        },
+      }, {
+        // Without this Claude Code retries a 429 ten times over several
+        // minutes before showing anything; with it the message is printed at
+        // once (checked against Claude Code 2.1.296).
+        'x-should-retry': 'false',
+        ...(Number.isFinite(hold.until)
+          ? { 'Retry-After': String(Math.max(1, Math.ceil((hold.until - Date.now()) / 1000))) }
+          : {}),
+        'x-gateway-account-reserved': '1',
+        Connection: 'close',
+      });
+    }, { limitBytes: MAX_REQUEST_BYTES });
+    return;
+  }
   // The account was refused for quota and has not reset, and no backup can
   // take the request: answer with that refusal now instead of spending a round
   // trip to collect it again.
@@ -874,6 +928,9 @@ export async function handleClaudeProxy(req, res, {
       },
       (upstreamRes) => {
         const status = upstreamRes.statusCode ?? 502;
+        // Every answer says how much of the account's windows is used; the
+        // reserve threshold is judged on the freshest of these.
+        quotaSignal.observe(account.id, upstreamRes.headers);
 
         const rejection = claudeQuotaRejection(status, upstreamRes.headers);
         // By the time the upstream answers, the body has usually gone past the
