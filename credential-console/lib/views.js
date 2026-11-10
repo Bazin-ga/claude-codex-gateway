@@ -4199,6 +4199,56 @@ export function conversationDetailView({
   `, { openMode, activeTab: 'conversations' });
 }
 
+/**
+ * Member page: register a Claude or Codex subscription and authorize it.
+ *
+ * Deliberately narrower than the administrator forms: no Bedrock, no OpenAI
+ * platform key. Both are billing credentials rather than a subscription a member
+ * signs in to, and the route refuses them from a member as well. The list below
+ * the forms is the member's own rows only, each with its authorization link,
+ * because that page is otherwise reachable only from the administrator area.
+ */
+function memberAccountsView(ownAccounts, csrf) {
+  const statusText = (account) => (account.status === 'login_required'
+    ? '<span class="pill low" data-i18n="member-account-pending">Waiting for authorization</span>'
+    : statusBadge(account.status));
+  const rows = ownAccounts.map((account) => {
+    const id = encodeURIComponent(account.id);
+    const page = account.provider === 'claude' ? 'claude-authorization' : 'codex-authorization';
+    const pending = account.status === 'login_required';
+    return `<li class="member-account">
+      <strong>${escapeHtml(account.alias)}</strong>
+      <span class="muted tiny">${escapeHtml(providerLabel(account.provider))}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}</span>
+      ${statusText(account)}
+      <a class="button ${pending ? '' : 'secondary'}" href="/accounts/${id}/${page}" data-i18n="${pending ? 'member-account-authorize' : 'member-account-reauthorize'}">${pending ? 'Authorize' : 'Authorize again'}</a>
+    </li>`;
+  }).join('');
+  const form = (provider, heading, headingKey, help, helpKey, emailRequired, placeholder) => `<article class="card split">
+      <h3 data-i18n="${headingKey}">${heading}</h3>
+      <p class="muted tiny" data-i18n="${helpKey}">${help}</p>
+      <form method="post" action="/accounts" class="stack" autocomplete="off" data-persist-draft="member-register-${provider}-account">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+        <input type="hidden" name="provider" value="${provider}">
+        <label><span data-i18n="account-alias">Account alias</span>
+          <input name="alias" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,63}" placeholder="${placeholder}" data-draft-field>
+        </label>
+        <label><span data-i18n="${emailRequired ? 'account-email' : 'account-email-optional'}">${emailRequired ? 'Account email label' : 'Account email label (optional, checked at authorization)'}</span>
+          <input name="email_label" type="email" placeholder="owner@example.com" maxlength="160" ${emailRequired ? 'required ' : ''}data-draft-field>
+        </label>
+        <button type="submit" data-i18n="member-register-and-authorize">Add and authorize</button>
+      </form>
+    </article>`;
+  return `<section class="member-accounts" id="member-accounts">
+    <h2 data-i18n="member-accounts-heading">Add your own account</h2>
+    <p class="muted" data-i18n="member-accounts-intro">Bought a Claude or ChatGPT subscription? Add it here and sign in to it on the next page. It joins the shared accounts everyone can use. You can authorize only the accounts you add yourself.</p>
+    <div class="grid">
+      ${form('claude', 'Add a Claude account', 'member-add-claude', 'The email must be the one you sign in to Claude with; it is checked when you authorize.', 'member-add-claude-help', true, 'claude-max-alex')}
+      ${form('codex', 'Add a Codex (ChatGPT) account', 'member-add-codex', 'You sign in to ChatGPT on the next page. The email is optional; if given, it is checked when you authorize.', 'member-add-codex-help', false, 'codex-pro-alex')}
+    </div>
+    ${rows ? `<h3 data-i18n="member-accounts-mine">Accounts you added</h3><ul class="member-account-list">${rows}</ul>` : ''}
+  </section>`;
+}
+
 export function dashboardView({
   accounts,
   devices,
@@ -4208,6 +4258,10 @@ export function dashboardView({
   notice = null,
   // Member page only: devices on shared accounts, each with where it may move.
   memberDevices = [],
+  // Member page only: whether the add-account forms are offered, and the ids of
+  // the accounts this member registered.
+  memberCanAddAccounts = false,
+  memberAccountIds = [],
   machines = [],
   codexClients = [],
   codexUnavailable = [],
@@ -4647,6 +4701,7 @@ export function dashboardView({
         </div>
         ${openMode ? '<p class="muted tiny" data-i18n="member-label-note">Nobody checks the label. It only keeps two members\' device names apart.</p>' : ''}
         ${adminArea ? '' : memberDevicesView(memberDevices, csrf)}
+        ${!adminArea && memberCanAddAccounts ? memberAccountsView(accounts.filter((account) => memberAccountIds.includes(account.id)), csrf) : ''}
       </section>` : ''}
 
       ${adminArea ? `<section class="admin-zone">

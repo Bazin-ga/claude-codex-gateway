@@ -209,6 +209,22 @@ const CONVERSATION_ROUND_RESPONSE_STATES = new Set([
 ]);
 const CONVERSATION_QUERY_MAX_BYTES = 256;
 const CONVERSATION_MEMBER_MAX_BYTES = 160;
+// Password mode: the account authorization pages a member may open (for rows
+// they registered; see allowAuthorization).
+const MEMBER_ACCOUNT_GET_ROUTES = [
+  '/accounts/:id/claude-authorization',
+  '/accounts/:id/codex-authorization',
+];
+const MEMBER_ACCOUNT_POST_ROUTES = [
+  '/accounts/:id/claude-authorization/start',
+  '/accounts/:id/claude-authorization/complete',
+  '/accounts/:id/codex-authorization/start',
+  '/accounts/:id/codex-authorization/complete',
+  '/accounts/:id/codex-authorization/paste',
+];
+// A member may hold this many registered rows that are still waiting for
+// authorization; enough to retry a typo, not enough to litter the account list.
+const MEMBER_PENDING_ACCOUNT_LIMIT = 3;
 const CONVERSATION_IDENTIFIER_MAX_BYTES = 128;
 const CONVERSATION_MODEL_MAX_BYTES = 256;
 export const SHUTDOWN_DEADLINE_MS = 1_000;
@@ -915,12 +931,40 @@ export async function createCredentialConsole(options = {}) {
   // device-token route or a static asset needs an administrator.
   function memberRoute(method, path) {
     if (method === 'GET') {
-      return ['/', '/docs', '/onboarding.md', '/metrics', '/metrics/chart-data', '/login', '/logout'].includes(path);
+      return ['/', '/docs', '/onboarding.md', '/metrics', '/metrics/chart-data', '/login', '/logout'].includes(path)
+        || MEMBER_ACCOUNT_GET_ROUTES.some((pattern) => Boolean(routeMatch(path, pattern)));
     }
+    // Registering a Claude or Codex account and authorizing it. The handlers
+    // themselves narrow this: a member may register only those two providers,
+    // with no pasted API key, and may authorize only a row they registered.
     if (method === 'POST') {
-      return ['/self-service', '/codex/self-service', '/login'].includes(path)
-        || Boolean(routeMatch(path, '/member/devices/:id/account'));
+      return ['/self-service', '/codex/self-service', '/login', '/accounts'].includes(path)
+        || Boolean(routeMatch(path, '/member/devices/:id/account'))
+        || MEMBER_ACCOUNT_POST_ROUTES.some((pattern) => routeMatch(path, pattern));
     }
+    return false;
+  }
+
+  /** Whether this member registered `account` (password mode only). */
+  function memberOwnsAccount(session, account) {
+    return Boolean(session?.admin_identity)
+      && account?.created_by?.role === 'member'
+      && account.created_by.identity === session.admin_identity;
+  }
+
+  /**
+   * Gate for the authorization pages. An administrator may authorize any row; a
+   * member only one they registered, because re-authorizing someone else's row
+   * would swap the credential every device on it uses. Answers the refusal
+   * itself and returns false.
+   */
+  function allowAuthorization(session, account, res) {
+    if (isAdmin(session) || memberOwnsAccount(session, account)) return true;
+    sendHtml(res, 403, messageView(
+      'Administrator sign-in required',
+      'Members can authorize only the accounts they added themselves. Sign in as an administrator to authorize this one.',
+      { error: true, openMode },
+    ));
     return false;
   }
 
@@ -2435,6 +2479,12 @@ export async function createCredentialConsole(options = {}) {
         notice: dashboardNotice(url.searchParams),
         // A member's page lists the devices on shared accounts they may move.
         memberDevices: admin ? [] : memberDeviceRows(),
+        // A member may register Claude and Codex accounts and authorize the
+        // ones they registered; the page lists those with their next step.
+        memberCanAddAccounts: passwordMode && !admin,
+        memberAccountIds: admin ? [] : store.state.accounts
+          .filter((entry) => memberOwnsAccount(session, entry))
+          .map((entry) => entry.id),
         devices: admin ? store.publicDevices() : [],
         // Revoked rows are carried into the page and collapsed there, rather than
         // filtered out here: they are the majority of rows over time, they are
@@ -2535,10 +2585,26 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
         return;
       }
+      const admin = isAdmin(session);
       try {
         const provider = String(form.provider ?? '');
         if (!['claude', 'codex', 'bedrock'].includes(provider)) {
           throw new Error('only Claude, Codex and Bedrock accounts can be added in the web UI');
+        }
+        if (!admin) {
+          // A member brings a subscription and authorizes it through OAuth. A
+          // Bedrock key or an OpenAI platform key is a billing credential, and
+          // stays with administrators.
+          if (provider === 'bedrock') throw new Error('only an administrator can add a Bedrock account');
+          if (String(form.openai_api_key ?? '').trim()) {
+            throw new Error('only an administrator can add an OpenAI API key account');
+          }
+          const pending = store.state.accounts.filter((entry) => (
+            memberOwnsAccount(session, entry) && entry.status === 'login_required'
+          )).length;
+          if (pending >= MEMBER_PENDING_ACCOUNT_LIMIT) {
+            throw new Error(`you already have ${pending} accounts waiting for authorization; authorize one of them first`);
+          }
         }
         // Hiding the form is not the same as closing the route. A console where
         // the Bedrock path is switched off must refuse the request too, or the
@@ -2578,14 +2644,24 @@ export async function createCredentialConsole(options = {}) {
         if (codexApiKey && !codexApiKeyEnabled) {
           throw new Error('OpenAI API key accounts are not enabled on this console');
         }
-        await store.addAccount({
+        const added = await store.addAccount({
           provider,
           alias: String(form.alias ?? '').trim(),
           emailLabel,
           ...(bedrock ? { bedrock, credential } : {}),
           ...(codexApiKey ? { codexApiKey } : {}),
+          createdBy: {
+            role: admin ? 'admin' : 'member',
+            identity: session.admin_identity ?? null,
+            admin_user: admin ? session.admin_user ?? null : null,
+          },
         });
-        redirect(res, `/?draft_completed=${encodeURIComponent(`register-${provider}-account`)}`);
+        log('account_added', { account_id: added.id, provider, alias: added.alias, role: admin ? 'admin' : 'member', identity: session.admin_identity ?? null });
+        // A member has nowhere else to go for the next step: send them straight
+        // to the new row's authorization page.
+        redirect(res, admin
+          ? `/?draft_completed=${encodeURIComponent(`register-${provider}-account`)}`
+          : `/accounts/${encodeURIComponent(added.id)}/${provider}-authorization`);
       } catch (error) {
         redirect(res, `/?error=${encodeURIComponent(error.message)}`);
       }
@@ -2601,6 +2677,7 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true, openMode }));
         return;
       }
+      if (!allowAuthorization(session, account, res)) return;
       sendHtml(res, 200, claudeAuthorizationView({
         account,
         csrf: session.csrf,
@@ -2624,6 +2701,7 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true, openMode }));
         return;
       }
+      if (!allowAuthorization(session, account, res)) return;
       try {
         const request = createClaudeAuthorizationRequest({ emailLabel: account.email_label });
         const flow = await store.beginClaudeAuthorization({
@@ -2665,6 +2743,7 @@ export async function createCredentialConsole(options = {}) {
         sendHtml(res, 404, messageView('Account not found', 'Claude account was not found.', { error: true, openMode }));
         return;
       }
+      if (!allowAuthorization(session, account, res)) return;
       try {
         const submitted = parseClaudeAuthorizationCode(form.authorization_code);
         const flow = store.claudeAuthorizationByState({
@@ -2748,6 +2827,7 @@ export async function createCredentialConsole(options = {}) {
       if (!session) return;
       const account = codexAccountOr404(codexAuthorizationParams.id);
       if (!account) return;
+      if (!allowAuthorization(session, account, res)) return;
       sendHtml(res, 200, codexAuthorizationPage(account, session));
       return;
     }
@@ -2763,6 +2843,7 @@ export async function createCredentialConsole(options = {}) {
       }
       const account = codexAccountOr404(codexAuthorizationStartParams.id);
       if (!account) return;
+      if (!allowAuthorization(session, account, res)) return;
       const targetSeedHome = codexSeedHomeFor(account);
       try {
         store.assertCodexSeedHome({ accountId: account.id, seedHome: targetSeedHome });
@@ -2798,6 +2879,7 @@ export async function createCredentialConsole(options = {}) {
       }
       const account = codexAccountOr404(codexAuthorizationCompleteParams.id);
       if (!account) return;
+      if (!allowAuthorization(session, account, res)) return;
       const identity = session.admin_identity ?? 'administrator';
       try {
         const submitted = parseCodexAuthorizationRedirect(form.authorization_code);
@@ -3321,6 +3403,7 @@ export async function createCredentialConsole(options = {}) {
       }
       const account = codexAccountOr404(codexPasteParams.id);
       if (!account) return;
+      if (!allowAuthorization(session, account, res)) return;
       const identity = session.admin_identity ?? 'administrator';
       const targetSeedHome = codexSeedHomeFor(account);
       try {

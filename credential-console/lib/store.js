@@ -942,6 +942,11 @@ export class CredentialStore {
     external = null,
     bedrock = null,
     codexApiKey = null,
+    // Who registered the row: `{ role: 'admin' | 'member', identity, admin_user }`.
+    // A member may only authorize rows they registered themselves, so this is
+    // what that check reads. Rows from before it existed carry nothing and are
+    // therefore administrator-only, which is what they always were.
+    createdBy = null,
   }) {
     return this.serialized(async () => {
       if (!GATEWAY_PROVIDERS.includes(provider)) throw new Error('unsupported provider');
@@ -992,9 +997,21 @@ export class CredentialStore {
         // every turn, and an operator has to be able to see what a row is
         // pinned to. Only the key itself goes through encryptJson above.
         ...(bedrockPin ? { bedrock: bedrockPin } : {}),
+        ...(createdBy ? {
+          created_by: {
+            role: createdBy.role === 'admin' ? 'admin' : 'member',
+            identity: createdBy.identity ? String(createdBy.identity).slice(0, 320) : null,
+            ...(createdBy.admin_user ? { admin_user: String(createdBy.admin_user).slice(0, 64) } : {}),
+          },
+        } : {}),
       };
       this.state.accounts.push(account);
-      this.audit('account_added', { account_id: id, provider, alias });
+      this.audit('account_added', {
+        account_id: id,
+        provider,
+        alias,
+        ...(account.created_by ? { created_by_role: account.created_by.role, created_by: account.created_by.identity } : {}),
+      });
       await this.persist();
       return account;
     });
