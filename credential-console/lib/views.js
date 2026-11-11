@@ -73,10 +73,6 @@ a { color: var(--green); }
 .shell { max-width: 1180px; margin: 0 auto; padding: 28px 22px 64px; }
 .topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 20px; margin-bottom: 28px; }
 .topbar-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; margin-left: auto; }
-.time-zone-switch { position: relative; display: inline-flex; align-items: center; gap: 7px; min-height: 38px; margin: 0; padding: 0 10px; border: 1px solid var(--line); border-radius: 11px; background: white; color: var(--muted); font-size: 13px; }
-.time-zone-switch:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
-.time-zone-switch b { color: var(--ink); white-space: nowrap; }
-.time-zone-switch select { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 0; margin: 0; opacity: 0; cursor: pointer; }
 .quota-window .until-left { color: var(--ink); }
 .until-at { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .until[data-until="expires"].passed .until-left { color: var(--red); }
@@ -815,7 +811,6 @@ h1, h2, h3, [id], [tabindex], input, select, textarea, button, a.button, summary
      a 0,1,1 rule outside this query beats the 0,0,1 rule inside it. */
   .metrics-segmented button, .metrics-segmented .button { min-height: 44px; }
   .page-tabs a, .language-switch button { min-height: 44px; display: inline-flex; align-items: center; }
-  .time-zone-switch { min-height: 52px; }
   .table-wrap { overflow-x: auto; }
   .zone-heading { display: grid; }
   .identity-chip { white-space: normal; }
