@@ -149,6 +149,15 @@ function bootMetricsDashboard() {
     if (numeric === null) return '—';
     const date = new Date(numeric);
     if (!Number.isFinite(date.getTime())) return '—';
+    // In the zone picked in the page header; UTC only if the page script is missing.
+    const time = window.credentialConsoleTime;
+    if (time) {
+      try {
+        return time.format(numeric, { bare: short });
+      } catch {
+        // Fall back to UTC below.
+      }
+    }
     const month = String(date.getUTCMonth() + 1).padStart(2, '0');
     const day = String(date.getUTCDate()).padStart(2, '0');
     const hour = String(date.getUTCHours()).padStart(2, '0');
@@ -237,6 +246,8 @@ function bootMetricsDashboard() {
         axisLine: { lineStyle: { color: '#cbd4cb' } },
         axisTick: { show: false },
         axisLabel: { color: '#60706a', hideOverlap: true, formatter: (value) => hourLabel(value, true) },
+        // The tooltip heading reads this too; left alone it shows browser time.
+        axisPointer: { label: { formatter: ({ value }) => hourLabel(value) } },
         splitLine: { show: false },
       },
       yAxis: {
@@ -600,7 +611,13 @@ function bootMetricsDashboard() {
     if (payload) renderAll();
   });
 
+  const onTimeZone = () => {
+    if (payload) renderAll();
+  };
+  window.addEventListener('credential-console-time-zone', onTimeZone);
+
   const releaseDashboard = () => {
+    window.removeEventListener('credential-console-time-zone', onTimeZone);
     observers.splice(0).forEach((observer) => observer.disconnect());
     for (const chart of instances.values()) {
       if (!chart.isDisposed()) chart.dispose();
