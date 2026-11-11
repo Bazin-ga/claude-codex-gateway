@@ -67,7 +67,7 @@ test('critical first-screen summary is capped at three and account rows show saf
   assert.match(html, /role="alert" aria-live="assertive"/);
   assert.match(html, /credential-alert-current-invalid/);
   assert.match(html, /credential-alert-current-unavailable/);
-  assert.match(html, /<strong class="until-left">expires in 3d<\/strong>/);
+  assert.match(html, /<span class="until-left">expires in 3d<\/span>/);
   assert.match(html, /Last successful credential check/);
   assert.match(html, /Last rotation/);
   assert.equal(html.includes('/secret/provider/path should not render'), false);
