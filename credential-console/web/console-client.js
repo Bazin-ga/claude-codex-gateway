@@ -345,7 +345,7 @@ const translations = {
   'metrics-token-partial-count': '部分',
   'metrics-token-unavailable-count': '不可用',
   'metrics-token-trend': '每小时 Token 构成',
-  'metrics-token-trend-description': '在真实 UTC 时间轴上堆叠四类已知 Token；未知值保留为空档。',
+  'metrics-token-trend-description': '在真实时间轴上堆叠四类已知 Token；未知值保留为空档。',
   'metrics-token-no-data': '所选范围没有可用的 token 用量。',
   'metrics-total-input-tokens': '输入 token',
   'metrics-total-cache-creation-input-tokens': '缓存创建输入 token',
@@ -810,6 +810,8 @@ function applyLanguage(language) {
   document.documentElement.lang = selected === 'zh' ? 'zh-CN' : 'en';
   translateSubtree(document, selected);
   translateElementsIn(document, selected);
+  renderTimeZoneSelect();
+  renderTimesIn(document);
   document.querySelectorAll('[data-language]').forEach((button) => {
     button.classList.toggle('active', button.dataset.language === selected);
     button.setAttribute('aria-pressed', button.dataset.language === selected ? 'true' : 'false');
@@ -839,16 +841,354 @@ function translateElementsIn(root, selected) {
   root.querySelectorAll('[data-metric-point-title]').forEach((element) => {
     if (!element.dataset.metricPointTitleEn) element.dataset.metricPointTitleEn = element.textContent;
     const key = element.dataset.metricSeriesKey ?? '';
-    const tail = element.dataset.metricPointTail ?? '';
-    element.textContent = selected === 'zh'
-      ? (translations[key] ?? element.dataset.metricPointTitleEn.split(' · ')[0]) + ' · ' + tail
-      : element.dataset.metricPointTitleEn;
+    const english = element.dataset.metricPointTitleEn.split(' · ')[0];
+    // The tail is "2026-08-17 10:00Z · 4": the hour in UTC, then the value.
+    let tail = element.dataset.metricPointTail ?? '';
+    const split = tail.indexOf(' · ');
+    const at = split > 0 ? Date.parse(tail.slice(0, split).replace(' ', 'T')) : NaN;
+    if (Number.isFinite(at)) tail = formatInstant(at) + tail.slice(split);
+    element.textContent = (selected === 'zh' ? (translations[key] ?? english) : english) + ' · ' + tail;
   });
 
   root.querySelectorAll('[data-account-switch-status][data-account-switch-result]').forEach((node) => {
     renderAccountSwitchStatus(node, node.dataset.accountSwitchResult, node.dataset.accountAlias ?? '');
   });
 }
+
+// Time zone. The server writes every moment in UTC and attaches the instant
+// (<time datetime>, or data-time-at where a <time> cannot go, inside an SVG).
+// Only the browser knows where its reader is, so the text is rewritten here in
+// the zone picked in the header — the browser's own unless the reader chose.
+const TIME_ZONE_STORAGE_KEY = 'credential_console_time_zone';
+const COMMON_TIME_ZONES = [
+  ['UTC', 'UTC', 'UTC'],
+  ['Asia/Shanghai', 'Beijing', '北京'],
+  ['Asia/Singapore', 'Singapore', '新加坡'],
+  ['Asia/Tokyo', 'Tokyo', '东京'],
+  ['Europe/London', 'London', '伦敦'],
+  ['America/New_York', 'New York', '纽约'],
+  ['America/Chicago', 'Chicago', '芝加哥'],
+  ['America/Los_Angeles', 'Los Angeles', '洛杉矶'],
+];
+const UNTIL_PHRASES = {
+  resets: { en: ['resets in {d}', 'reset due {d} ago'], zh: ['{d}后重置', '已于{d}前重置'] },
+  returns: { en: ['returns in {d}', 'return due {d} ago'], zh: ['{d}后切回', '应于{d}前切回'] },
+  until: { en: ['lifts in {d}', 'lifted {d} ago'], zh: ['{d}后解除', '已于{d}前解除'] },
+  expires: { en: ['expires in {d}', 'expired {d} ago'], zh: ['{d}后过期', '已过期{d}'] },
+};
+const zoneFormatters = new Map();
+
+function zoneFormatter(zone) {
+  let formatter = zoneFormatters.get(zone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: zone,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    zoneFormatters.set(zone, formatter);
+  }
+  return formatter;
+}
+
+function validTimeZone(zone) {
+  if (typeof zone !== 'string' || !zone || zone.length > 64) return false;
+  try {
+    zoneFormatter(zone);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function browserTimeZone() {
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (validTimeZone(zone)) return zone;
+  } catch {
+    // Fall through to UTC.
+  }
+  return 'UTC';
+}
+
+function storedTimeZone() {
+  try {
+    const zone = localStorage.getItem(TIME_ZONE_STORAGE_KEY);
+    if (zone && zone !== 'auto' && validTimeZone(zone)) return zone;
+  } catch {
+    // Storage can be unavailable; follow the browser.
+  }
+  return 'auto';
+}
+
+let timeZoneChoice = storedTimeZone();
+
+function activeTimeZone() {
+  return timeZoneChoice === 'auto' ? browserTimeZone() : timeZoneChoice;
+}
+
+function zoneParts(zone, ms) {
+  const parts = {};
+  for (const part of zoneFormatter(zone).formatToParts(new Date(ms))) parts[part.type] = part.value;
+  // Some engines still write midnight as hour 24 under h23.
+  if (parts.hour === '24') parts.hour = '00';
+  return parts;
+}
+
+function zoneOffsetMinutes(zone, ms) {
+  const p = zoneParts(zone, ms);
+  const wall = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day),
+    Number(p.hour), Number(p.minute), Number(p.second));
+  return Math.round((wall - Math.floor(ms / 1000) * 1000) / 60000);
+}
+
+/** "UTC+8", "UTC-5", "UTC+5:30" — for the instant, so daylight saving is right. */
+function zoneLabelAt(ms, zone = activeTimeZone()) {
+  const minutes = zoneOffsetMinutes(zone, ms);
+  if (!minutes) return 'UTC';
+  const abs = Math.abs(minutes);
+  const rest = abs % 60;
+  return 'UTC' + (minutes > 0 ? '+' : '-') + Math.floor(abs / 60)
+    + (rest ? ':' + String(rest).padStart(2, '0') : '');
+}
+
+/** "11-11 14:40 UTC+8"; the year only when it is not the current one. */
+function formatInstant(ms, { date = false, seconds = false, bare = false } = {}) {
+  const zone = activeTimeZone();
+  const p = zoneParts(zone, ms);
+  const day = date || p.year !== zoneParts(zone, Date.now()).year
+    ? p.year + '-' + p.month + '-' + p.day
+    : p.month + '-' + p.day;
+  if (date) return day;
+  return day + ' ' + p.hour + ':' + p.minute + (seconds ? ':' + p.second : '')
+    + (bare ? '' : ' ' + zoneLabelAt(ms, zone));
+}
+
+function fullInstant(ms) {
+  const zone = activeTimeZone();
+  const p = zoneParts(zone, ms);
+  return p.year + '-' + p.month + '-' + p.day + ' ' + p.hour + ':' + p.minute + ':' + p.second
+    + ' ' + zoneLabelAt(ms, zone) + ' (' + zone + ')';
+}
+
+function durationText(ms, language) {
+  const totalMinutes = Math.floor(Math.abs(ms) / 60_000);
+  const zh = language === 'zh';
+  if (totalMinutes < 1) return zh ? '不到 1 分钟' : 'under a minute';
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const [dayUnit, hourUnit, minuteUnit] = zh ? ['天', '小时', '分钟'] : ['d', 'h', 'm'];
+  const pieces = days
+    ? [days + dayUnit, hours ? hours + hourUnit : '']
+    : hours
+      ? [hours + hourUnit, minutes ? minutes + minuteUnit : '']
+      : [minutes + minuteUnit];
+  return pieces.filter(Boolean).join(zh ? '' : ' ');
+}
+
+function renderUntil(element, language, now) {
+  const at = Date.parse(element.dataset.untilAt ?? '');
+  if (!Number.isFinite(at)) return;
+  const phrases = (UNTIL_PHRASES[element.dataset.until] ?? UNTIL_PHRASES.resets)[language];
+  const left = at - now;
+  const target = element.querySelector('.until-left');
+  if (target) target.textContent = phrases[left > 0 ? 0 : 1].replace('{d}', durationText(left, language));
+  element.classList.toggle('passed', left <= 0);
+  element.closest('.relative-expiry')?.classList.toggle('expired', left <= 0);
+}
+
+function renderUntilIn(root) {
+  const language = currentLanguage();
+  const now = Date.now();
+  root.querySelectorAll('[data-until-at]').forEach((element) => renderUntil(element, language, now));
+}
+
+function renderTimesIn(root) {
+  try {
+    root.querySelectorAll('time[datetime]').forEach((element) => {
+      const ms = Date.parse(element.getAttribute('datetime') ?? '');
+      if (!Number.isFinite(ms)) return;
+      element.textContent = formatInstant(ms, {
+        date: element.hasAttribute('data-time-date'),
+        seconds: element.hasAttribute('data-time-seconds'),
+        bare: element.hasAttribute('data-time-bare'),
+      });
+      if (element instanceof HTMLElement) element.title = fullInstant(ms);
+    });
+    // Hour labels written in UTC where a <time> per row would cost too much:
+    // the first column of a raw hourly table, and the ends of an SVG chart axis.
+    const hourCells = 'table[data-utc-hours] > tbody > tr > td:first-child, svg text.metrics-axis';
+    root.querySelectorAll(hourCells).forEach((element) => {
+      if (!element.dataset.utcHour) {
+        const text = element.textContent.trim();
+        if (!/^\d{4}-\d\d-\d\d \d\d:\d\dZ?$/.test(text)) return;
+        element.dataset.utcHour = text;
+      }
+      const ms = Date.parse(element.dataset.utcHour.replace(' ', 'T').replace(/Z?$/, 'Z'));
+      if (Number.isFinite(ms)) element.textContent = formatInstant(ms, { bare: element.tagName === 'TD' });
+    });
+    const zone = zoneLabelAt(Date.now());
+    root.querySelectorAll('[data-time-zone-name]').forEach((element) => {
+      element.textContent = zone;
+    });
+    // "Hour (UTC)" over those columns names the zone they are now in.
+    root.querySelectorAll('table[data-utc-hours] > thead th:first-child').forEach((element) => {
+      element.textContent = element.textContent.replace(/UTC[^)）]*/, zone);
+    });
+    renderUntilIn(root);
+  } catch {
+    // A zone the engine cannot format leaves the server's UTC text in place.
+  }
+}
+
+function zoneOptionLabel(zone, language, now) {
+  const common = COMMON_TIME_ZONES.find(([candidate]) => candidate === zone);
+  const offset = zoneLabelAt(now, zone);
+  if (!common) return offset + ' · ' + zone.replaceAll('_', ' ');
+  const name = language === 'zh' ? common[2] : common[1];
+  return name === offset ? name : name + ' · ' + offset;
+}
+
+/**
+ * The picker sits beside the language switch. It is built here rather than by
+ * the server because it only means anything once this script runs: without it
+ * the page keeps the server's UTC text and should not offer a dead control.
+ */
+function timeZoneSelect() {
+  let select = document.querySelector('[data-time-zone-select]');
+  const anchor = document.querySelector('.topbar-actions .language-switch');
+  if (select || !anchor) return select;
+  const picker = document.createElement('label');
+  picker.className = 'time-zone-switch';
+  picker.innerHTML = '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5">'
+    + '<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.5 1.6"/></svg>'
+    + '<b data-time-zone-current aria-hidden="true"></b><span aria-hidden="true">▾</span><select data-time-zone-select></select>';
+  anchor.before(picker);
+  select = picker.querySelector('select');
+  return select;
+}
+
+function renderTimeZoneSelect() {
+  try {
+    const select = timeZoneSelect();
+    if (!select) return;
+    const language = currentLanguage();
+    const zh = language === 'zh';
+    const now = Date.now();
+    select.textContent = '';
+    delete select.dataset.timeZoneFilled;
+    select.add(new Option((zh ? '跟随浏览器' : 'Browser time') + ' · ' + zoneLabelAt(now, browserTimeZone()), 'auto'));
+    const common = document.createElement('optgroup');
+    common.label = zh ? '常用' : 'Common';
+    for (const [zone] of COMMON_TIME_ZONES) {
+      if (validTimeZone(zone)) common.append(new Option(zoneOptionLabel(zone, language, now), zone));
+    }
+    const all = document.createElement('optgroup');
+    all.label = zh ? '全部时区' : 'All time zones';
+    all.setAttribute('data-time-zone-all', '');
+    if (timeZoneChoice !== 'auto' && !COMMON_TIME_ZONES.some(([zone]) => zone === timeZoneChoice)) {
+      all.append(new Option(zoneOptionLabel(timeZoneChoice, language, now), timeZoneChoice));
+    }
+    select.append(common, all);
+    select.value = timeZoneChoice;
+    select.setAttribute('aria-label', zh ? '时区' : 'Time zone');
+    showTimeZoneChoice(select);
+    // About four hundred zones: build them once the page is idle, or the
+    // moment the reader reaches for the menu, whichever comes first.
+    if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(() => fillAllTimeZones(select));
+    else setTimeout(() => fillAllTimeZones(select), 400);
+  } catch {
+    // Without Intl time zones the page keeps its UTC text and no picker.
+  }
+}
+
+// The select itself is transparent over this label: a native select is as wide
+// as its longest option, and some of the four hundred zone names are long.
+function showTimeZoneChoice(select) {
+  const current = select.closest('.time-zone-switch')?.querySelector('[data-time-zone-current]');
+  if (current) current.textContent = select.selectedOptions[0]?.text ?? activeTimeZone();
+  select.title = (currentLanguage() === 'zh' ? '时区：' : 'Time zone: ') + activeTimeZone();
+}
+
+function fillAllTimeZones(select) {
+  if (!select.isConnected || select.dataset.timeZoneFilled) return;
+  select.dataset.timeZoneFilled = '1';
+  let zones = [];
+  try {
+    zones = Intl.supportedValuesOf('timeZone');
+  } catch {
+    return;
+  }
+  const group = select.querySelector('[data-time-zone-all]');
+  if (!group) return;
+  const language = currentLanguage();
+  const now = Date.now();
+  const listed = new Set(COMMON_TIME_ZONES.map(([zone]) => zone));
+  const entries = zones
+    .filter((zone) => !listed.has(zone) && validTimeZone(zone))
+    .map((zone) => ({ zone, offset: zoneOffsetMinutes(zone, now) }))
+    .sort((a, b) => a.offset - b.offset || a.zone.localeCompare(b.zone));
+  group.textContent = '';
+  for (const { zone } of entries) group.append(new Option(zoneOptionLabel(zone, language, now), zone));
+  if (timeZoneChoice !== 'auto' && !listed.has(timeZoneChoice) && !zones.includes(timeZoneChoice)) {
+    group.prepend(new Option(zoneOptionLabel(timeZoneChoice, language, now), timeZoneChoice));
+  }
+  select.value = timeZoneChoice;
+}
+
+function applyTimeZone(choice, { persist = true } = {}) {
+  timeZoneChoice = choice !== 'auto' && validTimeZone(choice) ? choice : 'auto';
+  if (persist) {
+    try {
+      if (timeZoneChoice === 'auto') localStorage.removeItem(TIME_ZONE_STORAGE_KEY);
+      else localStorage.setItem(TIME_ZONE_STORAGE_KEY, timeZoneChoice);
+    } catch {
+      // The choice still holds for this page.
+    }
+  }
+  const select = document.querySelector('[data-time-zone-select]');
+  if (select) {
+    select.value = timeZoneChoice;
+    showTimeZoneChoice(select);
+  }
+  translateElementsIn(document, currentLanguage());
+  renderTimesIn(document);
+  window.dispatchEvent(new CustomEvent('credential-console-time-zone', {
+    detail: { timeZone: activeTimeZone() },
+  }));
+}
+
+// For the metrics bundle, which draws its own axis labels and tooltips.
+window.credentialConsoleTime = Object.freeze({
+  format: (ms, options) => formatInstant(ms, options),
+  zoneLabel: (ms) => zoneLabelAt(ms),
+});
+
+document.addEventListener('change', (event) => {
+  const select = event.target.closest?.('[data-time-zone-select]');
+  if (select) applyTimeZone(select.value);
+});
+['pointerdown', 'focusin', 'keydown'].forEach((type) => {
+  document.addEventListener(type, (event) => {
+    const select = event.target.closest?.('[data-time-zone-select]');
+    if (select) fillAllTimeZones(select);
+  });
+});
+// Another tab changed the zone.
+window.addEventListener('storage', (event) => {
+  if (event.key === TIME_ZONE_STORAGE_KEY) applyTimeZone(storedTimeZone(), { persist: false });
+});
+// Countdowns move without a reload; a tab coming back catches up at once.
+setInterval(() => renderUntilIn(document), 30_000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') renderUntilIn(document);
+});
 
 applyLanguage(storedLanguage());
 
@@ -1429,6 +1769,7 @@ function hydrate(root, activeTab) {
   const language = currentLanguage();
   translateSubtree(root, language);
   translateElementsIn(root, language);
+  renderTimesIn(root);
   stampTableCardLabels(root);
   bindFormDrafts(root);
   root.querySelectorAll('details[data-persist-details]').forEach(restoreDetails);
@@ -1741,6 +2082,7 @@ async function swapConversationResults(form, submitter) {
     if (!replacement) return false;
 
     translateSubtree(replacement, currentLanguage());
+    renderTimesIn(replacement);
 
     // Remember whether focus was inside the region we are about to remove.
     const paging = Boolean(submitter && submitter.closest('.conversation-pagination'));
