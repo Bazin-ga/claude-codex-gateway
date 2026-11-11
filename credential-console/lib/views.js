@@ -71,8 +71,16 @@ html[data-language-pending] body {
 body { margin: 0; background: var(--paper); color: var(--ink); line-height: 1.45; }
 a { color: var(--green); }
 .shell { max-width: 1180px; margin: 0 auto; padding: 28px 22px 64px; }
-.topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 28px; }
-.topbar-actions { display: flex; align-items: center; gap: 10px; }
+.topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 20px; margin-bottom: 28px; }
+.topbar-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; margin-left: auto; }
+.time-zone-switch { position: relative; display: inline-flex; align-items: center; gap: 7px; min-height: 38px; margin: 0; padding: 0 10px; border: 1px solid var(--line); border-radius: 11px; background: white; color: var(--muted); font-size: 13px; }
+.time-zone-switch:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
+.time-zone-switch b { color: var(--ink); white-space: nowrap; }
+.time-zone-switch select { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 0; margin: 0; opacity: 0; cursor: pointer; }
+.quota-window .until-left { color: var(--ink); }
+.until-at { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.until[data-until="expires"].passed .until-left { color: var(--red); }
+.relative-expiry .until-at, td .until-at { display: block; }
 .language-switch { display: inline-flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 11px; background: white; }
 .language-switch button { min-width: 46px; padding: 6px 9px; background: transparent; color: var(--muted); }
 .language-switch button:hover, .language-switch button.active { background: var(--ink); color: white; }
@@ -807,6 +815,7 @@ h1, h2, h3, [id], [tabindex], input, select, textarea, button, a.button, summary
      a 0,1,1 rule outside this query beats the 0,0,1 rule inside it. */
   .metrics-segmented button, .metrics-segmented .button { min-height: 44px; }
   .page-tabs a, .language-switch button { min-height: 44px; display: inline-flex; align-items: center; }
+  .time-zone-switch { min-height: 52px; }
   .table-wrap { overflow-x: auto; }
   .zone-heading { display: grid; }
   .identity-chip { white-space: normal; }
@@ -886,10 +895,64 @@ function statusBadge(status) {
   return `<span class="badge ${escapeHtml(status)}" data-i18n="status-${escapeHtml(status.replaceAll('_', '-'))}">${escapeHtml(status.replaceAll('_', ' '))}</span>`;
 }
 
-function dateText(value) {
-  if (!value) return '—';
-  const time = Date.parse(value);
-  return Number.isFinite(time) ? new Date(time).toLocaleString('en-GB', { hour12: false }) : value;
+function instantMs(value) {
+  if (value === null || value === undefined || value === '') return NaN;
+  if (typeof value === 'number') return value;
+  if (value instanceof Date) return value.getTime();
+  return Date.parse(String(value));
+}
+
+/** The instant without milliseconds: these attributes repeat down long tables. */
+function isoInstant(ms) {
+  return new Date(ms).toISOString().replace('.000Z', 'Z');
+}
+
+/** "2026-11-11 06:40 UTC": the reading a page carries before its script runs. */
+function utcText(ms, { date = false, seconds = false, zone = true } = {}) {
+  const iso = new Date(ms).toISOString();
+  if (date) return iso.slice(0, 10);
+  return `${iso.slice(0, seconds ? 19 : 16).replace('T', ' ')}${zone ? ' UTC' : ''}`;
+}
+
+/**
+ * A moment in time, shown in the time zone the reader picked in the header.
+ *
+ * The server writes the UTC reading and the instant; the client script rewrites
+ * the text in the chosen zone (the browser's own by default). Formatting here
+ * with toLocaleString used the server's zone instead — UTC on one host, UTC+8 on
+ * another — and never said which. `bare` leaves the zone off, for a column whose
+ * header already names it.
+ */
+function timeHtml(value, { date = false, seconds = false, bare = false } = {}) {
+  const ms = instantMs(value);
+  if (!Number.isFinite(ms) || !Number.isFinite(new Date(ms).getTime())) {
+    return value ? escapeHtml(String(value)) : '—';
+  }
+  const flags = `${date ? ' data-time-date' : ''}${seconds ? ' data-time-seconds' : ''}${bare ? ' data-time-bare' : ''}`;
+  return `<time datetime="${isoInstant(ms)}"${flags}>${escapeHtml(utcText(ms, { date, seconds, zone: !bare }))}</time>`;
+}
+
+const UNTIL_PHRASES = Object.freeze({
+  resets: ['resets in', 'reset due'],
+  returns: ['returns in', 'return due'],
+  until: ['lifts in', 'lifted'],
+  expires: ['expires in', 'expired'],
+});
+
+/**
+ * How long until something happens — a quota reset, an expiry — first, and the
+ * moment itself second. A bare reset time made every reader work out the zone
+ * and then the gap; the client keeps the countdown current without a reload.
+ */
+function untilHtml(value, kind, { nowMs = Date.now() } = {}) {
+  const ms = instantMs(value);
+  if (!Number.isFinite(ms) || !Number.isFinite(new Date(ms).getTime())) {
+    return value ? escapeHtml(String(value)) : '—';
+  }
+  const [ahead, passed] = UNTIL_PHRASES[kind] ?? UNTIL_PHRASES.resets;
+  const left = ms - nowMs;
+  const text = left > 0 ? `${ahead} ${compactDuration(left)}` : `${passed} ${compactDuration(left)} ago`;
+  return `<span class="until${left > 0 ? '' : ' passed'}" data-until="${escapeHtml(kind)}" data-until-at="${isoInstant(ms)}"><strong class="until-left">${escapeHtml(text)}</strong> <span class="until-at">${timeHtml(ms)}</span></span>`;
 }
 
 function compactDuration(milliseconds) {
@@ -957,15 +1020,19 @@ function expiryView(alert) {
     return '<span class="muted" data-i18n="expires-unknown">Not available</span>';
   }
   const expired = alert.expiresInMs <= 0;
-  const duration = compactDuration(alert.expiresInMs);
+  const expiresAtMs = instantMs(alert.expiresAt);
+  if (Number.isFinite(expiresAtMs)) {
+    // Counted from the moment the alert was read, so the page and the alert agree.
+    return `<div class="relative-expiry${expired ? ' expired' : ''}">${untilHtml(expiresAtMs, 'expires', { nowMs: expiresAtMs - alert.expiresInMs })}</div>`;
+  }
   return `<div class="relative-expiry${expired ? ' expired' : ''}">
     <span data-i18n="${expired ? 'expires-ago' : 'expires-in'}">${expired ? 'Expired' : 'Expires in'}</span>
-    <strong>${escapeHtml(duration)}</strong>
-  </div><div class="muted tiny">${escapeHtml(dateText(alert.expiresAt))}</div>`;
+    <strong>${escapeHtml(compactDuration(alert.expiresInMs))}</strong>
+  </div>`;
 }
 
 function credentialCheckText(value, i18nKey) {
-  return `<div><span data-i18n="${i18nKey}">${i18nKey === 'last-successful-check' ? 'Last successful credential check' : 'Last rotation'}</span>: <span>${escapeHtml(value ? dateText(value) : '—')}</span></div>`;
+  return `<div><span data-i18n="${i18nKey}">${i18nKey === 'last-successful-check' ? 'Last successful credential check' : 'Last rotation'}</span>: <span>${timeHtml(value)}</span></div>`;
 }
 
 function credentialAlertSummaryView(accounts, alerts) {
@@ -1011,7 +1078,7 @@ function quotaWindowView(usage, kind, label, i18n) {
   return `<div class="quota-window">
     <span data-i18n="${i18n}">${label}</span>
     <strong><span data-i18n="usage-remaining">Remaining</span> ${escapeHtml(window.remaining_percent)}%</strong>
-    <small><span data-i18n="usage-resets">Resets</span> ${escapeHtml(dateText(window.resets_at))}</small>
+    <small>${window.resets_at ? untilHtml(window.resets_at, 'resets') : '<span data-i18n="usage-resets">Resets</span> —'}</small>
   </div>`;
 }
 
@@ -1208,7 +1275,7 @@ function deviceFailoverNote(device, accounts) {
   const marker = device.account_failover;
   if (!marker || device.revoked_at) return '';
   const home = accountForId(accounts, marker.home_account_id);
-  return `<div class="muted tiny" data-device-failover><span data-i18n="failover-device-moved">Moved by quota failover from</span> ${escapeHtml(home?.alias ?? marker.home_account_id ?? '—')}${marker.return_after ? ` · <span data-i18n="failover-device-returns">returns after</span> ${escapeHtml(dateText(marker.return_after))}` : ''} · <a href="/admin#failover-devices" data-i18n="failover-device-manage">manage</a></div>`;
+  return `<div class="muted tiny" data-device-failover><span data-i18n="failover-device-moved">Moved by quota failover from</span> ${escapeHtml(home?.alias ?? marker.home_account_id ?? '—')}${marker.return_after ? ` · ${untilHtml(marker.return_after, 'returns')}` : ''} · <a href="/admin#failover-devices" data-i18n="failover-device-manage">manage</a></div>`;
 }
 
 /** The credit balance, whole credits with separators; the decimals are noise. */
@@ -1249,7 +1316,7 @@ function accountUsageView(account, { showAccount = false } = {}) {
     : null;
   const quotaMeta = [
     updatedAt
-      ? `<span><span data-i18n="usage-updated">Updated</span> ${escapeHtml(dateText(updatedAt))}</span>`
+      ? `<span><span data-i18n="usage-updated">Updated</span> ${timeHtml(updatedAt)}</span>`
       : '',
     fableWeekly
       ? `<span class="quota-fable"><span data-i18n="usage-fable-remaining">Fable quota remaining</span> ${escapeHtml(fableWeekly.remaining_percent)}%</span>`
@@ -1314,7 +1381,7 @@ function apiSpendView(account, { showAccount = false } = {}) {
     </div>
     ${spend ? '' : '<div class="quota-message" data-i18n="api-spend-pending">Waiting for the first spend reading.</div>'}
     ${details}
-    ${spend ? `<div class="quota-meta"><span><span data-i18n="usage-updated">Updated</span> ${escapeHtml(dateText(spend.computed_at))}</span></div>` : ''}
+    ${spend ? `<div class="quota-meta"><span><span data-i18n="usage-updated">Updated</span> ${timeHtml(spend.computed_at)}</span></div>` : ''}
     ${codexModelGuardNote(account)}
   </div>`;
 }
@@ -1571,14 +1638,14 @@ function consoleCredentialRow(device, accounts, csrf, groupNames = []) {
     <td>${escapeHtml(providerLabel(provider))}</td>
     ${accountCell(selectedAccount, { selected: true })}
     <td>${credentialBadge(state)}</td>
-    <td>${escapeHtml(dateText(device.last_seen_at))}</td>
+    <td>${timeHtml(device.last_seen_at)}</td>
     <td><div class="stack">
       ${accountSelectionDetails(selection, accounts)}
       ${deviceFailoverNote(device, accounts)}
       ${deviceGroupControl(device, groupNames, csrf)}
       ${accountSwitchControl(device, selection, accounts, csrf)}
       ${device.revoked_at
-      ? `<span class="muted tiny">${escapeHtml(dateText(device.revoked_at))}</span>`
+      ? `<span class="muted tiny">${timeHtml(device.revoked_at)}</span>`
       : `<form method="post" action="/devices/${encodeURIComponent(device.id)}/revoke">
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
         <button class="danger" type="submit" data-i18n="revoke">Revoke</button>
@@ -1598,13 +1665,13 @@ function consoleCredentialRow(device, accounts, csrf, groupNames = []) {
 function codexCredentialRow(client, account) {
   const state = client.revoked ? 'revoked' : 'active';
   return `<tr data-credential-state="${state}">
-    <td><strong>${escapeHtml(client.name || '—')}</strong><div class="muted tiny"><span data-i18n="enrolled-at">Enrolled</span> ${escapeHtml(dateText(client.added_at))}</div></td>
+    <td><strong>${escapeHtml(client.name || '—')}</strong><div class="muted tiny"><span data-i18n="enrolled-at">Enrolled</span> ${timeHtml(client.added_at)}</div></td>
     <td>Codex</td>
     ${accountCell(account)}
     <td>${credentialBadge(state)}</td>
     <td><span class="muted tiny" data-i18n="not-reported-here">Not reported to this console</span></td>
     <td>${client.revoked
-      ? `<span class="muted tiny">${escapeHtml(dateText(client.revoked_at))}</span>${client.revoked_reason
+      ? `<span class="muted tiny">${timeHtml(client.revoked_at)}</span>${client.revoked_reason
         ? `<div class="muted tiny">${escapeHtml(client.revoked_reason)}</div>`
         : ''}`
       : '<span class="muted tiny" data-i18n="dispenser-managed">Managed by the dispenser</span>'}</td>
@@ -1914,6 +1981,17 @@ function metricHourLabel(value) {
   const date = new Date(numeric);
   if (!Number.isFinite(date.getTime())) return '—';
   return `${date.toISOString().slice(0, 16).replace('T', ' ')}Z`;
+}
+
+/**
+ * The hour cell of a raw hourly table, in UTC. The table carries
+ * data-utc-hours and the client rewrites its first column in the reader's
+ * zone: a <time> per row would push a 30-day page past its size budget.
+ */
+function metricHourCell(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || !Number.isFinite(new Date(numeric).getTime())) return '<td>—</td>';
+  return `<td>${utcText(numeric, { zone: false })}</td>`;
 }
 
 function normalizeMetricRows(hourly, { tokenRows = false } = {}) {
@@ -2238,7 +2316,7 @@ function metricsTable(rows, { wrapped = true } = {}) {
   const truncated = sourceRows.length > tableRows.length;
   const body = tableRows.length
     ? tableRows.map((row) => `<tr>
-        <td>${escapeHtml(metricHourLabel(row.hourBucketMs))}</td>
+        ${metricHourCell(row.hourBucketMs)}
         <td>${escapeHtml(metricDisplayNumber(row.requestCount))}</td>
         <td>${escapeHtml(metricDisplayNumber(row.successCount))}</td>
         <td>${escapeHtml(metricDisplayNumber(row.errorCount))}</td>
@@ -2255,7 +2333,7 @@ function metricsTable(rows, { wrapped = true } = {}) {
     : '<tr><td colspan="13" class="empty" data-i18n="metrics-no-data">No matching request data for this period.</td></tr>';
   const contents = `${truncated ? '<p class="notice metrics-comparison-note" role="note" data-i18n="metrics-hourly-table-truncated">The hourly table shows the latest 200 rows; older rows are omitted.</p>' : ''}
     <div class="metrics-table-wrap">
-      <table class="metrics-table">
+      <table class="metrics-table" data-utc-hours>
         <caption class="muted tiny" data-i18n="metrics-hourly-table-caption">Hourly request and token details</caption>
         <thead><tr>
         <th scope="col" data-i18n="metrics-hour">Hour (UTC)</th>
@@ -2487,7 +2565,7 @@ function deviceComparisonView(input) {
   }).join('');
   const tableRows = comparison.devices.flatMap((device) => (
     comparisonTableSource.filter((row) => String(row?.deviceId ?? row?.device_id ?? row?.device ?? '') === device.value).map((row) => `<tr>
-      <td>${escapeHtml(metricHourLabel(row.hourBucketMs ?? row.hour_bucket_ms))}</td>
+      ${metricHourCell(row.hourBucketMs ?? row.hour_bucket_ms)}
       <td>${escapeHtml(device.label)}</td>
       <td>${escapeHtml(metricTokenText(row.inputTokens ?? row.totalInputTokens))}</td>
       <td>${escapeHtml(metricTokenText(row.cacheCreationInputTokens ?? row.totalCacheCreationInputTokens))}</td>
@@ -2557,7 +2635,7 @@ function deviceComparisonView(input) {
     <details class="metrics-comparison-raw metrics-table-card" data-persist-details="device-raw-table">
       <summary data-i18n="metrics-device-comparison-table-toggle">Show raw comparison table</summary>
       <p class="metrics-scroll-hint" data-i18n="metrics-scroll-table-hint">Swipe horizontally to inspect every column.</p>
-      <div class="metrics-comparison-table-wrap"><table class="metrics-table metrics-comparison-table">
+      <div class="metrics-comparison-table-wrap"><table class="metrics-table metrics-comparison-table" data-utc-hours>
         <caption class="muted tiny" data-i18n="metrics-device-comparison-table-caption">Raw four-category values and coverage fallback</caption>
         <thead><tr><th scope="col" data-i18n="metrics-hour">Hour (UTC)</th><th scope="col" data-i18n="metrics-device-comparison-device">Device</th><th scope="col" data-i18n="metrics-total-input-tokens">Input tokens</th><th scope="col" data-i18n="metrics-total-cache-creation-input-tokens">Cache creation input tokens</th><th scope="col" data-i18n="metrics-total-cache-read-input-tokens">Cache read input tokens</th><th scope="col" data-i18n="metrics-total-output-tokens">Output tokens</th><th scope="col" data-i18n="metrics-device-comparison-coverage">Coverage</th></tr></thead>
         <tbody>${tableRows || '<tr><td colspan="7" class="empty" data-i18n="metrics-device-comparison-no-data">No cross-device token comparison data is available.</td></tr>'}</tbody>
@@ -2809,7 +2887,7 @@ export function metricsView({
         </div>
       </header>
       <div class="metrics-status-strip" role="status">
-        <span><strong>${escapeHtml(rangeLabel)}</strong> · UTC</span>
+        <span><strong>${escapeHtml(rangeLabel)}</strong> · ${hasAbsoluteWindow ? 'UTC' : '<span data-time-zone-name>UTC</span>'}</span>
         <span><span data-i18n="metrics-total-requests">All requests</span>: <strong>${escapeHtml(metricDisplayNumber(allTotal))}</strong></span>
         <span><span data-i18n="metrics-consumption-requests">Consumption requests</span>: <strong>${escapeHtml(metricDisplayNumber(consumptionTotal))}</strong></span>
         <span><span data-i18n="metrics-status-coverage">Complete coverage</span>: <strong>${coveragePercent === null ? '—' : `${escapeHtml(metricDisplayNumber(coveragePercent, { decimals: 1 }))}%`}</strong></span>
@@ -2880,7 +2958,7 @@ export function metricsView({
           kind: 'tokens',
           title: 'Hourly token composition',
           titleI18n: 'metrics-token-trend',
-          description: 'Stacked known token categories on a real UTC time axis; gaps stay unknown.',
+          description: 'Stacked known token categories on a real time axis; gaps stay unknown.',
           descriptionI18n: 'metrics-token-trend-description',
           fallback: `${tokenChart}${metricLegend(tokenSeries)}`,
           wide: true,
@@ -2960,17 +3038,11 @@ function conversationState(item) {
   return ALL_CONVERSATION_RESPONSE_STATES.has(candidate) ? candidate : 'unavailable';
 }
 
-function conversationDateText(value) {
+function conversationTimeHtml(value) {
   try {
     if (value === null || value === undefined || value === '') return '—';
     const numeric = Number(value);
-    if (Number.isFinite(numeric) && numeric >= 0) {
-      const date = new Date(numeric);
-      if (Number.isFinite(date.getTime())) {
-        return date.toISOString().replace('T', ' ').replace('.000Z', 'Z');
-      }
-    }
-    return dateText(value);
+    return timeHtml(Number.isFinite(numeric) && numeric >= 0 ? numeric : value, { seconds: true });
   } catch {
     return '—';
   }
@@ -3218,7 +3290,7 @@ function conversationItemView(item) {
       <div>
         <h2>${id ? `#${escapeHtml(id)}` : '<span data-i18n="conversation-unknown-id">API fragment</span>'}</h2>
         <div class="conversation-result-meta">
-          <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(item?.startedAtMs))}</span>
+          <span><span data-i18n="conversation-captured-at">Captured</span>: ${conversationTimeHtml(item?.startedAtMs)}</span>
           <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(item?.memberLabel ?? '—')}</span>
           <span><span data-i18n="conversation-device">Device</span>: ${escapeHtml(device)}</span>
           <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(item?.accountAlias ?? '—')}</span>
@@ -3530,8 +3602,8 @@ function conversationSessionItemView(item) {
         <h2><span data-i18n="conversation-session-heading">Conversation</span>${id ? ` #${escapeHtml(id)}` : ''}</h2>
         <div class="conversation-result-meta">
           <span><span data-i18n="conversation-session-turn-count">Turns</span>: ${escapeHtml(String(conversationCount(item?.turnCount)))}</span>
-          <span><span data-i18n="conversation-session-first-at">First prompt</span>: ${escapeHtml(conversationDateText(item?.firstPromptAtMs))}</span>
-          <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${escapeHtml(conversationDateText(item?.lastActivityAtMs))}</span>
+          <span><span data-i18n="conversation-session-first-at">First prompt</span>: ${conversationTimeHtml(item?.firstPromptAtMs)}</span>
+          <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${conversationTimeHtml(item?.lastActivityAtMs)}</span>
           <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(item?.memberLabel ?? '—')}</span>
           <span><span data-i18n="conversation-device">Device</span>: ${escapeHtml(device)}</span>
           <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(item?.accountAlias ?? '—')}</span>
@@ -3757,8 +3829,8 @@ function conversationSessionTurnView(turn, fallbackIndex) {
       <div>
         <h2><span data-i18n="conversation-session-turn">Round</span> ${escapeHtml(String(displayIndex))}</h2>
         <div class="conversation-detail-meta">
-          <span><span data-i18n="conversation-round-prompt-at">Prompt submitted</span>: ${escapeHtml(conversationDateText(turn?.promptAtMs))}</span>
-          <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${escapeHtml(conversationDateText(turn?.lastActivityAtMs ?? turn?.completedAtMs ?? turn?.promptAtMs))}</span>
+          <span><span data-i18n="conversation-round-prompt-at">Prompt submitted</span>: ${conversationTimeHtml(turn?.promptAtMs)}</span>
+          <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${conversationTimeHtml(turn?.lastActivityAtMs ?? turn?.completedAtMs ?? turn?.promptAtMs)}</span>
           <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(turn?.memberLabel ?? '—')}</span>
           <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(turn?.accountAlias ?? '—')}</span>
           ${turn?.model ? `<span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(turn.model)}</span>` : ''}
@@ -3844,8 +3916,8 @@ export function conversationSessionDetailView({
       </div>
       <div class="conversation-session-summary">
         <article class="card summary"><span class="muted" data-i18n="conversation-session-turn-count">Turns</span><strong>${escapeHtml(String(turnCount))}</strong></article>
-        <article class="card summary"><span class="muted" data-i18n="conversation-session-first-at">First prompt</span><strong>${escapeHtml(conversationDateText(record.firstPromptAtMs))}</strong></article>
-        <article class="card summary"><span class="muted" data-i18n="conversation-session-last-at">Latest activity</span><strong>${escapeHtml(conversationDateText(record.lastActivityAtMs))}</strong></article>
+        <article class="card summary"><span class="muted" data-i18n="conversation-session-first-at">First prompt</span><strong>${conversationTimeHtml(record.firstPromptAtMs)}</strong></article>
+        <article class="card summary"><span class="muted" data-i18n="conversation-session-last-at">Latest activity</span><strong>${conversationTimeHtml(record.lastActivityAtMs)}</strong></article>
       </div>
       ${truncated ? '<div class="notice" role="status" data-i18n="conversation-session-truncated">This conversation exceeds the bounded timeline budget. Only the oldest contiguous prefix, up to 200 turns and 8 MiB of stored text, is shown; open an individual turn for its full stored text.</div>' : ''}
       <div class="conversation-timeline">
@@ -3899,8 +3971,8 @@ export function conversationRoundDetailView({
           <span class="badge stored" data-i18n="conversation-round-label">Reliable user round</span>
           <h1><span data-i18n="conversation-session-turn">Round</span> ${escapeHtml(String(record.turnIndex ?? roundId))}</h1>
           <div class="conversation-detail-meta">
-            <span><span data-i18n="conversation-round-prompt-at">Prompt submitted</span>: ${escapeHtml(conversationDateText(record.promptAtMs))}</span>
-            <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${escapeHtml(conversationDateText(record.lastActivityAtMs ?? record.completedAtMs ?? record.promptAtMs))}</span>
+            <span><span data-i18n="conversation-round-prompt-at">Prompt submitted</span>: ${conversationTimeHtml(record.promptAtMs)}</span>
+            <span><span data-i18n="conversation-session-last-at">Latest activity</span>: ${conversationTimeHtml(record.lastActivityAtMs ?? record.completedAtMs ?? record.promptAtMs)}</span>
             <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(record.memberLabel ?? '—')}</span>
             <span><span data-i18n="conversation-device">Device</span>: ${escapeHtml(record.deviceName ?? record.deviceId ?? '—')}</span>
             <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(record.accountAlias ?? '—')}</span>
@@ -3968,7 +4040,7 @@ export function conversationDetailView({
           <span class="badge stored" data-i18n="conversations-label">API fragment diagnostics</span>
           <h1><span data-i18n="conversation-detail-heading">API fragment</span> #${escapeHtml(String(conversationId))}</h1>
           <div class="conversation-detail-meta">
-            <span><span data-i18n="conversation-captured-at">Captured</span>: ${escapeHtml(conversationDateText(record.startedAtMs))}</span>
+            <span><span data-i18n="conversation-captured-at">Captured</span>: ${conversationTimeHtml(record.startedAtMs)}</span>
             <span><span data-i18n="conversation-member-label">Member label</span>: ${escapeHtml(record.memberLabel ?? '—')}</span>
             <span><span data-i18n="conversation-account">Account</span>: ${escapeHtml(record.accountAlias ?? '—')}</span>
             <span><span data-i18n="conversation-model">Model</span>: ${escapeHtml(record.model ?? '—')}</span>
@@ -4611,7 +4683,7 @@ export function claudeAuthorizationView({
           <button type="submit" data-i18n="start-authorization">Start a fresh authorization</button>
         </form>
         ${authorization ? `
-          <div class="notice success"><span data-i18n="temporary-session-ready">A fresh 15-minute authorization session is ready.</span><br><span class="tiny">${escapeHtml(dateText(authorization.expires_at))}</span></div>
+          <div class="notice success"><span data-i18n="temporary-session-ready">A fresh 15-minute authorization session is ready.</span><br><span class="tiny">${untilHtml(authorization.expires_at, 'expires')}</span></div>
           <ol class="stack">
             <li data-i18n="owner-auth-step-1">Open the Claude page below and sign in with the expected account.</li>
             <li data-i18n="owner-auth-step-2">Approve inference and usage-view access, then copy the complete code including # and everything after it.</li>
@@ -4664,7 +4736,7 @@ export function codexAuthorizationView({
           <div class="notice success">${authorization.url
             ? '<span data-i18n="temporary-session-ready">A fresh 15-minute authorization session is ready.</span>'
             : '<span data-i18n="session-still-open">This authorization session is still open, so the code you already have can be pasted again. Starting a fresh one would invalidate it.</span>'
-          }<br><span class="tiny">${escapeHtml(dateText(authorization.expires_at))}</span></div>
+          }<br><span class="tiny">${untilHtml(authorization.expires_at, 'expires')}</span></div>
           ${authorization.url ? `
           <ol class="stack">
             <li data-i18n="codex-auth-step-1">Open the OpenAI page below and sign in with the ChatGPT account that holds the Codex subscription.</li>
@@ -5448,7 +5520,7 @@ function blockRuleFields(rule) {
 function blockRuleCard(rule, csrf) {
   const action = `/admin/model-block-rules/${encodeURIComponent(rule.id)}`;
   const changed = rule.updated_at
-    ? `<span class="muted tiny"><span data-i18n="admin-rule-updated">Last changed</span> ${escapeHtml(dateText(rule.updated_at))}${rule.updated_by ? ` · ${escapeHtml(rule.updated_by)}` : ''}</span>`
+    ? `<span class="muted tiny"><span data-i18n="admin-rule-updated">Last changed</span> ${timeHtml(rule.updated_at)}${rule.updated_by ? ` · ${escapeHtml(rule.updated_by)}` : ''}</span>`
     : '';
   return `<article class="block-rule${rule.enabled ? '' : ' is-off'}">
     <form method="post" action="${action}" class="block-rule-form">
@@ -5487,7 +5559,7 @@ function failoverQuota(usage) {
 function failoverQuotaPill(quota) {
   if (!quota) return '<span class="pill" data-i18n="failover-quota-unknown">Quota unknown</span>';
   if (quota.exhausted) {
-    return `<span class="pill out"><span data-i18n="failover-quota-out">Used up</span>${quota.resetsAt ? ` · <span data-i18n="failover-resets">resets</span> ${escapeHtml(dateText(quota.resetsAt))}` : ''}</span>`;
+    return `<span class="pill out"><span data-i18n="failover-quota-out">Used up</span>${quota.resetsAt ? ` · ${untilHtml(quota.resetsAt, 'resets')}` : ''}</span>`;
   }
   const tone = quota.remaining <= 15 ? 'low' : 'ok';
   return `<span class="pill ${tone}"><span data-i18n="failover-quota-left">Left</span> ${escapeHtml(String(quota.remaining))}%</span>`;
@@ -5566,8 +5638,8 @@ function failoverDevicesTable(devices, accounts, csrf) {
       <td><strong>${escapeHtml(device.name)}</strong></td>
       <td class="muted">${escapeHtml(device.member_label || '—')}</td>
       <td>${escapeHtml(home?.alias ?? marker.home_account_id)} <span class="chain-arrow">→</span> <strong>${escapeHtml(current?.alias ?? device.selected_account_id ?? '—')}</strong></td>
-      <td>${escapeHtml(dateText(marker.at))}</td>
-      <td>${escapeHtml(dateText(marker.return_after))}</td>
+      <td>${timeHtml(marker.at)}</td>
+      <td>${marker.return_after ? untilHtml(marker.return_after, 'returns') : '—'}</td>
       <td><form method="post" action="/admin/failover/devices/${encodeURIComponent(device.id)}/failback" class="inline">
         <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
         <button type="submit" class="secondary tiny" data-i18n="failover-failback">Return now</button>
@@ -5926,7 +5998,7 @@ export function relayView({
         ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
         ${settings.base_url ? `<p><span data-i18n="relay-platform">Platform</span>: <strong>${escapeHtml(settings.name ?? '')}</strong> <span class="muted tiny">${escapeHtml(settings.base_url)}</span></p>` : '<div class="notice" data-i18n="relay-not-configured">No platform is configured yet. Fill in the settings at the bottom of this page.</div>'}
         ${plaintext ? '<div class="notice error" data-i18n="relay-plaintext">This platform is reached over plain HTTP: the platform key and every prompt cross the internet unencrypted between this server and the platform. Do not send anything sensitive.</div>' : ''}
-        ${balance ? `<p><span data-i18n="relay-balance">Platform key spend</span>: <strong>${usd(balance.used_usd)}</strong> / ${usd(balance.limit_usd, 0)} <span class="muted tiny">(${escapeHtml(dateText(balance.fetched_at))})</span></p>` : ''}
+        ${balance ? `<p><span data-i18n="relay-balance">Platform key spend</span>: <strong>${usd(balance.used_usd)}</strong> / ${usd(balance.limit_usd, 0)} <span class="muted tiny">(${timeHtml(balance.fetched_at)})</span></p>` : ''}
         ${catalog?.error && catalog.error !== 'not_configured' ? `<div class="notice error"><span data-i18n="relay-catalog-error">The price list could not be refreshed</span>: ${escapeHtml(catalog.error)}</div>` : ''}
       </article>
       <article class="card">
@@ -5946,7 +6018,7 @@ export function relayView({
           <thead><tr><th data-i18n="relay-model">Model</th><th data-i18n="relay-vendor">Vendor</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cached">Cached input</th><th data-i18n="relay-endpoints">Endpoints</th><th></th></tr></thead>
           <tbody>${catalogRows || '<tr><td colspan="7" class="empty" data-i18n="relay-catalog-empty">Nothing to show.</td></tr>'}</tbody>
         </table></div>
-        ${catalog?.fetched_at ? `<p class="muted tiny"><span data-i18n="relay-catalog-updated">Price list read</span> ${escapeHtml(dateText(catalog.fetched_at))}</p>` : ''}
+        ${catalog?.fetched_at ? `<p class="muted tiny"><span data-i18n="relay-catalog-updated">Price list read</span> ${timeHtml(catalog.fetched_at)}</p>` : ''}
       </article>
       <article class="card">
         <details${settings.base_url ? '' : ' open'}>
