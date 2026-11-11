@@ -85,7 +85,7 @@ a { color: var(--green); }
 .quota-window .until-left { color: var(--ink); }
 .until-at { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .until[data-until="expires"].passed .until-left { color: var(--red); }
-.relative-expiry .until-at, td .until-at { display: block; }
+.relative-expiry .until-at, td .until-at, .quota-window .until-at { display: block; }
 .language-switch { display: inline-flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 11px; background: white; }
 .language-switch button { min-width: 46px; padding: 6px 9px; background: transparent; color: var(--muted); }
 .language-switch button:hover, .language-switch button.active { background: var(--ink); color: white; }
@@ -949,7 +949,7 @@ function untilHtml(value, kind, { nowMs = Date.now() } = {}) {
   const [ahead, passed] = UNTIL_PHRASES[kind] ?? UNTIL_PHRASES.resets;
   const left = ms - nowMs;
   const text = left > 0 ? `${ahead} ${compactDuration(left)}` : `${passed} ${compactDuration(left)} ago`;
-  return `<span class="until${left > 0 ? '' : ' passed'}" data-until="${escapeHtml(kind)}" data-until-at="${isoInstant(ms)}"><strong class="until-left">${escapeHtml(text)}</strong> <span class="until-at">${timeHtml(ms)}</span></span>`;
+  return `<span class="until${left > 0 ? '' : ' passed'}" data-until="${escapeHtml(kind)}" data-until-at="${isoInstant(ms)}"><span class="until-left">${escapeHtml(text)}</span> <span class="until-at">${timeHtml(ms)}</span></span>`;
 }
 
 function compactDuration(milliseconds) {

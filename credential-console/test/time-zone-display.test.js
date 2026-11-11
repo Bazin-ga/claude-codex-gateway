@@ -26,7 +26,7 @@ test('a quota window counts down to its reset and carries the instant for the cl
     windows: [{ kind: 'five_hour', remaining_percent: 40, resets_at: resetsAt }],
   });
   const instant = resetsAt.replace('.000Z', 'Z');
-  assert.match(html, new RegExp(`<span class="until" data-until="resets" data-until-at="${instant.replace(/[.]/g, '\\.')}"><strong class="until-left">resets in 3h 20m</strong>`));
+  assert.match(html, new RegExp(`<span class="until" data-until="resets" data-until-at="${instant.replace(/[.]/g, '\\.')}"><span class="until-left">resets in 3h 20m</span>`));
   // The moment itself follows, written in UTC until the script rewrites it.
   assert.match(html, new RegExp(`<time datetime="${instant.replace(/[.]/g, '\\.')}">\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC</time>`));
   // A past moment is plain: no countdown, and never the server's local zone.
@@ -39,7 +39,7 @@ test('a reset already past says so instead of counting down', () => {
   const html = renderWith({
     provider: 'claude', status: 'available', windows: [{ kind: 'weekly', remaining_percent: 0, resets_at: resetsAt }],
   });
-  assert.match(html, /<span class="until passed" data-until="resets"[^>]*><strong class="until-left">reset due 5m ago<\/strong>/);
+  assert.match(html, /<span class="until passed" data-until="resets"[^>]*><span class="until-left">reset due 5m ago<\/span>/);
 });
 
 /**
