@@ -649,7 +649,7 @@ test('a held account says so on the page, with the reset it is held until', asyn
   const { body } = await app.request('/');
   const card = new RegExp(`<article class="acct[^"]*" data-account-row="${app.account.id}"[\\s\\S]*?</article>`).exec(body)[0];
   assert.match(card, /data-i18n="claude-reserve-pill">Held in reserve</);
-  assert.match(body, /data-i18n="claude-reserve-in-force">in force: the gateway is not using this account<\/span> <span data-i18n="claude-reserve-until">until<\/span> \d/);
+  assert.match(body, /data-i18n="claude-reserve-in-force">in force: the gateway is not using this account<\/span> · <span class="until" data-until="until" data-until-at="[^"]+"><strong class="until-left">lifts in 2d<\/strong>/);
   const otherCard = new RegExp(`<article class="acct[^"]*" data-account-row="${app.other.id}"[\\s\\S]*?</article>`).exec(body)[0];
   assert.doesNotMatch(otherCard, /claude-reserve-pill/, 'the same reading without a reserve holds nothing');
 
