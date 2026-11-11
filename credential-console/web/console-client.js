@@ -1278,11 +1278,24 @@ function zoneOptionLabel(zone, language, now) {
  * The picker sits beside the language switch. It is built here rather than by
  * the server because it only means anything once this script runs: without it
  * the page keeps the server's UTC text and should not offer a dead control.
+ * Its styles come with it for the same reason, and because every byte of the
+ * shared stylesheet is paid again on each page — the 30-day metrics page has
+ * a size budget it sits right under.
  */
+const TIME_ZONE_PICKER_STYLES = `
+.time-zone-switch { position: relative; display: inline-flex; align-items: center; gap: 7px; min-height: 38px; margin: 0; padding: 0 10px; border: 1px solid var(--line); border-radius: 11px; background: white; color: var(--muted); font-size: 13px; }
+.time-zone-switch:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
+.time-zone-switch b { color: var(--ink); white-space: nowrap; }
+.time-zone-switch select { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 0; margin: 0; opacity: 0; cursor: pointer; }
+@media (max-width: 800px) { .time-zone-switch { min-height: 52px; } }`;
+
 function timeZoneSelect() {
   let select = document.querySelector('[data-time-zone-select]');
   const anchor = document.querySelector('.topbar-actions .language-switch');
   if (select || !anchor) return select;
+  const style = document.createElement('style');
+  style.textContent = TIME_ZONE_PICKER_STYLES;
+  document.head.append(style);
   const picker = document.createElement('label');
   picker.className = 'time-zone-switch';
   picker.innerHTML = '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5">'
