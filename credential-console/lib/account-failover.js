@@ -743,9 +743,10 @@ export function beginFailover({
       return backup;
     },
     /** Note that the request now runs on `backup` instead of the current account. */
-    moveTo(backup, { accountWide = true } = {}) {
+    moveTo(backup, { accountWide = true, credentialRejected = false } = {}) {
       state.failedOverFrom ??= state.account;
       state.accountWide ||= accountWide;
+      state.credentialMove ||= credentialRejected;
       state.account = backup;
     },
     /**
@@ -774,7 +775,9 @@ export function beginFailover({
         returnAfterMs,
         reason: state.reservedMove
           ? `reserve threshold reached on ${state.failedOverFrom.alias}`
-          : `quota exhausted on ${state.failedOverFrom.alias}`,
+          : state.credentialMove
+            ? `credential rejected on ${state.failedOverFrom.alias}`
+            : `quota exhausted on ${state.failedOverFrom.alias}`,
       })?.catch?.((error) => log(`${logPrefix}_failover_persist_failed`, {
         device_id: device.id,
         to_account_id: state.account.id,
@@ -793,6 +796,8 @@ export function beginFailover({
     reserved: null,
     // Whether the move away was for a reserve rather than for exhaustion.
     reservedMove: false,
+    // Whether the move away was because the upstream rejected the credential.
+    credentialMove: false,
   };
   const reserved = held(current);
   if (reserved) {

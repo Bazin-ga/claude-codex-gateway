@@ -951,3 +951,102 @@ test('a model refusal is cleared once its own window shows room again', async ()
   await recheckExhaustedAccounts({ store, exhaustion, refreshUsage: reading(30), now: Date.now() + 20 * 60_000 });
   assert.equal(exhaustion.modelExhausted('acct', 'fable'), null);
 });
+
+function revoked(res) {
+  res.writeHead(401, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({
+    type: 'error',
+    error: { type: 'authentication_error', message: 'OAuth token revoked. Please log in again.' },
+  }));
+}
+
+// Chicago, 2026-11-14: a device was sent back to an account whose token had
+// been revoked, and every request after that was a 401 the chain never caught.
+test('a revoked credential is replaced mid-request and the device moves off it', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken, deviceId } = await fleet();
+  const seen = [];
+  const { proxyUrl, exhaustion } = await harness(t, { store }, async (req, res) => {
+    const body = await readBody(req);
+    seen.push({ token: bearer(req), body });
+    if (bearer(req) === 'token-home') return revoked(res);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ served_by: bearer(req) }));
+  });
+
+  const response = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+
+  assert.equal(response.status, 200, 'the 401 must not reach the client while a backup can answer');
+  assert.equal(JSON.parse(response.body).served_by, 'token-backup');
+  assert.deepEqual(seen.map((entry) => entry.token), ['token-home', 'token-backup']);
+  assert.ok(seen[1].body.equals(PAYLOAD), 'the backup must receive the identical body');
+  assert.equal(exhaustion.exhausted(accounts.home.id), null, 'a rejected credential is not exhaustion');
+
+  await settled(store);
+  assert.equal(store.accountById(accounts.home.id).status, 'unhealthy');
+  const device = store.state.devices.find((entry) => entry.id === deviceId);
+  assert.equal(device.selected_account_id, accounts.backup.id);
+  assert.equal(device.account_failover.home_account_id, accounts.home.id);
+  assert.ok(store.state.audit.some((entry) => entry.event === 'device_account_failover'
+    && entry.reason === 'credential rejected on claude-home'));
+});
+
+test('a device is not sent back to a home account marked unhealthy, whenever its reset was', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken, deviceId } = await fleet();
+  await store.failoverDeviceAccount({
+    deviceId,
+    homeAccountId: accounts.home.id,
+    fromAccountId: accounts.home.id,
+    toAccountId: accounts.backup.id,
+    returnAfterMs: Date.now() - 1000,
+  });
+  await store.recordUsageCredentialAnswer(accounts.home.id, { rejected: true });
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+
+  await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+
+  assert.deepEqual(tokens, ['token-backup']);
+  await settled(store);
+  assert.equal(
+    store.state.devices.find((entry) => entry.id === deviceId).selected_account_id,
+    accounts.backup.id,
+  );
+});
+
+test('with failover off a 401 reaches the client and marks the account unhealthy', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken } = await fleet({ failoverEnabled: false });
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    revoked(res);
+  });
+
+  const response = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(tokens, ['token-home']);
+  await settled(store);
+  assert.equal(store.accountById(accounts.home.id).status, 'unhealthy');
+});
+
+test('a 403 is passed through without trying a backup', { timeout: 20_000 }, async (t) => {
+  const { store, deviceToken } = await fleet();
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'no' } }));
+  });
+
+  const response = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(tokens, ['token-home']);
+});

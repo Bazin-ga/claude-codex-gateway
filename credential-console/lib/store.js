@@ -69,6 +69,9 @@ const MAX_AUDIT_EVENTS = 2_000;
  */
 const GUEST_SPEND_PERSIST_MS = 1_000;
 const GUEST_SPEND_RETRY_MS = 30_000;
+// The failure a usage read records when the upstream rejects the credential;
+// see recordUsageCredentialAnswer.
+export const USAGE_CREDENTIAL_REJECTED = 'usage read rejected the credential (401)';
 
 /**
  * The opaque handle a client reports for the machine it runs on.
@@ -1255,6 +1258,36 @@ export class CredentialStore {
         account.last_failure = String(error ?? 'unknown failure').slice(0, 240);
       }
       await this.persist();
+    });
+  }
+
+  /**
+   * Record what a usage read said about an account's credential. Returns
+   * whether the account's status changed.
+   *
+   * A rejected credential marks a healthy account unhealthy, so failover
+   * neither returns a device to it nor moves one onto it. An account already
+   * unhealthy keeps the reason it has. Only an unhealthy mark this read made
+   * is cleared by a later read that gets through: one the proxy made after a
+   * refused request stands until a request succeeds, since a usage read can
+   * pass where inference does not.
+   */
+  async recordUsageCredentialAnswer(id, { rejected }) {
+    return this.serialized(async () => {
+      const account = this.accountById(id);
+      if (!account) return false;
+      if (rejected) {
+        if (!['healthy', 'stored'].includes(account.status)) return false;
+        account.status = 'unhealthy';
+        account.last_failure_at = nowIso();
+        account.last_failure = USAGE_CREDENTIAL_REJECTED;
+      } else {
+        if (account.status !== 'unhealthy' || account.last_failure !== USAGE_CREDENTIAL_REJECTED) return false;
+        account.status = 'healthy';
+        delete account.last_failure;
+      }
+      await this.persist();
+      return true;
     });
   }
 
