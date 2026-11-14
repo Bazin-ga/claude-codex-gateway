@@ -15,9 +15,13 @@ const CLAUDE_USAGE_URL = CLAUDE_FABLE_RESET_STATUS_URL;
 const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 
 class UsageFetchError extends Error {
-  constructor(code) {
+  constructor(code, httpStatus = null) {
     super(code);
     this.code = code;
+    // The upstream's HTTP status, when the failure was an answer rather than
+    // no answer: `authentication_failed` covers both 401 and 403, and only a
+    // 401 says the credential itself is gone.
+    this.httpStatus = httpStatus;
   }
 }
 
@@ -88,7 +92,7 @@ async function responseJson(response, provider) {
     throw new UsageFetchError('reauthorization_required');
   }
   if (response.status === 401 || response.status === 403) {
-    throw new UsageFetchError('authentication_failed');
+    throw new UsageFetchError('authentication_failed', response.status);
   }
   throw new UsageFetchError(`upstream_${response.status}`);
 }
@@ -374,6 +378,7 @@ export class UsageMonitor {
       }
       if (!this.#accountStillExists(account.id)) return;
       this.snapshots.set(account.id, snapshot);
+      if (account.provider === 'claude') await this.#recordCredentialAnswer(account, { rejected: false });
       this.log('account_usage_refreshed', {
         account_id: account.id,
         provider: account.provider,
@@ -391,6 +396,37 @@ export class UsageMonitor {
         account_id: account.id,
         provider: account.provider,
         code,
+      });
+      if (account.provider === 'claude' && error?.httpStatus === 401) {
+        await this.#recordCredentialAnswer(account, { rejected: true });
+      }
+    }
+  }
+
+  /**
+   * Tell the store what the usage read learned about a Claude credential.
+   *
+   * A 401 here is the same answer the inference endpoint gives a revoked token,
+   * and this read is often the only traffic an idle account gets: without it an
+   * account whose token was revoked days ago still reads healthy, and a device
+   * failed over away from it is sent back the moment its quota resets
+   * (Chicago, 2026-11-14). Only a Claude 401 counts. A 403 is also given to
+   * accounts that answer inference fine, and a Codex token is refreshed
+   * elsewhere and can be briefly stale here.
+   */
+  async #recordCredentialAnswer(account, { rejected }) {
+    try {
+      const changed = await this.store.recordUsageCredentialAnswer?.(account.id, { rejected });
+      if (changed) {
+        this.log(rejected ? 'account_usage_credential_rejected' : 'account_usage_credential_recovered', {
+          account_id: account.id,
+          provider: account.provider,
+        });
+      }
+    } catch (error) {
+      this.log('account_usage_health_update_failed', {
+        account_id: account.id,
+        code: error?.code ?? error?.name ?? 'unknown',
       });
     }
   }

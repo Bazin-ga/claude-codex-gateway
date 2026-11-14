@@ -320,3 +320,90 @@ test('a Codex account awaiting authorization is not reported as a usage failure'
     monitor.stop();
   }
 });
+
+// Chicago, 2026-11-14: an account whose token had been revoked for three days
+// still read healthy, because only the hourly usage read was hitting it, and a
+// device was failed back onto it the moment its quota reset.
+test('a Claude usage read the upstream answers 401 marks the account unhealthy until a read gets through', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-revoked-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const account = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-revoked',
+    credential: { oauth_token: 'sk-ant-oat01-revoked' },
+  });
+  let answer = 401;
+  const events = [];
+  const monitor = new UsageMonitor({
+    store,
+    home,
+    log: (event) => events.push(event),
+    fetchImpl: async () => (answer === 200
+      ? new Response(JSON.stringify({
+        five_hour: { utilization: 20, resets_at: null },
+        seven_day: { utilization: 30, resets_at: null },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      : new Response(JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'OAuth token revoked' },
+      }), { status: answer, headers: { 'Content-Type': 'application/json' } })),
+  });
+
+  await monitor.refreshAccount(account.id);
+  assert.equal(store.accountById(account.id).status, 'unhealthy');
+  assert.ok(events.includes('account_usage_credential_rejected'));
+
+  answer = 200;
+  await monitor.refreshAccount(account.id);
+  assert.equal(store.accountById(account.id).status, 'healthy', 'a read that gets through clears its own mark');
+  assert.equal(store.accountById(account.id).last_failure, undefined);
+  assert.ok(events.includes('account_usage_credential_recovered'));
+});
+
+test('a Claude usage 403 leaves the account as it was', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-forbidden-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const account = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-forbidden',
+    credential: { oauth_token: 'sk-ant-oat01-forbidden' },
+  });
+  const before = store.accountById(account.id).status;
+  const monitor = new UsageMonitor({
+    store,
+    home,
+    fetchImpl: async () => new Response(JSON.stringify({ error: { message: 'forbidden' } }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    }),
+  });
+
+  await monitor.refreshAccount(account.id);
+
+  assert.equal(monitor.snapshotForAccount(account.id).last_error, 'authentication_failed');
+  assert.equal(store.accountById(account.id).status, before);
+});
+
+test('a usage read that gets through does not clear an unhealthy mark the proxy made', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'credential-console-usage-proxy-mark-'));
+  const store = await new CredentialStore(home, { allowKeyInit: true }).init();
+  const account = await store.addAccount({
+    provider: 'claude',
+    alias: 'claude-proxy-marked',
+    credential: { oauth_token: 'sk-ant-oat01-proxy-marked' },
+  });
+  await store.updateAccountHealth(account.id, { success: false, error: 'upstream authentication failed (401)' });
+  const monitor = new UsageMonitor({
+    store,
+    home,
+    fetchImpl: async () => new Response(JSON.stringify({
+      five_hour: { utilization: 20, resets_at: null },
+      seven_day: { utilization: 30, resets_at: null },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  });
+
+  await monitor.refreshAccount(account.id);
+
+  assert.equal(store.accountById(account.id).status, 'unhealthy');
+  assert.equal(store.accountById(account.id).last_failure, 'upstream authentication failed (401)');
+});

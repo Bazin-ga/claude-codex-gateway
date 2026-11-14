@@ -936,7 +936,7 @@ export async function handleClaudeProxy(req, res, {
   // The refused attempt gets its own row, on the account that refused it, so
   // the dashboard shows the exhaustion and the move rather than only a turn
   // that mysteriously ran on a different account.
-  const recordFailedOverAttempt = (fromAccount, statusCode) => {
+  const recordFailedOverAttempt = (fromAccount, statusCode, outcome = 'quota_failover') => {
     let model = null;
     try {
       model = requestMetadata.snapshot()?.model ?? null;
@@ -955,7 +955,7 @@ export async function handleClaudeProxy(req, res, {
       model,
       stream: null,
       statusCode,
-      outcome: 'quota_failover',
+      outcome,
       ttfbMs: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
       durationMs: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
       requestBytes: requestLimit.bytes(),
@@ -1085,6 +1085,51 @@ export async function handleClaudeProxy(req, res, {
               // The upstream answered before the upload ended. Keep reading
               // the client into the buffer, but stop feeding a request that
               // has already been refused.
+              bodyAccumulator.unpipe(upstreamReq);
+              bodyAccumulator.resume();
+              upstreamReq.destroy();
+            }
+            const replay = () => {
+              if (clientAborted || metricFinalized) return;
+              sendUpstream(Buffer.concat(bodyChunks));
+            };
+            if (requestBodyFinished) replay();
+            else bodyFinishedWaiters.push(replay);
+            return;
+          }
+        }
+
+        // A 401 means the account's credential is gone — revoked, or signed
+        // out upstream — not that this request was wrong, so every account in
+        // the chain is a better bet. Mark the account unhealthy now (this
+        // attempt never reaches the health update below) so the device, once
+        // moved, is not sent back to it when its quota window resets.
+        if (status === 401
+          && failover.enabled
+          && !clientAborted
+          && failoversUsed < MAX_FAILOVERS) {
+          const found = backupWithCredential({ family });
+          if (found) {
+            failoversUsed += 1;
+            superseded = true;
+            const rejected = account;
+            recordFailedOverAttempt(rejected, status, 'credential_failover');
+            store.updateAccountHealth(rejected.id, {
+              success: false,
+              error: `upstream authentication failed (${status})`,
+            }).catch(() => {});
+            log('claude_proxy_credential_failover', {
+              stage: 'response',
+              device_id: device.id,
+              from_account_id: rejected.id,
+              to_account_id: found.backup.id,
+            });
+            failover.moveTo(found.backup, { credentialRejected: true });
+            account = found.backup;
+            headers.authorization = `Bearer ${found.token}`;
+            upstreamRes.once('error', () => {});
+            upstreamRes.resume();
+            if (!requestBodyFinished) {
               bodyAccumulator.unpipe(upstreamReq);
               bodyAccumulator.resume();
               upstreamReq.destroy();
