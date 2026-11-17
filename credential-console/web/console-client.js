@@ -171,7 +171,7 @@ const translations = {
   'relay-balance-set': '填入当前余额',
   'relay-tile-free': '免费。',
   'relay-tile-saved': '近 30 天省下',
-  'relay-tile-saved-at': '按此来源价格折算',
+  'relay-tile-saved-at': '折算价格来自',
   'relay-tile-balance-est': '估算余额',
   'relay-tile-anchor-at': '记于',
   'relay-tile-spent-since': '之后已花',
@@ -2546,9 +2546,11 @@ function relayCompact(value, metric) {
     if (value >= 1000) return '$' + Math.round(value).toLocaleString('en-US');
     return '$' + (value >= 10 ? value.toFixed(0) : value.toFixed(2));
   }
-  if (value >= 1e9) return (value / 1e9).toFixed(value >= 1e10 ? 0 : 1) + 'B';
-  if (value >= 1e6) return (value / 1e6).toFixed(value >= 1e7 ? 0 : 1) + 'M';
-  if (value >= 1e3) return (value / 1e3).toFixed(value >= 1e4 ? 0 : 1) + 'K';
+  // One decimal at most, and only when it says something: 12.5B, not 13B or 12.0B.
+  const short = (amount, unit) => `${Number(amount.toFixed(1))}${unit}`;
+  if (value >= 1e9) return short(value / 1e9, 'B');
+  if (value >= 1e6) return short(value / 1e6, 'M');
+  if (value >= 1e3) return short(value / 1e3, 'K');
   return String(Math.round(value));
 }
 
