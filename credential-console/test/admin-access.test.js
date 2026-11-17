@@ -288,6 +288,48 @@ test('password mode: a member sees self-service only, private accounts are absen
   }
 });
 
+test('password mode: a signed-in browser stays signed in after its session is gone, until sign-out or a new password', async () => {
+  const console = await app({
+    seed: async (store) => store.addAdminUser({ username: 'root', password: PASSWORD }),
+  });
+  // Only the remembered-login cookie, as a browser presents it after a restart
+  // emptied the session map or the 12-hour session ran out.
+  const rememberedOnly = (cookie, identity = MEMBER) => fetch(`${console.baseUrl}/admin`, {
+    redirect: 'manual',
+    headers: { ...identity, Cookie: cookie },
+  });
+  const rememberCookie = (response) => response.headers.getSetCookie()
+    .find((line) => line.startsWith('credential_console_admin='))?.split(';')[0];
+  try {
+    await console.request('/');
+    const signedIn = await console.login();
+    const cookie = rememberCookie(signedIn.response);
+    assert.ok(cookie, 'sign-in sets the remembered-login cookie');
+    assert.match(signedIn.response.headers.getSetCookie().join('\n'), /credential_console_admin=[^;]+; Path=\/; HttpOnly; SameSite=Strict; Max-Age=2592000/);
+    assert.equal(JSON.stringify(console.store.state).includes(cookie.split('=')[1]), false, 'only a digest is stored');
+
+    const back = await rememberedOnly(cookie);
+    assert.equal(back.status, 200);
+    assert.match(back.headers.get('set-cookie'), /credential_console_session=/);
+    assert.equal((await rememberedOnly(cookie, { 'Tailscale-User-Login': 'someone-else@example.com' })).status, 303);
+    assert.equal((await rememberedOnly('credential_console_admin=not-a-token')).status, 303);
+
+    // Signing out forgets this browser.
+    const logout = await fetch(`${console.baseUrl}/logout`, { redirect: 'manual', headers: { ...MEMBER, Cookie: cookie } });
+    assert.match(logout.headers.getSetCookie().join('\n'), /credential_console_admin=; [^\n]*Max-Age=0/);
+    assert.equal((await rememberedOnly(cookie)).status, 303);
+
+    // A new password forgets every remembered browser.
+    await console.request('/logout');
+    const again = rememberCookie((await console.login()).response);
+    assert.equal((await rememberedOnly(again)).status, 200);
+    await console.store.setAdminPassword('root', 'a brand new password');
+    assert.equal((await rememberedOnly(again)).status, 303);
+  } finally {
+    await console.close();
+  }
+});
+
 test('password mode: repeated wrong passwords are rate limited and a session token is replaced on sign-in', async () => {
   const console = await app({
     seed: async (store) => store.addAdminUser({ username: 'root', password: PASSWORD }),

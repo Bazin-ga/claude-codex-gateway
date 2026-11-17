@@ -6199,6 +6199,7 @@ export function adminLoginView({ csrf, next = '/', username = '', error = null }
           <label><span data-i18n="admin-login-password">Password</span>
             <input name="password" type="password" required maxlength="256" autocomplete="current-password">
           </label>
+          <p class="muted" data-i18n="admin-login-remember">This browser stays signed in for 30 days. Sign out to end that sooner.</p>
           <div><button type="submit" data-i18n="admin-login-submit">Sign in</button></div>
         </form>
         <a class="button secondary" href="/" data-i18n="admin-login-back">Back to self-service</a>

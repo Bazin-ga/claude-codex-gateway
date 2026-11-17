@@ -69,6 +69,15 @@ const MAX_AUDIT_EVENTS = 2_000;
  */
 const GUEST_SPEND_PERSIST_MS = 1_000;
 const GUEST_SPEND_RETRY_MS = 30_000;
+/**
+ * How long a browser an administrator signed in on stays signed in, across
+ * gateway restarts and expired console sessions, before the password is asked
+ * for again.
+ */
+export const ADMIN_REMEMBER_TTL_MS = 30 * 24 * 60 * 60_000;
+// Remembered browsers kept at most, all administrators together; the oldest
+// goes first.
+const ADMIN_REMEMBER_MAX = 64;
 // The failure a usage read records when the upstream rejects the credential;
 // see recordUsageCredentialAnswer.
 export const USAGE_CREDENTIAL_REJECTED = 'usage read rejected the credential (401)';
@@ -3403,6 +3412,76 @@ export class CredentialStore {
       : null;
     const ok = await verifyAdminPassword(user?.password ?? null, password);
     return ok && user ? user.username : null;
+  }
+
+  /**
+   * Remember the browser `username` just signed in on, and return the token for
+   * its cookie. Only a digest is stored, together with the password it was
+   * earned with: changing that password or deleting the administrator forgets
+   * every browser at once.
+   */
+  async rememberAdminLogin({ username, identity, ttlMs = ADMIN_REMEMBER_TTL_MS }) {
+    return this.serialized(async () => {
+      const user = (this.state.admin_users ?? []).find((entry) => entry.username === username);
+      if (!user) throw new Error('administrator not found');
+      const token = randomToken(32);
+      const now = Date.now();
+      const kept = this.#rememberedAdminLogins().filter((entry) => Date.parse(entry.expires_at) > now);
+      kept.push({
+        token_sha256: sha256(token),
+        username,
+        identity: identity ?? null,
+        password_changed_at: user.password_changed_at ?? null,
+        created_at: new Date(now).toISOString(),
+        expires_at: new Date(now + ttlMs).toISOString(),
+      });
+      const before = this.state.admin_remembered_logins;
+      this.state.admin_remembered_logins = kept.slice(-ADMIN_REMEMBER_MAX);
+      try {
+        await this.persist();
+      } catch (error) {
+        this.state.admin_remembered_logins = before;
+        throw error;
+      }
+      return token;
+    });
+  }
+
+  /**
+   * The administrator a remembered browser's token signs in, or null when the
+   * token is unknown, expired, presented by another tailnet identity, or older
+   * than the administrator's current password.
+   */
+  adminByRememberToken(token, identity) {
+    if (typeof token !== 'string' || !token) return null;
+    const entry = this.#rememberedAdminLogins().find((candidate) => secretMatches(token, candidate.token_sha256));
+    if (!entry || Date.parse(entry.expires_at) <= Date.now()
+      || (entry.identity ?? null) !== (identity ?? null)) return null;
+    const user = (this.state.admin_users ?? []).find((candidate) => candidate.username === entry.username);
+    if (!user || (user.password_changed_at ?? null) !== entry.password_changed_at) return null;
+    return { username: user.username, password_changed_at: user.password_changed_at ?? null };
+  }
+
+  /** Forget a remembered browser, on sign-out. Unknown tokens are ignored. */
+  async forgetAdminLogin(token) {
+    if (typeof token !== 'string' || !token) return;
+    return this.serialized(async () => {
+      const entries = this.#rememberedAdminLogins();
+      const kept = entries.filter((entry) => !secretMatches(token, entry.token_sha256));
+      if (kept.length === entries.length) return;
+      const before = this.state.admin_remembered_logins;
+      this.state.admin_remembered_logins = kept;
+      try {
+        await this.persist();
+      } catch (error) {
+        this.state.admin_remembered_logins = before;
+        throw error;
+      }
+    });
+  }
+
+  #rememberedAdminLogins() {
+    return Array.isArray(this.state.admin_remembered_logins) ? this.state.admin_remembered_logins : [];
   }
 
   /**

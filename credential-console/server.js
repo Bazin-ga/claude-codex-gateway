@@ -19,7 +19,7 @@ import {
   sendText,
   readBody,
 } from './lib/http.js';
-import { CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
+import { ADMIN_REMEMBER_TTL_MS, CredentialStore, MACHINE_ID_PATTERN } from './lib/store.js';
 import { accountUsableByDevice, isRestrictedAccount } from './lib/account-restriction.js';
 import { acquireHomeLock } from './lib/home-lock.js';
 import { handleClaudeProxy } from './lib/proxy.js';
@@ -174,6 +174,8 @@ const CLAUDE_USAGE_REFRESH_INTERVAL_MS = process.env.CREDENTIAL_CONSOLE_CLAUDE_U
   ? null
   : Number(process.env.CREDENTIAL_CONSOLE_CLAUDE_USAGE_REFRESH_INTERVAL_MS);
 const SESSION_TTL_MS = 12 * 60 * 60_000;
+// Password mode: the cookie that keeps an administrator's browser signed in.
+const ADMIN_REMEMBER_COOKIE = 'credential_console_admin';
 // Open mode mints a session for any visitor, so the map needs a ceiling that does
 // not depend on someone authenticating first. The main isolate is capped at 96
 // MB of old-space; an unbounded map is an OOM plus a restart loop.
@@ -867,6 +869,18 @@ export async function createCredentialConsole(options = {}) {
     // therefore already refused, so minting it a 12-hour session would only let an
     // anonymous caller grow this map one entry per request.
     if (adminAuth === 'open' && req.method !== 'GET') return null;
+    // A browser an administrator signed in on before comes back signed in: the
+    // session is gone after a restart or after its 12 hours, the remembered
+    // login is not.
+    const remembered = passwordMode
+      ? store.adminByRememberToken(parseCookies(req.headers.cookie)[ADMIN_REMEMBER_COOKIE], identity)
+      : null;
+    if (remembered) {
+      const adminSession = mintSession(res, { identity, role: 'admin', adminUser: remembered.username });
+      adminSession.admin_password_changed_at = remembered.password_changed_at;
+      log('admin_login_remembered', { identity, username: remembered.username });
+      return adminSession;
+    }
     const newSession = mintSession(res, {
       identity,
       role: passwordMode ? 'member' : 'admin',
@@ -886,7 +900,7 @@ export async function createCredentialConsole(options = {}) {
     };
     evictUntilBelowCap();
     sessions.set(newToken, newSession);
-    res.setHeader('Set-Cookie', setSessionCookie(newToken));
+    appendCookie(res, setSessionCookie(newToken));
     return newSession;
   }
 
@@ -1029,6 +1043,30 @@ export async function createCredentialConsole(options = {}) {
       throw new Error('member label must use letters, numbers, dots, underscores, or hyphens');
     }
     return label;
+  }
+
+  function appendCookie(res, cookie) {
+    const previous = res.getHeader('Set-Cookie');
+    res.setHeader('Set-Cookie', previous === undefined ? cookie : [previous, cookie].flat());
+  }
+
+  /**
+   * Remember this browser for `username` (password mode), replacing whatever
+   * login it remembered before. A failure only costs the next visit a sign-in.
+   */
+  async function rememberAdmin(req, res, { username, identity }) {
+    await store.forgetAdminLogin(parseCookies(req.headers.cookie)[ADMIN_REMEMBER_COOKIE]).catch(() => {});
+    try {
+      const token = await store.rememberAdminLogin({ username, identity });
+      appendCookie(res, `${ADMIN_REMEMBER_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(ADMIN_REMEMBER_TTL_MS / 1000)}${cookieSecure ? '; Secure' : ''}`);
+    } catch (error) {
+      log('admin_remember_failed', { username, code: error?.code ?? error?.name ?? 'unknown' });
+    }
+  }
+
+  async function forgetAdmin(req, res) {
+    await store.forgetAdminLogin(parseCookies(req.headers.cookie)[ADMIN_REMEMBER_COOKIE]).catch(() => {});
+    appendCookie(res, `${ADMIN_REMEMBER_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${cookieSecure ? '; Secure' : ''}`);
   }
 
   function setSessionCookie(token) {
@@ -2015,6 +2053,9 @@ export async function createCredentialConsole(options = {}) {
           // Every other session of this administrator ends; this one carries on.
           session.admin_password_changed_at = store.adminUsers()
             .find((user) => user.username === session.admin_user)?.password_changed_at ?? null;
+          // The new password forgets every remembered browser; this one is
+          // remembered again.
+          await rememberAdmin(req, res, { username: session.admin_user, identity: session.admin_identity });
         } else {
           if (adminUserDeleteParams.username === session.admin_user) {
             throw new Error('you cannot delete the administrator you are signed in as');
@@ -2618,6 +2659,7 @@ export async function createCredentialConsole(options = {}) {
       replaceSession(req, res, session, { role: 'admin', adminUser: username });
       requestSessions.get(req).admin_password_changed_at = store.adminUsers()
         .find((user) => user.username === username)?.password_changed_at ?? null;
+      await rememberAdmin(req, res, { username, identity });
       log('admin_login', { identity, username });
       await store.recordExternalAudit('admin_login', { username, identity }).catch(() => {});
       redirect(res, formNext);
@@ -2628,6 +2670,7 @@ export async function createCredentialConsole(options = {}) {
       const session = requireSession(req, res);
       if (!session) return;
       if (session.admin_user) log('admin_logout', { identity: session.admin_identity, username: session.admin_user });
+      await forgetAdmin(req, res);
       replaceSession(req, res, session, { role: 'member' });
       redirect(res, '/');
       return;

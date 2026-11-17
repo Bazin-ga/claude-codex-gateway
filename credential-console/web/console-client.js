@@ -219,6 +219,7 @@ const translations = {
   'admin-users-change-password': '修改我的密码',
   'admin-login-heading': '管理员登录',
   'admin-login-intro': '普通成员不需要登录就能开通设备、查看用量。管理账号、设备和设置需要先登录。',
+  'admin-login-remember': '登录后这个浏览器会保持登录 30 天，不用再输密码；点「退出」可以提前结束。',
   'admin-login-password': '密码',
   'admin-login-submit': '登录',
   'admin-login-back': '返回自助页面',
