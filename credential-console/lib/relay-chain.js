@@ -81,8 +81,24 @@ function normalizeSource(value) {
       : null,
     price: price(value.price),
     first_byte_timeout_s: firstByteTimeout(value.first_byte_timeout_s),
+    // A source with its own address has no balance this console can read; an
+    // administrator says what it held at a moment, and the console subtracts
+    // what it has recorded spending there since.
+    balance_anchor: kind === 'endpoint' ? balanceAnchor(value.balance_anchor) : null,
     credential: kind === 'endpoint' && value.credential ? value.credential : null,
   };
+}
+
+function balanceAnchor(value) {
+  const usd = Number(value?.usd);
+  const atMs = Number(value?.at_ms);
+  if (!Number.isFinite(usd) || usd < 0 || usd > 1e7 || !Number.isSafeInteger(atMs) || atMs <= 0) return null;
+  return { usd, at_ms: atMs, by: typeof value.by === 'string' ? value.by.slice(0, 160) : null };
+}
+
+/** An administrator's "this source holds $N now", as typed. Empty clears it. */
+export function parseRelayBalanceInput(text) {
+  return dollars(text, 'the balance');
 }
 
 /**

@@ -1835,6 +1835,8 @@ export class CredentialStore {
           // The form that changes a source does not say whether it is switched
           // on; saving it must not switch a rested source back on.
           enabled: input.enabled === undefined && previous ? previous.enabled : source.enabled,
+          // Nor forget the balance it was last told it holds.
+          ...(previous?.balance_anchor && source.kind === 'endpoint' ? { balance_anchor: previous.balance_anchor } : {}),
           id,
           credential: source.kind !== 'endpoint'
             ? null
@@ -1855,6 +1857,29 @@ export class CredentialStore {
         key_replaced: Boolean(apiKey),
         actor: auditActor(actor),
       });
+      await this.persist();
+      return this.relayChains();
+    });
+  }
+
+  /**
+   * Say what a source with its own address holds now, in dollars, or clear
+   * it with null. The console's estimate of its balance counts down from here.
+   */
+  async setRelaySourceBalance({ model, sourceId, usd, actor = null, nowMs = Date.now() }) {
+    return this.serialized(async () => {
+      let name = null;
+      this.#changeRelaySources(model, (sources) => {
+        const source = sources.find((entry) => entry.id === sourceId);
+        if (!source) throw new Error('unknown source');
+        if (source.kind !== 'endpoint') throw new Error('the platform\'s balance is read from the platform itself');
+        name = source.name;
+        const next = { ...source };
+        if (usd === null) delete next.balance_anchor;
+        else next.balance_anchor = { usd, at_ms: nowMs, by: auditActor(actor) };
+        return sources.map((entry) => (entry === source ? next : entry));
+      });
+      this.audit('relay_source_balance_set', { model, source: name, usd, actor: auditActor(actor) });
       await this.persist();
       return this.relayChains();
     });

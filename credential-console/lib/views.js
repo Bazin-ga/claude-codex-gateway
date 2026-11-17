@@ -6431,6 +6431,24 @@ tr.relay-source-off td, li.relay-source-off .relay-chain-source-head > strong { 
 .relay-source-form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); align-items: end; margin: 10px 0; }
 .relay-source-form p, .relay-source-form button { grid-column: 1 / -1; }
 .relay-source-form button { justify-self: start; width: auto; }
+.relay-overview { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 14px; }
+.relay-tile { border: 1px solid var(--line); border-radius: 14px; padding: 14px; background: #fbfcfa; display: grid; gap: 6px; align-content: start; }
+.relay-tile.is-main { border-color: var(--green); box-shadow: inset 4px 0 0 var(--green); }
+.relay-tile h3 { margin: 0; font-size: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.relay-tile .relay-big { font-size: 22px; font-weight: 800; }
+.relay-balance-form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 4px 0 0; }
+.relay-balance-form input { width: 120px; min-height: 0; padding: 6px 8px; margin: 0; }
+.relay-balance-form button { width: auto; min-height: 0; padding: 6px 12px; font-size: 12px; }
+.relay-chart-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.relay-chart-head h2, .relay-chart-head h3 { margin: 0; }
+.relay-metric { display: flex; gap: 6px; margin-left: auto; }
+.relay-metric button { width: auto; min-height: 0; padding: 3px 12px; border-radius: 999px; font-size: .85rem; }
+.relay-metric button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: #fff; }
+.relay-chart { margin-top: 10px; overflow-x: auto; }
+.relay-chart svg { display: block; min-width: 560px; width: 100%; height: auto; }
+.relay-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.relay-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.relay-saved-total { font-size: 15px; margin: 6px 0 0; }
 </style>`;
 
 const RELAY_WINDOW_LABELS = { '15m': ['relay-window-15m', '15 min'], '1h': ['relay-window-1h', '1 hour'], '24h': ['relay-window-24h', '24 hours'] };
@@ -6610,6 +6628,8 @@ export function relayView({
   chains = [],
   sources = null,
   spend = null,
+  // The month by hour and source (summarizeRelayDaily), for the charts.
+  usage = null,
   csrf,
   gatewayBaseUrl,
   query = '',
@@ -6726,6 +6746,90 @@ export function relayView({
     </article>`;
   })() : '';
 
+  // One tile per source, in the order turns try them: what it carried and
+  // cost this month and what it has left. The paid source with its own
+  // address is the one the money now goes to, so it is marked as the main one.
+  const chainRows = [];
+  for (const chain of sources?.chains ?? []) {
+    for (const row of chain.sources) if (!chainRows.some((entry) => entry.alias === row.alias)) chainRows.push({ ...row, chainModel: chain.model });
+  }
+  const usageOf = (alias) => usage?.sources.find((entry) => entry.alias === alias) ?? null;
+  const mainAlias = chainRows.find((row) => row.source?.kind === 'endpoint' && (usageOf(row.alias)?.totals.cost ?? 0) > 0)?.alias ?? null;
+  const tile = (row) => {
+    const used = usageOf(row.alias);
+    const totals = used?.totals;
+    const failRate = totals?.requests ? totals.failures / totals.requests : null;
+    const state = row.state;
+    const role = !state ? '' : !state.enabled
+      ? '<span class="badge unavailable" data-i18n="relay-src-disabled">switched off</span>'
+      : state.cooling_until_ms
+        ? '<span class="badge pending" data-i18n="relay-src-cooling">resting after a failure</span>'
+        : row.first
+          ? '<span class="badge healthy" data-i18n="relay-src-first">first choice now</span>'
+          : '<span class="badge stored" data-i18n="relay-src-standby">standby</span>';
+    const balanceForm = row.source?.kind === 'endpoint' && !used?.free
+      ? `<form method="post" action="/relay/chain/source" class="relay-balance-form">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <input type="hidden" name="op" value="balance">
+          <input type="hidden" name="model" value="${escapeHtml(row.chainModel)}">
+          <input type="hidden" name="source_id" value="${escapeHtml(row.source.id)}">
+          <input name="balance_usd" inputmode="decimal" maxlength="14" placeholder="$" aria-label="Balance in dollars">
+          <button type="submit" class="secondary" data-i18n="relay-balance-set">Set current balance</button>
+        </form>`
+      : '';
+    let balance = '';
+    if (used?.free) {
+      balance = `<div><span data-i18n="relay-tile-free">No charge.</span> <span data-i18n="relay-tile-saved">Saved this month</span>: <strong>${usd(totals?.saved)}</strong> <span class="muted tiny">(<span data-i18n="relay-tile-saved-at">at the price of</span> ${escapeHtml(used.reference_name ?? '—')})</span></div>`;
+    } else if (row.balance?.anchored) {
+      const anchored = row.balance.anchored;
+      balance = `<div><span data-i18n="relay-tile-balance-est">Estimated balance</span>: <span class="relay-big">${usdWhole(row.balance.remaining_usd)}</span></div>
+        ${row.balance.hours_left === null ? '' : `<div class="muted tiny"><span data-i18n="relay-src-runs-out">runs out in about</span> ${compactDuration(row.balance.hours_left * 3_600_000)} (${usd(row.balance.burn_usd_per_hour)}/h)</div>`}
+        <div class="muted tiny">${usdWhole(anchored.usd)} <span data-i18n="relay-tile-anchor-at">set</span> ${timeHtml(anchored.at_ms)} · <span data-i18n="relay-tile-spent-since">spent since</span> ${usd(anchored.spent_usd)}${anchored.incomplete ? ' · <span data-i18n="relay-tile-anchor-old">over 30 days ago, set it again</span>' : ''}</div>`;
+    } else if (row.balance) {
+      balance = `<div><span data-i18n="relay-src-balance">Balance</span>: <span class="relay-big">${usdWhole(row.balance.remaining_usd)}</span></div>
+        ${row.balance.line_usd === null ? '' : `<div class="muted tiny"><span data-i18n="relay-src-line">stops at</span> ${usdWhole(row.balance.line_usd)}</div>`}`;
+    } else if (row.source?.kind === 'endpoint') {
+      balance = '<div class="muted" data-i18n="relay-tile-balance-unknown">Balance unknown: this source has no balance API. Enter what its dashboard shows.</div>';
+    }
+    return `<section class="relay-tile${row.alias === mainAlias ? ' is-main' : ''}">
+      <h3>${row.order ? `<span class="relay-order">${row.order}</span>` : ''}${escapeHtml(row.name)} ${role}</h3>
+      <div class="muted tiny"><span data-i18n="relay-tile-month">Last 30 days</span>: ${(totals?.requests ?? 0).toLocaleString('en-US')} <span data-i18n="relay-requests">Requests</span>${failRate === null ? '' : ` · <span data-i18n="relay-src-errors">Failed</span> ${relayShare(failRate)}`}${used?.free ? '' : ` · <span data-i18n="relay-cost">Est. cost</span> ${usd(totals?.cost)}`}</div>
+      ${balance}
+      ${balanceForm}
+    </section>`;
+  };
+  const overview = chainRows.length ? `<div class="relay-overview">${chainRows.map(tile).join('')}</div>` : '';
+
+  // Drawn in the browser, so days are cut in the reader's time zone; the
+  // table below is what a page without scripting shows.
+  const usageSection = usage && usage.hours.length ? (() => {
+    const fallback = usage.sources.filter((entry) => entry.totals.requests).map((entry) => `<tr><td>${escapeHtml(entry.name)}</td><td>${entry.totals.requests.toLocaleString('en-US')}</td><td>${entry.totals.requests ? relayShare(entry.totals.failures / entry.totals.requests) : '—'}</td><td>${tokenCount(entry.totals.input)}</td><td>${tokenCount(entry.totals.cached)}</td><td>${tokenCount(entry.totals.output)}</td><td>${entry.free ? '—' : usd(entry.totals.cost)}</td><td>${entry.free ? usd(entry.totals.saved) : '—'}</td></tr>`).join('');
+    const data = JSON.stringify({ sources: usage.sources.map(({ alias, name, free, reference_name }) => ({ alias, name, free, reference: reference_name })), hours: usage.hours, from: usage.from_ms, to: usage.to_ms });
+    return `<article class="card" id="relay-usage">
+      <div class="relay-chart-head">
+        <h2 data-i18n="relay-usage-heading">Usage by source, last 30 days</h2>
+        <div class="relay-metric" data-relay-usage-metric hidden>
+          <button type="button" class="secondary" data-metric="cost" aria-pressed="true" data-i18n="relay-cost">Est. cost</button>
+          <button type="button" class="secondary" data-metric="tokens" aria-pressed="false" data-i18n="relay-usage-tokens">Tokens</button>
+          <button type="button" class="secondary" data-metric="requests" aria-pressed="false" data-i18n="relay-requests">Requests</button>
+        </div>
+      </div>
+      <p class="muted tiny" data-i18n="relay-usage-hint">Each day split by the source that served the turns, in the time zone chosen at the top of the page. Cost is estimated from recorded tokens at each source's price; a source that costs nothing adds no cost.</p>
+      <div class="relay-chart" data-relay-usage-chart></div>
+      <div class="relay-legend" data-relay-usage-legend></div>
+      <div class="relay-chart-head" style="margin-top:22px"><h3 data-i18n="relay-saved-heading">What the free source saved</h3></div>
+      <p class="muted tiny" data-i18n="relay-saved-hint">Tokens served by a source that costs nothing, priced at the first paid source in its chain: what those turns would have cost there. Bars are per day, the line is the running total.</p>
+      <p class="relay-saved-total" data-relay-saved-total></p>
+      <div class="relay-chart" data-relay-saved-chart></div>
+      <details class="relay-usage-days" style="margin-top:12px"><summary data-i18n="relay-usage-days">Day by day</summary><div class="table-wrap" data-relay-usage-table></div></details>
+      <div class="table-wrap" data-relay-usage-fallback><table>
+        <thead><tr><th data-i18n="relay-src-source">Source</th><th data-i18n="relay-requests">Requests</th><th data-i18n="relay-src-errors">Failed</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-cached">Cached input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cost">Est. cost</th><th data-i18n="relay-saved-col">Saved</th></tr></thead>
+        <tbody>${fallback}</tbody>
+      </table></div>
+      <script type="application/json" data-relay-usage-data>${data.replace(/</g, '\\u003c')}</script>
+    </article>`;
+  })() : '';
+
   const needle = query.trim().toLowerCase();
   const vendors = [...new Set(rows.map((row) => row.vendor).filter(Boolean))].sort();
   const shown = rows.filter((row) => (!needle || row.model.toLowerCase().includes(needle))
@@ -6760,14 +6864,13 @@ export function relayView({
     <section class="stack" data-relay-page>
       <article class="card">
         <h1 data-i18n="relay-heading">Third-party models</h1>
-        <p class="muted" data-i18n="relay-intro">Models from another provider, run through this gateway with the device you already have. Only the models allowed here can be used; every turn is billed to the shared platform key and recorded below.</p>
+        <p class="muted" data-i18n="relay-intro-sources">Models from other providers, run through this gateway with the device you already have. Each turn goes to the first source of its chain that can take it and is billed there; every turn is recorded below.</p>
         ${error && !chainsOpen ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
-        ${settings.base_url ? `<p><span data-i18n="relay-platform">Platform</span>: <strong>${escapeHtml(settings.name ?? '')}</strong> <span class="muted tiny">${escapeHtml(settings.base_url)}</span></p>` : '<div class="notice" data-i18n="relay-not-configured">No platform is configured yet. Fill in the settings at the bottom of this page.</div>'}
-        ${plaintext ? '<div class="notice error" data-i18n="relay-plaintext">This platform is reached over plain HTTP: the platform key and every prompt cross the internet unencrypted between this server and the platform. Do not send anything sensitive.</div>' : ''}
-        ${balance ? `<p><span data-i18n="relay-balance">Platform key spend</span>: <strong>${usd(balance.used_usd)}</strong> / ${usd(balance.limit_usd, 0)}${Number.isFinite(balance.remaining_usd) ? ` · <span data-i18n="relay-balance-left">left</span> <strong>${usdWhole(balance.remaining_usd)}</strong>` : ''} <span class="muted tiny">(${timeHtml(balance.fetched_at)})</span></p>` : ''}
-        ${catalog?.error && catalog.error !== 'not_configured' ? `<div class="notice error"><span data-i18n="relay-catalog-error">The price list could not be refreshed</span>: ${escapeHtml(catalog.error)}</div>` : ''}
+        ${overview}
+        ${!settings.base_url && !chainRows.length ? '<div class="notice" data-i18n="relay-not-configured">No platform is configured yet. Fill in the settings at the bottom of this page.</div>' : ''}
       </article>
       ${sourcesSection}
+      ${usageSection}
       <article class="card">
         <h2 data-i18n="relay-allowed-heading">Allowed models</h2>
         <div class="relay-models">${modelCards}</div>
@@ -6790,7 +6893,11 @@ export function relayView({
       </article>
       <article class="card">
         <details${settings.base_url ? '' : ' open'}>
-          <summary data-i18n="relay-settings">Platform settings</summary>
+          <summary><span data-i18n="relay-settings">Platform settings</span>${settings.name ? ` <span class="muted tiny">(${escapeHtml(settings.name)})</span>` : ''}</summary>
+          ${settings.base_url ? `<p><span data-i18n="relay-platform">Platform</span>: <strong>${escapeHtml(settings.name ?? '')}</strong> <span class="muted tiny">${escapeHtml(settings.base_url)}</span></p>` : ''}
+          ${plaintext ? '<div class="notice error" data-i18n="relay-plaintext">This platform is reached over plain HTTP: the platform key and every prompt cross the internet unencrypted between this server and the platform. Do not send anything sensitive.</div>' : ''}
+          ${balance ? `<p><span data-i18n="relay-balance">Platform key spend</span>: <strong>${usd(balance.used_usd)}</strong> / ${usd(balance.limit_usd, 0)}${Number.isFinite(balance.remaining_usd) ? ` · <span data-i18n="relay-balance-left">left</span> <strong>${usdWhole(balance.remaining_usd)}</strong>` : ''} <span class="muted tiny">(${timeHtml(balance.fetched_at)})</span></p>` : ''}
+          ${catalog?.error && catalog.error !== 'not_configured' ? `<div class="notice error"><span data-i18n="relay-catalog-error">The price list could not be refreshed</span>: ${escapeHtml(catalog.error)}</div>` : ''}
           ${settingsForm}
         </details>
       </article>

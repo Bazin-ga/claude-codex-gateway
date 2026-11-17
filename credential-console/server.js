@@ -39,10 +39,12 @@ import {
   RELAY_STAT_DEFAULT_WINDOW,
   createRelayStatsCache,
   relayPricer,
+  summarizeRelayDaily,
   summarizeRelaySources,
   summarizeRelaySpend,
 } from './lib/relay-stats.js';
 import { createRelay, parseRelayRoutes } from './lib/relay-proxy.js';
+import { parseRelayBalanceInput } from './lib/relay-chain.js';
 import { handleMachineControl, MACHINE_CONTROL_PREFIX } from './lib/machine-control.js';
 import { MetricsStore } from './lib/metrics.js';
 import { queryMetricsDataset } from './lib/metrics-page-query.js';
@@ -1882,6 +1884,9 @@ export async function createCredentialConsole(options = {}) {
               },
             })
             : null,
+          usage: stats
+            ? summarizeRelayDaily({ spend: stats.spend, chains, settings, catalog: relayCatalog, nowMs: stats.now_ms })
+            : null,
           csrf: session.csrf,
           gatewayBaseUrl: publicBaseUrl,
           query: url.searchParams.get('q') ?? '',
@@ -1945,6 +1950,8 @@ export async function createCredentialConsole(options = {}) {
               first_byte_timeout_s: form.first_byte_timeout_s,
               min_balance_usd: form.min_balance_usd,
             });
+          } else if (form.op === 'balance') {
+            await store.setRelaySourceBalance({ ...target, usd: parseRelayBalanceInput(form.balance_usd) });
           } else if (form.op === 'enable' || form.op === 'disable') {
             await store.setRelaySourceEnabled({ ...target, enabled: form.op === 'enable' });
           } else if (form.op === 'up' || form.op === 'down') {

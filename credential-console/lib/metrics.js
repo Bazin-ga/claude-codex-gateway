@@ -3762,6 +3762,7 @@ export class MetricsStore {
     const spend = this.#queryRows(
       `SELECT hour_bucket_ms, account_alias, model, device_id,
          COUNT(*) AS requests,
+         SUM(CASE WHEN outcome = 'upstream_error' THEN 1 ELSE 0 END) AS failures,
          SUM(COALESCE(input_tokens, 0)) AS input_tokens,
          SUM(COALESCE(cache_read_input_tokens, 0)) AS cache_read_tokens,
          SUM(COALESCE(output_tokens, 0)) AS output_tokens

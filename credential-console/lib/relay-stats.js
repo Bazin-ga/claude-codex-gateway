@@ -175,6 +175,35 @@ export function summarizeRelaySources({
       hours_to_line: lineUsd === null ? null : hours(balance.remaining_usd - lineUsd),
     };
   };
+  /**
+   * A source with its own address: what an administrator said it held, less
+   * what this console has recorded spending there since. The hour the
+   * reading was taken in counts for the part of it that came after.
+   */
+  const anchoredBalance = (alias, anchor) => {
+    if (!anchor) return null;
+    const nowMs = stats?.now_ms ?? Date.now();
+    let spent = 0;
+    for (const row of stats?.spend ?? []) {
+      if (row.account_alias !== alias) continue;
+      const hourMs = Number(row.hour_bucket_ms);
+      if (hourMs + HOUR_MS <= anchor.at_ms) continue;
+      const share = hourMs >= anchor.at_ms ? 1 : (hourMs + HOUR_MS - anchor.at_ms) / HOUR_MS;
+      spent += (costOf(price, alias, [row]) ?? 0) * share;
+    }
+    const daily = costOf(price, alias, measured.get(alias)?.windows['24h']?.usage ?? []);
+    const burn = daily > 0 ? daily / 24 : null;
+    const remaining = anchor.usd - spent;
+    return {
+      remaining_usd: remaining,
+      burn_usd_per_hour: burn,
+      burn_estimated: true,
+      hours_left: burn ? Math.max(0, remaining) / burn : null,
+      line_usd: null,
+      hours_to_line: null,
+      anchored: { usd: anchor.usd, at_ms: anchor.at_ms, spent_usd: spent, incomplete: anchor.at_ms < nowMs - SPEND_SPAN_MS },
+    };
+  };
   const entry = (alias) => {
     const source = measured.get(alias);
     const figures = source?.windows[key] ?? EMPTY_WINDOW;
@@ -218,7 +247,9 @@ export function summarizeRelaySources({
           cooling_until_ms: state.cooling_until_ms ?? null,
           last_failure: state.last_failure ?? null,
         },
-        balance: source.kind === 'platform' ? platformBalance(alias, source.min_balance_usd) : null,
+        balance: source.kind === 'platform'
+          ? platformBalance(alias, source.min_balance_usd)
+          : anchoredBalance(alias, source.balance_anchor),
       };
     });
     return {
@@ -272,5 +303,77 @@ export function summarizeRelaySpend({ spend = [], price, describeDevice = (id) =
       .map(({ deviceId, ...row }) => ({ label: describeDevice(deviceId), ...row }))
       .sort(byCost),
     totalUsd,
+  };
+}
+
+/**
+ * The month of third-party turns by hour and by the source that served them,
+ * for the page's charts: what each source carried, how often it failed, what
+ * it cost and, for a source that costs nothing, what the same tokens would
+ * have cost at the first paid source of its chain (what it saved). Days are
+ * cut in the browser, in the reader's time zone, so this stays in hours.
+ */
+export function summarizeRelayDaily({ spend = [], chains = [], settings = {}, catalog = null, nowMs = Date.now() }) {
+  const price = relayPricer({ chains, settings, catalog });
+  const isFree = (row) => Boolean(row) && row.input_usd_per_m !== null && row.input_usd_per_m !== undefined
+    && !row.input_usd_per_m && !row.output_usd_per_m && !row.cached_input_usd_per_m;
+  const isPaid = (row) => Boolean(row) && !isFree(row) && row.input_usd_per_m !== null && row.input_usd_per_m !== undefined;
+  const sources = [];
+  const index = new Map();
+  const add = (alias, extra = {}) => {
+    if (index.has(alias)) return;
+    index.set(alias, sources.length);
+    sources.push({ alias, name: alias.replace(/^relay:/, ''), free: false, reference: null, ...extra });
+  };
+  for (const chain of chains) {
+    const paid = chain.sources.find((source) => isPaid(price(`relay:${source.name}`, chain.model)));
+    for (const source of chain.sources) {
+      const alias = `relay:${source.name}`;
+      const free = isFree(price(alias, chain.model));
+      add(alias, { free, reference: free && paid ? `relay:${paid.name}` : null });
+    }
+  }
+  const hours = new Map();
+  for (const row of spend) {
+    add(row.account_alias);
+    const at = Number(row.hour_bucket_ms);
+    const key = `${at}\n${row.account_alias}`;
+    let entry = hours.get(key);
+    if (!entry) {
+      entry = { at, source: index.get(row.account_alias), requests: 0, failures: 0, input: 0, cached: 0, output: 0, cost: null, saved: null };
+      hours.set(key, entry);
+    }
+    entry.requests += Number(row.requests) || 0;
+    entry.failures += Number(row.failures) || 0;
+    entry.input += Number(row.input_tokens) || 0;
+    entry.cached += Number(row.cache_read_tokens) || 0;
+    entry.output += Number(row.output_tokens) || 0;
+    const cost = costOf(price, row.account_alias, [row]);
+    if (cost !== null) entry.cost = (entry.cost ?? 0) + cost;
+    const reference = sources[entry.source].reference;
+    if (reference) {
+      const saved = costOf(() => price(reference, row.model), reference, [row]);
+      if (saved !== null) entry.saved = (entry.saved ?? 0) + saved;
+    }
+  }
+  const rows = [...hours.values()].sort((left, right) => left.at - right.at || left.source - right.source);
+  const totals = sources.map(() => ({ requests: 0, failures: 0, input: 0, cached: 0, output: 0, cost: null, saved: null }));
+  for (const row of rows) {
+    const total = totals[row.source];
+    for (const field of ['requests', 'failures', 'input', 'cached', 'output']) total[field] += row[field];
+    if (row.cost !== null) total.cost = (total.cost ?? 0) + row.cost;
+    if (row.saved !== null) total.saved = (total.saved ?? 0) + row.saved;
+  }
+  const round = (value) => (value === null ? null : Math.round(value * 1e4) / 1e4);
+  return {
+    from_ms: nowMs - SPEND_SPAN_MS,
+    to_ms: nowMs,
+    sources: sources.map((source, position) => ({
+      ...source,
+      reference_name: source.reference ? source.reference.replace(/^relay:/, '') : null,
+      totals: totals[position],
+    })),
+    // Compact for the page: [hour, source, requests, failures, input, cached, output, cost, saved].
+    hours: rows.map((row) => [row.at, row.source, row.requests, row.failures, row.input, row.cached, row.output, round(row.cost), round(row.saved)]),
   };
 }
