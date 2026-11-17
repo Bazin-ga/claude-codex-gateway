@@ -191,6 +191,7 @@ const translations = {
   'relay-saved-daily': '当天省下',
   'relay-saved-running': '累计',
   'relay-usage-day': '日期',
+  'relay-usage-total': '合计',
   'relay-usage-cell': '每格：请求数；下面是失败率和估算花费（免费来源显示的是省下的钱，前面带 −）。',
   'member-visible-on': '成员页可见',
   'member-visible-off': '成员页不显示',
@@ -1426,6 +1427,11 @@ window.credentialConsoleTime = Object.freeze({
   format: (ms, options) => formatInstant(ms, options),
   zoneLabel: (ms) => zoneLabelAt(ms),
 });
+// For the chart bundle's own labels: the same words as the rest of the page.
+window.credentialConsoleText = Object.freeze({
+  text: (key, english) => translatedText(key, english),
+  language: () => currentLanguage(),
+});
 
 document.addEventListener('change', (event) => {
   const select = event.target.closest?.('[data-time-zone-select]');
@@ -2037,7 +2043,6 @@ function hydrate(root, activeTab) {
   stampTableCardLabels(root);
   bindFormDrafts(root);
   root.querySelectorAll('details[data-persist-details]').forEach(restoreDetails);
-  renderRelayUsage(root);
   if (activeTab) markActiveTab(activeTab);
 }
 
@@ -2530,194 +2535,3 @@ document.addEventListener('submit', (event) => {
   }
 }, true);
 
-// The third-party page's usage charts. The page carries the month by hour
-// and source; days are cut here, in the zone picked at the top of the page,
-// so a day means the same thing as every time shown beside it.
-const RELAY_USAGE_COLORS = ['#2f7d5b', '#c98a2b', '#4d6bb3', '#a04a62', '#6f8f2a', '#7a7a7a'];
-let relayUsageMetric = 'cost';
-
-function relayDayKey(ms) {
-  const p = zoneParts(activeTimeZone(), ms);
-  return `${p.year}-${p.month}-${p.day}`;
-}
-
-function relayCompact(value, metric) {
-  if (metric === 'cost') {
-    if (value >= 1000) return '$' + Math.round(value).toLocaleString('en-US');
-    return '$' + (value >= 10 ? value.toFixed(0) : value.toFixed(2));
-  }
-  // One decimal at most, and only when it says something: 12.5B, not 13B or 12.0B.
-  const short = (amount, unit) => `${Number(amount.toFixed(1))}${unit}`;
-  if (value >= 1e9) return short(value / 1e9, 'B');
-  if (value >= 1e6) return short(value / 1e6, 'M');
-  if (value >= 1e3) return short(value / 1e3, 'K');
-  return String(Math.round(value));
-}
-
-function relayNiceMax(value) {
-  if (!(value > 0)) return 1;
-  const step = 10 ** Math.floor(Math.log10(value));
-  for (const factor of [1, 2, 2.5, 5, 10]) if (factor * step >= value) return factor * step;
-  return 10 * step;
-}
-
-function relaySvgEscape(text) {
-  return String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-}
-
-/** Bars per day, stacked by series; an optional line on its own scale. */
-function relayBarChart({ days, series, metric, line = null }) {
-  const width = 960;
-  const height = 280;
-  const left = 64;
-  const right = line ? 64 : 16;
-  const top = 14;
-  const bottom = 34;
-  const plotW = width - left - right;
-  const plotH = height - top - bottom;
-  const totals = days.map((_, index) => series.reduce((sum, entry) => sum + (entry.values[index] || 0), 0));
-  const max = relayNiceMax(Math.max(...totals, 0));
-  const slot = plotW / Math.max(1, days.length);
-  const barW = Math.max(2, slot * 0.7);
-  const y = (value) => top + plotH - (value / max) * plotH;
-  const parts = [];
-  for (let tick = 0; tick <= 4; tick += 1) {
-    const value = (max / 4) * tick;
-    parts.push(`<line x1="${left}" x2="${width - right}" y1="${y(value)}" y2="${y(value)}" stroke="#e3e8e3"/>`);
-    parts.push(`<text x="${left - 6}" y="${y(value) + 4}" font-size="11" text-anchor="end" fill="#66736c">${relayCompact(value, metric)}</text>`);
-  }
-  const labelEvery = Math.max(1, Math.ceil(days.length / 12));
-  days.forEach((day, index) => {
-    const x = left + index * slot + (slot - barW) / 2;
-    let base = 0;
-    series.forEach((entry) => {
-      const value = entry.values[index] || 0;
-      if (value <= 0) return;
-      const y0 = y(base);
-      const y1 = y(base + value);
-      parts.push(`<rect x="${x.toFixed(1)}" y="${y1.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0.5, y0 - y1).toFixed(1)}" fill="${entry.color}"><title>${relaySvgEscape(`${day.label} · ${entry.name}: ${relayCompact(value, metric)}`)}</title></rect>`);
-      base += value;
-    });
-    if (index % labelEvery === 0) {
-      parts.push(`<text x="${(left + index * slot + slot / 2).toFixed(1)}" y="${height - 12}" font-size="11" text-anchor="middle" fill="#66736c">${day.label}</text>`);
-    }
-  });
-  if (line) {
-    const lineMax = relayNiceMax(Math.max(...line.values, 0));
-    const ly = (value) => top + plotH - (value / lineMax) * plotH;
-    const points = line.values.map((value, index) => `${(left + index * slot + slot / 2).toFixed(1)},${ly(value).toFixed(1)}`).join(' ');
-    parts.push(`<polyline points="${points}" fill="none" stroke="${line.color}" stroke-width="2"/>`);
-    line.values.forEach((value, index) => {
-      parts.push(`<circle cx="${(left + index * slot + slot / 2).toFixed(1)}" cy="${ly(value).toFixed(1)}" r="2.5" fill="${line.color}"><title>${relaySvgEscape(`${days[index].label} · ${line.name}: ${relayCompact(value, 'cost')}`)}</title></circle>`);
-    });
-    for (let tick = 0; tick <= 4; tick += 1) {
-      const value = (lineMax / 4) * tick;
-      parts.push(`<text x="${width - right + 6}" y="${ly(value) + 4}" font-size="11" fill="${line.color}">${relayCompact(value, 'cost')}</text>`);
-    }
-  }
-  return `<svg viewBox="0 0 ${width} ${height}" role="img">${parts.join('')}</svg>`;
-}
-
-function renderRelayUsage(root) {
-  const card = root.querySelector?.('#relay-usage') ?? (root.id === 'relay-usage' ? root : null);
-  const holder = card?.querySelector('[data-relay-usage-data]');
-  if (!card || !holder) return;
-  let data;
-  try {
-    data = JSON.parse(holder.textContent);
-  } catch {
-    return;
-  }
-  const sources = data.sources.map((source, index) => ({ ...source, color: RELAY_USAGE_COLORS[index % RELAY_USAGE_COLORS.length] }));
-  // Every day of the span, in order, even one with no turns.
-  const dayIndex = new Map();
-  const days = [];
-  for (let ms = Math.floor(data.from / 3_600_000) * 3_600_000; ms <= data.to; ms += 3_600_000) {
-    const key = relayDayKey(ms);
-    if (!dayIndex.has(key)) {
-      dayIndex.set(key, days.length);
-      days.push({ key, label: key.slice(5) });
-    }
-  }
-  const blank = () => days.map(() => 0);
-  const perSource = sources.map(() => ({ cost: blank(), tokens: blank(), requests: blank(), failures: blank(), saved: blank() }));
-  for (const [at, source, requests, failures, input, cached, output, cost, saved] of data.hours) {
-    const day = dayIndex.get(relayDayKey(at));
-    const bucket = perSource[source];
-    if (day === undefined || !bucket) continue;
-    bucket.requests[day] += requests;
-    bucket.failures[day] += failures;
-    bucket.tokens[day] += input + cached + output;
-    bucket.cost[day] += cost || 0;
-    bucket.saved[day] += saved || 0;
-  }
-  const metricNames = { cost: translatedText('relay-cost', 'Est. cost'), tokens: translatedText('relay-usage-tokens', 'Tokens'), requests: translatedText('relay-requests', 'Requests') };
-  const draw = () => {
-    const shown = sources.map((source, index) => ({ name: source.name, color: source.color, values: perSource[index][relayUsageMetric] }))
-      .filter((entry) => entry.values.some((value) => value > 0));
-    card.querySelector('[data-relay-usage-chart]').innerHTML = shown.length
-      ? relayBarChart({ days, series: shown, metric: relayUsageMetric })
-      : `<p class="muted">${relaySvgEscape(translatedText('relay-usage-none', 'Nothing in this measure yet.'))}</p>`;
-    card.querySelector('[data-relay-usage-legend]').innerHTML = sources
-      .filter((source, index) => perSource[index].requests.some((value) => value > 0))
-      .map((source) => `<span><i style="background:${source.color}"></i>${relaySvgEscape(source.name)}</span>`).join('');
-    card.querySelectorAll('[data-relay-usage-metric] button').forEach((button) => {
-      button.setAttribute('aria-pressed', button.dataset.metric === relayUsageMetric ? 'true' : 'false');
-    });
-  };
-  draw();
-  const metrics = card.querySelector('[data-relay-usage-metric]');
-  metrics.hidden = false;
-  if (metrics.dataset.bound !== 'true') {
-    metrics.dataset.bound = 'true';
-    metrics.addEventListener('click', (event) => {
-      const button = event.target.closest('button[data-metric]');
-      if (!button) return;
-      relayUsageMetric = button.dataset.metric;
-      draw();
-    });
-  }
-
-  // What the free source saved: per day, and the running total.
-  const free = sources.map((source, index) => ({ source, index })).filter(({ source }) => source.free);
-  const savedDaily = blank();
-  free.forEach(({ index }) => perSource[index].saved.forEach((value, day) => { savedDaily[day] += value; }));
-  let running = 0;
-  const cumulative = savedDaily.map((value) => (running += value));
-  const freeRequests = free.reduce((sum, { index }) => sum + perSource[index].requests.reduce((a, b) => a + b, 0), 0);
-  const freeTokens = free.reduce((sum, { index }) => sum + perSource[index].tokens.reduce((a, b) => a + b, 0), 0);
-  const reference = free.find(({ source }) => source.reference)?.source.reference ?? '—';
-  card.querySelector('[data-relay-saved-total]').innerHTML = free.length
-    ? `${relaySvgEscape(translatedText('relay-saved-total', 'Saved over these 30 days'))}: <strong>${relayCompact(running, 'cost')}</strong> <span class="muted tiny">(${relaySvgEscape(free.map(({ source }) => source.name).join(', '))} · ${freeRequests.toLocaleString('en-US')} ${relaySvgEscape(translatedText('relay-requests', 'Requests'))} · ${relayCompact(freeTokens, 'tokens')} tokens · ${relaySvgEscape(translatedText('relay-tile-saved-at', 'at the price of'))} ${relaySvgEscape(reference)})</span>`
-    : relaySvgEscape(translatedText('relay-saved-none', 'No source in a chain costs nothing.'));
-  card.querySelector('[data-relay-saved-chart]').innerHTML = free.length
-    ? relayBarChart({
-      days,
-      series: [{ name: translatedText('relay-saved-daily', 'Saved that day'), color: '#2f7d5b', values: savedDaily }],
-      metric: 'cost',
-      line: { name: translatedText('relay-saved-running', 'Running total'), color: '#c98a2b', values: cumulative },
-    })
-    : '';
-
-  // Day by day, newest first: what each source carried, how often it failed, what it cost.
-  const used = sources.map((source, index) => ({ source, index })).filter(({ index }) => perSource[index].requests.some((value) => value > 0));
-  const head = used.map(({ source }) => `<th>${relaySvgEscape(source.name)}</th>`).join('');
-  const rows = days.map((day, dayIndexValue) => ({ day, dayIndexValue })).reverse().map(({ day, dayIndexValue }) => {
-    const cells = used.map(({ source, index }) => {
-      const requests = perSource[index].requests[dayIndexValue];
-      if (!requests) return '<td class="muted">—</td>';
-      const failures = perSource[index].failures[dayIndexValue];
-      const money = source.free ? perSource[index].saved[dayIndexValue] : perSource[index].cost[dayIndexValue];
-      return `<td>${requests.toLocaleString('en-US')}<div class="muted tiny">${((failures / requests) * 100).toFixed(1)}% · ${source.free ? '−' : ''}${relayCompact(money, 'cost')}</div></td>`;
-    }).join('');
-    return `<tr><td>${day.key}</td>${cells}</tr>`;
-  }).join('');
-  card.querySelector('[data-relay-usage-table]').innerHTML = `<table><thead><tr><th>${relaySvgEscape(translatedText('relay-usage-day', 'Day'))}</th>${head}</tr></thead><tbody>${rows}</tbody></table>
-    <p class="muted tiny">${relaySvgEscape(translatedText('relay-usage-cell', 'Each cell: requests, then failure rate and estimated cost (for a free source, − what it saved).'))}</p>`;
-  const fallback = card.querySelector('[data-relay-usage-fallback]');
-  if (fallback) fallback.hidden = true;
-}
-
-renderRelayUsage(document);
-window.addEventListener('credential-console-time-zone', () => renderRelayUsage(document));
-window.addEventListener('credential-console-language', () => renderRelayUsage(document));

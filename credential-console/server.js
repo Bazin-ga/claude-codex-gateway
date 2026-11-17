@@ -1893,6 +1893,7 @@ export async function createCredentialConsole(options = {}) {
           vendor: url.searchParams.get('vendor') ?? '',
           error: url.searchParams.get('error'),
           chainsOpen: url.searchParams.has('chains'),
+          metricsAsset: metricsAsset ? { url: metricsAsset.url, integrity: metricsAsset.integrity } : null,
           openMode,
         }));
         return;

@@ -642,3 +642,220 @@ window.addEventListener('credential-console-navigated', () => {
   // and it renders every axis label on top of itself.
   requestAnimationFrame(() => requestAnimationFrame(bootMetricsDashboard));
 });
+
+/**
+ * The third-party page's month by source: a stacked bar per day (cost, tokens
+ * or requests), what the free source saved (per day and running total), and
+ * the day-by-day table. The page carries the month by hour; days are cut
+ * here in the zone picked in the page header.
+ */
+let teardownRelayCharts = null;
+
+function bootRelayCharts() {
+  const card = document.querySelector('#relay-usage');
+  const holder = card?.querySelector('[data-relay-usage-data]');
+  if (!card || !holder) {
+    teardownRelayCharts?.();
+    teardownRelayCharts = null;
+    return;
+  }
+  if (card.dataset.relayBound === 'true') return;
+  teardownRelayCharts?.();
+  card.dataset.relayBound = 'true';
+  let data;
+  try {
+    data = JSON.parse(holder.textContent);
+  } catch {
+    return;
+  }
+  const palette = ['#2f7d5b', '#c98a2b', '#4d6bb3', '#a04a62', '#6f8f2a', '#7a7a7a'];
+  const t = (key, english) => window.credentialConsoleText?.text(key, english) ?? english;
+  const usageHost = card.querySelector('[data-relay-usage-chart]');
+  const savedHost = card.querySelector('[data-relay-saved-chart]');
+  const charts = [];
+  let metric = 'cost';
+
+  const dayOf = (ms) => {
+    const time = window.credentialConsoleTime;
+    if (time) {
+      try {
+        return time.format(ms, { date: true });
+      } catch {
+        // UTC below.
+      }
+    }
+    return new Date(ms).toISOString().slice(0, 10);
+  };
+  const compact = (value, kind) => {
+    if (!Number.isFinite(value)) return '—';
+    if (kind === 'cost') {
+      if (value >= 1000) return `$${Math.round(value).toLocaleString('en-US')}`;
+      return `$${value >= 100 ? value.toFixed(0) : value.toFixed(2)}`;
+    }
+    const short = (amount, unit) => `${Number(amount.toFixed(1))}${unit}`;
+    if (value >= 1e9) return short(value / 1e9, 'B');
+    if (value >= 1e6) return short(value / 1e6, 'M');
+    if (value >= 1e3) return short(value / 1e3, 'K');
+    return String(Math.round(value));
+  };
+  const escape = (text) => String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  // Everything that depends on the time zone, recomputed when it changes.
+  const tally = () => {
+    const days = [];
+    const index = new Map();
+    for (let ms = Math.floor(data.from / 3_600_000) * 3_600_000; ms <= data.to; ms += 3_600_000) {
+      const key = dayOf(ms);
+      if (!index.has(key)) {
+        index.set(key, days.length);
+        days.push(key);
+      }
+    }
+    const blank = () => days.map(() => 0);
+    const per = data.sources.map(() => ({ cost: blank(), tokens: blank(), requests: blank(), failures: blank(), saved: blank() }));
+    for (const [at, source, requests, failures, input, cached, output, cost, saved] of data.hours) {
+      const day = index.get(dayOf(at));
+      const bucket = per[source];
+      if (day === undefined || !bucket) continue;
+      bucket.requests[day] += requests;
+      bucket.failures[day] += failures;
+      bucket.tokens[day] += input + cached + output;
+      bucket.cost[day] += cost || 0;
+      bucket.saved[day] += saved || 0;
+    }
+    return { days, per };
+  };
+
+  const chartFor = (host) => {
+    host.hidden = false;
+    let chart = echarts.getInstanceByDom(host);
+    if (!chart) {
+      chart = echarts.init(host, null, { renderer: 'svg' });
+      charts.push(chart);
+    }
+    return chart;
+  };
+  // Axis ticks are round numbers: no trailing ".00".
+  const axisLabel = (kind) => ({
+    formatter: (value) => (kind === 'cost' ? `$${Number(value.toFixed(2)).toLocaleString('en-US')}` : compact(value, kind)),
+    color: '#66736c',
+  });
+  const dayLabel = (key) => key.slice(5);
+
+  const render = () => {
+    const { days, per } = tally();
+    const used = data.sources.map((source, index) => ({ ...source, index, color: palette[index % palette.length] }))
+      .filter((source) => per[source.index].requests.some((value) => value > 0));
+
+    // Stacked bars by source.
+    const series = used.map((source) => ({
+      name: source.name,
+      type: 'bar',
+      stack: 'sources',
+      barMaxWidth: 28,
+      itemStyle: { color: source.color },
+      emphasis: { focus: 'series' },
+      data: per[source.index][metric],
+    }));
+    chartFor(usageHost).setOption({
+      animation: false,
+      grid: { left: 64, right: 18, top: 36, bottom: 30 },
+      legend: { top: 0, data: used.map((source) => source.name) },
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'shadow' },
+        formatter: (items) => {
+          const day = days[items[0]?.dataIndex] ?? '';
+          const total = items.reduce((sum, item) => sum + (item.value || 0), 0);
+          return `${escape(day)}<br>${items.filter((item) => item.value).map((item) => `${item.marker}${escape(item.seriesName)}: <b>${compact(item.value, metric)}</b>`).join('<br>')}<br>${escape(t('relay-usage-total', 'Total'))}: <b>${compact(total, metric)}</b>`;
+        },
+      },
+      xAxis: { type: 'category', data: days.map(dayLabel), axisLabel: { color: '#66736c' } },
+      yAxis: { type: 'value', axisLabel: axisLabel(metric === 'cost' ? 'cost' : 'count'), splitLine: { lineStyle: { color: '#e3e8e3' } } },
+      series,
+    }, { replaceMerge: ['series'] });
+    card.querySelectorAll('[data-relay-usage-metric] button').forEach((button) => {
+      button.setAttribute('aria-pressed', button.dataset.metric === metric ? 'true' : 'false');
+    });
+
+    // What the free source saved: bars per day, the running total as a line.
+    const free = data.sources.map((source, index) => ({ source, index })).filter(({ source }) => source.free);
+    const savedDaily = days.map((_, day) => free.reduce((sum, { index }) => sum + per[index].saved[day], 0));
+    let running = 0;
+    const cumulative = savedDaily.map((value) => (running += value));
+    const totalBox = card.querySelector('[data-relay-saved-total]');
+    if (free.length) {
+      const requests = free.reduce((sum, { index }) => sum + per[index].requests.reduce((a, b) => a + b, 0), 0);
+      const tokens = free.reduce((sum, { index }) => sum + per[index].tokens.reduce((a, b) => a + b, 0), 0);
+      const reference = free.find(({ source }) => source.reference)?.source.reference ?? '—';
+      totalBox.innerHTML = `${escape(t('relay-saved-total', 'Saved over these 30 days'))}: <strong>${compact(running, 'cost')}</strong> <span class="muted tiny">(${escape(free.map(({ source }) => source.name).join(', '))} · ${requests.toLocaleString('en-US')} ${escape(t('relay-requests', 'Requests'))} · ${compact(tokens, 'count')} tokens · ${escape(t('relay-tile-saved-at', 'at the price of'))} ${escape(reference)})</span>`;
+      chartFor(savedHost).setOption({
+        animation: false,
+        grid: { left: 64, right: 64, top: 36, bottom: 30 },
+        legend: { top: 0 },
+        tooltip: {
+          trigger: 'axis',
+          formatter: (items) => `${escape(days[items[0]?.dataIndex] ?? '')}<br>${items.map((item) => `${item.marker}${escape(item.seriesName)}: <b>${compact(item.value, 'cost')}</b>`).join('<br>')}`,
+        },
+        xAxis: { type: 'category', data: days.map(dayLabel), axisLabel: { color: '#66736c' } },
+        yAxis: [
+          { type: 'value', axisLabel: axisLabel('cost'), splitLine: { lineStyle: { color: '#e3e8e3' } } },
+          { type: 'value', axisLabel: { ...axisLabel('cost'), color: '#c98a2b' }, splitLine: { show: false } },
+        ],
+        series: [
+          { name: t('relay-saved-daily', 'Saved that day'), type: 'bar', barMaxWidth: 28, itemStyle: { color: '#2f7d5b' }, data: savedDaily },
+          { name: t('relay-saved-running', 'Running total'), type: 'line', yAxisIndex: 1, symbolSize: 5, itemStyle: { color: '#c98a2b' }, lineStyle: { width: 2 }, data: cumulative },
+        ],
+      }, { replaceMerge: ['series'] });
+    } else {
+      totalBox.textContent = t('relay-saved-none', 'No source in a chain costs nothing.');
+      savedHost.hidden = true;
+    }
+
+    // Day by day, newest first.
+    const head = used.map((source) => `<th>${escape(source.name)}</th>`).join('');
+    const rows = days.map((day, index) => ({ day, index })).reverse().map(({ day, index }) => `<tr><td>${escape(day)}</td>${used.map((source) => {
+      const requests = per[source.index].requests[index];
+      if (!requests) return '<td class="muted">—</td>';
+      const failures = per[source.index].failures[index];
+      const money = source.free ? per[source.index].saved[index] : per[source.index].cost[index];
+      return `<td>${requests.toLocaleString('en-US')}<div class="muted tiny">${((failures / requests) * 100).toFixed(1)}% · ${source.free ? '−' : ''}${compact(money, 'cost')}</div></td>`;
+    }).join('')}</tr>`).join('');
+    card.querySelector('[data-relay-usage-table]').innerHTML = `<table><thead><tr><th>${escape(t('relay-usage-day', 'Day'))}</th>${head}</tr></thead><tbody>${rows}</tbody></table>
+      <p class="muted tiny">${escape(t('relay-usage-cell', 'Each cell: requests, then failure rate and estimated cost (for a free source, − what it saved).'))}</p>`;
+    const fallback = card.querySelector('[data-relay-usage-fallback]');
+    if (fallback) fallback.hidden = true;
+  };
+
+  const metrics = card.querySelector('[data-relay-usage-metric]');
+  metrics.hidden = false;
+  const onMetric = (event) => {
+    const button = event.target.closest('button[data-metric]');
+    if (!button) return;
+    metric = button.dataset.metric;
+    render();
+  };
+  metrics.addEventListener('click', onMetric);
+  window.addEventListener('credential-console-language', render);
+  window.addEventListener('credential-console-time-zone', render);
+  const observer = typeof ResizeObserver === 'function'
+    ? new ResizeObserver(() => charts.forEach((chart) => chart.resize()))
+    : null;
+  observer?.observe(card);
+  render();
+
+  teardownRelayCharts = () => {
+    metrics.removeEventListener('click', onMetric);
+    window.removeEventListener('credential-console-language', render);
+    window.removeEventListener('credential-console-time-zone', render);
+    observer?.disconnect();
+    charts.splice(0).forEach((chart) => { if (!chart.isDisposed()) chart.dispose(); });
+    delete card.dataset.relayBound;
+  };
+  window.addEventListener('pagehide', () => teardownRelayCharts?.(), { once: true });
+}
+
+bootRelayCharts();
+window.addEventListener('credential-console-navigated', () => {
+  requestAnimationFrame(() => requestAnimationFrame(bootRelayCharts));
+});

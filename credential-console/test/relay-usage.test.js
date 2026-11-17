@@ -88,7 +88,9 @@ test('the page leads with the sources, carries the month for the charts, and kee
     csrf: 'tok',
     gatewayBaseUrl: 'https://gw.example',
     nowMs: 12 * HOUR,
+    metricsAsset: { url: '/assets/metrics-echarts.test.js', integrity: 'sha384-test' },
   });
+  assert.match(html, /<script src="\/assets\/metrics-echarts\.test\.js" integrity="sha384-test"/, 'the chart bundle draws the charts');
   const top = html.slice(html.indexOf('data-relay-page'), html.indexOf('id="relay-sources"'));
   assert.match(top, /class="relay-overview"/);
   assert.match(top, /relay-tile is-main/, 'the paid source with its own address leads');

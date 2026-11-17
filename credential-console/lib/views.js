@@ -6444,10 +6444,8 @@ tr.relay-source-off td, li.relay-source-off .relay-chain-source-head > strong { 
 .relay-metric { display: flex; gap: 6px; margin-left: auto; }
 .relay-metric button { width: auto; min-height: 0; padding: 3px 12px; border-radius: 999px; font-size: .85rem; }
 .relay-metric button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: #fff; }
-.relay-chart { margin-top: 10px; overflow-x: auto; }
-.relay-chart svg { display: block; min-width: 560px; width: 100%; height: auto; }
-.relay-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
-.relay-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.relay-chart { margin-top: 10px; height: 320px; min-width: 0; }
+.relay-chart[hidden] { display: none; }
 .relay-saved-total { font-size: 15px; margin: 6px 0 0; }
 </style>`;
 
@@ -6630,6 +6628,8 @@ export function relayView({
   spend = null,
   // The month by hour and source (summarizeRelayDaily), for the charts.
   usage = null,
+  // The chart bundle the metrics page uses; it draws this page's charts too.
+  metricsAsset = null,
   csrf,
   gatewayBaseUrl,
   query = '',
@@ -6815,12 +6815,11 @@ export function relayView({
         </div>
       </div>
       <p class="muted tiny" data-i18n="relay-usage-hint">Each day split by the source that served the turns, in the time zone chosen at the top of the page. Cost is estimated from recorded tokens at each source's price; a source that costs nothing adds no cost.</p>
-      <div class="relay-chart" data-relay-usage-chart></div>
-      <div class="relay-legend" data-relay-usage-legend></div>
+      <div class="relay-chart" data-relay-usage-chart hidden></div>
       <div class="relay-chart-head" style="margin-top:22px"><h3 data-i18n="relay-saved-heading">What the free source saved</h3></div>
       <p class="muted tiny" data-i18n="relay-saved-hint">Tokens served by a source that costs nothing, priced at the first paid source in its chain: what those turns would have cost there. Bars are per day, the line is the running total.</p>
       <p class="relay-saved-total" data-relay-saved-total></p>
-      <div class="relay-chart" data-relay-saved-chart></div>
+      <div class="relay-chart" data-relay-saved-chart hidden></div>
       <details class="relay-usage-days" style="margin-top:12px"><summary data-i18n="relay-usage-days">Day by day</summary><div class="table-wrap" data-relay-usage-table></div></details>
       <div class="table-wrap" data-relay-usage-fallback><table>
         <thead><tr><th data-i18n="relay-src-source">Source</th><th data-i18n="relay-requests">Requests</th><th data-i18n="relay-src-errors">Failed</th><th data-i18n="relay-input">Input</th><th data-i18n="relay-cached">Cached input</th><th data-i18n="relay-output">Output</th><th data-i18n="relay-cost">Est. cost</th><th data-i18n="relay-saved-col">Saved</th></tr></thead>
@@ -6902,7 +6901,7 @@ export function relayView({
         </details>
       </article>
     </section>
-  `, { openMode, activeTab: 'relay' });
+  `, { openMode, activeTab: 'relay', metricsAsset });
 }
 
 const GUEST_PROVIDER_LABELS = Object.freeze({ claude: 'Claude', codex: 'Codex' });
