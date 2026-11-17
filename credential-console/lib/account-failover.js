@@ -539,9 +539,12 @@ export function chooseFailoverAccount({
   // The model family the request is for, when known: a backup whose own
   // allowance for it is gone cannot answer it either.
   family = null,
+  // The chain to walk, when it is not simply the home account's own; see
+  // deviceFailoverChain.
+  chain = null,
   now = Date.now(),
 }) {
-  const policy = normalizeAccountFailover(homeAccount?.failover);
+  const policy = chain ?? normalizeAccountFailover(homeAccount?.failover);
   if (!policy.enabled) return null;
   // Accounts only the usage reading shows as used up, in chain order: tried
   // when nothing else is left, because the reading can be an hour old and a
@@ -673,7 +676,8 @@ export function beginFailover({
     ? store.accountById(marker.home_account_id)
     : null;
   const homeAccount = markerHome?.provider === account.provider ? markerHome : account;
-  const enabled = normalizeAccountFailover(homeAccount.failover).enabled;
+  const chain = deviceFailoverChain(store, device, homeAccount);
+  const enabled = chain.enabled;
   const snapshot = (id) => {
     try {
       return usageSnapshotFor(id);
@@ -731,6 +735,7 @@ export function beginFailover({
         family: requestFamily,
         store,
         homeAccount,
+        chain,
         device,
         exclude: tried,
         exhaustion,
@@ -847,6 +852,41 @@ export function beginFailover({
   const replay = refused ?? refusedForModel;
   if (replay?.reply && state.account === current) state.refusal = replay;
   return state;
+}
+
+/**
+ * The chain a device on `account` fails over along: the account's own, then
+ * the chain of the account the device was issued for, when that is another.
+ *
+ * A device somebody switched by hand would otherwise lose its chain with the
+ * switch. Chicago, 2026-11-17: agent-workstation-2, issued for claude-jinglin
+ * (chain zucan > shawn > ...), was moved to claude-zucan, which has no chain
+ * of its own, and stopped with "limit reached" when zucan's five-hour window
+ * ran out while shawn had most of its week left.
+ */
+export function deviceFailoverChain(store, device, account) {
+  const own = normalizeAccountFailover(account?.failover);
+  let issued = null;
+  if (device?.account_id && device.account_id !== account?.id) {
+    // Borrowing a chain is a bonus: failing to read one must not fail the
+    // request it was for.
+    try {
+      issued = store.accountById?.(device.account_id) ?? null;
+    } catch {
+      issued = null;
+    }
+  }
+  const inherited = issued?.provider === account?.provider
+    ? normalizeAccountFailover(issued.failover)
+    : { enabled: false, backup_account_ids: [] };
+  const ids = [];
+  for (const policy of [own, inherited]) {
+    if (!policy.enabled) continue;
+    for (const id of policy.backup_account_ids) {
+      if (id !== account?.id && !ids.includes(id)) ids.push(id);
+    }
+  }
+  return { enabled: ids.length > 0, backup_account_ids: ids };
 }
 
 /**

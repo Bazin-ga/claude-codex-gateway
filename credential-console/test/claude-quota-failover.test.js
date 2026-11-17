@@ -10,6 +10,7 @@ import {
   QuotaExhaustion,
   beginFailover,
   chooseFailoverAccount,
+  deviceFailoverChain,
   knownExhausted,
   usageExhaustedUntil,
   claudeModelFamily,
@@ -1049,4 +1050,57 @@ test('a 403 is passed through without trying a backup', { timeout: 20_000 }, asy
 
   assert.equal(response.status, 403);
   assert.deepEqual(tokens, ['token-home']);
+});
+
+// Chicago, 2026-11-17: agent-workstation-2 was switched by hand from its own
+// account (which had a chain) to one without a chain, and stopped at "limit
+// reached" when that account's five-hour window ran out.
+test('a device switched by hand to an account without a chain keeps the chain of the account it was issued for', { timeout: 20_000 }, async (t) => {
+  const { store, accounts, deviceToken, deviceId } = await fleet();
+  await store.configureDeviceAccount({ deviceId, selectedAccountId: accounts.spare.id, actor: 'admin:test' });
+  const tokens = [];
+  const { proxyUrl } = await harness(t, { store }, async (req, res) => {
+    await readBody(req);
+    tokens.push(bearer(req));
+    if (bearer(req) === 'token-spare') return refuse(res, exhaustedHeaders('five_hour'));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ served_by: bearer(req) }));
+  });
+
+  const response = await post(`${proxyUrl}/claude/v1/messages`, deviceToken);
+
+  assert.equal(response.status, 200, 'the limit must not reach the client while the inherited chain has room');
+  assert.equal(JSON.parse(response.body).served_by, 'token-backup');
+  assert.deepEqual(tokens, ['token-spare', 'token-backup']);
+  await settled(store);
+  const device = store.state.devices.find((entry) => entry.id === deviceId);
+  assert.equal(device.selected_account_id, accounts.backup.id);
+  assert.equal(device.account_failover.home_account_id, accounts.spare.id, 'it returns to the account it was switched to');
+});
+
+test('the inherited chain follows the account\'s own chain, without repeats or the account itself', async () => {
+  const { store, accounts, deviceId } = await fleet({ backups: ['backup', 'spare'] });
+  await store.setAccountFailover(accounts.spare.id, {
+    enabled: true,
+    backupAccountIds: [accounts.home.id, accounts.backup.id],
+    actor: 'test',
+  });
+  const device = store.state.devices.find((entry) => entry.id === deviceId);
+
+  assert.deepEqual(
+    deviceFailoverChain(store, device, accounts.spare),
+    { enabled: true, backup_account_ids: [accounts.home.id, accounts.backup.id] },
+  );
+  assert.deepEqual(
+    deviceFailoverChain(store, device, store.accountById(accounts.home.id)),
+    { enabled: true, backup_account_ids: [accounts.backup.id, accounts.spare.id] },
+    'on the account it was issued for, a device has just that account\'s chain',
+  );
+});
+
+test('a chain switched off is not inherited', async () => {
+  const { store, accounts, deviceId } = await fleet({ failoverEnabled: false });
+  const device = store.state.devices.find((entry) => entry.id === deviceId);
+
+  assert.deepEqual(deviceFailoverChain(store, device, accounts.spare), { enabled: false, backup_account_ids: [] });
 });
