@@ -5080,7 +5080,8 @@ if [ ! -f "$SETTINGS_FILE" ]; then printf '{}\n' > "$SETTINGS_FILE"; fi
 cat > "$PROFILE_FILE" <<'PROFILE'
 export ANTHROPIC_BASE_URL=${shellSingleQuote(gateway)}
 export ${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${shellSingleQuote(CLIENT_CONFIG_VERSION)}
-export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5'
+export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5-5'
+export CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1
 export CLAUDE_CODE_API_KEY_HELPER_TTL_MS=300000
 ${unixGatewayMode}
 export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
@@ -5124,7 +5125,8 @@ if (-not (Test-Path -LiteralPath $settings -PathType Leaf)) {
 $tokenFile = [IO.Path]::Combine($HOME, '.config', 'claude-codex-gateway', 'claude-${profile}.token')
 $env:ANTHROPIC_BASE_URL=${powerShellSingleQuote(gateway)}
 $env:${CLAUDE_CLIENT_CONFIG_VERSION_KEY}=${powerShellSingleQuote(CLIENT_CONFIG_VERSION)}
-$env:ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5'
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5-5'
+$env:CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK='1'
 ${windowsGatewayMode}
 $env:CLAUDE_CODE_SUBPROCESS_ENV_SCRUB='1'
 Remove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
