@@ -216,6 +216,31 @@ function unavailableSnapshot(account, code, previous = null) {
   };
 }
 
+/**
+ * Gemini has no account-wide window: each model (in practice each model family)
+ * has its own remaining fraction and reset. Every Gemini and Claude model the
+ * account lists is kept as a `model` window; the card shows them by name.
+ */
+export function geminiUsageSnapshotFrom(models, plan = null) {
+  const windows = (Array.isArray(models) ? models : [])
+    .filter((model) => model.remainingFraction !== null && model.remainingFraction !== undefined)
+    .filter((model) => /gemini|claude/i.test(model.id) && !/image|embedding|tts|audio/i.test(model.id))
+    .map((model) => {
+      const window = normalizedWindow('model', 100 - model.remainingFraction * 100, model.resetTime);
+      return window ? { ...window, model: model.id, label: model.displayName ?? model.id } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.model.localeCompare(b.model));
+  if (!windows.length) throw new UsageFetchError('usage_not_reported');
+  return {
+    provider: 'gemini',
+    status: 'available',
+    fetched_at: new Date().toISOString(),
+    plan_type: plan,
+    windows,
+  };
+}
+
 export class UsageMonitor {
   constructor({
     store,
@@ -225,8 +250,12 @@ export class UsageMonitor {
     claudeRefreshIntervalMs = null,
     writeCache = writeAtomic,
     log = () => {},
+    // `GeminiModelCache`: Gemini reports quota per model, on the same call that
+    // lists the models, so the proxy's cache is the one place it is read.
+    geminiModels = null,
   }) {
     this.store = store;
+    this.geminiModels = geminiModels;
     this.cachePath = join(home, 'usage.json');
     this.fetchImpl = fetchImpl;
     this.refreshIntervalMs = Number.isFinite(Number(refreshIntervalMs))
@@ -373,6 +402,19 @@ export class UsageMonitor {
           accountId: current.account_id,
           fetchImpl: this.fetchImpl,
         });
+      } else if (account.provider === 'gemini') {
+        if (!this.geminiModels) throw new UsageFetchError('unsupported_provider');
+        if (account.status === 'login_required') throw new UsageFetchError('authorization_required');
+        let models;
+        try {
+          models = await this.geminiModels.modelsFor(account.id, { force: true });
+        } catch (error) {
+          if (error?.code === 'LOGIN_REQUIRED') throw new UsageFetchError('authorization_required');
+          if (error?.code === 'INVALID_GRANT') throw new UsageFetchError('reauthorization_required');
+          if (error?.code === 'ACCOUNT_SUSPENDED') throw new UsageFetchError('account_suspended', 403);
+          throw new UsageFetchError(error?.httpStatus ? `upstream_${error.httpStatus}` : 'fetch_failed');
+        }
+        snapshot = geminiUsageSnapshotFrom(models, this.store.accountById(account.id)?.gemini?.plan ?? null);
       } else {
         throw new UsageFetchError('unsupported_provider');
       }

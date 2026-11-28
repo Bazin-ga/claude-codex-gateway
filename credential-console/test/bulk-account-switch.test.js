@@ -488,7 +488,7 @@ test('one member on two providers is split across sections, each aimed at its ow
   assert.equal(codexBulk.includes(claudeB.id), false);
 });
 
-test('both sections are always offered, with a count of what each holds', async () => {
+test('the subscription sections are always offered, with a count of what each holds', async () => {
   const store = await newStore();
   const claude = await claudeAccount(store, 'claude-a');
   const codex = await codexAccount(store, 'codex-a');
@@ -517,7 +517,9 @@ test('both sections are always offered, with a count of what each holds', async 
   assert.equal(tabs.includes('AWS Bedrock'), false, 'a provider nothing is on gets no section');
   // Not /provider-tab\b/: the word boundary also matches inside
   // "provider-tab-count", counting every tab twice.
-  assert.equal((tabs.match(/class="provider-tab[ "]/g) ?? []).length, 2);
+  // Claude, Codex and Gemini: the three subscriptions, always present.
+  assert.match(tabs, /provider-tab[^>]*>Gemini<span class="provider-tab-count">0</);
+  assert.equal((tabs.match(/class="provider-tab[ "]/g) ?? []).length, 3);
 });
 
 test('the live machine filter preserves its provider section', async () => {

@@ -354,6 +354,59 @@ subtracted, so `input + cache_read + cache_creation` remains the whole prompt co
 rather than a permanent silent undercount. A device's rate-limit budget is shared with the Claude
 proxy rather than duplicated.
 
+## Gemini (Google AI Pro / Ultra)
+
+The third subscription provider. Gemini CLI stopped serving consumer plans in
+June 2026, so the console signs an account in the way the Antigravity Hub does
+and speaks to the same Cloud Code backend (`daily-cloudcode-pa.googleapis.com`,
+`v1internal`). **Google's terms forbid using a consumer plan through a proxy,
+and Google has suspended accounts for it (Feb 2026, Nov 2026). Sign in only an
+account whose owner accepts that.**
+
+Authorization is the Codex paste flow: register an alias (administrator or
+member), open `/accounts/<id>/gemini-authorization`, sign in with Google, and
+paste the `http://localhost:51121/oauth-callback?...` address the browser fails
+to open. The console then reads the account email (checked against the label,
+if one was given), finds or onboards the account's Cloud Code project, and
+stores the refresh token and project id encrypted in `state.json`. Google
+refresh tokens do not rotate, so there is no refresh centre: hour-long access
+tokens are minted in memory on demand. The Antigravity OAuth client id and
+secret are not in the repository (secret scanning refuses them); set
+`CREDENTIAL_CONSOLE_GEMINI_OAUTH_CLIENT_ID` and
+`CREDENTIAL_CONSOLE_GEMINI_OAUTH_CLIENT_SECRET` in the service environment.
+Without them the authorization page reports that sign-in is not configured.
+
+Devices speak the public Gemini API under `/gemini` with the device token as
+the API key (`x-goog-api-key`, `?key=` or a bearer):
+
+| Route | Upstream |
+| --- | --- |
+| `POST /gemini/v1beta/models/{m}:generateContent` | `v1internal:generateContent` |
+| `POST /gemini/v1beta/models/{m}:streamGenerateContent?alt=sse` | `v1internal:streamGenerateContent` |
+| `POST /gemini/v1beta/models/{m}:countTokens` | `v1internal:countTokens`, estimated if refused |
+| `GET /gemini/v1beta/models[/{m}]` | `v1internal:fetchAvailableModels` |
+
+Each request is wrapped in the Hub's envelope (`project`, `model`,
+`requestType: agent`, `userAgent: antigravity`, the Hub's system instruction in
+front of the client's) and each response or SSE event is unwrapped from
+`{ response }`. The User-Agent carries the Hub version read from its updater
+manifest every six hours (`CREDENTIAL_CONSOLE_ANTIGRAVITY_VERSION` pins it).
+A model name the account does not list is sent to its newest Gemini model of
+the same family (pro / flash / lite), so Gemini CLI's defaults and helper calls
+work. Turns are metered (thinking counts as output); prompts are not archived.
+Model block rules apply. A 403 "disabled ... terms of service" marks the
+account unhealthy with that reason.
+
+The account card shows remaining quota per model, read from the same
+`fetchAvailableModels` call. Client setup is on the device page: Gemini CLI
+needs `GOOGLE_GEMINI_BASE_URL` + `GEMINI_API_KEY` and
+`{"security":{"auth":{"selectedType":"gemini-api-key"}}}` in
+`~/.gemini/settings.json`; Paseo runs it as a custom ACP provider
+(`"extends": "acp", "command": ["gemini", "--acp"]`). The gateway URL defaults to
+`<public url>/gemini`; `CREDENTIAL_CONSOLE_GEMINI_GATEWAY_URL` overrides it.
+
+Not covered: guest keys and quota failover for Gemini accounts.
+
 ## AI onboarding and the private live guide
 
 The repository's [`AI-ONBOARDING.md`](../AI-ONBOARDING.md) is the public, generic edition. It is

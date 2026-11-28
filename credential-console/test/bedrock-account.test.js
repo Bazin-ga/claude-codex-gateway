@@ -26,7 +26,7 @@ function bedrockInput(overrides = {}) {
 }
 
 test('bedrock is a gateway provider alongside claude and codex', () => {
-  assert.deepEqual([...GATEWAY_PROVIDERS], ['claude', 'codex', 'bedrock']);
+  assert.deepEqual([...GATEWAY_PROVIDERS], ['claude', 'codex', 'bedrock', 'gemini']);
 });
 
 test('a Bedrock account stores its pin in the clear and its key encrypted', async (t) => {

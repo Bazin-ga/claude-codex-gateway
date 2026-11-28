@@ -1063,6 +1063,28 @@ function credentialAlertSummaryView(accounts, alerts) {
   </section>`;
 }
 
+/**
+ * Gemini's allowance is per model rather than per account, so the card lists
+ * the models the subscription reports, each with what is left and when it
+ * refills — the same two facts the Claude and Codex windows give.
+ */
+function geminiUsageView(account, { showAccount = false } = {}) {
+  const usage = account.usage;
+  const windows = (usage?.windows ?? []).filter((entry) => entry.kind === 'model');
+  const updatedAt = usage?.observed_at ?? usage?.fetched_at ?? usage?.attempted_at;
+  const plan = usage?.plan_type ?? account.gemini?.plan ?? null;
+  return `<div class="quota-account">
+    ${showAccount || plan ? `<div class="quota-account-name">${showAccount ? `<strong>${escapeHtml(account.alias)}</strong>` : ''}${plan ? `<span class="badge stored">${escapeHtml(plan)}</span>` : ''}</div>` : ''}
+    ${windows.length ? `<div class="quota-grid">${windows.map((window) => `<div class="quota-window">
+      <span>${escapeHtml(window.label ?? window.model ?? '')}</span>
+      <strong><span data-i18n="usage-remaining">Remaining</span> ${escapeHtml(window.remaining_percent)}%</strong>
+      <small>${window.resets_at ? untilHtml(window.resets_at, 'resets') : '<span data-i18n="usage-resets">Resets</span> —'}</small>
+    </div>`).join('')}</div>` : ''}
+    ${usageMessage(usage)}
+    ${updatedAt ? `<div class="quota-meta"><span><span data-i18n="usage-updated">Updated</span> ${timeHtml(updatedAt)}</span></div>` : ''}
+  </div>`;
+}
+
 function quotaWindowView(usage, kind, label, i18n) {
   const window = usage?.windows?.find((entry) => entry.kind === kind);
   if (!window) {
@@ -1112,6 +1134,8 @@ function usageStatusTip(usage) {
       return '上游拒绝了该凭据（例如账号所属组织已禁用 OAuth，或 token 已被吊销）。该账号可能已不可用，请联系账号拥有者检查其组织的 OAuth / API 设置。 | The provider refused the credential (e.g. the account\'s organization has disabled OAuth, or the token was revoked). The account may be unusable — ask the owner to check their organization\'s OAuth / API policy.';
     case 'credential_unavailable':
       return '没有可用于查询额度的已发布凭据。 | No published credential is available to query usage with.';
+    case 'account_suspended':
+      return 'Google 以违反服务条款为由停用了这个账号的 Antigravity 访问（403）。控制台这边无法修复，只能由账号拥有者向 Google 申诉。 | Google has disabled Antigravity for this account for a terms-of-service violation (403). Nothing on this side fixes it; only the owner can appeal to Google.';
     default:
       if (code.startsWith('upstream_')) {
         const http = code.replace('upstream_', 'HTTP ');
@@ -1558,6 +1582,7 @@ function accountUsageView(account, { showAccount = false } = {}) {
   }
   // An API key has no allowance to report either; what it has is a bill.
   if (isCodexApiKeyAccount(account)) return apiSpendView(account, { showAccount });
+  if (account.provider === 'gemini') return geminiUsageView(account, { showAccount });
   const usage = account.usage;
   const message = usageMessage(usage);
   // `observed_at` outranks `fetched_at` because it is only ever set when a
@@ -1796,6 +1821,9 @@ function accountCanReceiveDevice(account) {
   if (account.status === 'disabled') return false;
   if (account.expires_at && Date.parse(account.expires_at) <= Date.now()) return false;
   if (account.provider === 'claude') return true;
+  // Status is the only signal a Gemini row gives the page: it turns healthy when
+  // the sign-in is stored, and an unauthorized row stays login_required.
+  if (account.provider === 'gemini') return ['stored', 'healthy'].includes(account.status);
   // A Bedrock key never expires and is present from the moment the row exists,
   // so the only question is whether the row carries the pin the proxy enforces.
   if (account.provider === 'bedrock') {
@@ -1814,6 +1842,7 @@ function providerLabel(provider) {
   if (provider === 'claude') return 'Claude Code';
   if (provider === 'codex') return 'Codex';
   if (provider === 'bedrock') return 'AWS Bedrock';
+  if (provider === 'gemini') return 'Gemini';
   return 'Unknown';
 }
 
@@ -4360,7 +4389,7 @@ function memberAccountsView(ownAccounts, csrf) {
     : statusBadge(account.status));
   const rows = ownAccounts.map((account) => {
     const id = encodeURIComponent(account.id);
-    const page = account.provider === 'claude' ? 'claude-authorization' : 'codex-authorization';
+    const page = `${account.provider === 'claude' || account.provider === 'gemini' ? account.provider : 'codex'}-authorization`;
     const pending = account.status === 'login_required';
     return `<li class="member-account">
       <strong>${escapeHtml(account.alias)}</strong>
@@ -4386,10 +4415,11 @@ function memberAccountsView(ownAccounts, csrf) {
     </article>`;
   return `<section class="member-accounts" id="member-accounts">
     <h2 data-i18n="member-accounts-heading">Add your own account</h2>
-    <p class="muted" data-i18n="member-accounts-intro">Bought a Claude or ChatGPT subscription? Add it here and sign in to it on the next page. It joins the shared accounts everyone can use. You can authorize only the accounts you add yourself.</p>
+    <p class="muted" data-i18n="member-accounts-intro">Bought a Claude, ChatGPT or Gemini subscription? Add it here and sign in to it on the next page. It joins the shared accounts everyone can use. You can authorize only the accounts you add yourself.</p>
     <div class="grid">
       ${form('claude', 'Add a Claude account', 'member-add-claude', 'The email must be the one you sign in to Claude with; it is checked when you authorize.', 'member-add-claude-help', true, 'claude-max-alex')}
       ${form('codex', 'Add a Codex (ChatGPT) account', 'member-add-codex', 'You sign in to ChatGPT on the next page. The email is optional; if given, it is checked when you authorize.', 'member-add-codex-help', false, 'codex-pro-alex')}
+      ${form('gemini', 'Add a Gemini (Google AI Pro / Ultra) account', 'member-add-gemini', 'You sign in with Google on the next page. The email is optional; if given, it is checked when you authorize. Google may suspend a subscription used through a proxy.', 'member-add-gemini-help', false, 'gemini-ultra-alex')}
     </div>
     ${rows ? `<h3 data-i18n="member-accounts-mine">Accounts you added</h3><ul class="member-account-list">${rows}</ul>` : ''}
   </section>`;
@@ -4513,6 +4543,17 @@ export function dashboardView({
   const codexUsage = codexGatewayAccounts.map((account) => accountUsageView(account, {
     showAccount: codexGatewayAccounts.length > 1,
   })).join('');
+  // The third subscription, offered the same way as the other two: every
+  // authorized account in the picker, each with its quota above the form.
+  const geminiUsableAccounts = accounts.filter((account) => (
+    account.provider === 'gemini' && accountCanReceiveDevice(account)
+  ));
+  const geminiOptions = geminiUsableAccounts.map((account) => (
+    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.alias)}${account.email_label ? ` · ${escapeHtml(account.email_label)}` : ''}${privateMark(account)}</option>`
+  )).join('');
+  const geminiUsage = geminiUsableAccounts.map((account) => accountUsageView(account, {
+    showAccount: geminiUsableAccounts.length > 1,
+  })).join('');
   const claudeUsage = selfServiceAccounts.map((account) => accountUsageView(account, {
     showAccount: selfServiceAccounts.length > 1,
   })).join('');
@@ -4527,7 +4568,9 @@ export function dashboardView({
       ? `<a class="button secondary" href="/accounts/${id}/claude-authorization" data-i18n="owner-authorization">Owner authorization</a>`
       : account.provider === 'codex' && !isCodexApiKeyAccount(account)
         ? `<a class="button secondary" href="/accounts/${id}/codex-authorization" data-i18n="codex-authorization">Codex authorization</a>`
-        : '';
+        : account.provider === 'gemini'
+          ? `<a class="button secondary" href="/accounts/${id}/gemini-authorization" data-i18n="gemini-authorization">Gemini authorization</a>`
+          : '';
     const enrollment = account.provider !== 'claude' ? ''
       : `<section class="acct-panel">
         <h3 data-i18n="enroll-panel-heading">One-time enrollment code</h3>
@@ -4631,7 +4674,7 @@ export function dashboardView({
   // The inventory is partitioned by provider, and these two are always present
   // even when empty: a section that appeared only when populated would make an
   // empty one look like a page that had not finished loading.
-  const INVENTORY_PROVIDERS = ['claude', 'codex'];
+  const INVENTORY_PROVIDERS = ['claude', 'codex', 'gemini'];
   const activeDeviceRows = devices.filter((device) => !device.revoked_at);
   // Any other provider a live credential is actually on. Empty in practice, and
   // therefore invisible — but a Bedrock credential that someone self-serves must
@@ -4825,6 +4868,29 @@ export function dashboardView({
               <div><button type="button" disabled data-i18n="waiting-owner">Waiting for account owner</button></div>
             </div><p class="muted tiny" data-i18n="owner-add-once">An account owner adds it once below; every member can then self-serve.</p>`}
           </article>
+          <article class="provider-card">
+            <div class="provider-title"><h2>Gemini</h2>${geminiUsableAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
+            <p class="muted" data-i18n="gemini-description">A Google AI Pro / Ultra subscription, for Gemini CLI, Paseo or any Gemini API client. The Google sign-in stays on this server; turns route through this console and are metered per device.</p>
+            ${geminiUsableAccounts.length ? `<div class="quota-list">${geminiUsage}</div>` : ''}
+            ${geminiUsableAccounts.length ? `<form method="post" action="/self-service" class="member-form with-machine${memberFormClass}" data-persist-draft="gemini-self-service">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <label><span data-i18n="team-account">Team account</span>
+                <select name="account_id" required data-draft-field>${geminiOptions}</select>
+              </label>
+              ${memberLabelField}
+              <label><span data-i18n="machine-optional">Machine (optional)</span>
+                <input name="machine" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
+              </label>
+              <label><span data-i18n="device-name">Device name</span>
+                <input name="device_name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" placeholder="my-laptop" maxlength="64" data-draft-field>
+              </label>
+              <div><button type="submit" data-i18n="get-gemini">Get Gemini setup</button></div>
+            </form>` : `<div class="member-form">
+              <label><span data-i18n="team-account">Team account</span><select disabled><option data-i18n="no-account">No account available</option></select></label>
+              <label><span data-i18n="device-name">Device name</span><input disabled data-placeholder-en="Available after account enrollment" data-placeholder-zh="账号录入后即可填写" placeholder="Available after account enrollment"></label>
+              <div><button type="button" disabled data-i18n="waiting-owner">Waiting for account owner</button></div>
+            </div><p class="muted tiny" data-i18n="owner-add-once">An account owner adds it once below; every member can then self-serve.</p>`}
+          </article>
           ${bedrockAccounts.length ? `<article class="provider-card">
             <div class="provider-title"><h2>AWS Bedrock</h2>${bedrockUsableAccounts.length ? statusBadge('healthy') : statusBadge('login_required')}</div>
             <p class="muted" data-i18n="bedrock-description">A device token in, metered Bedrock turns out — for Claude Code, Codex, or your own Converse calls. The AWS key stays on this server; each account is pinned to one region and a list of models.</p>
@@ -4896,6 +4962,21 @@ export function dashboardView({
               ${codexApiKeyEnabled ? `<label><span data-i18n="codex-api-key-optional">OpenAI API key (optional; instead of ChatGPT authorization, billed per token)</span>
                 <input name="openai_api_key" type="password" autocomplete="off" maxlength="4096" placeholder="sk-...">
               </label>` : ''}
+              <button type="submit" data-i18n="register-account">Register account</button>
+            </form>
+          </article>
+          <article class="card split">
+            <h2 data-i18n="add-gemini-heading">Add a Gemini (Google AI Pro / Ultra) account</h2>
+            <div class="notice"><span data-i18n="add-gemini-help">Register the alias, then sign in with Google from the account's own page. The console signs in the way the Antigravity app does, since that is the only Google client consumer plans still work in. Google's terms forbid using a consumer plan through a proxy and it has suspended accounts for it; use an account you can afford to lose.</span></div>
+            <form method="post" action="/accounts" class="stack" autocomplete="off" data-persist-draft="register-gemini-account">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+              <input type="hidden" name="provider" value="gemini">
+              <label><span data-i18n="account-alias">Account alias</span>
+                <input name="alias" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,63}" placeholder="gemini-ultra-1" data-draft-field>
+              </label>
+              <label><span data-i18n="account-email-optional">Account email label (optional, checked at authorization)</span>
+                <input name="email_label" type="email" placeholder="owner@gmail.com" maxlength="160" data-draft-field>
+              </label>
               <button type="submit" data-i18n="register-account">Register account</button>
             </form>
           </article>
@@ -5727,6 +5808,112 @@ echo "Codex gateway profile '${profile}' installed. Start Codex with: codex-${pr
  * model the gateway would refuse. A client whose models the pin does not name
  * exactly gets no block rather than a guess.
  */
+export function geminiAuthorizationView({
+  account,
+  csrf,
+  ownerPageUrl,
+  authorization = null,
+  error = null,
+  openMode = false,
+}) {
+  return layout('Gemini account authorization', `
+    <section class="login">
+      <div class="card stack">
+        <div><span class="badge stored">Gemini</span></div>
+        <h1 data-i18n="gemini-auth-heading">Gemini account authorization</h1>
+        <p><span data-i18n="team-account">Team account</span>: <strong>${escapeHtml(account.alias)}</strong>${account.email_label ? `<br><span data-i18n="owner-auth-account">Expected account</span>: <strong>${escapeHtml(account.email_label)}</strong>` : ''}</p>
+        ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ''}
+        <div class="notice error" data-i18n="gemini-auth-risk">Google's terms do not allow a Google AI Pro / Ultra plan to be used through a proxy, and Google has suspended accounts for it. Only sign in an account whose owner accepts that risk.</div>
+        <div class="notice" data-i18n="gemini-localhost-expected">Expect the final page to fail. Google sends the browser to http://localhost:51121, where nothing is listening. "Unable to connect" or "site can't be reached" is the successful outcome — the address bar then holds the authorization code.</div>
+        <div class="notice" data-i18n="owner-page-permanent">This control-page URL is permanent. Open it whenever the account owner is ready; the temporary OAuth session is created only after Start authorization is pressed.</div>
+        <pre id="owner-page-url">${escapeHtml(ownerPageUrl)}</pre>
+        <button type="button" class="secondary" data-copy-target="owner-page-url" data-i18n="copy-owner-link">Copy owner page link</button>
+        <form method="post" action="/accounts/${encodeURIComponent(account.id)}/gemini-authorization/start">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+          <button type="submit" data-i18n="start-authorization">Start a fresh authorization</button>
+        </form>
+        ${authorization ? `
+          <div class="notice success">${authorization.url
+            ? '<span data-i18n="temporary-session-ready">A fresh 15-minute authorization session is ready.</span>'
+            : '<span data-i18n="session-still-open">This authorization session is still open, so the code you already have can be pasted again. Starting a fresh one would invalidate it.</span>'
+          }<br><span class="tiny">${untilHtml(authorization.expires_at, 'expires')}</span></div>
+          ${authorization.url ? `
+          <ol class="stack">
+            <li data-i18n="gemini-auth-step-1">Open the Google page below and sign in with the Google account that holds the AI Pro or Ultra plan, then allow access.</li>
+            <li data-i18n="gemini-auth-step-2">Let the browser land on the localhost address that fails to load, then copy that whole address out of the address bar.</li>
+            <li data-i18n="gemini-auth-step-3">Paste it here and submit. The server exchanges it with Google and sets the account up for Antigravity, which can take up to half a minute.</li>
+          </ol>
+          <a class="button" href="${escapeHtml(authorization.url)}" target="_blank" rel="noopener noreferrer" data-i18n="open-gemini-authorization">Open Google sign-in</a>
+          ` : ''}
+          <form method="post" action="/accounts/${encodeURIComponent(account.id)}/gemini-authorization/complete" class="stack" autocomplete="off">
+            <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
+            <label><span data-i18n="codex-redirect-label">Failed localhost address, or the code alone</span>
+              <textarea name="authorization_code" required minlength="8" spellcheck="false" autocomplete="off" placeholder="http://localhost:51121/oauth-callback?state=...&amp;code=..."></textarea>
+            </label>
+            <button type="submit" data-i18n="complete-authorization">Complete authorization</button>
+          </form>
+        ` : ''}
+        <div class="notice" data-i18n="gemini-auth-security">The session is single-use, expires in 15 minutes, and is replaced when a new one starts. The Google refresh token is encrypted at rest and never shown; hour-long access tokens are minted from it in memory.</div>
+        <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+      </div>
+    </section>
+  `, { openMode });
+}
+
+/**
+ * A Gemini device: one token, used as the Gemini API key. Gemini CLI takes it
+ * through two environment variables; Paseo runs Gemini CLI as an ACP agent with
+ * the same two; anything else that speaks the Gemini API takes a base URL.
+ */
+export function geminiDeviceConfiguredView({
+  account, device, token, geminiGatewayUrl, openMode = false,
+}) {
+  const gateway = String(geminiGatewayUrl ?? '').replace(/\/$/, '');
+  const env = [
+    `export GOOGLE_GEMINI_BASE_URL=${shellSingleQuote(gateway)}`,
+    `export GEMINI_API_KEY=${shellSingleQuote(token)}`,
+  ].join('\n');
+  // Gemini CLI routes a base URL through its API-key mode; its own "gateway"
+  // auth type exists in the core but the CLI still refuses it at start-up.
+  const settings = JSON.stringify({ security: { auth: { selectedType: 'gemini-api-key' } } }, null, 2);
+  const paseo = JSON.stringify({
+    gemini: {
+      extends: 'acp',
+      label: 'Gemini',
+      command: ['gemini', '--acp'],
+      env: { GOOGLE_GEMINI_BASE_URL: gateway, GEMINI_API_KEY: token },
+    },
+  }, null, 2);
+  const example = `curl -sS "${gateway}/v1beta/models/gemini-3.5-flash:generateContent" \\
+  -H "x-goog-api-key: $GEMINI_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'`;
+  const block = (id, title, note, body) => `<h2>${title}</h2>
+      ${note}
+      <pre id="${id}">${escapeHtml(body)}</pre>
+      <div class="setup-actions">
+        <button type="button" class="secondary" data-copy-target="${id}">Copy</button>
+      </div>`;
+  return layout('Gemini device configured', `
+    <section class="stack">
+      <div class="notice success">Device <strong>${escapeHtml(device.name)}</strong> is enrolled for <strong>${escapeHtml(account.alias)}</strong>.</div>
+      <h1>Copy this now</h1>
+      <p class="muted">The device token below is displayed once and cannot be recovered from the control plane. Re-enroll if it is lost.</p>
+      ${gateway ? `${block('gemini-env', 'Gemini CLI — 1. environment',
+        '<p class="muted">Install with <code>npm install -g @google/gemini-cli</code> and put these two lines in the shell profile. Any model name works: one the subscription does not list under that name is sent to its newest model of the same family (pro, flash or lite).</p>', env)}
+      ${block('gemini-settings', 'Gemini CLI — 2. sign-in type',
+        '<p class="muted">Put this in <code>~/.gemini/settings.json</code> (merge it into an existing file), then run <code>gemini</code>. Without it Gemini CLI refuses to start with "Invalid auth method selected".</p>', settings)}
+      ${block('gemini-paseo', 'Paseo',
+        '<p class="muted">Paseo runs Gemini CLI as an ACP agent. On the machine running the Paseo daemon, install Gemini CLI and write the settings.json above, add this under <code>agents.providers</code> in <code>~/.paseo/config.json</code>, then restart the daemon. The token sits in that file, so keep it readable only by you.</p>', paseo)}
+      ${block('gemini-example', 'Anything else that speaks the Gemini API', '', example)}
+      <div class="notice">Per-turn token counts are recorded for this device; prompts are not archived on this path.</div>`
+    : '<div class="notice error">The Gemini gateway URL is not configured on this console, so no client configuration can be generated. Ask an administrator to set it.</div>'}
+      <div class="notice" data-i18n="closing-hides-token">Closing or refreshing this page permanently hides the credential.</div>
+      <a class="button secondary" href="/" data-i18n="back-dashboard">Back to dashboard</a>
+    </section>
+  `, { openMode, completedDraft: 'gemini-self-service' });
+}
+
 export function bedrockDeviceConfiguredView({
   account, device, token, bedrockGatewayUrl, openMode = false,
 }) {
@@ -6316,7 +6503,7 @@ export function accountDeleteView({ plan, accounts = [], csrf, error = null, ope
   const { account } = plan;
   const aliasOf = (id) => accounts.find((entry) => entry.id === id)?.alias ?? id;
   const deviceLine = (device, extra = '') => `<li><strong>${escapeHtml(device.name)}</strong> <span class="muted tiny">${escapeHtml(device.member_label ?? '')} · ${escapeHtml(device.id)}</span>${extra}</li>`;
-  const providerLabel = { claude: 'Claude', codex: 'Codex', bedrock: 'Bedrock' }[account.provider] ?? account.provider;
+  const providerLabel = { claude: 'Claude', codex: 'Codex', bedrock: 'Bedrock', gemini: 'Gemini' }[account.provider] ?? account.provider;
   // One plain block per effect: inside the card's stack, a heading, hint and
   // list each picked up the stack gap on top of their own margins.
   const deleteSection = (key, heading, body) => `<div class="delete-effect">
