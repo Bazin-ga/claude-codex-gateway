@@ -32,6 +32,15 @@ import { isCodexApiKeyAccount, parseApiKeyModels } from './lib/codex-api-key.js'
 import { GUEST_PROVIDERS, parseUsdAmount } from './lib/guest-keys.js';
 import { OPENAI_LONG_CONTEXT_ABOVE, summarizeApiSpend } from './lib/openai-api-pricing.js';
 import { BEDROCK_PROXY_PREFIX, handleBedrockProxy } from './lib/bedrock-proxy.js';
+import { GEMINI_PROXY_PREFIX, GeminiModelCache, handleGeminiProxy } from './lib/gemini-proxy.js';
+import {
+  GEMINI_UPSTREAM_BASE_URL,
+  GeminiTokenCache,
+  completeGeminiAuthorization as exchangeGeminiAuthorization,
+  createGeminiAuthorizationRequest,
+  discoverGeminiProject,
+  fetchGeminiUserEmail,
+} from './lib/gemini-oauth.js';
 import { readPublishedCodexCredential } from './lib/codex-proxy.js';
 import { isCodexGatewayAccount } from './lib/codex-api-key.js';
 import { RELAY_PROXY_PREFIX, RelayCatalog } from './lib/relay.js';
@@ -98,6 +107,8 @@ import {
   docsView,
   bedrockDeviceConfiguredView,
   codexDeviceConfiguredView,
+  geminiDeviceConfiguredView,
+  geminiAuthorizationView,
   deviceConfiguredView,
   enrollmentCreatedView,
   enrollmentView,
@@ -124,6 +135,7 @@ const PORT = Number(process.env.CREDENTIAL_CONSOLE_PORT ?? 9443);
 const PUBLIC_BASE_URL = process.env.CREDENTIAL_CONSOLE_PUBLIC_URL ?? `https://127.0.0.1:${PORT}`;
 const CLAUDE_GATEWAY_URL = process.env.CREDENTIAL_CONSOLE_CLAUDE_GATEWAY_URL;
 const CODEX_GATEWAY_URL = process.env.CREDENTIAL_CONSOLE_CODEX_GATEWAY_URL;
+const GEMINI_GATEWAY_URL = process.env.CREDENTIAL_CONSOLE_GEMINI_GATEWAY_URL;
 const TLS_CERT = process.env.CREDENTIAL_CONSOLE_TLS_CERT;
 const TLS_KEY = process.env.CREDENTIAL_CONSOLE_TLS_KEY;
 const COOKIE_SECURE = process.env.CREDENTIAL_CONSOLE_COOKIE_SECURE !== '0';
@@ -203,6 +215,7 @@ const COMPLETED_DRAFTS = new Set([
   'codex-self-service',
   'register-claude-account',
   'register-codex-account',
+  'register-gemini-account',
 ]);
 const DEVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const BOUNDED_CONVERSATION_SEARCH_ERRORS = new Set([
@@ -230,6 +243,7 @@ const CONVERSATION_MEMBER_MAX_BYTES = 160;
 const MEMBER_ACCOUNT_GET_ROUTES = [
   '/accounts/:id/claude-authorization',
   '/accounts/:id/codex-authorization',
+  '/accounts/:id/gemini-authorization',
 ];
 const MEMBER_ACCOUNT_POST_ROUTES = [
   '/accounts/:id/claude-authorization/start',
@@ -237,6 +251,8 @@ const MEMBER_ACCOUNT_POST_ROUTES = [
   '/accounts/:id/codex-authorization/start',
   '/accounts/:id/codex-authorization/complete',
   '/accounts/:id/codex-authorization/paste',
+  '/accounts/:id/gemini-authorization/start',
+  '/accounts/:id/gemini-authorization/complete',
 ];
 // A member may hold this many registered rows that are still waiting for
 // authorization; enough to retry a typo, not enough to litter the account list.
@@ -461,8 +477,15 @@ export async function createCredentialConsole(options = {}) {
   }
   let metricsQueryService = options.metricsQueryService ?? null;
   let metricsQueryWorkerInitError = null;
+  // Gemini access tokens live an hour and are minted from the stored refresh
+  // token on demand; the model list doubles as the account's quota reading.
+  const geminiFetch = options.geminiFetchImpl ?? fetch;
+  const geminiUpstreamBaseUrl = options.geminiUpstreamBaseUrl ?? GEMINI_UPSTREAM_BASE_URL;
+  const geminiTokens = options.geminiTokens ?? new GeminiTokenCache({ store, fetchImpl: geminiFetch });
+  const geminiModels = new GeminiModelCache({ tokens: geminiTokens, fetchImpl: geminiFetch, baseUrl: geminiUpstreamBaseUrl });
   const usageMonitor = options.usageMonitor ?? await new UsageMonitor({
     store,
+    geminiModels,
     home: options.home ?? store.home ?? HOME,
     refreshIntervalMs: options.usageRefreshIntervalMs ?? USAGE_REFRESH_INTERVAL_MS,
     claudeRefreshIntervalMs: options.claudeUsageRefreshIntervalMs ?? CLAUDE_USAGE_REFRESH_INTERVAL_MS,
@@ -791,7 +814,13 @@ export async function createCredentialConsole(options = {}) {
   // confidently wrong.
   const bedrockGatewayUrl = options.bedrockGatewayUrl
     ?? `${publicBaseUrl.replace(/\/$/, '')}${BEDROCK_PROXY_PREFIX}`;
+  const geminiGatewayUrl = options.geminiGatewayUrl
+    ?? GEMINI_GATEWAY_URL
+    ?? `${publicBaseUrl.replace(/\/$/, '')}${GEMINI_PROXY_PREFIX}`;
   const configuredDeviceView = (result) => {
+    if (result.account?.provider === 'gemini') {
+      return geminiDeviceConfiguredView({ ...result, geminiGatewayUrl, openMode });
+    }
     if (result.account?.provider === 'codex') {
       return codexDeviceConfiguredView({ ...result, codexGatewayUrl, openMode });
     }
@@ -1800,6 +1829,18 @@ export async function createCredentialConsole(options = {}) {
     // Off means off end to end. Without this the data plane would still serve a
     // console whose UI denies the mechanism exists, and any account left behind
     // on such a console would keep working invisibly.
+    if (path.startsWith(`${GEMINI_PROXY_PREFIX}/`)) {
+      await handleGeminiProxy(req, res, {
+        store,
+        tokens: geminiTokens,
+        models: geminiModels,
+        upstreamBaseUrl: geminiUpstreamBaseUrl,
+        requestMetrics,
+        fetchImpl: geminiFetch,
+      });
+      return;
+    }
+
     if (path.startsWith(`${BEDROCK_PROXY_PREFIX}/`) && !bedrockEnabled) {
       sendJson(res, 404, { message: 'not found' });
       return;
@@ -2808,8 +2849,8 @@ export async function createCredentialConsole(options = {}) {
       const admin = isAdmin(session);
       try {
         const provider = String(form.provider ?? '');
-        if (!['claude', 'codex', 'bedrock'].includes(provider)) {
-          throw new Error('only Claude, Codex and Bedrock accounts can be added in the web UI');
+        if (!['claude', 'codex', 'gemini', 'bedrock'].includes(provider)) {
+          throw new Error('only Claude, Codex, Gemini and Bedrock accounts can be added in the web UI');
         }
         if (!admin) {
           // A member brings a subscription and authorizes it through OAuth. A
@@ -3012,6 +3053,130 @@ export async function createCredentialConsole(options = {}) {
           error: error.message,
           openMode,
         }));
+      }
+      return;
+    }
+
+    const geminiOauthExchange = options.geminiOauthExchange
+      ?? ((input) => exchangeGeminiAuthorization({ ...input, fetchImpl: geminiFetch }));
+    const geminiUserEmail = options.geminiUserEmail
+      ?? ((input) => fetchGeminiUserEmail({ ...input, fetchImpl: geminiFetch }));
+    const geminiDiscoverProject = options.geminiDiscoverProject
+      ?? ((input) => discoverGeminiProject({ ...input, fetchImpl: geminiFetch, baseUrl: geminiUpstreamBaseUrl }));
+    const geminiAccountOr404 = (id) => {
+      const account = store.accountById(id);
+      if (!account || account.provider !== 'gemini') {
+        sendHtml(res, 404, messageView('Account not found', 'Gemini account was not found.', { error: true, openMode }));
+        return null;
+      }
+      return account;
+    };
+    const geminiAuthorizationPage = (account, session, extra = {}) => {
+      const pending = store.pendingCodexAuthorization({ accountId: account.id });
+      return geminiAuthorizationView({
+        account,
+        csrf: session.csrf,
+        ownerPageUrl: `${publicBaseUrl.replace(/\/$/, '')}/accounts/${encodeURIComponent(account.id)}/gemini-authorization`,
+        openMode,
+        ...(pending ? { authorization: { expires_at: pending.expires_at } } : {}),
+        ...extra,
+      });
+    };
+
+    const geminiAuthorizationParams = routeMatch(path, '/accounts/:id/gemini-authorization');
+    if (req.method === 'GET' && geminiAuthorizationParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const account = geminiAccountOr404(geminiAuthorizationParams.id);
+      if (!account) return;
+      if (!allowAuthorization(session, account, res)) return;
+      sendHtml(res, 200, geminiAuthorizationPage(account, session));
+      return;
+    }
+
+    const geminiAuthorizationStartParams = routeMatch(path, '/accounts/:id/gemini-authorization/start');
+    if (req.method === 'POST' && geminiAuthorizationStartParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const account = geminiAccountOr404(geminiAuthorizationStartParams.id);
+      if (!account) return;
+      if (!allowAuthorization(session, account, res)) return;
+      try {
+        const request = createGeminiAuthorizationRequest({ emailLabel: account.email_label });
+        const flow = await store.beginGeminiAuthorization({
+          accountId: account.id,
+          verifier: request.verifier,
+          state: request.state,
+          initiatedBy: session.admin_identity ?? 'administrator',
+        });
+        sendHtml(res, 200, geminiAuthorizationPage(account, session, {
+          authorization: { url: request.url, expires_at: flow.expires_at },
+        }));
+      } catch (error) {
+        sendHtml(res, 400, geminiAuthorizationPage(account, session, { error: error.message }));
+      }
+      return;
+    }
+
+    const geminiAuthorizationCompleteParams = routeMatch(path, '/accounts/:id/gemini-authorization/complete');
+    if (req.method === 'POST' && geminiAuthorizationCompleteParams) {
+      const session = requireSession(req, res);
+      if (!session) return;
+      const form = await readForm(req).catch(() => ({}));
+      if (!checkCsrf(session, form)) {
+        sendHtml(res, 403, messageView('Request refused', 'Invalid CSRF token.', { error: true, openMode }));
+        return;
+      }
+      const account = geminiAccountOr404(geminiAuthorizationCompleteParams.id);
+      if (!account) return;
+      if (!allowAuthorization(session, account, res)) return;
+      const identity = session.admin_identity ?? 'administrator';
+      try {
+        // Same paste rules as Codex: the whole failed localhost address, or the
+        // code alone when there is exactly one live session.
+        const submitted = parseCodexAuthorizationRedirect(form.authorization_code);
+        const flow = submitted.state
+          ? store.geminiAuthorizationByState({ accountId: account.id, state: submitted.state })
+          : store.liveCodexAuthorization({ accountId: account.id });
+        if (flow.initiated_by !== identity) {
+          throw new Error('authorization must be completed by the same administrator who started it');
+        }
+        const exchanged = await geminiOauthExchange({ code: submitted.code, verifier: flow.verifier });
+        const email = await geminiUserEmail({ accessToken: exchanged.accessToken });
+        const expectedEmail = String(account.email_label ?? '').trim().toLowerCase();
+        // Checked before onboarding, so a wrong sign-in creates nothing upstream.
+        if (expectedEmail && email !== expectedEmail) {
+          throw new Error(`authorized account email does not match ${expectedEmail}`);
+        }
+        const { projectId, plan } = await geminiDiscoverProject({ accessToken: exchanged.accessToken });
+        await store.completeGeminiAuthorization({
+          flowId: flow.id,
+          refreshToken: exchanged.refreshToken,
+          email,
+          projectId,
+          plan,
+        });
+        geminiTokens.forget(account.id);
+        usageMonitor.refreshAccount(account.id).catch(() => {});
+        log('gemini_account_authorized', { account_id: account.id, account_alias: account.alias, email, plan, identity });
+        sendHtml(res, 200, messageView(
+          'Gemini account authorized',
+          `${account.alias} is ready (${email}${plan ? `, ${plan}` : ''}). Members can now get a Gemini setup from the dashboard.`,
+          { openMode },
+        ));
+      } catch (error) {
+        log('gemini_account_authorization_failed', {
+          account_id: account.id,
+          account_alias: account.alias,
+          identity,
+          error: error.message,
+        });
+        sendHtml(res, 400, geminiAuthorizationPage(account, session, { error: error.message }));
       }
       return;
     }

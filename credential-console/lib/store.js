@@ -115,7 +115,7 @@ const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
  * refused. Adding the third provider by editing seven literals was how that
  * would have happened.
  */
-export const GATEWAY_PROVIDERS = Object.freeze(['claude', 'codex', 'bedrock']);
+export const GATEWAY_PROVIDERS = Object.freeze(['claude', 'codex', 'bedrock', 'gemini']);
 
 /**
  * A Bedrock account is pinned to one region and a list of models.
@@ -337,6 +337,7 @@ export class CredentialStore {
       external: account.external ? { kind: account.external.kind } : null,
       codex_auth: account.codex_auth ?? null,
       bedrock: account.bedrock ? { ...account.bedrock } : null,
+      gemini: account.gemini ? { ...account.gemini } : null,
       codex_guard: account.codex_guard ? { ...account.codex_guard } : null,
       codex_credit_guard: account.codex_credit_guard ? { ...account.codex_credit_guard } : null,
       claude_reserve: account.claude_reserve
@@ -655,7 +656,9 @@ export class CredentialStore {
     // with the region/model pin the proxy enforces. A row missing the pin is
     // unusable in a way the proxy could not report legibly, so it is refused
     // here instead.
-    const credentialField = account.provider === 'bedrock' ? 'api_key' : 'oauth_token';
+    const credentialField = account.provider === 'bedrock'
+      ? 'api_key'
+      : account.provider === 'gemini' ? 'refresh_token' : 'oauth_token';
     if (account.provider === 'bedrock'
       && (!account.bedrock?.region || !account.bedrock?.model_id)) {
       throw storeError('target account has no region and model pin', 'ACCOUNT_UNAVAILABLE');
@@ -2231,6 +2234,69 @@ export class CredentialStore {
 
   codexAuthorizationByState({ accountId, state }) {
     return this.#flowByState({ accountId, state });
+  }
+
+  async beginGeminiAuthorization({ accountId, verifier, state, initiatedBy, ttlMinutes = 15 }) {
+    return this.serialized(async () => {
+      const account = this.accountById(accountId);
+      if (!account) throw new Error('account not found');
+      if (account.provider !== 'gemini') throw new Error('account is not a Gemini account');
+      const flow = this.#openAuthorizationFlow({
+        account,
+        verifier,
+        state,
+        initiatedBy,
+        ttlMinutes,
+        event: 'gemini_authorization_started',
+      });
+      await this.persist();
+      return { ...flow, verifier: undefined, state_sha256: undefined };
+    });
+  }
+
+  geminiAuthorizationByState({ accountId, state }) {
+    return this.#flowByState({ accountId, state });
+  }
+
+  /**
+   * Store a Gemini sign-in. Google's refresh token does not rotate, so unlike
+   * Codex it is kept here, encrypted, beside the Cloud Code project it bills
+   * to; access tokens are minted from it in memory and never stored.
+   */
+  async completeGeminiAuthorization({ flowId, refreshToken, email, projectId, plan = null }) {
+    return this.serialized(async () => {
+      const flow = this.#liveFlowById(flowId);
+      const account = this.accountById(flow.account_id);
+      if (!account || account.provider !== 'gemini') throw new Error('Gemini account was not found');
+      const actualEmail = String(email ?? '').trim().toLowerCase();
+      const expectedEmail = String(account.email_label ?? '').trim().toLowerCase();
+      if (expectedEmail && actualEmail !== expectedEmail) {
+        throw new Error(`authorized account email does not match ${expectedEmail}`);
+      }
+      if (typeof refreshToken !== 'string' || !refreshToken) throw new Error('Google did not return a refresh token');
+      if (typeof projectId !== 'string' || !projectId) throw new Error('the account has no Cloud Code project');
+      account.credential = encryptJson(
+        this.masterKey,
+        { refresh_token: refreshToken, project_id: projectId },
+        `account:${account.id}:credential:v1`,
+      );
+      if (!account.email_label && actualEmail) account.email_label = actualEmail.slice(0, 160);
+      account.gemini = { plan: plan ? String(plan).slice(0, 40) : null };
+      account.status = 'healthy';
+      account.expires_at = null;
+      account.last_success_at = nowIso();
+      delete account.last_failure;
+      delete account.last_failure_at;
+      flow.used_at = nowIso();
+      delete flow.verifier;
+      this.audit('gemini_authorization_completed', {
+        oauth_flow_id: flow.id,
+        account_id: account.id,
+        email: actualEmail,
+      });
+      await this.persist();
+      return account;
+    });
   }
 
   #liveCodexFlow(accountId) {
